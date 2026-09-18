@@ -12,12 +12,11 @@ import (
 const (
 	openAIBase   = "https://api.openai.com/v1"
 	deepSeekBase = "https://api.deepseek.com/v1"
-	ollamaBase   = "http://localhost:11434/v1"
 )
 
 // openAICompat handles every provider that speaks the OpenAI wire format:
-// openai, deepseek, ollama (its /v1 endpoint) and custom_openai (vLLM, LM
-// Studio, LiteLLM, ...).
+// openai, deepseek and custom_openai (vLLM, LM Studio, LiteLLM, Ollama's
+// /v1 shim, ...). The ollama type uses the native adapter in ollama.go.
 type openAICompat struct {
 	cfg  Config
 	base string
@@ -25,11 +24,8 @@ type openAICompat struct {
 
 func newOpenAICompat(cfg Config) *openAICompat {
 	def := openAIBase
-	switch cfg.ProviderType {
-	case "deepseek":
+	if cfg.ProviderType == "deepseek" {
 		def = deepSeekBase
-	case "ollama":
-		def = ollamaBase
 	}
 	base := cfg.baseURL(def)
 	// Users often paste the host without /v1 for Ollama/vLLM. Add it when the
