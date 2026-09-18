@@ -3,6 +3,7 @@ package rag
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,7 +11,7 @@ import (
 
 func TestExtractMarkdownSections(t *testing.T) {
 	md := "# Install\n\nIntro paragraph.\n\n## Docker\n\nRun the container.\n\nSecond docker paragraph.\n\n## Binary\n\n```\n# not a heading\n```\n\n# Usage\n\nCall the API."
-	blocks, err := ExtractBlocks("guide.md", []byte(md))
+	blocks, err := ExtractBlocks(context.Background(), "guide.md", []byte(md))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,15 +31,15 @@ func TestExtractMarkdownSections(t *testing.T) {
 		}
 	}
 	// Deep hierarchies keep only the last two levels.
-	deep, _ := ExtractBlocks("d.md", []byte("# A\n## B\n### C\n\ntext"))
+	deep, _ := ExtractBlocks(context.Background(), "d.md", []byte("# A\n## B\n### C\n\ntext"))
 	if len(deep) != 1 || deep[0].Section != "B > C" {
 		t.Errorf("deep section: %+v", deep)
 	}
 	// ExtractText still returns the joined plain text.
-	if txt, _ := ExtractText("guide.md", []byte(md)); !strings.Contains(txt, "Intro paragraph.\n\nRun the container.") {
+	if txt, _ := ExtractText(context.Background(), "guide.md", []byte(md)); !strings.Contains(txt, "Intro paragraph.\n\nRun the container.") {
 		t.Errorf("ExtractText: %q", txt)
 	}
-	if blocks, _ := ExtractBlocks("notes.txt", []byte("one\n\ntwo")); len(blocks) != 2 || blocks[1].Text != "two" || blocks[0].Section != "" {
+	if blocks, _ := ExtractBlocks(context.Background(), "notes.txt", []byte("one\n\ntwo")); len(blocks) != 2 || blocks[1].Text != "two" || blocks[0].Section != "" {
 		t.Errorf("txt blocks: %+v", blocks)
 	}
 }
@@ -86,7 +87,7 @@ func TestExtractDOCX(t *testing.T) {
 	if !SniffOK("h.docx", data) || SniffOK("h.docx", []byte("<html>")) {
 		t.Error("docx sniffing")
 	}
-	blocks, err := ExtractBlocks("h.docx", data)
+	blocks, err := ExtractBlocks(context.Background(), "h.docx", data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +107,7 @@ func TestExtractDOCX(t *testing.T) {
 			t.Errorf("block %d = %+v, want %+v", i, blocks[i], want[i])
 		}
 	}
-	if _, err := ExtractBlocks("x.docx", []byte("not a zip")); err == nil {
+	if _, err := ExtractBlocks(context.Background(), "x.docx", []byte("not a zip")); err == nil {
 		t.Error("expected error for non-zip docx")
 	}
 }
@@ -120,7 +121,7 @@ func TestExtractHTML(t *testing.T) {
 	<pre>line 1
 line 2</pre><svg><text>icon</text></svg><noscript>enable js</noscript>
 	<h1>Usage</h1><blockquote>Quoted.</blockquote><footer>footer text</footer></body></html>`
-	p, err := Extract("page.html", []byte(page))
+	p, err := Extract(context.Background(), "page.html", []byte(page))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +195,7 @@ func buildPDF(t *testing.T, pages ...string) []byte {
 
 func TestExtractPDFPages(t *testing.T) {
 	data := buildPDF(t, "Hello page one", "Second page here")
-	blocks, err := ExtractBlocks("doc.pdf", data)
+	blocks, err := ExtractBlocks(context.Background(), "doc.pdf", data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +208,7 @@ func TestExtractPDFPages(t *testing.T) {
 	if blocks[1].Page != 2 || !strings.Contains(blocks[1].Text, "Second page here") {
 		t.Errorf("page 2: %+v", blocks[1])
 	}
-	if _, err := ExtractBlocks("x.pdf", []byte("%PDF-1.4 garbage")); err == nil {
+	if _, err := ExtractBlocks(context.Background(), "x.pdf", []byte("%PDF-1.4 garbage")); err == nil {
 		t.Error("expected error for a broken pdf")
 	}
 }

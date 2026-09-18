@@ -5,12 +5,15 @@ package rag
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/ledongthuc/pdf"
@@ -45,10 +48,31 @@ type Parsed struct {
 	Title string
 }
 
+// Extraction limits. Uploads are bounded by MAX_UPLOAD_MB, but a small file
+// can expand into far more text (zip bombs, PDFs with thousands of pages),
+// so the parsers cap what they produce as well.
+const (
+	// maxExtractedText caps the total text of one document, every format.
+	maxExtractedText = 20 << 20
+	// maxPDFPages is the number of pages read from a PDF; the rest is ignored.
+	maxPDFPages = 2000
+	// pdfTimeout bounds PDF parsing, which runs in library code that has no
+	// cancellation hook of its own.
+	pdfTimeout = 60 * time.Second
+	// maxDocxXML caps the size of word/document.xml inside a DOCX.
+	maxDocxXML = 32 << 20
+	// maxDocxRatio is the highest uncompressed/compressed ratio accepted for
+	// word/document.xml; real documents sit far below it.
+	maxDocxRatio = 100
+)
+
+// ErrTooMuchText reports a document whose extracted text exceeds the cap.
+var ErrTooMuchText = fmt.Errorf("document text exceeds %d MiB after extraction", maxExtractedText>>20)
+
 // ExtractBlocks parses an uploaded document into blocks. The file type is
 // taken from the filename extension.
-func ExtractBlocks(filename string, data []byte) ([]Block, error) {
-	p, err := Extract(filename, data)
+func ExtractBlocks(ctx context.Context, filename string, data []byte) ([]Block, error) {
+	p, err := Extract(ctx, filename, data)
 	if err != nil {
 		return nil, err
 	}
@@ -56,26 +80,49 @@ func ExtractBlocks(filename string, data []byte) ([]Block, error) {
 }
 
 // Extract parses an uploaded document into blocks plus document metadata.
-func Extract(filename string, data []byte) (*Parsed, error) {
+// ctx bounds the parse (PDF parsing also has its own timeout).
+func Extract(ctx context.Context, filename string, data []byte) (*Parsed, error) {
+	var (
+		p   *Parsed
+		err error
+	)
 	switch strings.ToLower(filepath.Ext(filename)) {
 	case ".pdf":
-		return extractPDF(data)
+		p, err = extractPDF(ctx, data)
 	case ".txt":
-		return &Parsed{Blocks: paragraphBlocks(normalizeText(string(data)), "", 0)}, nil
+		if len(data) > maxExtractedText {
+			return nil, ErrTooMuchText
+		}
+		p = &Parsed{Blocks: paragraphBlocks(normalizeText(string(data)), "", 0)}
 	case ".md", ".markdown":
-		return &Parsed{Blocks: extractMarkdown(normalizeText(string(data)))}, nil
+		if len(data) > maxExtractedText {
+			return nil, ErrTooMuchText
+		}
+		p = &Parsed{Blocks: extractMarkdown(normalizeText(string(data)))}
 	case ".docx":
-		return extractDOCX(data)
+		p, err = extractDOCX(data)
 	case ".html", ".htm":
-		return extractHTML(data)
+		p, err = extractHTML(data)
+	default:
+		return nil, fmt.Errorf("unsupported file type %q", filepath.Ext(filename))
 	}
-	return nil, fmt.Errorf("unsupported file type %q", filepath.Ext(filename))
+	if err != nil {
+		return nil, err
+	}
+	total := 0
+	for _, b := range p.Blocks {
+		total += len(b.Text)
+		if total > maxExtractedText {
+			return nil, ErrTooMuchText
+		}
+	}
+	return p, nil
 }
 
 // ExtractText returns the plain text of an uploaded document: all blocks
 // joined by blank lines. Kept for callers that do not need structure.
-func ExtractText(filename string, data []byte) (string, error) {
-	blocks, err := ExtractBlocks(filename, data)
+func ExtractText(ctx context.Context, filename string, data []byte) (string, error) {
+	blocks, err := ExtractBlocks(ctx, filename, data)
 	if err != nil {
 		return "", err
 	}
@@ -201,7 +248,36 @@ func atxHeading(line string) (int, string, bool) {
 	return level, title, true
 }
 
-func extractPDF(data []byte) (out *Parsed, err error) {
+// extractPDF parses at most maxPDFPages pages within pdfTimeout. The PDF
+// library can loop or crawl on crafted content streams and offers no way to
+// interrupt a page, so the work runs in a goroutine: on timeout the caller
+// returns an error and the goroutine is abandoned. It exits on its own when
+// the current page finishes because it checks ctx between pages, and the
+// buffered result channel means it never blocks on a departed receiver.
+func extractPDF(ctx context.Context, data []byte) (*Parsed, error) {
+	ctx, cancel := context.WithTimeout(ctx, pdfTimeout)
+	defer cancel()
+	type result struct {
+		out *Parsed
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := extractPDFPages(ctx, data)
+		done <- result{out, err}
+	}()
+	select {
+	case r := <-done:
+		return r.out, r.err
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("pdf parse exceeded %s", pdfTimeout)
+		}
+		return nil, ctx.Err()
+	}
+}
+
+func extractPDFPages(ctx context.Context, data []byte) (out *Parsed, err error) {
 	defer func() {
 		// The PDF library panics on some malformed inputs.
 		if r := recover(); r != nil {
@@ -213,8 +289,12 @@ func extractPDF(data []byte) (out *Parsed, err error) {
 		return nil, fmt.Errorf("open pdf: %w", err)
 	}
 	out = &Parsed{}
-	n := r.NumPage()
+	n := min(r.NumPage(), maxPDFPages)
+	total := 0
 	for i := 1; i <= n; i++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		p := r.Page(i)
 		if p.V.IsNull() {
 			continue
@@ -222,6 +302,10 @@ func extractPDF(data []byte) (out *Parsed, err error) {
 		s, perr := p.GetPlainText(nil)
 		if perr != nil {
 			continue
+		}
+		total += len(s)
+		if total > maxExtractedText {
+			return nil, ErrTooMuchText
 		}
 		out.Blocks = append(out.Blocks, paragraphBlocks(normalizeText(s), "", i)...)
 	}
@@ -244,14 +328,26 @@ func extractDOCX(data []byte) (*Parsed, error) {
 	var docXML []byte
 	for _, f := range zr.File {
 		if f.Name == "word/document.xml" {
+			// The header sizes are checked first (a bomb declares them
+			// honestly or lies; both are caught: an honest header fails
+			// here, a lying one hits the LimitReader below).
+			if f.UncompressedSize64 > maxDocxXML {
+				return nil, fmt.Errorf("docx document.xml is %d MiB; the limit is %d MiB", f.UncompressedSize64>>20, maxDocxXML>>20)
+			}
+			if f.UncompressedSize64 > maxDocxRatio*max(f.CompressedSize64, 1) {
+				return nil, errors.New("docx document.xml has an implausible compression ratio")
+			}
 			rc, err := f.Open()
 			if err != nil {
 				return nil, fmt.Errorf("open docx: %w", err)
 			}
-			docXML, err = io.ReadAll(io.LimitReader(rc, 256<<20))
+			docXML, err = io.ReadAll(io.LimitReader(rc, maxDocxXML+1))
 			_ = rc.Close()
 			if err != nil {
 				return nil, fmt.Errorf("read docx: %w", err)
+			}
+			if len(docXML) > maxDocxXML {
+				return nil, fmt.Errorf("docx document.xml exceeds %d MiB", maxDocxXML>>20)
 			}
 			break
 		}
