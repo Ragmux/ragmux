@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/store"
@@ -32,6 +33,11 @@ type Result struct {
 	Mode string
 	// Reranked is true when the LLM reranker successfully reordered the hits.
 	Reranked bool
+	// RetrievalLatencyMS covers embedding the query and the database search.
+	RetrievalLatencyMS int64
+	// RerankLatencyMS is the time spent in the reranker; nil when reranking
+	// did not run (off for the store, or no chat provider given).
+	RerankLatencyMS *int64
 }
 
 // Search returns the top-k hits for a query using the store's settings.
@@ -56,6 +62,7 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	if rs.ChunkCount == 0 || strings.TrimSpace(query) == "" {
 		return res, nil
 	}
+	start := time.Now()
 	conn, err := r.store.GetConnection(ctx, rs.EmbeddingConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("embedding connection: %w", err)
@@ -87,20 +94,26 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	if err != nil {
 		return nil, err
 	}
-	if rerank && len(hits) > 1 {
-		rr := r.Reranker
-		if rr == nil {
-			rr = &Reranker{}
-		}
-		ranked, err := rr.Rerank(ctx, prov, model, query, hits, k)
-		if err != nil {
-			if r.Log != nil {
-				r.Log.Warn("rerank failed; using fused order", "store", rs.ID, "err", err)
+	res.RetrievalLatencyMS = time.Since(start).Milliseconds()
+	if rerank {
+		rerankStart := time.Now()
+		if len(hits) > 1 {
+			rr := r.Reranker
+			if rr == nil {
+				rr = &Reranker{}
 			}
-		} else {
-			res.Reranked = true
+			ranked, err := rr.Rerank(ctx, prov, model, query, hits, k)
+			if err != nil {
+				if r.Log != nil {
+					r.Log.Warn("rerank failed; using fused order", "store", rs.ID, "err", err)
+				}
+			} else {
+				res.Reranked = true
+			}
+			hits = ranked
 		}
-		hits = ranked
+		ms := time.Since(rerankStart).Milliseconds()
+		res.RerankLatencyMS = &ms
 	}
 	if len(hits) > k {
 		hits = hits[:k]

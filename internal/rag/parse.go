@@ -46,6 +46,9 @@ type Parsed struct {
 	// Title is the document title when the format carries one (HTML
 	// <title>); empty otherwise.
 	Title string
+	// PageCount is the number of pages of a PDF (before the page cap); 0
+	// for formats without pages.
+	PageCount int
 }
 
 // Extraction limits. Uploads are bounded by MAX_UPLOAD_MB, but a small file
@@ -288,7 +291,7 @@ func extractPDFPages(ctx context.Context, data []byte) (out *Parsed, err error) 
 	if err != nil {
 		return nil, fmt.Errorf("open pdf: %w", err)
 	}
-	out = &Parsed{}
+	out = &Parsed{PageCount: r.NumPage()}
 	n := min(r.NumPage(), maxPDFPages)
 	total := 0
 	for i := 1; i <= n; i++ {

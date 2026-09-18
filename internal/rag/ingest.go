@@ -149,7 +149,7 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	if err != nil {
 		return err
 	}
-	if err := ing.store.SetDocumentStatus(ctx, docID, store.DocProcessing, ""); err != nil {
+	if err := ing.store.StartDocumentProcessing(ctx, docID); err != nil {
 		return err
 	}
 	rs, err := ing.store.GetRAGStore(ctx, doc.RAGStoreID)
@@ -174,6 +174,11 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	if err != nil {
 		return err
 	}
+	var pages *int
+	if parsed.PageCount > 0 {
+		pages = &parsed.PageCount
+	}
+	ing.progress(ctx, docID, progressParsed, pages)
 	pieces := SplitBlocks(parsed.Blocks, rs.ChunkSize, rs.ChunkOverlap)
 	if len(pieces) == 0 {
 		return fmt.Errorf("document produced no text chunks")
@@ -203,6 +208,7 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 		}
 		chunks[i] = c
 	}
+	ing.progress(ctx, docID, progressChunked, nil)
 	for i := 0; i < len(chunks); i += ing.batchSize {
 		end := i + ing.batchSize
 		if end > len(chunks) {
@@ -216,6 +222,11 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 		for j := range vecs {
 			chunks[i+j].Embedding = vecs[j]
 		}
+		// One write per batch; the last step (100) is written together with
+		// the ready status by ReplaceDocumentChunks.
+		if end < len(chunks) {
+			ing.progress(ctx, docID, progressChunked+(100-progressChunked)*end/len(chunks), nil)
+		}
 	}
 	if err := ing.store.ReplaceDocumentChunks(ctx, doc, chunks); err != nil {
 		return fmt.Errorf("store chunks: %w", err)
@@ -223,6 +234,21 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	ing.log.Info("document ingested", "doc", docID, "file", doc.Filename, "chunks", len(chunks),
 		"dims", len(chunks[0].Embedding), "took", time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+// Progress milestones of Process, in percent; embedding batches fill the
+// range between progressChunked and 100.
+const (
+	progressParsed  = 10
+	progressChunked = 20
+)
+
+// progress records ingestion progress; a failed write only costs the
+// dashboard a stale number, so it is logged and otherwise ignored.
+func (ing *Ingester) progress(ctx context.Context, docID int64, percent int, pages *int) {
+	if err := ing.store.SetDocumentProgress(ctx, docID, percent, pages); err != nil {
+		ing.log.Warn("record ingest progress", "doc", docID, "err", err)
+	}
 }
 
 // ContextualText is what gets embedded when contextual chunks are enabled:
