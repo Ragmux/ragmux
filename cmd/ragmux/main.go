@@ -112,6 +112,14 @@ func run(cfg config.Config) error {
 	log.Info("database: connected", "postgres_version", st.ServerVersion, "max_conns", cfg.DBMaxConns,
 		"secret_key_source", st.SecretKeySource)
 
+	// Credentials written by releases before 0.2.3 are not bound to their
+	// row; re-seal them with the connection id once, before anything reads them.
+	if n, err := st.UpgradeConnectionKeys(ctx); err != nil {
+		return fmt.Errorf("upgrade stored provider keys (is SECRET_KEY the right one?): %w", err)
+	} else if n > 0 {
+		log.Info("provider keys re-sealed with their connection id", "connections", n)
+	}
+
 	if err := bootstrapAdmin(ctx, st, cfg, log); err != nil {
 		return err
 	}

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -76,7 +77,38 @@ func newCipher(key []byte) (*cipher, error) {
 	return &cipher{aead: aead}, nil
 }
 
-func (c *cipher) encrypt(plain string) ([]byte, error) {
+// Key versions recorded in model_connections.key_version.
+const (
+	// keyVersionLegacy sealed the credential without associated data.
+	keyVersionLegacy int16 = 0
+	// keyVersionBound binds the ciphertext to the connection id, so a blob
+	// copied onto another row (by someone with database write access) no
+	// longer decrypts there.
+	keyVersionBound int16 = 1
+)
+
+// connectionAAD is the associated data for a connection credential at
+// keyVersionBound.
+func connectionAAD(id int64) []byte {
+	return []byte("ragmux:model_connection:" + strconv.FormatInt(id, 10))
+}
+
+// aadFor returns the associated data to use for a stored key version.
+func aadFor(version int16, id int64) ([]byte, error) {
+	switch version {
+	case keyVersionLegacy:
+		return nil, nil
+	case keyVersionBound:
+		return connectionAAD(id), nil
+	default:
+		return nil, fmt.Errorf("unknown key version %d", version)
+	}
+}
+
+// encrypt seals plain with a fresh nonce; aad is authenticated but not
+// stored and must be supplied again to decrypt. An empty plaintext yields a
+// nil blob.
+func (c *cipher) encrypt(plain string, aad []byte) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
@@ -84,10 +116,11 @@ func (c *cipher) encrypt(plain string) ([]byte, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return append(nonce, c.aead.Seal(nil, nonce, []byte(plain), nil)...), nil
+	return append(nonce, c.aead.Seal(nil, nonce, []byte(plain), aad)...), nil
 }
 
-func (c *cipher) decrypt(blob []byte) (string, error) {
+// decrypt opens a blob produced by encrypt with the same aad.
+func (c *cipher) decrypt(blob, aad []byte) (string, error) {
 	if len(blob) == 0 {
 		return "", nil
 	}
@@ -95,7 +128,7 @@ func (c *cipher) decrypt(blob []byte) (string, error) {
 	if len(blob) < n {
 		return "", errors.New("ciphertext too short")
 	}
-	out, err := c.aead.Open(nil, blob[:n], blob[n:], nil)
+	out, err := c.aead.Open(nil, blob[:n], blob[n:], aad)
 	if err != nil {
 		return "", err
 	}
