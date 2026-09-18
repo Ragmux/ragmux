@@ -205,9 +205,18 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
 
-	// RAG pipeline. The hit count header is set here, before either the
-	// JSON or the streaming path writes the status line.
-	ragUsed := false
+	// The ragmux request object is ours; it must not reach the upstream.
+	opts := ragmuxOptions(req.Extra)
+	delete(req.Extra, "ragmux")
+
+	// RAG pipeline. The hit count and sources headers are set here, before
+	// either the JSON or the streaming path writes the status line.
+	var (
+		ragUsed      bool
+		ragHits      int
+		sources      []ragSource
+		contextBlock string
+	)
 	if p.RAGStoreID != nil && g.Retriever != nil {
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
@@ -216,8 +225,11 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
-				req.Messages = rag.InjectContext(req.Messages, rag.FormatContext(hits))
-				ragUsed = true
+				contextBlock = rag.FormatContext(hits)
+				req.Messages = rag.InjectContext(req.Messages, contextBlock)
+				ragUsed, ragHits = true, len(hits)
+				sources = ragSources(hits)
+				w.Header().Set("x-ragmux-rag-sources", sourcesHeader(sources))
 			}
 			w.Header().Set("x-ragmux-rag-hits", strconv.Itoa(len(hits)))
 		} else {
@@ -225,7 +237,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, RAGUsed: ragUsed, Streamed: req.Stream}
+	rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, RAGUsed: ragUsed, RAGHits: ragHits, Streamed: req.Stream}
 	promptChars := messageChars(req.Messages)
 	defer func() {
 		rec.LatencyMs = time.Since(start).Milliseconds()
@@ -266,7 +278,112 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	fillUsage(rec, resp.Usage, promptChars, completionChars(resp))
 	rec.StatusCode = http.StatusOK
 	w.Header().Set("Content-Type", "application/json")
+	if opts.IncludeContext {
+		if b, err := withRagmuxField(resp, sources, contextBlock); err == nil {
+			_, _ = w.Write(b)
+			return
+		}
+	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ragmuxRequest is the optional "ragmux" object clients may add to a chat
+// request. It is stripped before the request goes upstream.
+type ragmuxRequest struct {
+	// IncludeContext asks for the injected sources and context block in the
+	// (non-streaming) response body.
+	IncludeContext bool `json:"include_context"`
+}
+
+func ragmuxOptions(extra map[string]json.RawMessage) ragmuxRequest {
+	var o ragmuxRequest
+	if raw, ok := extra["ragmux"]; ok {
+		// A malformed object is treated as absent; it is still stripped.
+		_ = json.Unmarshal(raw, &o)
+	}
+	return o
+}
+
+// ragSource is one injected hit as exposed to the client: where the passage
+// came from and how it ranked, never its content.
+type ragSource struct {
+	DocumentID int64   `json:"document_id"`
+	Filename   string  `json:"filename"`
+	Section    string  `json:"section"`
+	Page       int     `json:"page"`
+	Score      float64 `json:"score"`
+}
+
+func ragSources(hits []store.SearchHit) []ragSource {
+	out := make([]ragSource, len(hits))
+	for i, h := range hits {
+		out[i] = ragSource{DocumentID: h.DocumentID, Filename: h.Filename, Section: h.Section, Page: h.Page, Score: h.Score}
+	}
+	return out
+}
+
+// maxSourcesHeaderBytes bounds x-ragmux-rag-sources so long file names or a
+// large top_k cannot push the response head past proxy header limits.
+const maxSourcesHeaderBytes = 2048
+
+// sourcesHeader renders the sources as compact ASCII JSON, dropping trailing
+// entries until the array fits; the result is always a complete array.
+func sourcesHeader(sources []ragSource) string {
+	for n := len(sources); n > 0; n-- {
+		b, err := json.Marshal(sources[:n])
+		if err != nil {
+			return "[]"
+		}
+		v := asciiJSON(b)
+		if len(v) <= maxSourcesHeaderBytes {
+			return v
+		}
+	}
+	return "[]"
+}
+
+// asciiJSON escapes non-ASCII runes as \uXXXX so the value is safe in a
+// header regardless of how intermediaries treat raw UTF-8.
+func asciiJSON(b []byte) string {
+	var sb strings.Builder
+	for _, r := range string(b) {
+		switch {
+		case r < 0x80:
+			sb.WriteRune(r)
+		case r > 0xFFFF:
+			r -= 0x10000
+			fmt.Fprintf(&sb, `\u%04x\u%04x`, 0xD800+(r>>10), 0xDC00+(r&0x3FF))
+		default:
+			fmt.Fprintf(&sb, `\u%04x`, r)
+		}
+	}
+	return sb.String()
+}
+
+// withRagmuxField adds a top-level "ragmux" object to the serialised
+// response without disturbing the OpenAI fields.
+func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBlock string) ([]byte, error) {
+	base, err := json.Marshal(resp)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(base, &m); err != nil {
+		return nil, err
+	}
+	if sources == nil {
+		sources = []ragSource{}
+	}
+	extra, err := json.Marshal(map[string]any{"sources": sources, "context": contextBlock})
+	if err != nil {
+		return nil, err
+	}
+	m["ragmux"] = extra
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
 }
 
 func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, req provider.ChatRequest, rec *store.RequestLog, promptChars int) {
