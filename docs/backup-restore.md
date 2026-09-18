@@ -64,7 +64,10 @@ Notes:
 
 Both scripts live in `scripts/`, run with `bash`, print `-h` help, exit `0` on success,
 `1` when the dump/restore itself fails and `2` for usage or configuration errors. They
-never print `DATABASE_URL`, passwords or `SECRET_KEY`.
+never print `DATABASE_URL`, passwords or `SECRET_KEY`, run with `umask 077` so every file
+they create is private to the invoking user, and never put a credential on a command
+line (`restore.sh` sends the login body through stdin and the bearer token through a
+private header file, so neither shows up in `ps` or shell history).
 
 ### Where they connect
 
@@ -80,18 +83,19 @@ never print `DATABASE_URL`, passwords or `SECRET_KEY`.
 
 ```bash
 scripts/backup.sh                       # -> ./backups/ragmux-YYYYmmdd-HHMMSS.dump
-BACKUP_DIR=/mnt/backups KEEP_DAYS=30 INCLUDE_SECRET_KEY=1 scripts/backup.sh
+BACKUP_DIR=/mnt/backups KEEP_DAYS=30 INCLUDE_SECRET_KEY=1 SECRET_KEY_DIR=/mnt/keys scripts/backup.sh
 make backup                             # same as scripts/backup.sh
 ```
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BACKUP_DIR` | `./backups` | output directory (created if missing) |
+| `BACKUP_DIR` | `./backups` | output directory (created with mode `700` if missing) |
 | `KEEP_DAYS` | `14` | delete `ragmux-*.dump` / `.key` files older than N days; `0` keeps everything |
 | `POSTGRES_SERVICE` | `postgres` | Compose service that runs Postgres |
 | `POSTGRES_DB`, `POSTGRES_USER` | `ragmux` | database and role |
 | `DATABASE_URL` | unset | use local `pg_dump` against this URL instead of Compose |
-| `INCLUDE_SECRET_KEY` | `0` | `1` writes `SECRET_KEY` (from the environment, else from `.env`) to `<dump>.key` with mode `600` |
+| `INCLUDE_SECRET_KEY` | `0` | `1` writes `SECRET_KEY` (from the environment, else from `.env`) to `SECRET_KEY_DIR/<name>.key` with mode `600` |
+| `SECRET_KEY_DIR` | `BACKUP_DIR` | where the `.key` file goes. **Keep it apart from the dumps**: a dump and its key on the same disk let anyone who reads that disk decrypt every provider credential. The script warns when both land in the same directory |
 | `COMPOSE_PROJECT` / `-p` | unset | Compose project name |
 
 What it does: `pg_dump -Fc --no-owner --no-privileges` into `<name>.dump.partial`,
@@ -254,12 +258,43 @@ Rules of thumb:
 - Alert when the newest dump is older than twice the schedule.
 - Keep dumps from before a `SECRET_KEY` rotation together with the old key.
 
+## Rotating SECRET_KEY
+
+Rotate the key when it may have leaked, when someone who knew it leaves, or on a
+schedule. `ragmux rotate-key` re-encrypts every stored provider API key in one
+transaction, verifies each row decrypts with the new key before committing and prints
+the number of rows changed. It needs the **current** key in the environment
+(`SECRET_KEY`, `SECRET_KEY_FILE` or the `secret.key` fallback) and `DATABASE_URL`.
+
+1. Take a backup (`scripts/backup.sh`) and keep the old key with it.
+2. Stop the gateway so nothing writes a credential with the old key meanwhile:
+   `docker compose stop ragmux`.
+3. Generate the new key and run the rotation with the old one still configured:
+
+   ```bash
+   NEW_KEY=$(openssl rand -hex 32)
+   docker compose run --rm ragmux rotate-key --new "$NEW_KEY"
+   # rotate-key: re-encrypted 3 model connection(s); start the gateway with the new SECRET_KEY
+   ```
+
+   With the binary: `SECRET_KEY=<old> DATABASE_URL=… ragmux rotate-key --new "$NEW_KEY"`.
+4. Put the new key into `.env` (or the secret file) and start the gateway:
+   `docker compose up -d ragmux`.
+5. Verify: **Test chat** on a model connection succeeds. If the gateway was started with
+   the wrong key, connections fail with `cipher: message authentication failed`; put the
+   right key back, nothing was lost.
+
+Rows are only rewritten when every one of them decrypts with the current key and
+re-decrypts with the new one; otherwise the command exits `1` and the database is
+unchanged. Dumps taken before the rotation still need the old key.
+
 ## Security notes
 
 Dumps contain the encrypted provider API keys, every uploaded document, password
 hashes, the audit log and request logs (which include model names, token counts and
 error messages, but not prompts or completions). Treat them like the database itself:
 encrypt at rest (`age`, `gpg`, or an encrypted bucket), restrict who can read the
-`backups` directory, and do not store `<dump>.key` next to the dump on the same
-unencrypted disk unless the whole disk is encrypted. The `.key` file is written with
-mode `600`; when you copy it elsewhere, keep those permissions.
+`backups` directory (`backup.sh` creates it with mode `700` and every file with `600`),
+and do not store `<name>.key` next to the dump on the same unencrypted disk unless the
+whole disk is encrypted: point `SECRET_KEY_DIR` somewhere else. When you copy the key
+file elsewhere, keep its permissions.

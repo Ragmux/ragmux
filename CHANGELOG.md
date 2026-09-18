@@ -6,6 +6,42 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- Behind a proxy the client address is now the **last** `X-Forwarded-For` entry (the one
+  the nearest proxy appended) instead of the first; `X-Real-IP` only counts when
+  `X-Forwarded-For` is absent. New `TRUSTED_PROXY_CIDRS` limits proxy headers to
+  connections from those networks and skips them when walking the header.
+- Login: username (≤ 64) and password (≤ 1024) are validated before any database or
+  bcrypt work; the 15-minute lockout is keyed on username **and** IP so a stranger cannot
+  lock a user out; passwords over bcrypt's 72-byte limit are refused on create, reset and
+  change instead of being truncated.
+- The login response returns `token` only when the request sets `"bearer": true`; the
+  dashboard uses the cookie alone. The cookie is `Secure` on TLS connections and behind a
+  trusted proxy reporting `X-Forwarded-Proto: https`, not only with `SECURE_COOKIES`.
+- Changing your own password revokes every other session of the account.
+- Cookie-authenticated `POST`/`PUT`/`DELETE` requests must be same-origin
+  (`Sec-Fetch-Site` / `Origin` vs `Host`) and JSON bodies must be
+  `Content-Type: application/json` (`403` / `415`); bearer requests are unaffected.
+- `/admin/api` responses are `Cache-Control: no-store` and carry `X-Request-Id`; every
+  response carries `X-Content-Type-Options`, `Referrer-Policy` and `X-Frame-Options`; the
+  dashboard is served with a `Content-Security-Policy` pinning its script by hash.
+- Request bodies get per-route read deadlines (login 10 s, admin JSON 30 s, uploads 5 min,
+  chat 60 s) so idle connections cannot hold handlers open.
+- Unexpected admin errors answer `internal error (request id …)`; the gateway hides
+  provider factory errors behind `model connection unavailable`.
+- `POST /admin/api/models/{id}/test` now requires the editor role. Demoting, deactivating
+  or deleting the last active admin is refused atomically, and a project and its members
+  are created in one transaction. A panic inside a provider stream becomes a `502`
+  instead of crashing the process.
+- `SECRET_KEY_FILE` and `DATABASE_URL_FILE` read secrets from files; `ragmux rotate-key
+  --new <hex>` re-encrypts stored provider keys with a new `SECRET_KEY`.
+- Compose publishes the gateway on `127.0.0.1:8080` and requires `POSTGRES_PASSWORD`
+  (no more `ragmux` default); `.env.example` ships without an admin password.
+  `backup.sh` runs with `umask 077`, creates `BACKUP_DIR` with mode `700` and can put
+  the key file elsewhere (`SECRET_KEY_DIR`); `restore.sh` no longer passes credentials
+  on the command line. Dependabot, image provenance/SBOM and a pinned golangci-lint
+  version were added to CI.
+
 ## [0.2.1] — 2026-09-18
 
 ### Fixed

@@ -14,7 +14,7 @@ dashboard (**Users** tab) or via `POST /admin/api/users`. Every user has exactly
 |----------|------------------------------------------|----------|------------------|
 | `admin`  | full access | all projects, all metrics | full access |
 | `editor` | create, edit, delete, upload, test, search | create (becomes a member); read, edit, delete, rotate key, metrics and members only for projects it belongs to | list active users (`/users/lite`) |
-| `viewer` | read, test and search only | read and metrics only for projects it belongs to | — |
+| `viewer` | read and search only | read and metrics only for projects it belongs to | — |
 
 Writes the role does not allow answer `403 {"error":{"type":"forbidden"}}`. Everyone can
 change their own password (`POST /admin/api/me/password`) and read `/admin/api/system`.
@@ -36,23 +36,33 @@ replace the member set freely.
   deactivate or delete their own account (`400`).
 - `POST /admin/api/users/{id}/reset-password` sets a new password and revokes the user's
   sessions; `POST /admin/api/users/{id}/sessions/revoke` only signs the user out everywhere.
-- Passwords must be at least 8 characters; usernames at most 64.
+- Passwords must be at least 8 characters and at most 72 bytes (bcrypt's input limit);
+  usernames at most 64.
+- Changing your own password (`POST /admin/api/me/password`) signs out every other
+  session of the account; the session that made the change stays valid.
 
 ## Login protection
 
-Every login attempt is recorded in the database, so all replicas share the counters.
+Login bodies are checked before anything else: the username (trimmed) must be 1–64
+characters and the password 1–1024; anything else is a `400` that is neither recorded
+nor counted.
+
+Every remaining attempt is recorded in the database, so all replicas share the counters.
 After `LOGIN_USER_LIMIT_PER_MIN` (default 5) failures for a username or
 `LOGIN_RATE_LIMIT_PER_MIN` (default 10) failures from an IP within a minute, and after
-`LOGIN_LOCKOUT_FAILURES` (default 20) failures for a username within
+`LOGIN_LOCKOUT_FAILURES` (default 20) failures for one **username from one IP** within
 `LOGIN_LOCKOUT_MINUTES` (default 15), `POST /admin/api/login` answers
 `429 {"error":{"message":"too many login attempts, try again later","type":"rate_limited"}}`
-with a `Retry-After` header. Setting a limit to `0` disables it. Successful logins do not
-reset the counters; the windows simply expire. Attempts older than 24 hours are purged
-hourly.
+with a `Retry-After` header. The lockout is keyed on the username/address pair so that
+a stranger hammering your username cannot lock you out from your own address; the
+per-minute limits still slow them down. Setting a limit to `0` disables it. Successful
+logins do not reset the counters; the windows simply expire. Attempts older than 24
+hours are purged hourly.
 
 The client IP is the TCP peer address unless `TRUST_PROXY_HEADERS=true`, in which case
-`X-Real-IP` or the first `X-Forwarded-For` entry is used; only enable it behind a reverse
-proxy that overwrites those headers (see [Configuration](configuration.md#behind-a-reverse-proxy)).
+the last `X-Forwarded-For` entry (or `X-Real-IP`) is used, optionally restricted with
+`TRUSTED_PROXY_CIDRS`; only enable it behind a reverse proxy (see
+[Configuration](configuration.md#behind-a-reverse-proxy)).
 
 ## Audit log
 

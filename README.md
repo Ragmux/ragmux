@@ -45,12 +45,16 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 
 ```bash
 cp .env.example .env
-echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env   # encrypts provider keys; keep it with your backups
+echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env         # encrypts provider keys; keep it with your backups
+echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> .env  # password of the bundled Postgres
 docker compose up -d
 ```
 
-Open <http://localhost:8080/admin/>. On first start an `admin` user is created; if
-`ADMIN_PASSWORD` is not set in `.env`, a random password is printed **once**:
+Open <http://localhost:8080/admin/> (the port is published on loopback only; put a
+TLS-terminating reverse proxy in front for network access, see
+[Configuration](docs/configuration.md#behind-a-reverse-proxy)). On first start an
+`admin` user is created; if `ADMIN_PASSWORD` is not set in `.env`, a random password is
+printed **once**:
 
 ```bash
 docker logs ragmux 2>&1 | grep -A3 "Initial admin"
@@ -72,7 +76,7 @@ Compose profile — see [Backup and restore](docs/backup-restore.md).
 
 ```bash
 TOKEN=$(curl -s localhost:8080/admin/api/login -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"YOUR_PASSWORD"}' | jq -r .token)
+  -d '{"username":"admin","password":"YOUR_PASSWORD","bearer":true}' | jq -r .token)
 AUTH="Authorization: Bearer $TOKEN"
 ```
 
