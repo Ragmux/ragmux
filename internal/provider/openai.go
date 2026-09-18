@@ -45,7 +45,7 @@ func (p *openAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	req.Stream = false
 	req.StreamOptions = nil
 	var out ChatResponse
-	if err := doJSON(ctx, p.cfg, http.MethodPost, p.base+"/chat/completions", p.headers(), req, &out); err != nil {
+	if err := doJSON(ctx, p.cfg, p.base+"/chat/completions", p.headers(), req, &out); err != nil {
 		return nil, err
 	}
 	if out.ID == "" {
@@ -70,7 +70,7 @@ func (p *openAICompat) ChatStream(ctx context.Context, req ChatRequest, out chan
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var streamErr error
 	err = readSSE(resp.Body, func(ev sseEvent) bool {
 		data := strings.TrimSpace(ev.Data)

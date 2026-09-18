@@ -68,7 +68,7 @@ func probe(port int) int {
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return 1
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return 0
 }
 
@@ -97,7 +97,11 @@ func run(cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer func() {
+		if err := st.Close(); err != nil {
+			log.Warn("close database", "err", err)
+		}
+	}()
 	log.Info("database: connected", "postgres_version", st.ServerVersion, "max_conns", cfg.DBMaxConns,
 		"secret_key_source", st.SecretKeySource)
 
@@ -138,7 +142,9 @@ func run(cfg config.Config) error {
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	if cfg.TrustProxyHeaders {
+		r.Use(realIP)
+	}
 	r.Use(requestLogger(log))
 	r.Use(middleware.Recoverer)
 	if len(cfg.CORSOrigins) > 0 {
@@ -150,7 +156,7 @@ func run(cfg config.Config) error {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","version":"` + version + `"}`))
+		_, _ = w.Write([]byte(`{"status":"ok","version":"` + version + `"}`))
 	})
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusFound)
@@ -260,6 +266,26 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 				"req_id", middleware.GetReqID(r.Context()))
 		})
 	}
+}
+
+// realIP replaces RemoteAddr with the client address a trusted reverse proxy
+// reported in X-Real-IP or the first X-Forwarded-For entry. It is only
+// installed when TRUST_PROXY_HEADERS is set, because any client can send
+// these headers when the gateway is reachable directly.
+func realIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+		if ip == "" {
+			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+				ip, _, _ = strings.Cut(xff, ",")
+				ip = strings.TrimSpace(ip)
+			}
+		}
+		if ip != "" && net.ParseIP(ip) != nil {
+			r.RemoteAddr = ip
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func cors(origins []string) func(http.Handler) http.Handler {

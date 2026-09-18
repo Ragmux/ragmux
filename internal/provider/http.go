@@ -46,14 +46,14 @@ func (c Config) baseURL(def string) string {
 
 // doJSON posts a JSON body and decodes a JSON response, mapping non-2xx
 // statuses to *Error.
-func doJSON(ctx context.Context, cfg Config, method, url string, headers map[string]string, body any, out any) error {
+func doJSON(ctx context.Context, cfg Config, url string, headers map[string]string, body any, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, cfg.timeout())
 	defer cancel()
-	resp, err := doRequest(ctx, cfg, method, url, headers, body)
+	resp, err := doRequest(ctx, cfg, http.MethodPost, url, headers, body)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "read upstream response: " + err.Error()}
@@ -78,7 +78,7 @@ func doStream(ctx context.Context, cfg Config, url string, headers map[string]st
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, upstreamError(resp.StatusCode, raw)
 	}
 	return resp, nil

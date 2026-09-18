@@ -66,7 +66,7 @@ func RequireRole(min Role) func(http.Handler) http.Handler {
 func Forbidden(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
-	w.Write([]byte(`{"error":{"message":"insufficient role","type":"forbidden"}}`))
+	_, _ = w.Write([]byte(`{"error":{"message":"insufficient role","type":"forbidden"}}`))
 }
 
 // CanAccessProject reports whether the user may see the project: admins see

@@ -42,6 +42,9 @@ type Config struct {
 	// LoginLockoutFailures failures within LoginLockoutMinutes lock a username out.
 	LoginLockoutFailures int
 	LoginLockoutMinutes  int
+	// TrustProxyHeaders enables X-Forwarded-For / X-Real-IP as the client
+	// address for login limits and audit entries.
+	TrustProxyHeaders bool
 	// LogRetentionDays is how long request logs are kept; 0 keeps them forever.
 	LogRetentionDays int
 	// AuditRetentionDays is how long audit entries are kept; 0 keeps them forever.
@@ -93,6 +96,7 @@ func Load() (Config, error) {
 		return c, err
 	}
 	c.Port = p
+	c.TrustProxyHeaders = os.Getenv("TRUST_PROXY_HEADERS") == "true"
 	if v := os.Getenv("CORS_ORIGINS"); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {

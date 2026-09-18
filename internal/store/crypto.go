@@ -42,7 +42,7 @@ func loadCipher(keyHex, dataDir string, log *slog.Logger) (*cipher, string, erro
 }
 
 func loadOrCreateCipher(path string) (*cipher, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(filepath.Clean(path))
 	switch {
 	case err == nil:
 		key, derr := hex.DecodeString(strings.TrimSpace(string(raw)))

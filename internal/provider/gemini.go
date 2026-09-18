@@ -196,7 +196,7 @@ func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	}
 	var gr geminiResponse
 	url := p.base + "/models/" + p.cfg.Model + ":generateContent"
-	if err := doJSON(ctx, p.cfg, http.MethodPost, url, p.headers(), body, &gr); err != nil {
+	if err := doJSON(ctx, p.cfg, url, p.headers(), body, &gr); err != nil {
 		return nil, err
 	}
 	resp := &ChatResponse{ID: chatID(), Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
@@ -224,7 +224,7 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	id := chatID()
 	created := time.Now().Unix()
 	usage := &Usage{}

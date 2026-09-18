@@ -58,7 +58,7 @@ func (g *Gateway) Routes(r chi.Router) {
 func writeError(w http.ResponseWriter, status int, typ, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": nil}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": nil}})
 }
 
 func (g *Gateway) authenticate(next http.Handler) http.Handler {
@@ -100,7 +100,7 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
 		"data":   []map[string]any{modelObject(conn)},
 	})
@@ -114,7 +114,7 @@ func (g *Gateway) getModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(modelObject(conn))
+	_ = json.NewEncoder(w).Encode(modelObject(conn))
 }
 
 func modelObject(conn *store.ModelConnection) map[string]any {
@@ -256,7 +256,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	fillUsage(rec, resp.Usage, promptChars, completionChars(resp))
 	rec.StatusCode = http.StatusOK
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, req provider.ChatRequest, rec *store.RequestLog, promptChars int) {
@@ -399,7 +399,7 @@ func writeLimitError(w http.ResponseWriter, d limits.Decision) {
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusTooManyRequests)
-	json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": d.Reason}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": d.Reason}})
 }
 
 func providerError(err error) (int, *provider.Error) {

@@ -123,7 +123,7 @@ func (a *Admin) Routes(r chi.Router) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
@@ -214,7 +214,8 @@ func (a *Admin) logout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// clientIP is the address middleware.RealIP resolved, without the port.
+// clientIP is the request address (from the proxy headers when
+// TRUST_PROXY_HEADERS is set) without the port.
 func clientIP(r *http.Request) string {
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
@@ -730,7 +731,7 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		max = 50 << 20
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, max)
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
+	if err := r.ParseMultipartForm(8 << 20); err != nil { //nolint:gosec // G120: the body is bounded by MaxBytesReader above
 		writeErr(w, http.StatusBadRequest, "multipart form too large or malformed: "+err.Error())
 		return
 	}
@@ -757,7 +758,7 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		// The whole request body is already bounded by MaxBytesReader, so a
 		// single file can never exceed the upload limit.
 		data, err := io.ReadAll(io.LimitReader(src, max))
-		src.Close()
+		_ = src.Close()
 		if err != nil {
 			a.fail(w, err)
 			return

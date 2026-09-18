@@ -263,7 +263,7 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		return nil, err
 	}
 	var ar anthropicResponse
-	if err := doJSON(ctx, p.cfg, http.MethodPost, p.base+"/v1/messages", p.headers(), body, &ar); err != nil {
+	if err := doJSON(ctx, p.cfg, p.base+"/v1/messages", p.headers(), body, &ar); err != nil {
 		return nil, err
 	}
 	var text strings.Builder
@@ -309,7 +309,7 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	id := chatID()
 	created := time.Now().Unix()
@@ -430,7 +430,7 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 					Message string `json:"message"`
 				} `json:"error"`
 			}
-			json.Unmarshal([]byte(ev.Data), &e)
+			_ = json.Unmarshal([]byte(ev.Data), &e) // best effort; an empty message is still an error
 			streamErr = &Error{Status: http.StatusBadGateway, Type: e.Error.Type, Message: e.Error.Message}
 			return false
 		}

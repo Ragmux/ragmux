@@ -42,7 +42,7 @@ func NewIngester(ctx context.Context, st *store.Store, factory EmbedderFactory, 
 		stopping: make(chan struct{}), batchSize: 32}
 	for i := 0; i < workers; i++ {
 		ing.wg.Add(1)
-		go ing.worker(ctx)
+		go ing.worker(ctx) //nolint:gosec // G118: the worker runs on the caller's context; Background is only used to record a failure after cancellation
 	}
 	return ing
 }

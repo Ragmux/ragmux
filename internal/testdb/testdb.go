@@ -47,10 +47,10 @@ func Config(t *testing.T) store.OpenConfig {
 		t.Fatalf("connect to %s: %v", EnvVar, err)
 	}
 	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
-		admin.Close(ctx)
+		_ = admin.Close(ctx)
 		t.Fatalf("create test schema: %v", err)
 	}
-	admin.Close(ctx)
+	_ = admin.Close(ctx)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -59,7 +59,7 @@ func Config(t *testing.T) store.OpenConfig {
 			t.Logf("cleanup: connect: %v", err)
 			return
 		}
-		defer c.Close(ctx)
+		defer func() { _ = c.Close(ctx) }()
 		if _, err := c.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE"); err != nil {
 			t.Logf("cleanup: drop schema %s: %v", schema, err)
 		}
@@ -95,7 +95,7 @@ func OpenWith(t *testing.T, cfg store.OpenConfig) *store.Store {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
