@@ -33,7 +33,7 @@ sessions of the account), a password reset, a session revoke or deactivation of 
 account.
 
 ```bash
-TOKEN=$(curl -s localhost:8080/admin/api/login -H 'Content-Type: application/json' \
+TOKEN=$(curl -s localhost:8765/admin/api/login -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_PASSWORD","bearer":true}' | jq -r .token)
 AUTH="Authorization: Bearer $TOKEN"
 ```
@@ -434,7 +434,7 @@ or `503 db unavailable` (plain text). No authentication.
 
 ## Client API (`/v1`)
 
-Point any OpenAI SDK at `http://<host>:8080/v1` with the project key as `api_key`.
+Point any OpenAI SDK at `http://<host>:8765/v1` with the project key as `api_key`.
 
 ### `POST /v1/chat/completions`
 

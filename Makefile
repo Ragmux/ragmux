@@ -12,7 +12,7 @@ build:
 
 # Runs against the dev database; SECRET_KEY falls back to ./data/secret.key.
 run: build
-	DATABASE_URL=$(TEST_DATABASE_URL) DATA_DIR=./data PORT=8080 ./bin/ragmux
+	DATABASE_URL=$(TEST_DATABASE_URL) DATA_DIR=./data PORT=8765 ./bin/ragmux
 
 test:
 	go test -race -count=1 ./...

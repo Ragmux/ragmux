@@ -53,7 +53,7 @@ Environment:
                      tables after step 4                  (default ragmux_app)
   DATABASE_URL       use local pg_restore against this URL instead of compose
   STOP_CMD/START_CMD shell commands run around the restore in direct mode
-  RAGMUX_URL         base URL used for the health wait   (default http://localhost:8080)
+  RAGMUX_URL         base URL used for the health wait   (default http://localhost:8765)
   WAIT_TIMEOUT       seconds to wait for /healthz        (default 120)
   ADMIN_USER, ADMIN_PASSWORD  optional; used to read /admin/api/system after start
   COMPOSE_PROJECT    compose project name (same as -p)
@@ -104,7 +104,7 @@ RAGMUX_SERVICE="${RAGMUX_SERVICE:-ragmux}"
 POSTGRES_DB="${POSTGRES_DB:-ragmux}"
 POSTGRES_USER="${POSTGRES_USER:-ragmux}"
 APP_ROLE="${APP_ROLE:-ragmux_app}"
-RAGMUX_URL="${RAGMUX_URL:-http://localhost:8080}"
+RAGMUX_URL="${RAGMUX_URL:-http://localhost:8765}"
 case "$APP_ROLE" in
   *[!A-Za-z0-9_]*|'') die "APP_ROLE must be a plain identifier, got '$APP_ROLE'" 2 ;;
 esac

@@ -123,7 +123,7 @@ make restore FILE=backups/ragmux-20260918-153455.dump YES=1
 | `DATABASE_URL` | unset | use local `pg_restore` against this URL instead of Compose |
 | `STOP_CMD`, `START_CMD` | unset | in `DATABASE_URL` mode: shell commands run before and after the restore (e.g. `systemctl stop ragmux`) |
 | `APP_ROLE` | `ragmux_app` | role that receives ownership of the restored tables (step 4) |
-| `RAGMUX_URL` | `http://localhost:8080` | where to poll `/healthz` |
+| `RAGMUX_URL` | `http://localhost:8765` | where to poll `/healthz` |
 | `WAIT_TIMEOUT` | `120` | seconds to wait for the gateway |
 | `ADMIN_USER`, `ADMIN_PASSWORD` | unset | when both are set, log in and print `migrations_version`, vector table count and document bytes from `/admin/api/system` |
 
@@ -234,7 +234,7 @@ to run, and a Postgres 17 with pgvector.
    - Restoring a **newer dump into an older Ragmux** is not: the old binary does not know
      the newer schema. Upgrade the image first.
 4. **Verify** (or let the script do the first three):
-   - `curl -fsS http://localhost:8080/healthz` returns `{"status":"ok",…}`.
+   - `curl -fsS http://localhost:8765/healthz` returns `{"status":"ok",…}`.
    - Log in to `/admin/` with a known user.
    - `GET /admin/api/system`: `database.migrations_version` matches the app's expected
      version, `backup.tables` and `backup.documents_bytes` look like the source.

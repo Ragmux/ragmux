@@ -51,7 +51,7 @@ echo "RAGMUX_DB_PASSWORD=$(openssl rand -hex 16)" >> .env # least-privilege role
 docker compose up -d
 ```
 
-Open <http://localhost:8080/admin/> (the port is published on loopback only; put a
+Open <http://localhost:8765/admin/> (the port is published on loopback only; put a
 TLS-terminating reverse proxy in front for network access, see
 [Configuration](docs/configuration.md#behind-a-reverse-proxy)). On a fresh database the
 dashboard asks you to **create the first administrator** (username and a password of at
@@ -85,7 +85,7 @@ Compose profile — see [Backup and restore](docs/backup-restore.md).
 **1. Log in** and keep the session token:
 
 ```bash
-TOKEN=$(curl -s localhost:8080/admin/api/login -H 'Content-Type: application/json' \
+TOKEN=$(curl -s localhost:8765/admin/api/login -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_PASSWORD","bearer":true}' | jq -r .token)
 AUTH="Authorization: Bearer $TOKEN"
 ```
@@ -93,25 +93,25 @@ AUTH="Authorization: Bearer $TOKEN"
 **2. Add model connections** (a chat model and, for RAG, an embedding model):
 
 ```bash
-curl -s localhost:8080/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
+curl -s localhost:8765/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "claude", "provider_type": "anthropic", "api_key": "sk-ant-...", "model_name": "claude-sonnet-4-5"}'
-curl -s localhost:8080/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
+curl -s localhost:8765/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "openai-embed", "provider_type": "openai", "api_key": "sk-...", "model_name": "text-embedding-3-small"}'
 ```
 
 **3. Create a RAG store and upload documents** (optional):
 
 ```bash
-curl -s localhost:8080/admin/api/rag-stores -H "$AUTH" -H 'Content-Type: application/json' -d '{
+curl -s localhost:8765/admin/api/rag-stores -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "handbook", "embedding_connection_id": 2}'
-curl -s localhost:8080/admin/api/rag-stores/1/documents -H "$AUTH" -F file=@handbook.pdf
-curl -s localhost:8080/admin/api/rag-stores/1/documents -H "$AUTH"    # status: pending → processing → ready
+curl -s localhost:8765/admin/api/rag-stores/1/documents -H "$AUTH" -F file=@handbook.pdf
+curl -s localhost:8765/admin/api/rag-stores/1/documents -H "$AUTH"    # status: pending → processing → ready
 ```
 
 **4. Create a project** and get its `sk-proj-…` key (shown only once):
 
 ```bash
-curl -s localhost:8080/admin/api/projects -H "$AUTH" -H 'Content-Type: application/json' -d '{
+curl -s localhost:8765/admin/api/projects -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "support-bot", "model_connection_id": 1, "rag_store_id": 1,
   "system_prompt": "You are the company support assistant."}'
 ```
@@ -121,14 +121,14 @@ real model; retrieved passages are injected into the system prompt and counted i
 `x-ragmux-rag-hits` header.
 
 ```bash
-curl -N localhost:8080/v1/chat/completions \
+curl -N localhost:8765/v1/chat/completions \
   -H "Authorization: Bearer sk-proj-..." -H 'Content-Type: application/json' \
   -d '{"model":"default","stream":true,"messages":[{"role":"user","content":"How many vacation days do I get?"}]}'
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="sk-proj-...")
+client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-proj-...")
 resp = client.chat.completions.create(model="default", stream=True,
     messages=[{"role": "user", "content": "How many vacation days do I get?"}])
 for chunk in resp:
@@ -183,7 +183,7 @@ Requires Go 1.27+ and Docker for the database.
 ```bash
 make dev-db               # pgvector Postgres on localhost:5433 (docker-compose.dev.yml)
 make test                 # unit + end-to-end tests (mock upstream, real Postgres)
-make run                  # builds and runs on :8080 against the dev database
+make run                  # builds and runs on :8765 against the dev database
 make docker-build         # local image, VERSION from git describe
 make backup               # scripts/backup.sh against the compose stack
 make restore FILE=backups/ragmux-<stamp>.dump YES=1   # without YES=1: plan only

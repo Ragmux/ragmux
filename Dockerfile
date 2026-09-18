@@ -24,13 +24,13 @@ RUN mkdir -p /out/data && chown 65532:65532 /out/data
 FROM gcr.io/distroless/static-debian12:nonroot
 
 ENV DATA_DIR=/app/data \
-    PORT=8080
+    PORT=8765
 
 COPY --from=build /out/ragmux /app/ragmux
 COPY --from=build --chown=65532:65532 /out/data /app/data
 
 WORKDIR /app
-EXPOSE 8080
+EXPOSE 8765
 USER nonroot:nonroot
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

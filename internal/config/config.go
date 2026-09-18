@@ -91,7 +91,7 @@ func Load() (Config, error) {
 		DBMaxConns:      10,
 		SecretKeyHex:    secretKey,
 		DataDir:         env("DATA_DIR", "/app/data"),
-		Port:            8080,
+		Port:            8765,
 		AdminUser:       env("ADMIN_USER", "admin"),
 		AdminPassword:   os.Getenv("ADMIN_PASSWORD"),
 		LogLevel:        env("LOG_LEVEL", "info"),
@@ -270,12 +270,12 @@ func envOrFile(name string) (string, error) {
 	return strings.TrimSpace(string(raw)), nil
 }
 
-// PortFromEnv reads PORT (default 8080). It is separate from Load so the
+// PortFromEnv reads PORT (default 8765). It is separate from Load so the
 // container healthcheck can probe the server without a full configuration.
 func PortFromEnv() (int, error) {
 	v := os.Getenv("PORT")
 	if v == "" {
-		return 8080, nil
+		return 8765, nil
 	}
 	p, err := strconv.Atoi(v)
 	if err != nil || p <= 0 || p > 65535 {

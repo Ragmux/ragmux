@@ -6,6 +6,11 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Default port is now `8765`** (was `8080`): the binary, the Docker image, the Compose file,
+  the health check and the documentation all use it. Set `PORT=8080` to keep the old value;
+  existing Compose deployments should update their published port mapping.
+
 ### Security
 - **Signed container images.** The release workflow signs the pushed image digest of
   `ghcr.io/ragmux/ragmux` (and the Docker Hub mirror when configured) with cosign, keyless

@@ -14,7 +14,7 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `SECRET_KEY_FILE` | *(none)* | Path of a file holding the key, used when `SECRET_KEY` is unset. |
 | `DB_MAX_CONNS` | `10` | Connection pool size (must be `>= 1`). |
 | `DATA_DIR` | `/app/data` | Only used for the `secret.key` fallback when `SECRET_KEY` is unset. |
-| `PORT` | `8080` | HTTP listen port (`1`-`65535`). Also read by `-healthcheck`. |
+| `PORT` | `8765` | HTTP listen port (`1`-`65535`). Also read by `-healthcheck`. |
 | `ADMIN_USER` | `admin` | Username of the administrator pre-created on first start when `ADMIN_PASSWORD` is set and the `users` table is empty. Ignored otherwise. |
 | `ADMIN_PASSWORD` | *(none)* | Set it for unattended installs: the account is created once with this password and the log says `admin user created from ADMIN_PASSWORD`. When unset, nothing is created; the log says `no users yet: open /admin/ to create the first administrator` and the dashboard shows the first-run setup form (see [`/setup`](api.md#first-run-setup)) until the first account exists. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are JSON lines on stdout; unknown values fall back to `info`. |
@@ -126,9 +126,9 @@ These are not configurable:
 
 Every other variable from the table above can be added to `.env` as well; the gateway
 service loads the whole file through `env_file`. The gateway is published on
-`127.0.0.1:8080` only, so it is reachable from the host but not from the network; put a
+`127.0.0.1:8765` only, so it is reachable from the host but not from the network; put a
 TLS-terminating reverse proxy in front of it (below) or change the mapping to
-`8080:8080` deliberately. The database is not published. All state lives in the
+`8765:8765` deliberately. The database is not published. All state lives in the
 `pgdata` volume plus `SECRET_KEY`.
 
 To keep the secrets out of `.env`, mount them as Compose secrets and point the `_FILE`
