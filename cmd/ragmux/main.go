@@ -119,8 +119,10 @@ func run(cfg config.Config) error {
 
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true"}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20}
+	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
+		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
-		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS}
+		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -160,6 +162,7 @@ func run(cfg config.Config) error {
 				return
 			case <-t.C:
 				_ = st.PurgeExpiredSessions(ctx)
+				_ = st.DeleteLoginAttemptsBefore(ctx, time.Now().Add(-24*time.Hour))
 			}
 		}
 	}()
@@ -206,7 +209,7 @@ func bootstrapAdmin(ctx context.Context, st *store.Store, cfg config.Config, log
 	if err != nil {
 		return err
 	}
-	if _, err := st.CreateUser(ctx, cfg.AdminUser, hash); err != nil {
+	if _, err := st.CreateUser(ctx, cfg.AdminUser, hash, string(auth.RoleAdmin)); err != nil {
 		return err
 	}
 	if generated {

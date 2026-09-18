@@ -35,6 +35,13 @@ type Config struct {
 	IngestWorkers int
 	// MaxUploadBytes caps a single document upload.
 	MaxUploadBytes int64
+	// LoginRateLimitPerMin caps failed logins per minute from one IP.
+	LoginRateLimitPerMin int
+	// LoginUserLimitPerMin caps failed logins per minute for one username.
+	LoginUserLimitPerMin int
+	// LoginLockoutFailures failures within LoginLockoutMinutes lock a username out.
+	LoginLockoutFailures int
+	LoginLockoutMinutes  int
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -52,6 +59,11 @@ func Load() (Config, error) {
 		UpstreamTimeout: 5 * time.Minute,
 		IngestWorkers:   2,
 		MaxUploadBytes:  50 << 20,
+
+		LoginRateLimitPerMin: 10,
+		LoginUserLimitPerMin: 5,
+		LoginLockoutFailures: 20,
+		LoginLockoutMinutes:  15,
 	}
 	if c.DatabaseURL == "" {
 		return c, errors.New("DATABASE_URL is required (e.g. postgres://user:pass@host:5432/ragmux?sslmode=disable)")
@@ -108,6 +120,23 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid MAX_UPLOAD_MB %q", v)
 		}
 		c.MaxUploadBytes = int64(n) << 20
+	}
+	for _, v := range []struct {
+		name string
+		dst  *int
+	}{
+		{"LOGIN_RATE_LIMIT_PER_MIN", &c.LoginRateLimitPerMin},
+		{"LOGIN_USER_LIMIT_PER_MIN", &c.LoginUserLimitPerMin},
+		{"LOGIN_LOCKOUT_FAILURES", &c.LoginLockoutFailures},
+		{"LOGIN_LOCKOUT_MINUTES", &c.LoginLockoutMinutes},
+	} {
+		if raw := os.Getenv(v.name); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 0 {
+				return c, fmt.Errorf("invalid %s %q (0 disables)", v.name, raw)
+			}
+			*v.dst = n
+		}
 	}
 	return c, nil
 }

@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"math/big"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Project maps a client API key to a model connection and optional RAG store.
@@ -15,19 +17,25 @@ type Project struct {
 	RAGStoreID        *int64 `json:"rag_store_id"`
 	APIKeyPrefix      string `json:"api_key_prefix"`
 	SystemPrompt      string `json:"system_prompt"`
-	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at"`
+	// MemberIDs lists the users attached to the project.
+	MemberIDs []int64 `json:"member_ids"`
+	CreatedAt string  `json:"created_at"`
+	UpdatedAt string  `json:"updated_at"`
 }
 
-const projCols = "id, name, model_connection_id, rag_store_id, api_key_prefix, system_prompt, created_at, updated_at"
+const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, system_prompt, created_at, updated_at,
+	ARRAY(SELECT user_id FROM project_members pm WHERE pm.project_id = projects.id ORDER BY user_id)`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	p := &Project{}
 	var created, updated time.Time
 	err := row.Scan(&p.ID, &p.Name, &p.ModelConnectionID, &p.RAGStoreID, &p.APIKeyPrefix, &p.SystemPrompt,
-		&created, &updated)
+		&created, &updated, &p.MemberIDs)
 	if err != nil {
 		return nil, scanErr(err)
+	}
+	if p.MemberIDs == nil {
+		p.MemberIDs = []int64{}
 	}
 	p.CreatedAt, p.UpdatedAt = ts(created), ts(updated)
 	return p, nil
@@ -127,6 +135,10 @@ func (s *Store) ListProjects(ctx context.Context) ([]*Project, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	return collectProjects(rows)
+}
+
+func collectProjects(rows pgx.Rows) ([]*Project, error) {
 	out := []*Project{}
 	for rows.Next() {
 		p, err := scanProject(rows)
