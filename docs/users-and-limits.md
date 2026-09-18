@@ -75,7 +75,8 @@ small JSON `details` object that never contains credentials. Action names are
 `document.upload`, `document.delete`, `document.reprocess`, `project.create`,
 `project.update`, `project.delete`, `project.rotate_key`, `project.members_update`,
 `user.create`, `user.update`, `user.delete`, `user.reset_password`,
-`user.revoke_sessions`, `password.change`, `logout`.
+`user.revoke_sessions`, `password.change`, `logout`, and `setup.complete` for the first
+administrator created through the first-run form.
 
 Admins read the log with
 `GET /admin/api/audit?limit=100&action=project.&actor_user_id=1&before=2026-09-18T10:00:00Z`
