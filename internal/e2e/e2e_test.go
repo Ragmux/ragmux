@@ -141,8 +141,10 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	authSvc := &auth.Service{Store: st, TTL: time.Hour}
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log, Limiter: usage}
+	// The mock upstreams listen on loopback, which the save-time base_url
+	// check would otherwise reject.
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
-		Limiter: auth.DefaultLoginLimiter(st), Usage: usage}
+		Limiter: auth.DefaultLoginLimiter(st), Usage: usage, ProviderConfig: provCfg, AllowPrivateUpstreams: true}
 	r := chi.NewRouter()
 	r.Route("/v1", gw.Routes)
 	r.Route("/admin", adm.Routes)
@@ -256,7 +258,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	connID := int64(conn["id"].(float64))
 
 	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
-		"chunk_size": 100, "chunk_overlap": 0, "top_k": 1}, "")
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 1}, "")
 	if rs["_status"] != float64(201) {
 		t.Fatalf("create store: %v", rs)
 	}

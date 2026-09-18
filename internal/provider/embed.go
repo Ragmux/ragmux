@@ -68,10 +68,10 @@ type geminiEmbedder struct {
 }
 
 func (e *geminiEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
-	model := e.cfg.Model
-	if !strings.HasPrefix(model, "models/") {
-		model = "models/" + model
-	}
+	// The body carries the plain "models/<name>"; the URL gets the escaped
+	// segment so the name cannot alter the request path.
+	model := "models/" + strings.TrimPrefix(e.cfg.Model, "models/")
+	path := "/models/" + geminiModelPath(e.cfg.Model)
 	reqs := make([]map[string]any, len(inputs))
 	for i, in := range inputs {
 		reqs[i] = map[string]any{"model": model, "content": map[string]any{"parts": []map[string]string{{"text": in}}}}
@@ -81,7 +81,7 @@ func (e *geminiEmbedder) Embed(ctx context.Context, inputs []string) ([][]float3
 			Values []float32 `json:"values"`
 		} `json:"embeddings"`
 	}
-	if err := doJSON(ctx, e.cfg, e.base+"/"+model+":batchEmbedContents",
+	if err := doJSON(ctx, e.cfg, e.base+path+":batchEmbedContents",
 		map[string]string{"x-goog-api-key": e.cfg.APIKey}, map[string]any{"requests": reqs}, &out); err != nil {
 		return nil, err
 	}

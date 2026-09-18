@@ -56,6 +56,17 @@ Open <http://localhost:8080/admin/>. On first start an `admin` user is created; 
 docker logs ragmux 2>&1 | grep -A3 "Initial admin"
 ```
 
+Running models locally? Provider URLs on private networks (Ollama on the Docker host,
+a vLLM service in the same Compose network) are refused by default as an SSRF guard;
+allow them by hostname in `.env` before adding the connection:
+
+```bash
+echo "PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama" >> .env
+```
+
+(or `ALLOW_PRIVATE_UPSTREAMS=true` on a trusted network — see
+[Configuration](docs/configuration.md#private-upstreams)).
+
 The Compose file runs the gateway next to a `pgvector/pgvector:pg17` database. To use
 your own PostgreSQL instead, run the image alone with `DATABASE_URL` and `SECRET_KEY`
 set (the `vector` extension is created automatically when the role may do so). Prebuilt

@@ -26,6 +26,7 @@ import (
 	"github.com/ragmux/ragmux/internal/gateway"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/maintenance"
+	"github.com/ragmux/ragmux/internal/netguard"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -109,23 +110,37 @@ func run(cfg config.Config) error {
 		return err
 	}
 
-	httpClient := &http.Client{Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+	// Outbound provider calls: the dialer refuses private and local
+	// addresses unless ALLOW_PRIVATE_UPSTREAMS / PRIVATE_UPSTREAM_ALLOWLIST
+	// say otherwise. A proxy would connect on our behalf and bypass that
+	// filter, so HTTP_PROXY is only honoured when private upstreams are
+	// allowed anyway.
+	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy:                 nil,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: cfg.UpstreamTimeout,
-		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-	}}
+		DialContext:           netguard.SafeDialContext(dialer, cfg.AllowPrivateUpstreams, cfg.PrivateUpstreamAllowlist),
+	}
+	if cfg.AllowPrivateUpstreams {
+		transport.Proxy = http.ProxyFromEnvironment
+	}
+	httpClient := &http.Client{Transport: transport, CheckRedirect: netguard.CheckRedirect(3)}
+	log.Info("upstream policy", "allow_private_upstreams", cfg.AllowPrivateUpstreams,
+		"private_upstream_allowlist", len(cfg.PrivateUpstreamAllowlist))
 	provCfg := func(c *store.ModelConnection) provider.Config {
 		return provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey,
-			Model: c.ModelName, Timeout: cfg.UpstreamTimeout, Client: httpClient}
+			Model: c.ModelName, Timeout: cfg.UpstreamTimeout, Client: httpClient,
+			StreamMaxDuration: cfg.StreamMaxDuration, StreamMaxBytes: cfg.StreamMaxBytes, Logger: log}
 	}
 	providers := func(c *store.ModelConnection) (provider.Provider, error) { return provider.New(provCfg(c)) }
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) { return provider.NewEmbedder(provCfg(c)) }
 
 	ingester := rag.NewIngester(bgCtx, st, embedders, cfg.IngestWorkers, log)
+	ingester.MaxChunksPerDocument = cfg.MaxChunksPerDocument
 	defer ingester.Stop()
 	if err := ingester.Resume(ctx); err != nil {
 		log.Warn("resume ingestion", "err", err)
@@ -138,7 +153,8 @@ func run(cfg config.Config) error {
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
 		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
-		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage}
+		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage,
+		ProviderConfig: provCfg, AllowPrivateUpstreams: cfg.AllowPrivateUpstreams, PrivateAllowlist: cfg.PrivateUpstreamAllowlist}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)

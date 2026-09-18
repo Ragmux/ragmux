@@ -259,7 +259,7 @@ function storeForm(r, embModels){
   modal(r?'Edit RAG store':'New RAG store', `
     ${field('Name', input('name', r?.name||'', 'required'))}
     ${field('Embedding model connection', select('embedding_connection_id', embModels.map(m=>({value:m.id,label:`${m.name} (${m.provider_type} · ${m.model_name})`})), r?.embedding_connection_id))}
-    <div class="row"><div style="flex:1">${field('Chunk size (chars)', input('chunk_size', r?.chunk_size||1000, 'type=number min=100 max=20000'))}</div>
+    <div class="row"><div style="flex:1">${field('Chunk size (chars)', input('chunk_size', r?.chunk_size||1000, 'type=number min=200 max=20000'))}</div>
     <div style="flex:1">${field('Chunk overlap', input('chunk_overlap', r?.chunk_overlap??200, 'type=number min=0'))}</div>
     <div style="flex:1">${field('Top-k', input('top_k', r?.top_k||5, 'type=number min=1 max=50'))}</div></div>
     ${field('', checkbox('contextual_chunks', r?r.contextual_chunks:true, 'Contextual chunks — embed the filename and section together with each chunk (changing this needs a reprocess)'))}
