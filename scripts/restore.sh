@@ -22,9 +22,16 @@ Steps:
      Errors about the vector extension (already exists / cannot drop / must
      be owner) are expected when the target already has it and are ignored;
      any other error fails the restore.
-  4. start the gateway (compose: `docker compose up -d <RAGMUX_SERVICE>`,
+  4. hand the restored tables to the application role: when the role named
+     by APP_ROLE (default ragmux_app, created by docker/postgres-init) exists,
+     ALTER ... OWNER TO and GRANT ALL on every table and sequence in public.
+     pg_restore runs as POSTGRES_USER (the superuser) with --no-owner, so
+     without this step the gateway could neither read the tables nor apply
+     the next migration (ALTER TABLE needs ownership). Skipped with a note
+     when the role does not exist (deployments still using the superuser URL).
+  5. start the gateway (compose: `docker compose up -d <RAGMUX_SERVICE>`,
      direct: START_CMD if set); migrations run automatically
-  5. wait for RAGMUX_URL/healthz, then print migrations_version from
+  6. wait for RAGMUX_URL/healthz, then print migrations_version from
      /admin/api/system when ADMIN_USER and ADMIN_PASSWORD are set
 
 Where the restore goes (first match wins):
@@ -42,6 +49,8 @@ Environment:
   RAGMUX_SERVICE     compose service running the gateway (default ragmux)
   POSTGRES_DB        database name                       (default ragmux)
   POSTGRES_USER      database role                       (default ragmux)
+  APP_ROLE           role the gateway connects as; owner of the restored
+                     tables after step 4                  (default ragmux_app)
   DATABASE_URL       use local pg_restore against this URL instead of compose
   STOP_CMD/START_CMD shell commands run around the restore in direct mode
   RAGMUX_URL         base URL used for the health wait   (default http://localhost:8080)
@@ -94,7 +103,11 @@ POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
 RAGMUX_SERVICE="${RAGMUX_SERVICE:-ragmux}"
 POSTGRES_DB="${POSTGRES_DB:-ragmux}"
 POSTGRES_USER="${POSTGRES_USER:-ragmux}"
+APP_ROLE="${APP_ROLE:-ragmux_app}"
 RAGMUX_URL="${RAGMUX_URL:-http://localhost:8080}"
+case "$APP_ROLE" in
+  *[!A-Za-z0-9_]*|'') die "APP_ROLE must be a plain identifier, got '$APP_ROLE'" 2 ;;
+esac
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-120}"
 
 mode=""
@@ -102,6 +115,14 @@ if [ -n "${DATABASE_URL:-}" ] && command -v pg_restore >/dev/null 2>&1; then
   mode="direct"
   list_cmd() { pg_restore --list "$dump" >/dev/null; }
   restore_cmd() { pg_restore --clean --if-exists --no-owner --no-privileges -d "$DATABASE_URL" "$dump"; }
+  psql_cmd() {
+    if command -v psql >/dev/null 2>&1; then
+      psql -v ON_ERROR_STOP=1 -qAt -d "$DATABASE_URL" "$@"
+    else
+      log "warning: psql not on PATH; run scripts/restore.sh's ownership step by hand (see -h, step 4)"
+      return 3
+    fi
+  }
   stop_app() { if [ -n "${STOP_CMD:-}" ]; then sh -c "$STOP_CMD"; else log "direct mode: no STOP_CMD set, make sure no gateway instance is connected"; fi; }
   start_app() { if [ -n "${START_CMD:-}" ]; then sh -c "$START_CMD"; else log "direct mode: no START_CMD set, start the gateway yourself"; return 3; fi; }
 else
@@ -116,6 +137,10 @@ else
   restore_cmd() {
     "${compose[@]}" exec -T "$POSTGRES_SERVICE" \
       pg_restore --clean --if-exists --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB" <"$dump"
+  }
+  psql_cmd() {
+    "${compose[@]}" exec -T "$POSTGRES_SERVICE" \
+      psql -v ON_ERROR_STOP=1 -qAt -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"
   }
   stop_app() { "${compose[@]}" stop "$RAGMUX_SERVICE"; }
   start_app() { "${compose[@]}" up -d --no-build "$RAGMUX_SERVICE"; }
@@ -162,6 +187,45 @@ if [ -n "$real_errors" ] || { [ "$status" -ne 0 ] && [ -z "$ext_errors" ]; }; th
   die "restore failed; the gateway was left stopped"
 fi
 log "restore finished"
+
+# The dump was written with --no-owner and restored by the superuser, so every
+# table now belongs to POSTGRES_USER. The gateway connects as APP_ROLE (a
+# plain role without superuser rights, see docker/postgres-init/01-ragmux.sql)
+# and needs to own its tables: migrations run ALTER TABLE, which only the
+# owner may do, and the GRANTs cover reads and writes on everything else.
+log "handing tables in schema public to $APP_ROLE"
+own_status=0
+psql_cmd -v role="$APP_ROLE" <<'SQL' || own_status=$?
+SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role')
+            THEN 'role ' || :'role' || ' found'
+            ELSE 'role ' || :'role' || ' does not exist; tables stay with the superuser' END;
+-- psql variables are not expanded inside dollar quotes: pass the role name
+-- to the DO block through a session setting instead.
+SET ragmux.app_role TO :'role';
+DO $$
+DECLARE
+    r RECORD;
+    role TEXT := current_setting('ragmux.app_role');
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role) THEN
+        RETURN;
+    END IF;
+    FOR r IN SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public' LOOP
+        EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.name, role);
+    END LOOP;
+    FOR r IN SELECT sequencename AS name FROM pg_sequences WHERE schemaname = 'public' LOOP
+        EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.name, role);
+    END LOOP;
+    EXECUTE format('GRANT ALL ON ALL TABLES IN SCHEMA public TO %I', role);
+    EXECUTE format('GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO %I', role);
+END
+$$;
+SQL
+case "$own_status" in
+  0) ;;
+  3) ;; # direct mode without psql: already warned
+  *) die "could not hand the restored tables to $APP_ROLE (exit $own_status); the gateway was left stopped" ;;
+esac
 
 log "starting gateway"
 start_status=0

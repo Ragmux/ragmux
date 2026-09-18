@@ -122,6 +122,7 @@ make restore FILE=backups/ragmux-20260918-153455.dump YES=1
 | `POSTGRES_DB`, `POSTGRES_USER` | `ragmux` | database and role |
 | `DATABASE_URL` | unset | use local `pg_restore` against this URL instead of Compose |
 | `STOP_CMD`, `START_CMD` | unset | in `DATABASE_URL` mode: shell commands run before and after the restore (e.g. `systemctl stop ragmux`) |
+| `APP_ROLE` | `ragmux_app` | role that receives ownership of the restored tables (step 4) |
 | `RAGMUX_URL` | `http://localhost:8080` | where to poll `/healthz` |
 | `WAIT_TIMEOUT` | `120` | seconds to wait for the gateway |
 | `ADMIN_USER`, `ADMIN_PASSWORD` | unset | when both are set, log in and print `migrations_version`, vector table count and document bytes from `/admin/api/system` |
@@ -133,15 +134,28 @@ Steps, in order:
    or warn). This matters: `--clean` drops tables and blocks on open connections.
 3. `pg_restore --clean --if-exists --no-owner --no-privileges -d ragmux`. Every object
    in the dump is dropped and recreated, so the target does not need to be empty.
-4. Start the gateway (`docker compose up -d ragmux`; `START_CMD` in direct mode).
+4. Hand the restored tables to the application role (`APP_ROLE`, default `ragmux_app`),
+   see *Ownership* below.
+5. Start the gateway (`docker compose up -d ragmux`; `START_CMD` in direct mode).
    Migrations run at startup.
-5. Poll `/healthz` and, if admin credentials are set, print the system info.
+6. Poll `/healthz` and, if admin credentials are set, print the system info.
+
+**Ownership.** `pg_restore` runs as the superuser (`POSTGRES_USER`) with `--no-owner`,
+so every restored table belongs to the superuser, while the gateway connects as the
+least-privilege role `ragmux_app` (see [Database privileges](configuration.md#database-privileges)).
+Reads would fail and the next migration's `ALTER TABLE` too, so right after the restore
+the script changes the owner of every table and sequence in `public` to `APP_ROLE`
+(default `ragmux_app`) and grants it `ALL` on them. The step is skipped with a note when
+the role does not exist (a deployment that still uses the superuser `DATABASE_URL`), and
+in `DATABASE_URL` mode it needs `psql` on `PATH` (otherwise a warning tells you to run it
+by hand: `ALTER TABLE ... OWNER TO ragmux_app` for each table, or simply re-run
+`docker/postgres-init/01-ragmux.sql`, whose last block does the same).
 
 **Extension errors.** The dump contains `DROP EXTENSION IF EXISTS vector` and
-`CREATE EXTENSION vector`. On the bundled Postgres the role owns the database, so both
-succeed silently. On servers where the extension was created by a superuser (managed
-Postgres, shared clusters) the drop fails and the create then reports
-`extension "vector" already exists`. `pg_restore` marks any failed statement with a
+`CREATE EXTENSION vector`. On the bundled Postgres the restore runs as the superuser,
+so both succeed silently. On servers where the extension was created by a superuser and
+the restore runs as a plain role (managed Postgres, shared clusters) the drop fails and
+the create then reports `extension "vector" already exists`. `pg_restore` marks any failed statement with a
 non-zero exit, so the script reads its stderr instead of using `--exit-on-error`:
 errors mentioning `extension` are printed as *ignored*, any other `pg_restore: error:`
 line fails the restore with exit `1`, and the gateway is left stopped so you can

@@ -16,7 +16,10 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgres://ragmux:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/ragmux?sslmode=disable
+      # The gateway connects as the least-privilege role ragmux_app that
+      # docker/postgres-init creates on the first start; POSTGRES_PASSWORD
+      # (the superuser) is only used by that init step, backups and restores.
+      DATABASE_URL: postgres://ragmux_app:${RAGMUX_DB_PASSWORD:?Set RAGMUX_DB_PASSWORD in .env}@postgres:5432/ragmux?sslmode=disable
       # Generate once with: openssl rand -hex 32. Keep it: it decrypts the
       # provider credentials stored in Postgres.
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (openssl rand -hex 32)}
@@ -56,9 +59,19 @@ services:
       POSTGRES_USER: ragmux
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ragmux
+      # Password of the ragmux_app role created by docker/postgres-init on
+      # the first start (empty data volume only). Use a hex value: it is
+      # interpolated into DATABASE_URL above, so URL-reserved characters
+      # (@ / : ? # %) and "$" would break the connection string.
+      RAGMUX_DB_PASSWORD: ${RAGMUX_DB_PASSWORD:?Set RAGMUX_DB_PASSWORD in .env}
     volumes:
       # All persistent state (models, projects, documents, vectors, metrics).
       - pgdata:/var/lib/postgresql/data
+      # First-start init: vector extension + ragmux_app role. The .sql is
+      # mounted outside initdb.d so the entrypoint runs it only through the
+      # wrapper, which passes the password as a psql variable.
+      - ./docker/postgres-init/01-ragmux.sh:/docker-entrypoint-initdb.d/01-ragmux.sh:ro
+      - ./docker/postgres-init/01-ragmux.sql:/ragmux-init/01-ragmux.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ragmux -d ragmux"]
       interval: 5s
