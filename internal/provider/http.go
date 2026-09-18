@@ -110,7 +110,7 @@ func doRequest(ctx context.Context, cfg Config, method, url string, headers map[
 		if ctx.Err() != nil {
 			return nil, &Error{Status: http.StatusGatewayTimeout, Type: "timeout", Message: "upstream request cancelled or timed out"}
 		}
-		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "upstream request failed: " + err.Error()}
+		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: Redact("upstream request failed: " + err.Error())}
 	}
 	return resp, nil
 }
@@ -148,6 +148,7 @@ func upstreamError(status int, raw []byte) *Error {
 	if len(e.Message) > 2000 {
 		e.Message = e.Message[:2000]
 	}
+	e.Message = Redact(e.Message)
 	// Do not relay 5xx codes verbatim as our own; mark them as bad gateway.
 	if status >= 500 {
 		e.Status = http.StatusBadGateway

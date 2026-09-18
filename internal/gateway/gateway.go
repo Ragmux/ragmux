@@ -39,6 +39,14 @@ type Gateway struct {
 
 type ctxKey struct{}
 
+// statusClientClosed is recorded in the request log when the client
+// disconnected before the completion finished (nginx's 499 convention). It is
+// never sent on the wire.
+const (
+	statusClientClosed = 499
+	errClientClosed    = "client closed request"
+)
+
 // Routes mounts /v1 handlers on the router.
 func (g *Gateway) Routes(r chi.Router) {
 	r.Use(g.authenticate)
@@ -230,12 +238,18 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := prov.Chat(ctx, req)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The client went away while the upstream call was running; the
+			// provider already saw the cancellation through ctx.
+			rec.StatusCode, rec.Error = statusClientClosed, errClientClosed
+			return
+		}
 		status, pe := providerError(err)
 		rec.StatusCode, rec.Error = status, pe.Message
 		log.Warn("upstream error", "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		w.Write(pe.ErrorJSON())
+		_, _ = w.Write(pe.ErrorJSON())
 		return
 	}
 	resp.Model = clientModel
@@ -276,7 +290,11 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 
 	var usage *provider.Usage
 	compChars := 0
+	clientGone := false
 	for chunk := range out {
+		if clientGone {
+			continue // drain until the provider notices the cancellation
+		}
 		sendHeaders()
 		chunk.Model = req.Model
 		if chunk.Usage != nil {
@@ -289,18 +307,30 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		}
 		b, _ := json.Marshal(chunk)
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			// Writing to a closed client: stop the upstream call. The
+			// goroutine exits once ChatStream observes ctx and closes out.
+			clientGone = true
 			cancel()
-			break
+			continue
 		}
 		flusher.Flush()
 	}
 	err := <-errc
+	if clientGone || r.Context().Err() != nil {
+		// The client disconnected before the completion finished. cancel()
+		// (deferred, or called above) has already torn down the upstream
+		// request through ctx; nothing can be written to the client.
+		rec.StatusCode, rec.Error = statusClientClosed, errClientClosed
+		fillUsage(rec, usage, promptChars, compChars)
+		return
+	}
 	if err != nil && !headersSent {
 		status, pe := providerError(err)
 		rec.StatusCode, rec.Error = status, pe.Message
+		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		w.Write(pe.ErrorJSON())
+		_, _ = w.Write(pe.ErrorJSON())
 		return
 	}
 	sendHeaders()
@@ -308,11 +338,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		// Mid-stream failure: surface it as an SSE error event then end.
 		_, pe := providerError(err)
 		rec.StatusCode, rec.Error = http.StatusBadGateway, pe.Message
-		fmt.Fprintf(w, "data: %s\n\n", pe.ErrorJSON())
+		g.Log.Warn("upstream stream failed", "project", rec.ProjectID, "msg", pe.Message)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", pe.ErrorJSON())
 	} else {
 		rec.StatusCode = http.StatusOK
 	}
-	fmt.Fprint(w, "data: [DONE]\n\n")
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	fillUsage(rec, usage, promptChars, compChars)
 }
@@ -380,9 +411,9 @@ func providerError(err error) (int, *provider.Error) {
 		return pe.Status, pe
 	}
 	if errors.Is(err, context.Canceled) {
-		return 499, &provider.Error{Status: 499, Type: "client_closed", Message: "client closed request"}
+		return statusClientClosed, &provider.Error{Status: statusClientClosed, Type: "client_closed", Message: errClientClosed}
 	}
-	return http.StatusBadGateway, &provider.Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: err.Error()}
+	return http.StatusBadGateway, &provider.Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: provider.Redact(err.Error())}
 }
 
 func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {
