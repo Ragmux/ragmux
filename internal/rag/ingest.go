@@ -114,27 +114,36 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	if err != nil {
 		return fmt.Errorf("load document content: %w", err)
 	}
-	text, err := ExtractText(doc.Filename, data)
+	parsed, err := Extract(doc.Filename, data)
 	if err != nil {
 		return err
 	}
-	pieces := Split(text, rs.ChunkSize, rs.ChunkOverlap)
+	pieces := SplitBlocks(parsed.Blocks, rs.ChunkSize, rs.ChunkOverlap)
 	if len(pieces) == 0 {
 		return fmt.Errorf("document produced no text chunks")
 	}
+	title := parsed.Title
+	if title == "" {
+		title = doc.Filename
+	}
 	chunks := make([]*store.Chunk, len(pieces))
+	inputs := make([]string, len(pieces))
 	for i, p := range pieces {
-		chunks[i] = &store.Chunk{Index: p.Index, Content: p.Content, TokenEstimate: EstimateTokens(p.Content)}
+		c := &store.Chunk{Index: p.Index, Content: p.Content, TokenEstimate: EstimateTokens(p.Content),
+			Metadata: chunkMetadata(title, p)}
+		inputs[i] = p.Content
+		if rs.ContextualChunks {
+			c.EmbedText = ContextualText(doc.Filename, p)
+			inputs[i] = c.EmbedText
+		}
+		chunks[i] = c
 	}
 	for i := 0; i < len(chunks); i += ing.batchSize {
 		end := i + ing.batchSize
 		if end > len(chunks) {
 			end = len(chunks)
 		}
-		inputs := make([]string, end-i)
-		for j := i; j < end; j++ {
-			inputs[j-i] = chunks[j].Content
-		}
+		inputs := inputs[i:end]
 		vecs, err := embedder.Embed(ctx, inputs)
 		if err != nil {
 			return fmt.Errorf("embed batch %d: %w", i/ing.batchSize, err)
@@ -149,6 +158,29 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	ing.log.Info("document ingested", "doc", docID, "file", doc.Filename, "chunks", len(chunks),
 		"dims", len(chunks[0].Embedding), "took", time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+// ContextualText is what gets embedded when contextual chunks are enabled:
+// the filename and section path prefixed to the chunk content, so the
+// vector carries where the passage sits in the document.
+func ContextualText(filename string, c Chunk) string {
+	head := filename
+	if c.Section != "" {
+		head += " · " + c.Section
+	}
+	return head + "\n\n" + c.Content
+}
+
+// chunkMetadata builds the JSON metadata stored with a chunk.
+func chunkMetadata(title string, c Chunk) map[string]any {
+	m := map[string]any{"title": title}
+	if c.Section != "" {
+		m["section"] = c.Section
+	}
+	if c.Page > 0 {
+		m["page"] = c.Page
+	}
+	return m
 }
 
 func truncate(s string, n int) string {

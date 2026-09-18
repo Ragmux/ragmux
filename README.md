@@ -29,8 +29,9 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
   Works with the official OpenAI SDKs by changing `base_url` and `api_key`.
 - **Format translation:** Anthropic Messages API and Gemini `generateContent` requests and
   streams are converted to and from the OpenAI schema, including tool calls for Anthropic.
-- **RAG stores:** upload PDF / TXT / Markdown, automatic chunking (size/overlap), batch
-  embedding, pgvector HNSW search (cosine), context injection into the system prompt.
+- **RAG stores:** upload PDF / DOCX / HTML / TXT / Markdown, section-aware chunking with
+  contextual embeddings, hybrid vector + full-text search (RRF), optional LLM reranking and a
+  similarity threshold, context injection into the system prompt. See [Retrieval (RAG)](#retrieval-rag).
 - **Projects:** each project has its own `sk-proj-…` key mapped to one model connection and an
   optional RAG store. Provider credentials are AES-256-GCM encrypted at rest and never leave
   the server.
@@ -154,15 +155,19 @@ ping through the connection.
 ```bash
 curl -s localhost:8080/admin/api/rag-stores -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "handbook", "embedding_connection_id": 2,
-  "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5}'
+  "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
+  "search_mode": "hybrid", "fts_config": "english", "rerank": false, "max_distance": 0}'
 
 curl -s localhost:8080/admin/api/rag-stores/1/documents -H "$AUTH" -F file=@handbook.pdf
+curl -s localhost:8080/admin/api/rag-stores/1/documents -H "$AUTH" -F file=@policies.docx -F file=@faq.html
 curl -s localhost:8080/admin/api/rag-stores/1/documents -H "$AUTH"      # status: pending → processing → ready
 
-# try retrieval directly
+# try retrieval directly (mode / rerank / max_distance override the store settings for this call)
 curl -s localhost:8080/admin/api/rag-stores/1/search -H "$AUTH" \
-  -H 'Content-Type: application/json' -d '{"query":"vacation policy"}'
+  -H 'Content-Type: application/json' -d '{"query":"vacation policy", "top_k": 3, "mode": "hybrid", "rerank": true}'
 ```
+
+The settings and how retrieval works are described in [Retrieval (RAG)](#retrieval-rag).
 
 ### 4. Create a project (get an `sk-proj-…` key)
 
@@ -199,9 +204,103 @@ for chunk in resp:
 ```
 
 The `model` field is ignored for routing (the project's connection decides) and echoed in
-the response so SDKs stay happy. When a RAG store is linked, the last user message is
-embedded, the top-k chunks are fetched and injected into the system prompt inside a
-`<context>` block before the request reaches the provider.
+the response so SDKs stay happy. When a RAG store is linked, the last user message is used
+as the query, the top-k chunks are retrieved and injected into the system prompt inside a
+`<context>` block before the request reaches the provider; the response carries an
+`x-ragmux-rag-hits` header with the number of passages injected.
+
+## Retrieval (RAG)
+
+A RAG store is a set of documents embedded with one model connection. Projects link to at
+most one store.
+
+### Formats and parsing
+
+| Format | Extensions | What becomes a block |
+|--------|------------|----------------------|
+| PDF | `.pdf` | paragraphs per page; the page number is kept |
+| Word | `.docx` | paragraphs; `Heading 1-9` / `Title` styles form the section path; table rows become `cell | cell` lines |
+| HTML | `.html`, `.htm` | `p`, `li`, `td`, `pre`, `blockquote`, `div`…; `h1`-`h3` form the section path; `script`, `style`, `nav`, `header`, `footer`, `svg` are dropped; `<title>` is the document title |
+| Markdown | `.md`, `.markdown` | paragraphs; `#` headings form the section path |
+| Text | `.txt` | paragraphs |
+
+No external tools are needed: DOCX is read from `word/document.xml`, HTML with
+`golang.org/x/net/html`. Uploads are checked by extension and, for DOCX, by the zip
+signature. Scanned PDFs without a text layer are rejected.
+
+### Chunking and contextual chunks
+
+Blocks are packed into chunks of `chunk_size` characters with `chunk_overlap` characters
+carried over between consecutive chunks. A chunk never spans two sections or two pages, so
+every chunk has exactly one section path (the last two heading levels, e.g.
+`Install > Docker`) and page. Blocks larger than `chunk_size` are split on sentence or word
+boundaries.
+
+With `contextual_chunks` (default on) the text that is *embedded* is
+`<filename> · <section>` followed by the chunk content, so the vector reflects where the
+passage sits in the document; the stored content and the context sent to the model stay
+unchanged. Changing `chunk_size`, `chunk_overlap` or `contextual_chunks` on a store with
+documents returns `"reprocess_recommended": true` — use **Reprocess all**
+(`POST /rag-stores/{id}/reprocess`) to re-parse, re-chunk and re-embed every document.
+
+### Search modes
+
+- `vector` — cosine nearest neighbours on the pgvector HNSW index.
+- `hybrid` (default) — the vector top-N and a PostgreSQL full-text top-N are fused with
+  reciprocal rank fusion: `score = 1/(60+vector_rank) + 1/(60+fts_rank)`. A chunk that is
+  close in embedding space *and* contains the query terms ranks first; an exact product name,
+  error code or identifier the embedding model does not know still surfaces through the
+  full-text side. Hybrid retrieves `3 × top_k` candidates before fusing.
+
+Full-text indexing always uses the `simple` configuration (language-agnostic, no stemming,
+no stop words) because the index column is generated once per chunk. `fts_config` only
+selects the configuration used to parse the *query* (`websearch_to_tsquery`), which makes a
+difference when it drops stop words or stems: with `english`, "policies" is looked up as
+`polici` — which will not match an index built with `simple`. Keep `fts_config = simple`
+unless you know your corpus benefits; any configuration listed in `pg_ts_config` is accepted.
+Plain queries are OR-ed (chunks matching more terms rank higher); quoted phrases, `or` and
+`-term` follow the `websearch_to_tsquery` syntax and are passed through unchanged.
+
+`max_distance` (0-2, default 0 = off) drops every candidate whose cosine distance to the
+query exceeds it, in both modes and before reranking. Use it to keep unrelated passages out
+of the prompt when a question has no answer in the store; the right value depends on the
+embedding model (try the dashboard's search test: it shows the distance of every hit).
+
+### Reranking
+
+With `rerank` on, the top `rerank_candidates` (default 15) fused hits are sent to the
+project's chat model in one listwise prompt (each passage cut to ~800 characters,
+`temperature 0`, `max_tokens 200`); the model returns the passage numbers ordered by
+relevance and the result is cut to `top_k`. Passages the model omits are appended in their
+original order, so nothing is lost. This costs one extra model call per request (roughly
+`rerank_candidates × chunk_size / 4` prompt tokens) and adds its latency; failures and
+timeouts (10 s) fall back to the fused order and are logged at warn level. From the admin
+search endpoint reranking uses the chat model of the first project linked to the store.
+
+### Response headers and context format
+
+`x-ragmux-rag-hits: <n>` is set on every chat response of a project with a linked store
+(`0` when nothing matched; absent when the project has no store). Passages are injected as
+
+```
+[1] (handbook.pdf · Leave > Vacation · p.12)
+…chunk text…
+```
+
+so the model can cite `[n]`; the label carries only the parts that exist.
+
+### Search endpoint
+
+`POST /admin/api/rag-stores/{id}/search` takes `{query, top_k, mode, rerank, max_distance}`
+(everything but `query` optional; unset fields use the store settings) and returns
+
+```json
+{"mode":"hybrid","reranked":true,"latency_ms":412,
+ "hits":[{"chunk_id":8,"document_id":2,"filename":"handbook.pdf","index":3,"section":"Leave > Vacation","page":12,
+          "content":"…","distance":0.18,"score":0.0325,"vector_rank":1,"fts_rank":2}]}
+```
+
+`vector_rank` / `fts_rank` are 0 when the chunk was not a candidate on that side.
 
 ## Users, roles and projects
 
@@ -321,7 +420,8 @@ minimum role; `member` means the project membership rule above applies too.
 | GET / POST | `/rag-stores` | viewer / editor | List / create RAG stores |
 | GET / PUT / DELETE | `/rag-stores/{id}` | viewer / editor / editor | Read / update / delete (cascades documents + vectors) |
 | GET / POST | `/rag-stores/{id}/documents` | viewer / editor | List / upload (`multipart`, field `file`) |
-| POST | `/rag-stores/{id}/search` | viewer | Vector search `{query, top_k}` |
+| POST | `/rag-stores/{id}/search` | viewer | Retrieval test `{query, top_k, mode, rerank, max_distance}` |
+| POST | `/rag-stores/{id}/reprocess` | editor | Re-parse, re-chunk and re-embed every document |
 | GET / DELETE | `/documents/{id}` | viewer / editor | Document status / delete |
 | POST | `/documents/{id}/reprocess` | editor | Re-chunk and re-embed |
 | GET / POST | `/projects` | member / editor | List own projects (admin: all) / create (`member_user_ids` optional, returns key once) |
@@ -369,7 +469,7 @@ internal/config/     environment configuration
 internal/store/      PostgreSQL schema, migrations, encryption, pgvector search
 internal/testdb/     per-test schemas on TEST_DATABASE_URL
 internal/provider/   OpenAI-compatible, Anthropic, Gemini adapters + embedders
-internal/rag/        parsing (PDF/TXT/MD), chunking, ingestion worker, retrieval
+internal/rag/        parsing (PDF/DOCX/HTML/TXT/MD), chunking, ingestion worker, retrieval, reranking
 internal/gateway/    /v1 proxy, RAG injection, metrics
 internal/limits/     per-project rate limits, token budgets, usage counters
 internal/admin/      /admin REST API + dashboard hosting
@@ -378,7 +478,7 @@ web/index.html       dashboard (vanilla JS, embedded in the binary)
 
 ## Roadmap / not yet
 
-Gemini tool calling, reranking, DOCX/HTML ingestion, prompt caching passthrough.
+Gemini tool calling, prompt caching passthrough.
 
 ## License
 

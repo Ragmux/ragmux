@@ -187,19 +187,21 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
 
-	// RAG pipeline.
+	// RAG pipeline. The hit count header is set here, before either the
+	// JSON or the streaming path writes the status line.
 	ragUsed := false
 	if p.RAGStoreID != nil && g.Retriever != nil {
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
 			q := rag.LastUserQuery(req.Messages)
-			hits, err := g.Retriever.Search(ctx, rs, q, rs.TopK)
+			hits, err := g.Retriever.Search(ctx, rs, q, rs.TopK, prov, conn.ModelName)
 			if err != nil {
 				log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
 				req.Messages = rag.InjectContext(req.Messages, rag.FormatContext(hits))
 				ragUsed = true
 			}
+			w.Header().Set("x-ragmux-rag-hits", strconv.Itoa(len(hits)))
 		} else {
 			log.Warn("rag store missing", "id", *p.RAGStoreID, "err", err)
 		}
