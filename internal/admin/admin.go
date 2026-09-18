@@ -2,6 +2,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +23,7 @@ import (
 
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/netguard"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -39,6 +43,15 @@ type Admin struct {
 	Limiter *auth.LoginLimiter
 	// Usage reads project rate-limit counters; nil builds one on the Store.
 	Usage *limits.Limiter
+	// ProviderConfig builds the provider configuration for a connection the
+	// same way the gateway does (hardened HTTP client, limits); nil falls
+	// back to a bare configuration.
+	ProviderConfig func(conn *store.ModelConnection) provider.Config
+	// AllowPrivateUpstreams and PrivateAllowlist mirror the netguard policy
+	// of the outbound client so a base_url pointing at a private address is
+	// rejected when it is saved rather than on first use.
+	AllowPrivateUpstreams bool
+	PrivateAllowlist      map[string]bool
 }
 
 // Routes mounts /admin handlers.
@@ -303,7 +316,11 @@ type connInput struct {
 	ModelName    string `json:"model_name"`
 }
 
-func (in connInput) validate() error {
+// modelNamePattern bounds model names to the characters providers use; the
+// name ends up in request paths (Gemini) and bodies.
+var modelNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$`)
+
+func (in connInput) validate(ctx context.Context, a *Admin) error {
 	if strings.TrimSpace(in.Name) == "" {
 		return errors.New("name is required")
 	}
@@ -313,11 +330,32 @@ func (in connInput) validate() error {
 	if strings.TrimSpace(in.ModelName) == "" {
 		return errors.New("model_name is required")
 	}
-	if in.BaseURL != "" && !strings.HasPrefix(in.BaseURL, "http://") && !strings.HasPrefix(in.BaseURL, "https://") {
-		return errors.New("base_url must start with http:// or https://")
+	if !modelNamePattern.MatchString(in.ModelName) || strings.Contains(in.ModelName, "..") {
+		return errors.New("model_name may only contain letters, digits and . _ : / @ - (max 128 characters, no leading / and no ..)")
 	}
 	if in.ProviderType == "custom_openai" && in.BaseURL == "" {
 		return errors.New("base_url is required for custom_openai")
+	}
+	if in.BaseURL == "" {
+		return nil
+	}
+	u, err := url.Parse(in.BaseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return errors.New("base_url must be an http:// or https:// URL")
+	}
+	if u.Hostname() == "" {
+		return errors.New("base_url must include a host")
+	}
+	if u.User != nil {
+		return errors.New("base_url must not contain credentials")
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
+		return errors.New("base_url must not contain a query string or fragment")
+	}
+	// Reject a host that only resolves to private addresses now so the
+	// admin sees the problem when saving; the dialer checks again on use.
+	if err := netguard.CheckHost(ctx, u.Hostname(), a.AllowPrivateUpstreams, a.PrivateAllowlist); err != nil {
+		return err
 	}
 	return nil
 }
@@ -337,7 +375,7 @@ func (a *Admin) createConnection(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if err := in.validate(); err != nil {
+	if err := in.validate(r.Context(), a); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -369,7 +407,7 @@ func (a *Admin) updateConnection(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if err := in.validate(); err != nil {
+	if err := in.validate(r.Context(), a); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -410,7 +448,9 @@ func (a *Admin) testConnection(w http.ResponseWriter, r *http.Request) {
 	a.audit(r, "model.test", "model", ptr(c.ID), map[string]any{"mode": in.Mode})
 	start := time.Now()
 	if in.Mode == "embedding" {
-		emb, err := provider.NewEmbedder(provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.ModelName, Timeout: 60 * time.Second})
+		pc := a.providerConfig(c)
+		pc.Timeout = 60 * time.Second
+		emb, err := provider.NewEmbedder(pc)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -444,6 +484,15 @@ func (a *Admin) testConnection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reply": reply, "usage": resp.Usage, "latency_ms": time.Since(start).Milliseconds()})
 }
 
+// providerConfig builds the provider configuration through the gateway's
+// factory when one is wired, so tests use the same hardened client.
+func (a *Admin) providerConfig(c *store.ModelConnection) provider.Config {
+	if a.ProviderConfig != nil {
+		return a.ProviderConfig(c)
+	}
+	return provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.ModelName}
+}
+
 // ---- RAG stores ----
 
 type ragInput struct {
@@ -468,8 +517,8 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	if in.ChunkSize <= 0 {
 		in.ChunkSize = 1000
 	}
-	if in.ChunkSize < 100 || in.ChunkSize > 20000 {
-		return errors.New("chunk_size must be between 100 and 20000")
+	if in.ChunkSize < 200 || in.ChunkSize > 20000 {
+		return errors.New("chunk_size must be between 200 and 20000")
 	}
 	if in.ChunkOverlap < 0 || in.ChunkOverlap >= in.ChunkSize {
 		return errors.New("chunk_overlap must be >= 0 and smaller than chunk_size")
@@ -616,8 +665,19 @@ func (a *Admin) reprocessStore(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	for _, docID := range ids {
-		a.Ingester.Enqueue(docID)
+	queued := 0
+	for i, docID := range ids {
+		if err := a.Ingester.Enqueue(docID); err != nil {
+			// Everything not queued yet would otherwise sit in "pending"
+			// until the next restart; mark it so the dashboard shows why.
+			for _, rest := range ids[i:] {
+				_ = a.Store.SetDocumentStatus(r.Context(), rest, store.DocFailed, err.Error())
+			}
+			a.audit(r, "rag_store.reprocess_all", "rag_store", ptr(id), map[string]any{"documents": len(ids), "queued": queued, "error": err.Error()})
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		queued++
 	}
 	a.audit(r, "rag_store.reprocess_all", "rag_store", ptr(id), map[string]any{"documents": len(ids)})
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "documents": len(ids)})
@@ -661,6 +721,14 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Rerank != nil {
 		rs.Rerank = *in.Rerank
+	}
+	// top_k is clamped to the store's own bounds; 0 means "use the store's
+	// top_k", which validateRAG already keeps within 1..50.
+	if in.TopK < 0 {
+		in.TopK = 0
+	}
+	if in.TopK > 50 {
+		in.TopK = 50
 	}
 	if in.MaxDistance != nil {
 		if *in.MaxDistance < 0 || *in.MaxDistance > 2 {
@@ -774,7 +842,12 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 			a.fail(w, err)
 			return
 		}
-		a.Ingester.Enqueue(doc.ID)
+		if err := a.Ingester.Enqueue(doc.ID); err != nil {
+			_ = a.Store.SetDocumentStatus(r.Context(), doc.ID, store.DocFailed, err.Error())
+			a.audit(r, "document.upload", "document", ptr(doc.ID), map[string]any{"rag_store_id": id, "filename": name, "size_bytes": len(data), "error": err.Error()})
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		a.audit(r, "document.upload", "document", ptr(doc.ID), map[string]any{"rag_store_id": id, "filename": name, "size_bytes": len(data)})
 		created = append(created, doc)
 	}
@@ -816,7 +889,11 @@ func (a *Admin) reprocessDocument(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.Ingester.Enqueue(d.ID)
+	if err := a.Ingester.Enqueue(d.ID); err != nil {
+		_ = a.Store.SetDocumentStatus(r.Context(), d.ID, store.DocFailed, err.Error())
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	a.audit(r, "document.reprocess", "document", ptr(d.ID), nil)
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }

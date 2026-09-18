@@ -49,6 +49,19 @@ type Config struct {
 	LogRetentionDays int
 	// AuditRetentionDays is how long audit entries are kept; 0 keeps them forever.
 	AuditRetentionDays int
+	// AllowPrivateUpstreams lets provider base URLs point at loopback,
+	// link-local and private networks. Off by default (SSRF protection).
+	AllowPrivateUpstreams bool
+	// PrivateUpstreamAllowlist lists hostnames (lower-case) that may resolve
+	// to private addresses even when AllowPrivateUpstreams is false.
+	PrivateUpstreamAllowlist map[string]bool
+	// StreamMaxDuration bounds one streaming provider response end to end.
+	StreamMaxDuration time.Duration
+	// StreamMaxBytes caps the bytes read from one streaming response.
+	StreamMaxBytes int64
+	// MaxChunksPerDocument fails ingestion of documents that split into more
+	// chunks than this, bounding memory and embedding cost per document.
+	MaxChunksPerDocument int
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -150,6 +163,37 @@ func Load() (Config, error) {
 			}
 			*v.dst = n
 		}
+	}
+	c.AllowPrivateUpstreams = os.Getenv("ALLOW_PRIVATE_UPSTREAMS") == "true"
+	c.PrivateUpstreamAllowlist = map[string]bool{}
+	for _, h := range strings.Split(os.Getenv("PRIVATE_UPSTREAM_ALLOWLIST"), ",") {
+		if h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), "."); h != "" {
+			c.PrivateUpstreamAllowlist[h] = true
+		}
+	}
+	c.StreamMaxDuration = 30 * time.Minute
+	if v := os.Getenv("STREAM_MAX_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return c, fmt.Errorf("invalid STREAM_MAX_DURATION %q", v)
+		}
+		c.StreamMaxDuration = d
+	}
+	c.StreamMaxBytes = 256 << 20
+	if v := os.Getenv("STREAM_MAX_BYTES_MB"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("invalid STREAM_MAX_BYTES_MB %q", v)
+		}
+		c.StreamMaxBytes = int64(n) << 20
+	}
+	c.MaxChunksPerDocument = 20000
+	if v := os.Getenv("MAX_CHUNKS_PER_DOCUMENT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("invalid MAX_CHUNKS_PER_DOCUMENT %q", v)
+		}
+		c.MaxChunksPerDocument = n
 	}
 	return c, nil
 }
