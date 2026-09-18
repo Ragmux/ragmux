@@ -6,6 +6,21 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **First-run setup replaces the generated password.** A fresh database no longer gets an
+  `admin` account with a random password printed to the logs. The dashboard now shows a
+  "Create the first administrator" form (username, password of at least 12 characters)
+  backed by `GET`/`POST /admin/api/setup`, which only work while the `users` table is
+  empty and refuse with `409` afterwards; the creation is serialised so two concurrent
+  requests cannot both succeed, failed attempts count against the per-address login
+  limit and the result is audited as `setup.complete`. `ADMIN_USER` / `ADMIN_PASSWORD`
+  still pre-create the account for unattended installs; without `ADMIN_PASSWORD` the log
+  says `no users yet: open /admin/ to create the first administrator`.
+
+### Added
+- `SECURITY.md`: supported versions, how to report a vulnerability, response targets,
+  scope and hardening pointers.
+
 ### Security
 - **Provider keys are bound to their connection.** `api_key_enc` is now sealed with the
   connection id as AES-GCM associated data (`key_version = 1`), so a ciphertext copied

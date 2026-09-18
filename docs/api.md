@@ -93,6 +93,18 @@ The client API uses the OpenAI shape with a `code` field:
 
 All paths are relative to `/admin/api`.
 
+### First-run setup
+
+Unauthenticated by design; both refuse as soon as any user exists.
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/setup` | — | `{"needs_setup": true}` while the `users` table is empty, `false` afterwards |
+| POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
+
+`ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
+case setup is already complete (see [Configuration](configuration.md#environment-variables)).
+
 ### Session and account
 
 | Method | Path | Role | Purpose |
