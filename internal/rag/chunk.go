@@ -5,16 +5,31 @@ import (
 	"unicode/utf8"
 )
 
-// Chunk is one text window produced by the splitter.
+// Chunk is one text window produced by the splitter together with the
+// section and page of the blocks it was built from.
 type Chunk struct {
 	Index   int
 	Content string
+	Section string
+	Page    int
 }
 
 // Split divides text into windows of roughly size characters (runes) with
 // the given overlap. Paragraph boundaries are preferred; paragraphs longer
 // than size are split on sentence/word boundaries where possible.
 func Split(text string, size, overlap int) []Chunk {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	return SplitBlocks([]Block{{Text: text}}, size, overlap)
+}
+
+// SplitBlocks packs blocks into windows of roughly size runes with the
+// given overlap. A window never spans two sections: when the section (or
+// page) changes a new chunk starts, so every chunk carries one Section and
+// Page. Blocks larger than size are split on sentence/word boundaries.
+func SplitBlocks(blocks []Block, size, overlap int) []Chunk {
 	if size <= 0 {
 		size = 1000
 	}
@@ -24,33 +39,44 @@ func Split(text string, size, overlap int) []Chunk {
 	if overlap >= size {
 		overlap = size / 4
 	}
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return nil
-	}
 
-	// First pass: greedy packing of paragraphs into windows.
-	var units []string
-	for _, p := range strings.Split(text, "\n\n") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
+	// First pass: split every block into paragraph units no larger than size.
+	type unit struct {
+		text    string
+		section string
+		page    int
+	}
+	var units []unit
+	for _, b := range blocks {
+		for _, p := range strings.Split(strings.TrimSpace(b.Text), "\n\n") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if utf8.RuneCountInString(p) <= size {
+				units = append(units, unit{p, b.Section, b.Page})
+				continue
+			}
+			for _, piece := range slide(p, size, overlap) {
+				units = append(units, unit{piece, b.Section, b.Page})
+			}
 		}
-		if utf8.RuneCountInString(p) <= size {
-			units = append(units, p)
-			continue
-		}
-		units = append(units, slide(p, size, overlap)...)
 	}
 
 	var out []Chunk
 	var cur []rune
-	flush := func() {
+	var curSection string
+	var curPage int
+	// onlyOverlap is true while cur holds nothing but the tail carried over
+	// from the previous chunk.
+	onlyOverlap := false
+	flush := func(keepOverlap bool) {
 		if len(cur) == 0 {
 			return
 		}
-		out = append(out, Chunk{Index: len(out), Content: strings.TrimSpace(string(cur))})
-		if overlap > 0 && len(cur) > overlap {
+		out = append(out, Chunk{Index: len(out), Content: strings.TrimSpace(string(cur)), Section: curSection, Page: curPage})
+		onlyOverlap = keepOverlap && overlap > 0 && len(cur) > overlap
+		if onlyOverlap {
 			tail := cur[len(cur)-overlap:]
 			// Start the overlap at a word boundary when possible.
 			if i := indexRune(tail, ' '); i >= 0 && i < len(tail)-1 {
@@ -62,16 +88,28 @@ func Split(text string, size, overlap int) []Chunk {
 		}
 	}
 	for _, u := range units {
-		ur := []rune(u)
+		ur := []rune(u.text)
+		if len(cur) > 0 && (u.section != curSection || u.page != curPage) {
+			// Section or page boundary: no overlap across it.
+			if onlyOverlap {
+				cur = cur[:0]
+			} else {
+				flush(false)
+			}
+		}
 		if len(cur) > 0 && len(cur)+2+len(ur) > size {
-			flush()
+			flush(true)
+		}
+		if len(cur) == 0 {
+			curSection, curPage = u.section, u.page
 		}
 		if len(cur) > 0 {
 			cur = append(cur, '\n', '\n')
 		}
 		cur = append(cur, ur...)
+		onlyOverlap = false
 		if len(cur) >= size {
-			flush()
+			flush(true)
 		}
 	}
 	if len(strings.TrimSpace(string(cur))) > 0 {
@@ -81,7 +119,7 @@ func Split(text string, size, overlap int) []Chunk {
 			last = out[len(out)-1].Content
 		}
 		if c := strings.TrimSpace(string(cur)); !strings.HasSuffix(last, c) {
-			out = append(out, Chunk{Index: len(out), Content: c})
+			out = append(out, Chunk{Index: len(out), Content: c, Section: curSection, Page: curPage})
 		}
 	}
 	return out

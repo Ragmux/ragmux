@@ -3,47 +3,216 @@
 package rag
 
 import (
+	"archive/zip"
 	"bytes"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/ledongthuc/pdf"
+	"golang.org/x/net/html"
 )
 
 // SupportedExtensions lists accepted upload types.
-var SupportedExtensions = map[string]bool{".pdf": true, ".txt": true, ".md": true, ".markdown": true}
+var SupportedExtensions = map[string]bool{
+	".pdf": true, ".txt": true, ".md": true, ".markdown": true,
+	".docx": true, ".html": true, ".htm": true,
+}
 
 // IsSupported reports whether a filename can be ingested.
 func IsSupported(filename string) bool {
 	return SupportedExtensions[strings.ToLower(filepath.Ext(filename))]
 }
 
-// ExtractText returns the plain text of an uploaded document. The file type
-// is taken from the filename extension.
-func ExtractText(filename string, data []byte) (string, error) {
+// Block is one unit of extracted text: a paragraph, list item, table row
+// or page fragment together with the heading path it sits under and the
+// page it came from (PDF only; 0 otherwise).
+type Block struct {
+	Text    string
+	Section string
+	Page    int
+}
+
+// Parsed is the result of extracting a document.
+type Parsed struct {
+	Blocks []Block
+	// Title is the document title when the format carries one (HTML
+	// <title>); empty otherwise.
+	Title string
+}
+
+// ExtractBlocks parses an uploaded document into blocks. The file type is
+// taken from the filename extension.
+func ExtractBlocks(filename string, data []byte) ([]Block, error) {
+	p, err := Extract(filename, data)
+	if err != nil {
+		return nil, err
+	}
+	return p.Blocks, nil
+}
+
+// Extract parses an uploaded document into blocks plus document metadata.
+func Extract(filename string, data []byte) (*Parsed, error) {
 	switch strings.ToLower(filepath.Ext(filename)) {
 	case ".pdf":
 		return extractPDF(data)
-	case ".txt", ".md", ".markdown":
-		return normalizeText(string(data)), nil
+	case ".txt":
+		return &Parsed{Blocks: paragraphBlocks(normalizeText(string(data)), "", 0)}, nil
+	case ".md", ".markdown":
+		return &Parsed{Blocks: extractMarkdown(normalizeText(string(data)))}, nil
+	case ".docx":
+		return extractDOCX(data)
+	case ".html", ".htm":
+		return extractHTML(data)
 	}
-	return "", fmt.Errorf("unsupported file type %q", filepath.Ext(filename))
+	return nil, fmt.Errorf("unsupported file type %q", filepath.Ext(filename))
 }
 
-func extractPDF(data []byte) (text string, err error) {
+// ExtractText returns the plain text of an uploaded document: all blocks
+// joined by blank lines. Kept for callers that do not need structure.
+func ExtractText(filename string, data []byte) (string, error) {
+	blocks, err := ExtractBlocks(filename, data)
+	if err != nil {
+		return "", err
+	}
+	return JoinBlocks(blocks), nil
+}
+
+// JoinBlocks concatenates block texts with blank lines between them.
+func JoinBlocks(blocks []Block) string {
+	parts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		parts = append(parts, b.Text)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// SniffOK checks that the bytes plausibly match the extension. Only DOCX is
+// checked (it must be a zip archive); everything else is accepted.
+func SniffOK(filename string, data []byte) bool {
+	if strings.ToLower(filepath.Ext(filename)) == ".docx" {
+		return len(data) >= 2 && data[0] == 'P' && data[1] == 'K'
+	}
+	return true
+}
+
+// paragraphBlocks splits text on blank lines.
+func paragraphBlocks(text, section string, page int) []Block {
+	var out []Block
+	for _, p := range strings.Split(text, "\n\n") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, Block{Text: p, Section: section, Page: page})
+	}
+	return out
+}
+
+// sectionPath tracks a heading hierarchy and renders the last two levels
+// as "Parent > Child".
+type sectionPath struct {
+	levels [10]string // index = heading level 1..9; 0 is a document title
+}
+
+func (sp *sectionPath) set(level int, title string) {
+	if level < 0 || level > 9 {
+		return
+	}
+	sp.levels[level] = strings.TrimSpace(title)
+	for i := level + 1; i < len(sp.levels); i++ {
+		sp.levels[i] = ""
+	}
+}
+
+func (sp *sectionPath) String() string {
+	var parts []string
+	for _, l := range sp.levels {
+		if l != "" {
+			parts = append(parts, l)
+		}
+	}
+	if len(parts) > 2 {
+		parts = parts[len(parts)-2:]
+	}
+	return strings.Join(parts, " > ")
+}
+
+// extractMarkdown tracks ATX headings and yields paragraphs under them.
+// Fenced code blocks are kept intact and never mistaken for headings.
+func extractMarkdown(text string) []Block {
+	var (
+		out   []Block
+		sp    sectionPath
+		para  []string
+		fence bool
+	)
+	flush := func() {
+		if p := strings.TrimSpace(strings.Join(para, "\n")); p != "" {
+			out = append(out, Block{Text: p, Section: sp.String()})
+		}
+		para = para[:0]
+	}
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			fence = !fence
+			para = append(para, line)
+			continue
+		}
+		if fence {
+			para = append(para, line)
+			continue
+		}
+		if level, title, ok := atxHeading(trimmed); ok {
+			flush()
+			sp.set(level, title)
+			continue
+		}
+		if trimmed == "" {
+			flush()
+			continue
+		}
+		para = append(para, line)
+	}
+	flush()
+	return out
+}
+
+func atxHeading(line string) (int, string, bool) {
+	if !strings.HasPrefix(line, "#") {
+		return 0, "", false
+	}
+	level := 0
+	for level < len(line) && line[level] == '#' {
+		level++
+	}
+	if level > 6 || level == len(line) || line[level] != ' ' {
+		return 0, "", false
+	}
+	title := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(line[level:]), "#"))
+	if title == "" {
+		return 0, "", false
+	}
+	return level, title, true
+}
+
+func extractPDF(data []byte) (out *Parsed, err error) {
 	defer func() {
 		// The PDF library panics on some malformed inputs.
 		if r := recover(); r != nil {
-			err = fmt.Errorf("pdf parse failed: %v", r)
+			out, err = nil, fmt.Errorf("pdf parse failed: %v", r)
 		}
 	}()
 	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return "", fmt.Errorf("open pdf: %w", err)
+		return nil, fmt.Errorf("open pdf: %w", err)
 	}
-	var buf bytes.Buffer
+	out = &Parsed{}
 	n := r.NumPage()
 	for i := 1; i <= n; i++ {
 		p := r.Page(i)
@@ -54,14 +223,283 @@ func extractPDF(data []byte) (text string, err error) {
 		if perr != nil {
 			continue
 		}
-		buf.WriteString(s)
-		buf.WriteString("\n\n")
+		out.Blocks = append(out.Blocks, paragraphBlocks(normalizeText(s), "", i)...)
 	}
-	out := normalizeText(buf.String())
-	if strings.TrimSpace(out) == "" {
-		return "", fmt.Errorf("pdf contains no extractable text (scanned image?)")
+	if len(out.Blocks) == 0 {
+		return nil, fmt.Errorf("pdf contains no extractable text (scanned image?)")
 	}
 	return out, nil
+}
+
+// ---- DOCX ----
+
+// extractDOCX reads word/document.xml from the OOXML archive. Paragraphs
+// styled Heading1..9 (or Title) form the section hierarchy; table rows
+// become one block per row with cells joined by " | ".
+func extractDOCX(data []byte) (*Parsed, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("open docx: %w", err)
+	}
+	var docXML []byte
+	for _, f := range zr.File {
+		if f.Name == "word/document.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				return nil, fmt.Errorf("open docx: %w", err)
+			}
+			docXML, err = io.ReadAll(io.LimitReader(rc, 256<<20))
+			rc.Close()
+			if err != nil {
+				return nil, fmt.Errorf("read docx: %w", err)
+			}
+			break
+		}
+	}
+	if docXML == nil {
+		return nil, fmt.Errorf("docx has no word/document.xml")
+	}
+
+	var (
+		out          Parsed
+		sp           sectionPath
+		para         strings.Builder // current w:p text
+		style        string          // current w:p style
+		inPara       bool
+		cells        []string // finished cells of the current row
+		cell         strings.Builder
+		inCell       bool
+		depth        int // nesting inside w:tbl
+		cellHasParas bool
+	)
+	dec := xml.NewDecoder(bytes.NewReader(docXML))
+	emitPara := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		if level, ok := docxHeadingLevel(style); ok {
+			sp.set(level, text)
+			return
+		}
+		out.Blocks = append(out.Blocks, Block{Text: text, Section: sp.String()})
+	}
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse docx: %w", err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "tbl":
+				depth++
+			case "tr":
+				cells = cells[:0]
+			case "tc":
+				inCell = true
+				cell.Reset()
+				cellHasParas = false
+			case "p":
+				inPara = true
+				para.Reset()
+				style = ""
+			case "pStyle":
+				for _, a := range t.Attr {
+					if a.Name.Local == "val" {
+						style = a.Value
+					}
+				}
+			case "tab":
+				if inPara {
+					para.WriteByte('\t')
+				}
+			case "br", "cr":
+				if inPara {
+					para.WriteByte('\n')
+				}
+			case "t":
+				var s string
+				if err := dec.DecodeElement(&s, &t); err != nil {
+					return nil, fmt.Errorf("parse docx: %w", err)
+				}
+				if inPara {
+					para.WriteString(s)
+				}
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "p":
+				inPara = false
+				if inCell {
+					if cellHasParas {
+						cell.WriteByte(' ')
+					}
+					cell.WriteString(strings.TrimSpace(para.String()))
+					cellHasParas = true
+				} else {
+					emitPara(para.String())
+				}
+			case "tc":
+				inCell = false
+				cells = append(cells, strings.TrimSpace(cell.String()))
+			case "tr":
+				if depth > 0 {
+					row := strings.TrimSpace(strings.Join(cells, " | "))
+					if strings.Trim(row, " |") != "" {
+						out.Blocks = append(out.Blocks, Block{Text: row, Section: sp.String()})
+					}
+				}
+			case "tbl":
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+	}
+	if len(out.Blocks) == 0 {
+		return nil, fmt.Errorf("docx contains no text")
+	}
+	return &out, nil
+}
+
+// docxHeadingLevel maps paragraph styles like "Heading1" or "heading 2" to
+// a heading level; "Title" sits above all headings (level 0).
+func docxHeadingLevel(style string) (int, bool) {
+	s := strings.ToLower(strings.ReplaceAll(style, " ", ""))
+	if s == "title" {
+		return 0, true
+	}
+	if !strings.HasPrefix(s, "heading") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(s, "heading"))
+	if err != nil || n < 1 || n > 9 {
+		return 0, false
+	}
+	return n, true
+}
+
+// ---- HTML ----
+
+var htmlSkip = map[string]bool{"script": true, "style": true, "noscript": true, "nav": true,
+	"header": true, "footer": true, "svg": true, "template": true, "head": true}
+
+var htmlBlockTags = map[string]bool{"p": true, "li": true, "td": true, "th": true, "pre": true,
+	"blockquote": true, "div": true, "h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
+	"section": true, "article": true, "main": true, "tr": true, "ul": true, "ol": true, "table": true, "body": true}
+
+// extractHTML walks the DOM: h1..h3 set the section hierarchy, block
+// elements with direct text become blocks and boilerplate elements are
+// dropped. The <title> element becomes the document title.
+func extractHTML(data []byte) (*Parsed, error) {
+	root, err := html.Parse(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("parse html: %w", err)
+	}
+	var (
+		out Parsed
+		sp  sectionPath
+		cur strings.Builder
+	)
+	flush := func() {
+		if t := collapseSpace(cur.String()); t != "" {
+			out.Blocks = append(out.Blocks, Block{Text: t, Section: sp.String()})
+		}
+		cur.Reset()
+	}
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		switch n.Type {
+		case html.TextNode:
+			cur.WriteString(n.Data)
+			return
+		case html.ElementNode:
+			tag := strings.ToLower(n.Data)
+			if tag == "head" {
+				if t := findElement(n, "title"); t != nil {
+					out.Title = collapseSpace(nodeText(t))
+				}
+				return
+			}
+			if tag == "title" {
+				return
+			}
+			if htmlSkip[tag] {
+				return
+			}
+			if tag == "h1" || tag == "h2" || tag == "h3" {
+				flush()
+				sp.set(int(tag[1]-'0'), collapseSpace(nodeText(n)))
+				return
+			}
+			if tag == "br" {
+				cur.WriteByte('\n')
+				return
+			}
+			if htmlBlockTags[tag] {
+				flush()
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					walk(c)
+				}
+				flush()
+				return
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	flush()
+	if len(out.Blocks) == 0 {
+		return nil, fmt.Errorf("html contains no text")
+	}
+	return &out, nil
+}
+
+func findElement(n *html.Node, tag string) *html.Node {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && strings.ToLower(c.Data) == tag {
+			return c
+		}
+		if f := findElement(c, tag); f != nil {
+			return f
+		}
+	}
+	return nil
+}
+
+func nodeText(n *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			b.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return b.String()
+}
+
+// collapseSpace squeezes runs of whitespace into single spaces, keeping
+// newlines that separate lines (as in <pre> or <br>).
+func collapseSpace(s string) string {
+	lines := strings.Split(s, "\n")
+	var out []string
+	for _, l := range lines {
+		l = strings.Join(strings.Fields(l), " ")
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return normalizeText(strings.Join(out, "\n"))
 }
 
 // normalizeText fixes invalid UTF-8, line endings and excessive blank lines.
