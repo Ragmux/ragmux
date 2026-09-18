@@ -62,6 +62,15 @@ const (
 	// pdfTimeout bounds PDF parsing, which runs in library code that has no
 	// cancellation hook of its own.
 	pdfTimeout = 60 * time.Second
+	// maxPDFPageText caps the text of a single page. A dense real page holds
+	// a few KiB; far more means a crafted content stream.
+	maxPDFPageText = 2 << 20
+	// maxPDFTreeNodes bounds the page-tree walk in pdfPages: at most this
+	// many nodes are visited, however many the tree references.
+	maxPDFTreeNodes = 100_000
+	// maxPDFTreeDepth bounds /Pages nesting and the /Parent chain a page's
+	// inherited attributes are looked up through.
+	maxPDFTreeDepth = 64
 	// maxDocxXML caps the size of word/document.xml inside a DOCX.
 	maxDocxXML = 32 << 20
 	// maxDocxRatio is the highest uncompressed/compressed ratio accepted for
@@ -251,15 +260,21 @@ func atxHeading(line string) (int, string, bool) {
 	return level, title, true
 }
 
-// extractPDF parses at most maxPDFPages pages within pdfTimeout. The PDF
-// library can loop or crawl on crafted content streams and offers no way to
-// interrupt a page, so the work runs in a goroutine: on timeout the caller
-// returns an error and the goroutine is abandoned. It exits on its own when
-// the current page finishes because it checks ctx between pages, and the
-// buffered result channel means it never blocks on a departed receiver.
+// extractPDF parses at most maxPDFPages pages within pdfTimeout, in the
+// PDFWorker child process when one is configured (see pdfworker.go).
+//
+// In-process, the PDF library can loop or crawl on crafted content and
+// offers no way to interrupt a page, so the work runs in a goroutine: on
+// timeout the caller returns an error and the goroutine is abandoned. It
+// exits on its own when the current page finishes because it checks ctx
+// between pages, and the buffered result channel means it never blocks on
+// a departed receiver.
 func extractPDF(ctx context.Context, data []byte) (*Parsed, error) {
 	ctx, cancel := context.WithTimeout(ctx, pdfTimeout)
 	defer cancel()
+	if len(PDFWorker) > 0 {
+		return extractPDFExternal(ctx, data)
+	}
 	type result struct {
 		out *Parsed
 		err error
@@ -280,9 +295,12 @@ func extractPDF(ctx context.Context, data []byte) (*Parsed, error) {
 	}
 }
 
+// extractPDFPages does the parsing. It must run under the recover below:
+// the library panics on many malformed inputs (dangling references, object
+// streams that are not streams, bad filters) and the panic would otherwise
+// take the ingester down with it.
 func extractPDFPages(ctx context.Context, data []byte) (out *Parsed, err error) {
 	defer func() {
-		// The PDF library panics on some malformed inputs.
 		if r := recover(); r != nil {
 			out, err = nil, fmt.Errorf("pdf parse failed: %v", r)
 		}
@@ -291,31 +309,87 @@ func extractPDFPages(ctx context.Context, data []byte) (out *Parsed, err error) 
 	if err != nil {
 		return nil, fmt.Errorf("open pdf: %w", err)
 	}
-	out = &Parsed{PageCount: r.NumPage()}
-	n := min(r.NumPage(), maxPDFPages)
+	pages, count := pdfPages(r)
+	out = &Parsed{PageCount: count}
 	total := 0
-	for i := 1; i <= n; i++ {
+	for i, v := range pages {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		p := r.Page(i)
-		if p.V.IsNull() {
+		if !pdfParentChainOK(v) {
 			continue
 		}
-		s, perr := p.GetPlainText(nil)
+		s, perr := pdf.Page{V: v}.GetPlainText(nil)
 		if perr != nil {
 			continue
+		}
+		if len(s) > maxPDFPageText {
+			return nil, fmt.Errorf("pdf page %d yields more than %d MiB of text", i+1, maxPDFPageText>>20)
 		}
 		total += len(s)
 		if total > maxExtractedText {
 			return nil, ErrTooMuchText
 		}
-		out.Blocks = append(out.Blocks, paragraphBlocks(normalizeText(s), "", i)...)
+		out.Blocks = append(out.Blocks, paragraphBlocks(normalizeText(s), "", i+1)...)
 	}
 	if len(out.Blocks) == 0 {
 		return nil, fmt.Errorf("pdf contains no extractable text (scanned image?)")
 	}
 	return out, nil
+}
+
+// pdfPages walks the page tree from the catalog and returns the first
+// maxPDFPages leaf pages in document order plus the number of leaves seen.
+// Reader.Page is not used: it follows /Kids and trusts /Count with no cycle
+// guard, so a node that lists itself keeps it spinning past the timeout
+// (the goroutine cannot be interrupted), and a huge /Count is reported as
+// the page count. The walk is bounded by depth and by a node budget.
+func pdfPages(r *pdf.Reader) ([]pdf.Value, int) {
+	type node struct {
+		v     pdf.Value
+		depth int
+	}
+	stack := []node{{v: r.Trailer().Key("Root").Key("Pages")}}
+	budget := maxPDFTreeNodes
+	var pages []pdf.Value
+	count := 0
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch n.v.Key("Type").Name() {
+		case "Page":
+			count++
+			if len(pages) < maxPDFPages {
+				pages = append(pages, n.v)
+			}
+		case "Pages":
+			if n.depth >= maxPDFTreeDepth {
+				continue
+			}
+			kids := n.v.Key("Kids")
+			// Pushed in reverse so the first kid is popped first.
+			for i := kids.Len() - 1; i >= 0 && budget > 0; i-- {
+				budget--
+				stack = append(stack, node{kids.Index(i), n.depth + 1})
+			}
+		}
+	}
+	return pages, count
+}
+
+// pdfParentChainOK reports whether the page carries /Resources itself or
+// its /Parent chain ends within maxPDFTreeDepth hops. The library resolves
+// inherited resources by walking that chain with no cycle guard, so a page
+// whose ancestry loops back on itself is skipped rather than parsed.
+func pdfParentChainOK(page pdf.Value) bool {
+	v := page
+	for i := 0; i < maxPDFTreeDepth && !v.IsNull(); i++ {
+		if !v.Key("Resources").IsNull() {
+			return true
+		}
+		v = v.Key("Parent")
+	}
+	return v.IsNull()
 }
 
 // ---- DOCX ----
