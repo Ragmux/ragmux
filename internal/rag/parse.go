@@ -66,8 +66,11 @@ const (
 	// a few KiB; far more means a crafted content stream.
 	maxPDFPageText = 2 << 20
 	// maxPDFTreeNodes bounds the page-tree walk in pdfPages: at most this
-	// many nodes are visited, however many the tree references.
-	maxPDFTreeNodes = 100_000
+	// many nodes are visited, however many the tree references. Every visit
+	// re-reads the object through the xref, so the budget is what keeps a
+	// crafted fan-out (one node listed thousands of times) to about a
+	// second; a real 2000-page document has a few thousand nodes.
+	maxPDFTreeNodes = 10_000
 	// maxPDFTreeDepth bounds /Pages nesting and the /Parent chain a page's
 	// inherited attributes are looked up through.
 	maxPDFTreeDepth = 64

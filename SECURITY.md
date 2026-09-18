@@ -68,7 +68,7 @@ a tag before pulling it into production:
 
 ```sh
 cosign verify ghcr.io/ragmux/ragmux:<tag> \
-  --certificate-identity-regexp '^https://github.com/ragmux/ragmux/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-identity-regexp '^https://github.com/[Rr]agmux/ragmux/.github/workflows/release.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
