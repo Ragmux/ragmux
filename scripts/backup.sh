@@ -5,6 +5,9 @@
 #
 # See docs/backup-restore.md for the full guide.
 set -euo pipefail
+# Dumps contain password hashes, encrypted provider keys and every uploaded
+# document: nothing this script writes may be readable by other users.
+umask 077
 
 usage() {
   cat <<'USAGE'
@@ -31,7 +34,11 @@ Environment:
   POSTGRES_USER       database role                         (default ragmux)
   DATABASE_URL        use a local pg_dump against this URL instead of compose
   INCLUDE_SECRET_KEY  1 = also write SECRET_KEY (from env or .env) to
-                      <dump>.key with mode 600
+                      SECRET_KEY_DIR/<name>.key with mode 600
+  SECRET_KEY_DIR      where the .key file goes             (default BACKUP_DIR)
+                      Prefer a different, separately protected location: a
+                      dump plus its key on one disk decrypts every provider
+                      credential for whoever reads that disk.
   COMPOSE_PROJECT     compose project name (same as -p)
 
 Exit codes: 0 success, 1 dump or verification failed, 2 usage/configuration error.
@@ -59,6 +66,7 @@ POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-ragmux}"
 POSTGRES_USER="${POSTGRES_USER:-ragmux}"
 INCLUDE_SECRET_KEY="${INCLUDE_SECRET_KEY:-0}"
+SECRET_KEY_DIR="${SECRET_KEY_DIR:-$BACKUP_DIR}"
 
 case "$KEEP_DAYS" in
   ''|*[!0-9]*) die "KEEP_DAYS must be a non-negative integer, got '$KEEP_DAYS'" 2 ;;
@@ -85,7 +93,7 @@ else
   list_cmd() { "${compose[@]}" exec -T "$POSTGRES_SERVICE" pg_restore --list >/dev/null <"$1"; }
 fi
 
-mkdir -p "$BACKUP_DIR"
+install -d -m 700 "$BACKUP_DIR"
 stamp="$(date '+%Y%m%d-%H%M%S')"
 name="ragmux-$stamp"
 out="$BACKUP_DIR/$name.dump"
@@ -112,10 +120,14 @@ if [ "$INCLUDE_SECRET_KEY" = "1" ]; then
   if [ -z "$key" ]; then
     log "warning: INCLUDE_SECRET_KEY=1 but SECRET_KEY is neither in the environment nor in .env; no key file written"
   else
-    keyfile="$BACKUP_DIR/$name.key"
-    (umask 077 && printf '%s\n' "$key" >"$keyfile")
+    install -d -m 700 "$SECRET_KEY_DIR"
+    keyfile="$SECRET_KEY_DIR/$name.key"
+    printf '%s\n' "$key" >"$keyfile"
     chmod 600 "$keyfile"
     log "secret key written to $keyfile (mode 600)"
+    if [ "$SECRET_KEY_DIR" = "$BACKUP_DIR" ]; then
+      log "warning: the key sits next to the dump; set SECRET_KEY_DIR to keep them apart"
+    fi
   fi
 fi
 
@@ -128,7 +140,7 @@ if [ "$KEEP_DAYS" -gt 0 ]; then
     rm -f "$f"
     removed=$((removed + 1))
     log "rotated: $f"
-  done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name 'ragmux-*.dump' -o -name 'ragmux-*.key' \) -mtime +"$KEEP_DAYS" -print)
+  done < <(find "$BACKUP_DIR" "$SECRET_KEY_DIR" -maxdepth 1 -type f \( -name 'ragmux-*.dump' -o -name 'ragmux-*.key' \) -mtime +"$KEEP_DAYS" -print | sort -u)
   log "rotation: KEEP_DAYS=$KEEP_DAYS, removed $removed file(s)"
 fi
 printf '%s\n' "$out"
