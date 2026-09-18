@@ -86,7 +86,7 @@ func (c Config) baseURL(def string) string {
 func doJSON(ctx context.Context, cfg Config, url string, headers map[string]string, body any, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, cfg.timeout())
 	defer cancel()
-	resp, err := doRequest(ctx, cfg, http.MethodPost, url, headers, body)
+	resp, err := doRequest(ctx, cfg, url, headers, body)
 	if err != nil {
 		return err
 	}
@@ -112,7 +112,7 @@ func doJSON(ctx context.Context, cfg Config, url string, headers map[string]stri
 // StreamMaxDuration); closing it releases the timeout.
 func doStream(ctx context.Context, cfg Config, url string, headers map[string]string, body any) (*http.Response, error) {
 	sctx, cancel := context.WithTimeout(ctx, cfg.streamMaxDuration())
-	resp, err := doRequest(sctx, cfg, http.MethodPost, url, headers, body)
+	resp, err := doRequest(sctx, cfg, url, headers, body)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -156,7 +156,7 @@ func (s *streamBody) Close() error {
 	return s.body.Close()
 }
 
-func doRequest(ctx context.Context, cfg Config, method, url string, headers map[string]string, body any) (*http.Response, error) {
+func doRequest(ctx context.Context, cfg Config, url string, headers map[string]string, body any) (*http.Response, error) {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -165,7 +165,7 @@ func doRequest(ctx context.Context, cfg Config, method, url string, headers map[
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, rdr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, rdr)
 	if err != nil {
 		return nil, err
 	}
