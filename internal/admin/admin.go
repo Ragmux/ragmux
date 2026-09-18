@@ -168,9 +168,11 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !allowed {
+			action := "login.rate_limited"
 			if locked {
-				a.auditAs(r, nil, "login.locked", "user", nil, map[string]any{"username": in.Username})
+				action = "login.locked"
 			}
+			a.auditAs(r, nil, action, "user", nil, map[string]any{"username": in.Username})
 			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
 			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{
 				"message": "too many login attempts, try again later", "type": "rate_limited"}})
