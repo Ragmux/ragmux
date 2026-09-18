@@ -1,0 +1,26 @@
+services:
+  ragmux:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: ragmux/ragmux:latest
+    container_name: ragmux
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_DIR: /app/data
+      PORT: "8080"
+    volumes:
+      # Everything persistent (SQLite DB, vectors, uploads, secret key) lives here.
+      - ./gateway_data:/app/data
+    healthcheck:
+      test: ["CMD", "/app/ragmux", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

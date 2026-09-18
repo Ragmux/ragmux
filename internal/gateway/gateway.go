@@ -1,0 +1,318 @@
+// Package gateway serves the OpenAI-compatible /v1 API backed by project API
+// keys, applying the RAG pipeline and recording metrics.
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/muhammetsafak/ragmux/internal/provider"
+	"github.com/muhammetsafak/ragmux/internal/rag"
+	"github.com/muhammetsafak/ragmux/internal/store"
+)
+
+// ProviderFactory builds a chat adapter for a model connection.
+type ProviderFactory func(conn *store.ModelConnection) (provider.Provider, error)
+
+// Gateway holds dependencies for the /v1 routes.
+type Gateway struct {
+	Store     *store.Store
+	Providers ProviderFactory
+	Retriever *rag.Retriever
+	Log       *slog.Logger
+	// MaxBodyBytes caps chat request bodies.
+	MaxBodyBytes int64
+}
+
+type ctxKey struct{}
+
+// Routes mounts /v1 handlers on the router.
+func (g *Gateway) Routes(r chi.Router) {
+	r.Use(g.authenticate)
+	r.Post("/chat/completions", g.chatCompletions)
+	r.Get("/models", g.listModels)
+	r.Get("/models/{id}", g.getModel)
+}
+
+func writeError(w http.ResponseWriter, status int, typ, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": nil}})
+}
+
+func (g *Gateway) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		if !strings.HasPrefix(h, "Bearer ") {
+			writeError(w, http.StatusUnauthorized, "invalid_request_error", "missing Authorization: Bearer <project api key> header")
+			return
+		}
+		key := strings.TrimSpace(h[7:])
+		if !strings.HasPrefix(key, "sk-proj-") {
+			writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid project api key")
+			return
+		}
+		p, err := g.Store.GetProjectByKey(r.Context(), key)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid project api key")
+				return
+			}
+			g.Log.Error("project lookup", "err", err)
+			writeError(w, http.StatusInternalServerError, "server_error", "project lookup failed")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, p)))
+	})
+}
+
+func projectFrom(ctx context.Context) *store.Project {
+	p, _ := ctx.Value(ctxKey{}).(*store.Project)
+	return p
+}
+
+func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
+	p := projectFrom(r.Context())
+	conn, err := g.Store.GetConnection(r.Context(), p.ModelConnectionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"object": "list",
+		"data":   []map[string]any{modelObject(conn)},
+	})
+}
+
+func (g *Gateway) getModel(w http.ResponseWriter, r *http.Request) {
+	p := projectFrom(r.Context())
+	conn, err := g.Store.GetConnection(r.Context(), p.ModelConnectionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(modelObject(conn))
+}
+
+func modelObject(conn *store.ModelConnection) map[string]any {
+	created := time.Now().Unix()
+	if t, err := time.Parse("2006-01-02T15:04:05.000Z", conn.CreatedAt); err == nil {
+		created = t.Unix()
+	}
+	return map[string]any{"id": conn.ModelName, "object": "model", "created": created, "owned_by": conn.ProviderType}
+}
+
+func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	ctx := r.Context()
+	p := projectFrom(ctx)
+	log := g.Log.With("project", p.ID)
+
+	max := g.MaxBodyBytes
+	if max <= 0 {
+		max = 4 << 20
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
+	if err != nil || int64(len(body)) > max {
+		writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
+		return
+	}
+	var req provider.ChatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
+		return
+	}
+	if len(req.Messages) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "messages is required")
+		return
+	}
+	clientModel := req.Model
+
+	conn, err := g.Store.GetConnection(ctx, p.ModelConnectionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+		return
+	}
+	prov, err := g.Providers(conn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	if clientModel == "" {
+		clientModel = conn.ModelName
+	}
+	req.Model = clientModel
+
+	// Project-level system prompt, if configured, goes first.
+	if p.SystemPrompt != "" {
+		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
+	}
+
+	// RAG pipeline.
+	ragUsed := false
+	if p.RAGStoreID != nil && g.Retriever != nil {
+		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
+		if err == nil {
+			q := rag.LastUserQuery(req.Messages)
+			hits, err := g.Retriever.Search(ctx, rs, q, rs.TopK)
+			if err != nil {
+				log.Warn("rag retrieval failed; continuing without context", "err", err)
+			} else if len(hits) > 0 {
+				req.Messages = rag.InjectContext(req.Messages, rag.FormatContext(hits))
+				ragUsed = true
+			}
+		} else {
+			log.Warn("rag store missing", "id", *p.RAGStoreID, "err", err)
+		}
+	}
+
+	rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, RAGUsed: ragUsed, Streamed: req.Stream}
+	promptChars := 0
+	for _, m := range req.Messages {
+		promptChars += len(m.Text())
+	}
+	defer func() {
+		rec.LatencyMs = time.Since(start).Milliseconds()
+		if err := g.Store.InsertRequestLog(context.Background(), rec); err != nil {
+			log.Error("write request log", "err", err)
+		}
+	}()
+
+	if req.Stream {
+		g.stream(w, r, prov, req, rec, promptChars)
+		return
+	}
+
+	resp, err := prov.Chat(ctx, req)
+	if err != nil {
+		status, pe := providerError(err)
+		rec.StatusCode, rec.Error = status, pe.Message
+		log.Warn("upstream error", "status", status, "msg", pe.Message)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write(pe.ErrorJSON())
+		return
+	}
+	resp.Model = clientModel
+	fillUsage(rec, resp.Usage, promptChars, completionChars(resp))
+	rec.StatusCode = http.StatusOK
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, req provider.ChatRequest, rec *store.RequestLog, promptChars int) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by server")
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	out := make(chan provider.StreamChunk, 16)
+	errc := make(chan error, 1)
+	go func() {
+		errc <- prov.ChatStream(ctx, req, out)
+		close(out)
+	}()
+
+	headersSent := false
+	sendHeaders := func() {
+		if headersSent {
+			return
+		}
+		headersSent = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+	}
+
+	var usage *provider.Usage
+	compChars := 0
+	for chunk := range out {
+		sendHeaders()
+		chunk.Model = req.Model
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != nil {
+				compChars += len(*c.Delta.Content)
+			}
+		}
+		b, _ := json.Marshal(chunk)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			cancel()
+			break
+		}
+		flusher.Flush()
+	}
+	err := <-errc
+	if err != nil && !headersSent {
+		status, pe := providerError(err)
+		rec.StatusCode, rec.Error = status, pe.Message
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write(pe.ErrorJSON())
+		return
+	}
+	sendHeaders()
+	if err != nil {
+		// Mid-stream failure: surface it as an SSE error event then end.
+		_, pe := providerError(err)
+		rec.StatusCode, rec.Error = http.StatusBadGateway, pe.Message
+		fmt.Fprintf(w, "data: %s\n\n", pe.ErrorJSON())
+	} else {
+		rec.StatusCode = http.StatusOK
+	}
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+	fillUsage(rec, usage, promptChars, compChars)
+}
+
+func providerError(err error) (int, *provider.Error) {
+	var pe *provider.Error
+	if errors.As(err, &pe) {
+		if pe.Status == 0 {
+			pe.Status = http.StatusBadGateway
+		}
+		return pe.Status, pe
+	}
+	if errors.Is(err, context.Canceled) {
+		return 499, &provider.Error{Status: 499, Type: "client_closed", Message: "client closed request"}
+	}
+	return http.StatusBadGateway, &provider.Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: err.Error()}
+}
+
+func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {
+	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
+		rec.PromptTokens, rec.CompletionTokens = u.PromptTokens, u.CompletionTokens
+		return
+	}
+	rec.Estimated = true
+	rec.PromptTokens = (promptChars + 3) / 4
+	rec.CompletionTokens = (compChars + 3) / 4
+}
+
+func completionChars(resp *provider.ChatResponse) int {
+	n := 0
+	for _, c := range resp.Choices {
+		if c.Message.Content != nil {
+			n += len(*c.Message.Content)
+		}
+	}
+	return n
+}

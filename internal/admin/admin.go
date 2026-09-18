@@ -1,0 +1,805 @@
+// Package admin exposes the management REST API and the embedded dashboard.
+package admin
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/muhammetsafak/ragmux/internal/auth"
+	"github.com/muhammetsafak/ragmux/internal/provider"
+	"github.com/muhammetsafak/ragmux/internal/rag"
+	"github.com/muhammetsafak/ragmux/internal/store"
+)
+
+// Admin holds dependencies for management routes.
+type Admin struct {
+	Store          *store.Store
+	Auth           *auth.Service
+	Ingester       *rag.Ingester
+	Retriever      *rag.Retriever
+	Providers      func(conn *store.ModelConnection) (provider.Provider, error)
+	Log            *slog.Logger
+	MaxUploadBytes int64
+	WebFS          fs.FS
+}
+
+// Routes mounts /admin handlers.
+func (a *Admin) Routes(r chi.Router) {
+	r.Post("/api/login", a.login)
+	r.Group(func(r chi.Router) {
+		r.Use(a.Auth.Middleware)
+		r.Post("/api/logout", a.logout)
+		r.Get("/api/me", a.me)
+		r.Post("/api/me/password", a.changePassword)
+
+		r.Get("/api/provider-types", a.providerTypes)
+
+		r.Get("/api/models", a.listConnections)
+		r.Post("/api/models", a.createConnection)
+		r.Get("/api/models/{id}", a.getConnection)
+		r.Put("/api/models/{id}", a.updateConnection)
+		r.Delete("/api/models/{id}", a.deleteConnection)
+		r.Post("/api/models/{id}/test", a.testConnection)
+
+		r.Get("/api/rag-stores", a.listRAGStores)
+		r.Post("/api/rag-stores", a.createRAGStore)
+		r.Get("/api/rag-stores/{id}", a.getRAGStore)
+		r.Put("/api/rag-stores/{id}", a.updateRAGStore)
+		r.Delete("/api/rag-stores/{id}", a.deleteRAGStore)
+		r.Get("/api/rag-stores/{id}/documents", a.listDocuments)
+		r.Post("/api/rag-stores/{id}/documents", a.uploadDocument)
+		r.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
+		r.Get("/api/documents/{id}", a.getDocument)
+		r.Delete("/api/documents/{id}", a.deleteDocument)
+		r.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
+
+		r.Get("/api/projects", a.listProjects)
+		r.Post("/api/projects", a.createProject)
+		r.Get("/api/projects/{id}", a.getProject)
+		r.Put("/api/projects/{id}", a.updateProject)
+		r.Delete("/api/projects/{id}", a.deleteProject)
+		r.Post("/api/projects/{id}/rotate-key", a.rotateKey)
+		r.Get("/api/projects/{id}/metrics", a.projectMetrics)
+
+		r.Get("/api/metrics/summary", a.metricsSummary)
+		r.Get("/api/metrics/requests", a.recentRequests)
+		r.Get("/api/system", a.systemInfo)
+	})
+	if a.WebFS != nil {
+		fileServer := http.FileServer(http.FS(a.WebFS))
+		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Path = "/"
+			fileServer.ServeHTTP(w, r)
+		})
+		r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+			http.StripPrefix("/admin", fileServer).ServeHTTP(w, r)
+		})
+	}
+}
+
+// ---- helpers ----
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": http.StatusText(status)}})
+}
+
+func (a *Admin) fail(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "not found")
+	case strings.Contains(err.Error(), "UNIQUE constraint"):
+		writeErr(w, http.StatusConflict, "an item with that name already exists")
+	case strings.Contains(err.Error(), "FOREIGN KEY constraint"):
+		writeErr(w, http.StatusConflict, "item is still referenced by a project or RAG store")
+	default:
+		a.Log.Error("admin request failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func idParam(r *http.Request) (int64, error) {
+	return strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+}
+
+func decode(r *http.Request, v any) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	return dec.Decode(v)
+}
+
+// ---- auth ----
+
+func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	u, tok, err := a.Auth.Login(r.Context(), in.Username, in.Password)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			writeErr(w, http.StatusUnauthorized, "invalid username or password")
+			return
+		}
+		a.fail(w, err)
+		return
+	}
+	a.Auth.SetCookie(w, tok)
+	writeJSON(w, http.StatusOK, map[string]any{"token": tok, "user": u})
+}
+
+func (a *Admin) logout(w http.ResponseWriter, r *http.Request) {
+	_ = a.Auth.Logout(r.Context(), r)
+	a.Auth.ClearCookie(w)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *Admin) me(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, auth.UserFrom(r.Context()))
+}
+
+func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Current string `json:"current_password"`
+		New     string `json:"new_password"`
+	}
+	if err := decode(r, &in); err != nil || len(in.New) < 8 {
+		writeErr(w, http.StatusBadRequest, "new_password must be at least 8 characters")
+		return
+	}
+	u := auth.UserFrom(r.Context())
+	if !auth.CheckPassword(u.PasswordHash, in.Current) {
+		writeErr(w, http.StatusForbidden, "current password is wrong")
+		return
+	}
+	h, err := auth.HashPassword(in.New)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err := a.Store.UpdateUserPassword(r.Context(), u.ID, h); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
+	type pt struct {
+		Type       string `json:"type"`
+		Label      string `json:"label"`
+		DefaultURL string `json:"default_base_url"`
+		Embeddings bool   `json:"supports_embeddings"`
+		NeedsKey   bool   `json:"requires_api_key"`
+	}
+	out := []pt{
+		{"openai", "OpenAI", "https://api.openai.com/v1", true, true},
+		{"anthropic", "Anthropic", "https://api.anthropic.com", false, true},
+		{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", true, true},
+		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", false, true},
+		{"ollama", "Ollama", "http://localhost:11434", true, false},
+		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", true, false},
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ---- model connections ----
+
+type connInput struct {
+	Name         string `json:"name"`
+	ProviderType string `json:"provider_type"`
+	BaseURL      string `json:"base_url"`
+	APIKey       string `json:"api_key"`
+	ModelName    string `json:"model_name"`
+}
+
+func (in connInput) validate() error {
+	if strings.TrimSpace(in.Name) == "" {
+		return errors.New("name is required")
+	}
+	if !store.IsValidProviderType(in.ProviderType) {
+		return fmt.Errorf("provider_type must be one of %s", strings.Join(store.ValidProviderTypes, ", "))
+	}
+	if strings.TrimSpace(in.ModelName) == "" {
+		return errors.New("model_name is required")
+	}
+	if in.BaseURL != "" && !strings.HasPrefix(in.BaseURL, "http://") && !strings.HasPrefix(in.BaseURL, "https://") {
+		return errors.New("base_url must start with http:// or https://")
+	}
+	if in.ProviderType == "custom_openai" && in.BaseURL == "" {
+		return errors.New("base_url is required for custom_openai")
+	}
+	return nil
+}
+
+func (a *Admin) listConnections(w http.ResponseWriter, r *http.Request) {
+	list, err := a.Store.ListConnections(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (a *Admin) createConnection(w http.ResponseWriter, r *http.Request) {
+	var in connInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := in.validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	c, err := a.Store.CreateConnection(r.Context(), &store.ModelConnection{
+		Name: strings.TrimSpace(in.Name), ProviderType: in.ProviderType, BaseURL: strings.TrimSpace(in.BaseURL),
+		APIKey: strings.TrimSpace(in.APIKey), ModelName: strings.TrimSpace(in.ModelName)})
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, c)
+}
+
+func (a *Admin) getConnection(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	c, err := a.Store.GetConnection(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (a *Admin) updateConnection(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	var in connInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := in.validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	c, err := a.Store.UpdateConnection(r.Context(), &store.ModelConnection{ID: id,
+		Name: strings.TrimSpace(in.Name), ProviderType: in.ProviderType, BaseURL: strings.TrimSpace(in.BaseURL),
+		APIKey: strings.TrimSpace(in.APIKey), ModelName: strings.TrimSpace(in.ModelName)})
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (a *Admin) deleteConnection(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	if err := a.Store.DeleteConnection(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// testConnection sends a tiny prompt (or embedding) through the connection.
+func (a *Admin) testConnection(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	c, err := a.Store.GetConnection(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	var in struct {
+		Mode string `json:"mode"`
+	}
+	_ = decode(r, &in)
+	start := time.Now()
+	if in.Mode == "embedding" {
+		emb, err := provider.NewEmbedder(provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.ModelName, Timeout: 60 * time.Second})
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		vecs, err := emb.Embed(r.Context(), []string{"ping"})
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "latency_ms": time.Since(start).Milliseconds()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dimensions": len(vecs[0]), "latency_ms": time.Since(start).Milliseconds()})
+		return
+	}
+	prov, err := a.Providers(c)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	maxTok := 16
+	req := provider.ChatRequest{Model: c.ModelName, MaxTokens: &maxTok,
+		Messages: []provider.Message{{Role: "user", Content: provider.TextContent("Reply with the single word: pong")}}}
+	resp, err := prov.Chat(r.Context(), req)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "latency_ms": time.Since(start).Milliseconds()})
+		return
+	}
+	reply := ""
+	if len(resp.Choices) > 0 && resp.Choices[0].Message.Content != nil {
+		reply = *resp.Choices[0].Message.Content
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reply": reply, "usage": resp.Usage, "latency_ms": time.Since(start).Milliseconds()})
+}
+
+// ---- RAG stores ----
+
+type ragInput struct {
+	Name                  string `json:"name"`
+	EmbeddingConnectionID int64  `json:"embedding_connection_id"`
+	ChunkSize             int    `json:"chunk_size"`
+	ChunkOverlap          int    `json:"chunk_overlap"`
+	TopK                  int    `json:"top_k"`
+}
+
+func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
+	if strings.TrimSpace(in.Name) == "" {
+		return errors.New("name is required")
+	}
+	if in.ChunkSize <= 0 {
+		in.ChunkSize = 1000
+	}
+	if in.ChunkSize < 100 || in.ChunkSize > 20000 {
+		return errors.New("chunk_size must be between 100 and 20000")
+	}
+	if in.ChunkOverlap < 0 || in.ChunkOverlap >= in.ChunkSize {
+		return errors.New("chunk_overlap must be >= 0 and smaller than chunk_size")
+	}
+	if in.TopK <= 0 {
+		in.TopK = 5
+	}
+	if in.TopK > 50 {
+		return errors.New("top_k must be <= 50")
+	}
+	conn, err := a.Store.GetConnection(r.Context(), in.EmbeddingConnectionID)
+	if err != nil {
+		return errors.New("embedding_connection_id does not reference an existing model connection")
+	}
+	if !provider.SupportsEmbeddings(conn.ProviderType) {
+		return fmt.Errorf("provider %q cannot be used for embeddings", conn.ProviderType)
+	}
+	return nil
+}
+
+func (a *Admin) listRAGStores(w http.ResponseWriter, r *http.Request) {
+	list, err := a.Store.ListRAGStores(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
+	var in ragInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := a.validateRAG(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rs, err := a.Store.CreateRAGStore(r.Context(), &store.RAGStore{Name: strings.TrimSpace(in.Name),
+		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK})
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, rs)
+}
+
+func (a *Admin) getRAGStore(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	rs, err := a.Store.GetRAGStore(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rs)
+}
+
+func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	var in ragInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := a.validateRAG(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rs, err := a.Store.UpdateRAGStore(r.Context(), &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
+		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			a.fail(w, err)
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rs)
+}
+
+func (a *Admin) deleteRAGStore(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	docs, err := a.Store.ListDocuments(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err := a.Store.DeleteRAGStore(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	for _, d := range docs {
+		os.RemoveAll(filepath.Dir(a.Store.DocumentPath(d)))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	rs, err := a.Store.GetRAGStore(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	var in struct {
+		Query string `json:"query"`
+		TopK  int    `json:"top_k"`
+	}
+	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Query) == "" {
+		writeErr(w, http.StatusBadRequest, "query is required")
+		return
+	}
+	start := time.Now()
+	hits, err := a.Retriever.Search(r.Context(), rs, in.Query, in.TopK)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if hits == nil {
+		hits = []store.SearchHit{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hits": hits, "latency_ms": time.Since(start).Milliseconds()})
+}
+
+// ---- documents ----
+
+func (a *Admin) listDocuments(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	if _, err := a.Store.GetRAGStore(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	docs, err := a.Store.ListDocuments(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, docs)
+}
+
+func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	if _, err := a.Store.GetRAGStore(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	max := a.MaxUploadBytes
+	if max <= 0 {
+		max = 50 << 20
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, max)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, "multipart form too large or malformed: "+err.Error())
+		return
+	}
+	files := r.MultipartForm.File["file"]
+	if len(files) == 0 {
+		files = r.MultipartForm.File["files"]
+	}
+	if len(files) == 0 {
+		writeErr(w, http.StatusBadRequest, "no file field in form (use 'file')")
+		return
+	}
+	var created []*store.Document
+	for _, fh := range files {
+		name := filepath.Base(fh.Filename)
+		if !rag.IsSupported(name) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported file type for %q (pdf, txt, md)", name))
+			return
+		}
+		src, err := fh.Open()
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		doc, err := a.Store.CreateDocument(r.Context(), &store.Document{RAGStoreID: id, Filename: name,
+			Mime: fh.Header.Get("Content-Type"), SizeBytes: fh.Size})
+		if err != nil {
+			src.Close()
+			a.fail(w, err)
+			return
+		}
+		path := a.Store.DocumentPath(doc)
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			src.Close()
+			a.fail(w, err)
+			return
+		}
+		dst, err := os.Create(path)
+		if err != nil {
+			src.Close()
+			a.fail(w, err)
+			return
+		}
+		_, err = io.Copy(dst, src)
+		src.Close()
+		dst.Close()
+		if err != nil {
+			_ = a.Store.SetDocumentStatus(r.Context(), doc.ID, store.DocFailed, "write failed: "+err.Error())
+			a.fail(w, err)
+			return
+		}
+		a.Ingester.Enqueue(doc.ID)
+		created = append(created, doc)
+	}
+	if len(created) == 1 {
+		writeJSON(w, http.StatusAccepted, created[0])
+		return
+	}
+	writeJSON(w, http.StatusAccepted, created)
+}
+
+func (a *Admin) getDocument(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	d, err := a.Store.GetDocument(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+func (a *Admin) deleteDocument(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	if err := a.Store.DeleteDocument(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *Admin) reprocessDocument(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	d, err := a.Store.GetDocument(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err := a.Store.SetDocumentStatus(r.Context(), d.ID, store.DocPending, ""); err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.Ingester.Enqueue(d.ID)
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+// ---- projects ----
+
+type projectInput struct {
+	Name              string `json:"name"`
+	ModelConnectionID int64  `json:"model_connection_id"`
+	RAGStoreID        *int64 `json:"rag_store_id"`
+	SystemPrompt      string `json:"system_prompt"`
+}
+
+func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
+	if strings.TrimSpace(in.Name) == "" {
+		return errors.New("name is required")
+	}
+	if _, err := a.Store.GetConnection(r.Context(), in.ModelConnectionID); err != nil {
+		return errors.New("model_connection_id does not reference an existing model connection")
+	}
+	if in.RAGStoreID != nil {
+		if *in.RAGStoreID == 0 {
+			in.RAGStoreID = nil
+		} else if _, err := a.Store.GetRAGStore(r.Context(), *in.RAGStoreID); err != nil {
+			return errors.New("rag_store_id does not reference an existing RAG store")
+		}
+	}
+	return nil
+}
+
+func (a *Admin) listProjects(w http.ResponseWriter, r *http.Request) {
+	list, err := a.Store.ListProjects(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
+	var in projectInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := a.validateProject(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p, key, err := a.Store.CreateProject(r.Context(), &store.Project{Name: strings.TrimSpace(in.Name),
+		ModelConnectionID: in.ModelConnectionID, RAGStoreID: in.RAGStoreID, SystemPrompt: in.SystemPrompt})
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
+}
+
+func (a *Admin) getProject(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	p, err := a.Store.GetProject(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	var in projectInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := a.validateProject(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p, err := a.Store.UpdateProject(r.Context(), &store.Project{ID: id, Name: strings.TrimSpace(in.Name),
+		ModelConnectionID: in.ModelConnectionID, RAGStoreID: in.RAGStoreID, SystemPrompt: in.SystemPrompt})
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (a *Admin) deleteProject(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	if err := a.Store.DeleteProject(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *Admin) rotateKey(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	key, err := a.Store.RotateProjectKey(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	p, _ := a.Store.GetProject(r.Context(), id)
+	writeJSON(w, http.StatusOK, map[string]any{"project": p, "api_key": key})
+}
+
+// ---- metrics ----
+
+func sinceParam(r *http.Request) time.Time {
+	d := 24 * time.Hour
+	if v := r.URL.Query().Get("window"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			d = parsed
+		}
+	}
+	return time.Now().Add(-d)
+}
+
+func (a *Admin) projectMetrics(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	if _, err := a.Store.GetProject(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.metrics(w, r, &id)
+}
+
+func (a *Admin) metricsSummary(w http.ResponseWriter, r *http.Request) {
+	a.metrics(w, r, nil)
+}
+
+func (a *Admin) metrics(w http.ResponseWriter, r *http.Request, projectID *int64) {
+	ctx := r.Context()
+	window, err := a.Store.Summarize(ctx, projectID, sinceParam(r))
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	total, err := a.Store.Summarize(ctx, projectID, time.Time{})
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	daily, err := a.Store.DailySeries(ctx, projectID, 14)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	recent, err := a.Store.RecentRequests(ctx, projectID, 50)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"window": window, "total": total, "daily": daily, "recent": recent})
+}
+
+func (a *Admin) recentRequests(w http.ResponseWriter, r *http.Request) {
+	var pid *int64
+	if v := r.URL.Query().Get("project_id"); v != "" {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad project_id")
+			return
+		}
+		pid = &id
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	list, err := a.Store.RecentRequests(r.Context(), pid, limit)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (a *Admin) systemInfo(w http.ResponseWriter, r *http.Request) {
+	var dbSize int64
+	if fi, err := os.Stat(filepath.Join(a.Store.DataDir, "ragmux.db")); err == nil {
+		dbSize = fi.Size()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data_dir":      a.Store.DataDir,
+		"db_size_bytes": dbSize,
+		"vector_engine": map[string]any{"sqlite_vec": a.Store.VecAvailable},
+		"version":       Version,
+	})
+}
+
+// Version is stamped at build time via -ldflags.
+var Version = "dev"

@@ -1,0 +1,10 @@
+.git
+gateway_data
+*.md
+!README.md
+.env
+.env.*
+!.env.example
+docker-compose*.yml
+Makefile
+.claude

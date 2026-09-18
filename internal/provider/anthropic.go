@@ -1,0 +1,443 @@
+package provider
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+)
+
+const (
+	anthropicBase    = "https://api.anthropic.com"
+	anthropicVersion = "2023-06-01"
+	defaultMaxTokens = 4096
+)
+
+type anthropic struct {
+	cfg  Config
+	base string
+}
+
+func newAnthropic(cfg Config) *anthropic {
+	base := cfg.baseURL(anthropicBase)
+	base = strings.TrimSuffix(base, "/v1")
+	return &anthropic{cfg: cfg, base: base}
+}
+
+func (p *anthropic) headers() map[string]string {
+	return map[string]string{
+		"x-api-key":         p.cfg.APIKey,
+		"anthropic-version": anthropicVersion,
+	}
+}
+
+// anthropicRequest is the Messages API payload.
+type anthropicRequest struct {
+	Model         string             `json:"model"`
+	System        string             `json:"system,omitempty"`
+	Messages      []anthropicMessage `json:"messages"`
+	MaxTokens     int                `json:"max_tokens"`
+	Temperature   *float64           `json:"temperature,omitempty"`
+	TopP          *float64           `json:"top_p,omitempty"`
+	StopSequences []string           `json:"stop_sequences,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	Tools         []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice    json.RawMessage    `json:"tool_choice,omitempty"`
+}
+
+type anthropicMessage struct {
+	Role    string             `json:"role"`
+	Content []anthropicContent `json:"content"`
+}
+
+type anthropicContent struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	Source    *anthropicImage `json:"source,omitempty"`
+}
+
+type anthropicImage struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+type anthropicTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+type anthropicResponse struct {
+	ID         string             `json:"id"`
+	Type       string             `json:"type"`
+	Role       string             `json:"role"`
+	Model      string             `json:"model"`
+	Content    []anthropicContent `json:"content"`
+	StopReason string             `json:"stop_reason"`
+	Usage      struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// translateAnthropic converts an OpenAI request into the Messages format.
+func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error) {
+	out := anthropicRequest{Model: model, MaxTokens: defaultMaxTokens}
+	if n := req.MaxOutputTokens(); n > 0 {
+		out.MaxTokens = n
+	}
+	out.Temperature = req.Temperature
+	out.TopP = req.TopP
+	out.StopSequences = req.StopSequences()
+
+	var system []string
+	for _, m := range req.Messages {
+		switch m.Role {
+		case "system", "developer":
+			system = append(system, m.Text())
+		case "user":
+			parts, err := openAIPartsToAnthropic(m.Content)
+			if err != nil {
+				return out, err
+			}
+			out.Messages = appendAnthropic(out.Messages, "user", parts)
+		case "assistant":
+			var parts []anthropicContent
+			if t := m.Text(); t != "" {
+				parts = append(parts, anthropicContent{Type: "text", Text: t})
+			}
+			if len(m.ToolCalls) > 0 {
+				var calls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				}
+				if err := json.Unmarshal(m.ToolCalls, &calls); err == nil {
+					for _, c := range calls {
+						args := json.RawMessage(c.Function.Arguments)
+						if !json.Valid(args) {
+							args = json.RawMessage("{}")
+						}
+						parts = append(parts, anthropicContent{Type: "tool_use", ID: c.ID, Name: c.Function.Name, Input: args})
+					}
+				}
+			}
+			if len(parts) == 0 {
+				continue
+			}
+			out.Messages = appendAnthropic(out.Messages, "assistant", parts)
+		case "tool":
+			out.Messages = appendAnthropic(out.Messages, "user", []anthropicContent{{
+				Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Text(),
+			}})
+		}
+	}
+	if len(system) > 0 {
+		out.System = strings.Join(system, "\n\n")
+	}
+	if len(req.Tools) > 0 {
+		var tools []struct {
+			Type     string `json:"type"`
+			Function struct {
+				Name        string          `json:"name"`
+				Description string          `json:"description"`
+				Parameters  json.RawMessage `json:"parameters"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(req.Tools, &tools); err == nil {
+			for _, t := range tools {
+				schema := t.Function.Parameters
+				if len(schema) == 0 {
+					schema = json.RawMessage(`{"type":"object","properties":{}}`)
+				}
+				out.Tools = append(out.Tools, anthropicTool{Name: t.Function.Name, Description: t.Function.Description, InputSchema: schema})
+			}
+		}
+		if len(req.ToolChoice) > 0 {
+			var s string
+			if json.Unmarshal(req.ToolChoice, &s) == nil {
+				switch s {
+				case "auto":
+					out.ToolChoice = json.RawMessage(`{"type":"auto"}`)
+				case "required":
+					out.ToolChoice = json.RawMessage(`{"type":"any"}`)
+				case "none":
+					out.Tools = nil
+				}
+			} else {
+				var obj struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				}
+				if json.Unmarshal(req.ToolChoice, &obj) == nil && obj.Function.Name != "" {
+					b, _ := json.Marshal(map[string]string{"type": "tool", "name": obj.Function.Name})
+					out.ToolChoice = b
+				}
+			}
+		}
+	}
+	if len(out.Messages) == 0 {
+		return out, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "messages must contain at least one user message"}
+	}
+	return out, nil
+}
+
+// appendAnthropic merges consecutive same-role messages, which the Messages
+// API requires.
+func appendAnthropic(msgs []anthropicMessage, role string, parts []anthropicContent) []anthropicMessage {
+	if n := len(msgs); n > 0 && msgs[n-1].Role == role {
+		msgs[n-1].Content = append(msgs[n-1].Content, parts...)
+		return msgs
+	}
+	return append(msgs, anthropicMessage{Role: role, Content: parts})
+}
+
+func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return []anthropicContent{{Type: "text", Text: s}}, nil
+	}
+	var parts []struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		ImageURL struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported message content"}
+	}
+	var out []anthropicContent
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			out = append(out, anthropicContent{Type: "text", Text: p.Text})
+		case "image_url":
+			u := p.ImageURL.URL
+			if strings.HasPrefix(u, "data:") {
+				meta, data, ok := strings.Cut(strings.TrimPrefix(u, "data:"), ",")
+				if !ok {
+					continue
+				}
+				mt := strings.TrimSuffix(meta, ";base64")
+				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: mt, Data: data}})
+			} else {
+				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: u}})
+			}
+		}
+	}
+	if len(out) == 0 {
+		out = []anthropicContent{{Type: "text", Text: ""}}
+	}
+	return out, nil
+}
+
+func anthropicFinish(stop string) *string {
+	switch stop {
+	case "end_turn", "stop_sequence":
+		return strPtr("stop")
+	case "max_tokens":
+		return strPtr("length")
+	case "tool_use":
+		return strPtr("tool_calls")
+	case "":
+		return nil
+	}
+	return strPtr(stop)
+}
+
+func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	body, err := translateAnthropic(req, p.cfg.Model)
+	if err != nil {
+		return nil, err
+	}
+	var ar anthropicResponse
+	if err := doJSON(ctx, p.cfg, http.MethodPost, p.base+"/v1/messages", p.headers(), body, &ar); err != nil {
+		return nil, err
+	}
+	var text strings.Builder
+	var toolCalls []map[string]any
+	for _, c := range ar.Content {
+		switch c.Type {
+		case "text":
+			text.WriteString(c.Text)
+		case "tool_use":
+			args := string(c.Input)
+			if args == "" {
+				args = "{}"
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id": c.ID, "type": "function",
+				"function": map[string]string{"name": c.Name, "arguments": args},
+			})
+		}
+	}
+	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String())}
+	if len(toolCalls) > 0 {
+		msg.ToolCalls, _ = json.Marshal(toolCalls)
+	}
+	id := ar.ID
+	if id == "" {
+		id = chatID()
+	}
+	return &ChatResponse{
+		ID: id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
+		Choices: []Choice{{Index: 0, Message: msg, FinishReason: anthropicFinish(ar.StopReason)}},
+		Usage: &Usage{PromptTokens: ar.Usage.InputTokens, CompletionTokens: ar.Usage.OutputTokens,
+			TotalTokens: ar.Usage.InputTokens + ar.Usage.OutputTokens},
+	}, nil
+}
+
+func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
+	body, err := translateAnthropic(req, p.cfg.Model)
+	if err != nil {
+		return err
+	}
+	body.Stream = true
+	resp, err := doStream(ctx, p.cfg, p.base+"/v1/messages", p.headers(), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	id := chatID()
+	created := time.Now().Unix()
+	usage := &Usage{}
+	emit := func(c StreamChunk) bool {
+		c.ID, c.Object, c.Created, c.Model = id, "chat.completion.chunk", created, req.Model
+		select {
+		case out <- c:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	// Track tool_use blocks by content index so argument deltas map to the
+	// right OpenAI tool_calls index.
+	toolIndex := map[int]int{}
+	nextTool := 0
+	var streamErr error
+	sentRole := false
+
+	err = readSSE(resp.Body, func(ev sseEvent) bool {
+		var base struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(ev.Data), &base) != nil {
+			return true
+		}
+		switch base.Type {
+		case "message_start":
+			var ms struct {
+				Message struct {
+					ID    string `json:"id"`
+					Usage struct {
+						InputTokens int `json:"input_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+			}
+			if json.Unmarshal([]byte(ev.Data), &ms) == nil {
+				if ms.Message.ID != "" {
+					id = ms.Message.ID
+				}
+				usage.PromptTokens = ms.Message.Usage.InputTokens
+			}
+			sentRole = true
+			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{Role: "assistant", Content: strPtr("")}}}})
+		case "content_block_start":
+			var cb struct {
+				Index        int `json:"index"`
+				ContentBlock struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"content_block"`
+			}
+			if json.Unmarshal([]byte(ev.Data), &cb) == nil && cb.ContentBlock.Type == "tool_use" {
+				toolIndex[cb.Index] = nextTool
+				tc, _ := json.Marshal([]map[string]any{{
+					"index": nextTool, "id": cb.ContentBlock.ID, "type": "function",
+					"function": map[string]string{"name": cb.ContentBlock.Name, "arguments": ""},
+				}})
+				nextTool++
+				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
+			}
+			return true
+		case "content_block_delta":
+			var d struct {
+				Index int `json:"index"`
+				Delta struct {
+					Type        string `json:"type"`
+					Text        string `json:"text"`
+					PartialJSON string `json:"partial_json"`
+				} `json:"delta"`
+			}
+			if json.Unmarshal([]byte(ev.Data), &d) != nil {
+				return true
+			}
+			switch d.Delta.Type {
+			case "text_delta":
+				delta := Delta{Content: strPtr(d.Delta.Text)}
+				if !sentRole {
+					delta.Role = "assistant"
+					sentRole = true
+				}
+				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}})
+			case "input_json_delta":
+				ti, ok := toolIndex[d.Index]
+				if !ok {
+					return true
+				}
+				tc, _ := json.Marshal([]map[string]any{{
+					"index": ti, "function": map[string]string{"arguments": d.Delta.PartialJSON},
+				}})
+				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
+			}
+			return true
+		case "message_delta":
+			var md struct {
+				Delta struct {
+					StopReason string `json:"stop_reason"`
+				} `json:"delta"`
+				Usage struct {
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal([]byte(ev.Data), &md) != nil {
+				return true
+			}
+			usage.CompletionTokens = md.Usage.OutputTokens
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: anthropicFinish(md.Delta.StopReason)}}})
+		case "message_stop":
+			// Final usage-only chunk, mirroring OpenAI's include_usage behaviour.
+			return emit(StreamChunk{Choices: []StreamChoice{}, Usage: usage})
+		case "error":
+			var e struct {
+				Error struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			json.Unmarshal([]byte(ev.Data), &e)
+			streamErr = &Error{Status: http.StatusBadGateway, Type: e.Error.Type, Message: e.Error.Message}
+			return false
+		}
+		return true
+	})
+	if streamErr != nil {
+		return streamErr
+	}
+	return err
+}
