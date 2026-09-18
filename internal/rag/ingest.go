@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/muhammetsafak/ragmux/internal/provider"
-	"github.com/muhammetsafak/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/provider"
+	"github.com/ragmux/ragmux/internal/store"
 )
 
 // EmbedderFactory builds an embedder for a model connection.

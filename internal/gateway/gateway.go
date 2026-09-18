@@ -15,9 +15,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/muhammetsafak/ragmux/internal/provider"
-	"github.com/muhammetsafak/ragmux/internal/rag"
-	"github.com/muhammetsafak/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/provider"
+	"github.com/ragmux/ragmux/internal/rag"
+	"github.com/ragmux/ragmux/internal/store"
 )
 
 // ProviderFactory builds a chat adapter for a model connection.

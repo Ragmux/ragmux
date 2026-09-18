@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/muhammetsafak/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/store"
 )
 
 // CookieName is the dashboard session cookie.

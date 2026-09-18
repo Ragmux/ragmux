@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/muhammetsafak/ragmux/internal/provider"
+	"github.com/ragmux/ragmux/internal/provider"
 )
 
 func TestInjectContext(t *testing.T) {

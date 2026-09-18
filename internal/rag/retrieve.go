@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/muhammetsafak/ragmux/internal/provider"
-	"github.com/muhammetsafak/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/provider"
+	"github.com/ragmux/ragmux/internal/store"
 )
 
 // Retriever embeds a query and finds the closest chunks in a store.

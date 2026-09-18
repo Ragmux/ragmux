@@ -17,12 +17,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/muhammetsafak/ragmux/internal/admin"
-	"github.com/muhammetsafak/ragmux/internal/auth"
-	"github.com/muhammetsafak/ragmux/internal/gateway"
-	"github.com/muhammetsafak/ragmux/internal/provider"
-	"github.com/muhammetsafak/ragmux/internal/rag"
-	"github.com/muhammetsafak/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/admin"
+	"github.com/ragmux/ragmux/internal/auth"
+	"github.com/ragmux/ragmux/internal/gateway"
+	"github.com/ragmux/ragmux/internal/provider"
+	"github.com/ragmux/ragmux/internal/rag"
+	"github.com/ragmux/ragmux/internal/store"
 )
 
 // mockUpstream is an OpenAI-compatible server that embeds by keyword and

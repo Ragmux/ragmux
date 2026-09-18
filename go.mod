@@ -1,4 +1,4 @@
-module github.com/muhammetsafak/ragmux
+module github.com/ragmux/ragmux
 
 go 1.27.1
 
