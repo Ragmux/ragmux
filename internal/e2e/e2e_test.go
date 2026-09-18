@@ -852,7 +852,9 @@ func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
 			t.Errorf("zyxquux hit ranks: %v", hm)
 		}
 	}
-	if vec := search(map[string]any{"query": "apple zyxquux", "mode": "vector"}); hasContent(vec, "zyxquux") || !strings.Contains(hitContents(vec)[0], "Apples") {
+	// Every non-apple chunk sits at the same cosine distance from this query,
+	// so only the first hit is deterministic: ask for one.
+	if vec := search(map[string]any{"query": "apple zyxquux", "mode": "vector", "top_k": 1}); hasContent(vec, "zyxquux") || !strings.Contains(hitContents(vec)[0], "Apples") {
 		t.Errorf("vector mode: %v", hitContents(vec))
 	}
 
