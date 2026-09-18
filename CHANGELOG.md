@@ -6,7 +6,31 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-09-18
+
 ### Security
+- **SSRF guard for provider URLs.** Outbound provider connections are dialled through a
+  resolver that refuses loopback, link-local, multicast and private ranges (DNS rebinding
+  included) unless `ALLOW_PRIVATE_UPSTREAMS=true` or the host is in
+  `PRIVATE_UPSTREAM_ALLOWLIST` (e.g. `host.docker.internal,ollama`); `base_url` is validated
+  at save time (http/https only, no credentials, query or fragment); redirects are limited to
+  three hops on the same host; `HTTP_PROXY` is ignored unless private upstreams are allowed.
+- Upstream transport failures are reported as classified messages (`upstream unreachable`,
+  `upstream request timed out`, …) instead of raw error text, and relayed provider error
+  bodies are capped at 512 characters. Redaction covers Basic auth, JWTs, Google OAuth,
+  Groq/HF/xAI keys, URL credentials and the connection's own key literally, including
+  Anthropic and Ollama stream errors.
+- Gemini `model_name` is URL-escaped as a single path segment and validated
+  (`[A-Za-z0-9._:/@-]`, no `..`), closing a path-injection issue.
+- Document parsing is bounded: PDFs stop at 2000 pages and 60 s, DOCX parts over 32 MiB or
+  with a compression ratio above 100:1 are rejected, extracted text is capped at 20 MiB,
+  documents that split into more than `MAX_CHUNKS_PER_DOCUMENT` (20000) chunks fail before
+  embedding, ingestion of one document is limited to 15 minutes, `chunk_size` must be ≥ 200
+  and a full ingest queue answers `503` instead of silently dropping the document.
+- Streaming provider responses are bounded by `STREAM_MAX_DURATION` (30m) and
+  `STREAM_MAX_BYTES_MB` (256).
+- Retrieved passages are labelled as untrusted data in the RAG and rerank prompts and
+  `<context>` tags inside documents are neutralised, limiting prompt injection from uploads.
 - Behind a proxy the client address is now the **last** `X-Forwarded-For` entry (the one
   the nearest proxy appended) instead of the first; `X-Real-IP` only counts when
   `X-Forwarded-For` is absent. New `TRUSTED_PROXY_CIDRS` limits proxy headers to
@@ -145,6 +169,7 @@ for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over P
 projects with `sk-proj-` keys, metrics and an embedded dashboard.
 
 [Unreleased]: https://github.com/ragmux/ragmux/compare/v0.2.0...HEAD
+[0.2.2]: https://github.com/ragmux/ragmux/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ragmux/ragmux/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ragmux/ragmux/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ragmux/ragmux/releases/tag/v0.1.0
