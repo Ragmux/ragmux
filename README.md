@@ -7,7 +7,7 @@ and LLM providers, exposes one **OpenAI-compatible API**, and can augment every 
 with **retrieval (RAG)** from documents you upload. All state — users, model
 connections, projects, documents, chunks, vectors and metrics — lives in one
 **PostgreSQL** database with the [pgvector](https://github.com/pgvector/pgvector)
-extension. Two containers, no Redis, no separate vector database.
+extension. One container, no Redis, no separate vector database.
 
 ```
 client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
@@ -44,20 +44,28 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 ## Quick start
 
 ```bash
-cp .env.example .env
-echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env         # encrypts provider keys; keep it with your backups
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> .env  # superuser of the bundled Postgres (init, backups)
-echo "RAGMUX_DB_PASSWORD=$(openssl rand -hex 16)" >> .env # least-privilege role the gateway connects as
 docker compose up -d
 ```
 
-Open <http://localhost:8765/admin/> (the port is published on loopback only; put a
-TLS-terminating reverse proxy in front for network access, see
+That starts one container with the gateway and its own PostgreSQL 17 + pgvector server
+(`ghcr.io/ragmux/ragmux`, built from `Dockerfile.aio`; state lives in the `ragmux-data`
+volume). Open <http://localhost:8765/admin/> (the port is published on loopback only;
+put a TLS-terminating reverse proxy in front for network access, see
 [Configuration](docs/configuration.md#behind-a-reverse-proxy)). On a fresh database the
 dashboard asks you to **create the first administrator** (username and a password of at
 least 12 characters); that form only works while no user exists. For unattended installs
 set `ADMIN_USER` / `ADMIN_PASSWORD` in `.env` instead and the account is created on
 first start (see [Configuration](docs/configuration.md#environment-variables)).
+
+Nothing in `.env` is required, but set `SECRET_KEY` before you add a provider: it
+encrypts the provider credentials, and without it the gateway generates a key file
+inside the volume that you then have to back up together with the database.
+
+```bash
+cp .env.example .env
+echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env   # keep it with your backups
+docker compose up -d
+```
 
 Running models locally? Provider URLs on private networks (Ollama on the Docker host,
 a vLLM service in the same Compose network) are refused by default as an SSRF guard;
@@ -70,15 +78,22 @@ echo "PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama" >> .env
 (or `ALLOW_PRIVATE_UPSTREAMS=true` on a trusted network — see
 [Configuration](docs/configuration.md#private-upstreams)).
 
-The Compose file runs the gateway next to a `pgvector/pgvector:pg17` database. To use
-your own PostgreSQL instead, run the image alone with `DATABASE_URL` and `SECRET_KEY`
-set (the `vector` extension is created automatically when the role may do so). Prebuilt
-images are published as `ghcr.io/ragmux/ragmux`.
+**Separate or external database.** `docker-compose.split.yml` runs the gateway alone
+next to a `pgvector/pgvector:pg17` service (it needs `SECRET_KEY`, `POSTGRES_PASSWORD`
+and `RAGMUX_DB_PASSWORD` in `.env`):
+`docker compose -f docker-compose.split.yml up -d`. For your own PostgreSQL set
+`DATABASE_URL` and the default container skips its embedded server, or run the
+gateway-only distroless image `ghcr.io/ragmux/ragmux:latest-app` (`<version>-app`) with
+`DATABASE_URL` and `SECRET_KEY`. The two layouts, the `/data` volume and how to move
+between them are described in
+[Deployment layouts](docs/configuration.md#deployment-layouts).
 
-**Where state lives.** The gateway container is stateless. Your state is the PostgreSQL
-database (`pgdata` volume) plus `SECRET_KEY`; keep both and you can rebuild the gateway
-anywhere. Back up with `scripts/backup.sh` (`pg_dump -Fc`) or the scheduled `backup`
-Compose profile — see [Backup and restore](docs/backup-restore.md).
+**Where state lives.** With the default layout everything is in the `ragmux-data`
+volume (`/data/pg`: the database, `/data/ragmux`: the `secret.key` fallback) plus
+`SECRET_KEY`. With the split layout the gateway container is stateless and the state is
+the `pgdata` volume plus `SECRET_KEY`. Either way, back up with `scripts/backup.sh`
+(`pg_dump -Fc`, works with both layouts) or the scheduled `backup` Compose profile — see
+[Backup and restore](docs/backup-restore.md).
 
 ## Using the gateway
 
@@ -184,7 +199,8 @@ Requires Go 1.27+ and Docker for the database.
 make dev-db               # pgvector Postgres on localhost:5433 (docker-compose.dev.yml)
 make test                 # unit + end-to-end tests (mock upstream, real Postgres)
 make run                  # builds and runs on :8765 against the dev database
-make docker-build         # local image, VERSION from git describe
+make docker-build         # local all-in-one image, VERSION from git describe
+make docker-build-app     # local gateway-only (distroless) image
 make backup               # scripts/backup.sh against the compose stack
 make restore FILE=backups/ragmux-<stamp>.dump YES=1   # without YES=1: plan only
 ```
@@ -194,7 +210,10 @@ Tests read `TEST_DATABASE_URL` (the Makefile defaults it to
 throwaway schema per test, so they run in parallel against one server; they are skipped
 when the variable is unset. CI also runs `gofmt`, `go vet`, `golangci-lint run ./...`
 (v2, config in `.golangci.yml`) and `govulncheck`. The binary is pure Go
-(`CGO_ENABLED=0`, `pgx`), shipped as a static executable on a distroless base. Schema
+(`CGO_ENABLED=0`, `pgx`), shipped as a static executable: on a `pgvector/pgvector:pg17`
+base with the entrypoint `docker/aio/entrypoint.sh` supervising both processes
+(`Dockerfile.aio`, the default image) and on a distroless base (`Dockerfile`, the
+`-app` image). Schema
 changes are embedded SQL files in `internal/store/migrations/` applied at startup under
 an advisory lock.
 
@@ -209,6 +228,8 @@ internal/limits/      per-project rate limits, token budgets, usage counters
 internal/maintenance/ hourly retention job
 internal/admin/       /admin REST API + dashboard hosting
 web/                  dashboard (index.html, vanilla JS) and its fonts, embedded in the binary
+docker/aio/           entrypoint of the all-in-one image (Postgres + gateway supervision)
+docker/postgres-init/ ragmux_app role and vector extension SQL shared by both layouts
 ```
 
 ## Roadmap

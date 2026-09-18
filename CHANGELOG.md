@@ -6,14 +6,50 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **All-in-one container image** (`Dockerfile.aio`, published as `ghcr.io/ragmux/ragmux:<version>`
+  and `:latest`): PostgreSQL 17 with pgvector and the gateway in one container, supervised by
+  `docker/aio/entrypoint.sh`. One volume at `/data` holds the database (`/data/pg`) and the
+  `secret.key` fallback (`/data/ragmux`); Postgres listens on a unix socket only (no TCP,
+  trust authentication inside the container) and the gateway connects as the least-privilege
+  role `ragmux_app`. `SIGTERM` stops the gateway first, then Postgres (`pg_ctl stop -m fast`);
+  if either process dies the container exits non-zero. `DATABASE_URL` (or
+  `EMBEDDED_POSTGRES=false`) skips the embedded server; `PG_SHARED_BUFFERS` tunes it;
+  `ragmux-aio postgres-only` runs Postgres alone for maintenance. Documented in
+  [Deployment layouts](docs/configuration.md#deployment-layouts).
+- `scripts/backup.sh` and `scripts/restore.sh` detect the Compose layout (`LAYOUT=auto|split|aio`):
+  in the all-in-one layout they run `pg_dump`/`pg_restore` inside the `ragmux` container as
+  `postgres` over the socket, and the restore goes through a one-off `postgres-only` container
+  while the service is stopped.
+- The `backup` Compose profile works with the all-in-one file over a shared socket volume.
+- `make docker-build-app` builds the gateway-only image; `make docker-build` now builds the
+  all-in-one image.
+
 ### Changed
+- **Breaking for Compose users: `docker-compose.yml` is now the single-container layout**
+  (`ragmux` service built from `Dockerfile.aio`, volume `ragmux-data`, nothing required in
+  `.env`; `SECRET_KEY` recommended). The previous two-service file (gateway image + separate
+  `pgvector/pgvector:pg17`, requiring `SECRET_KEY`, `POSTGRES_PASSWORD` and
+  `RAGMUX_DB_PASSWORD`) is unchanged in behaviour but renamed to **`docker-compose.split.yml`**:
+  existing deployments add `-f docker-compose.split.yml` (or `COMPOSE_FILE` in `.env`) to keep
+  their `pgdata` volume, or move to the default layout with a dump/restore cycle
+  ([Moving between layouts](docs/backup-restore.md#moving-between-layouts)). No automatic
+  migration of the data volume.
+- **Image tags.** `ghcr.io/ragmux/ragmux:<version>`, `:<major>.<minor>` and `:latest` now point
+  at the all-in-one image; the gateway-only distroless image is published as
+  `:<version>-app`, `:<major>.<minor>-app` and `:latest-app`. Both are built for
+  `linux/amd64` and `linux/arm64` and signed with cosign by digest; CI builds both Dockerfiles.
+- `docker/postgres-init/01-ragmux.sql` is shared by both layouts: the `ragmux_app` password
+  is only set when the `pw` psql variable is passed (the split init script still passes it).
+- `.env.example` lists only optional variables for the default file; the split-layout
+  passwords sit in a separate block at the end.
 - **Default port is now `8765`** (was `8080`): the binary, the Docker image, the Compose file,
   the health check and the documentation all use it. Set `PORT=8080` to keep the old value;
   existing Compose deployments should update their published port mapping.
 
 ### Security
-- **Signed container images.** The release workflow signs the pushed image digest of
-  `ghcr.io/ragmux/ragmux` (and the Docker Hub mirror when configured) with cosign, keyless
+- **Signed container images.** The release workflow signs the pushed image digests of
+  `ghcr.io/ragmux/ragmux` (all-in-one and `-app`, and the Docker Hub mirror when configured) with cosign, keyless
   through GitHub OIDC. Verify with `cosign verify` as documented in
   [SECURITY.md](SECURITY.md#verifying-the-container-image); images from v0.3.1 onward carry
   a signature.
