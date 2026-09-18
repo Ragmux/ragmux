@@ -51,7 +51,7 @@ func (s *Service) Login(ctx context.Context, username, password string) (*store.
 		}
 		return nil, "", err
 	}
-	if !CheckPassword(u.PasswordHash, password) {
+	if !CheckPassword(u.PasswordHash, password) || !u.IsActive {
 		return nil, "", ErrInvalidCredentials
 	}
 	tok, err := store.GenerateSessionToken()
@@ -108,8 +108,14 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 			unauthorized(w)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, u)))
+		next.ServeHTTP(w, r.WithContext(ContextWithUser(r.Context(), u)))
 	})
+}
+
+// ContextWithUser attaches a user the way Middleware does (for tests and
+// internal callers).
+func ContextWithUser(ctx context.Context, u *store.User) context.Context {
+	return context.WithValue(ctx, ctxKey{}, u)
 }
 
 // UserFrom returns the authenticated user, if any.

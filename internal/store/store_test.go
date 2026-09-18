@@ -57,8 +57,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.MigrationsVersion != 1 {
-		t.Errorf("migrations version = %d, want 1", info.MigrationsVersion)
+	if info.MigrationsVersion != 2 {
+		t.Errorf("migrations version = %d, want 2", info.MigrationsVersion)
 	}
 }
 
@@ -272,7 +272,7 @@ func TestMetrics(t *testing.T) {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
-	m, err := s.Summarize(ctx, &p.ID, time.Now().Add(-time.Hour))
+	m, err := s.Summarize(ctx, store.MetricsFilter{ProjectID: &p.ID}, time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,21 +282,21 @@ func TestMetrics(t *testing.T) {
 	if m.AvgLatencyMs != 200 || m.P95LatencyMs != 290 {
 		t.Errorf("latency: avg %v p95 %v", m.AvgLatencyMs, m.P95LatencyMs)
 	}
-	if m, _ = s.Summarize(ctx, nil, time.Now().Add(time.Hour)); m.Requests != 0 || m.P95LatencyMs != 0 {
+	if m, _ = s.Summarize(ctx, store.MetricsFilter{}, time.Now().Add(time.Hour)); m.Requests != 0 || m.P95LatencyMs != 0 {
 		t.Errorf("empty window summary: %+v", m)
 	}
-	recent, err := s.RecentRequests(ctx, &p.ID, 2)
+	recent, err := s.RecentRequests(ctx, store.MetricsFilter{ProjectID: &p.ID}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(recent) != 2 || recent[0].StatusCode != 502 || !recent[1].Estimated || recent[1].Streamed {
 		t.Errorf("recent: %+v %+v", recent[0], recent[1])
 	}
-	all, _ := s.RecentRequests(ctx, nil, 0)
+	all, _ := s.RecentRequests(ctx, store.MetricsFilter{}, 0)
 	if len(all) != 3 || !all[2].RAGUsed || !all[2].Streamed {
 		t.Errorf("all recent: %d rows", len(all))
 	}
-	daily, err := s.DailySeries(ctx, &p.ID, 7)
+	daily, err := s.DailySeries(ctx, store.MetricsFilter{ProjectID: &p.ID}, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestMetrics(t *testing.T) {
 func TestSessions(t *testing.T) {
 	ctx := context.Background()
 	s := testdb.Open(t)
-	u, err := s.CreateUser(ctx, "admin", "hash")
+	u, err := s.CreateUser(ctx, "admin", "hash", "admin")
 	if err != nil {
 		t.Fatal(err)
 	}

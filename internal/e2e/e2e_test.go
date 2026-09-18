@@ -99,7 +99,7 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	st := testdb.OpenWith(t, cfg)
 	if n, _ := st.CountUsers(ctx); n == 0 {
 		h, _ := auth.HashPassword("password123")
-		if _, err := st.CreateUser(ctx, "admin", h); err != nil {
+		if _, err := st.CreateUser(ctx, "admin", h, "admin"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -114,7 +114,8 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	ret := rag.NewRetriever(st, embedders)
 	authSvc := &auth.Service{Store: st, TTL: time.Hour}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log}
-	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log}
+	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
+		Limiter: auth.DefaultLoginLimiter(st)}
 	r := chi.NewRouter()
 	r.Route("/v1", gw.Routes)
 	r.Route("/admin", adm.Routes)
@@ -127,6 +128,13 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 }
 
 func (e *env) call(method, path string, body any, bearer string) map[string]any {
+	e.t.Helper()
+	out, _ := e.callRaw(method, path, body, bearer)
+	return out
+}
+
+// callRaw is call plus the response headers (for Retry-After).
+func (e *env) callRaw(method, path string, body any, bearer string) (map[string]any, http.Header) {
 	e.t.Helper()
 	var rdr io.Reader
 	if body != nil {
@@ -148,12 +156,21 @@ func (e *env) call(method, path string, body any, bearer string) map[string]any 
 	if err := json.Unmarshal(raw, &out); err != nil {
 		var arr []any
 		if json.Unmarshal(raw, &arr) == nil {
-			return map[string]any{"_list": arr, "_status": float64(resp.StatusCode)}
+			return map[string]any{"_list": arr, "_status": float64(resp.StatusCode)}, resp.Header
 		}
 		e.t.Fatalf("%s %s: non-JSON response %d: %s", method, path, resp.StatusCode, raw)
 	}
 	out["_status"] = float64(resp.StatusCode)
-	return out
+	return out, resp.Header
+}
+
+func (e *env) login(username, password string) string {
+	e.t.Helper()
+	r := e.call("POST", "/admin/api/login", map[string]string{"username": username, "password": password}, "x")
+	if r["_status"] != float64(200) {
+		e.t.Fatalf("login %s: %v", username, r)
+	}
+	return r["token"].(string)
 }
 
 func (e *env) upload(storeID int64, name, content string) map[string]any {
@@ -321,7 +338,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(1) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(2) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
@@ -341,5 +358,216 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	if r := e2.call("GET", fmt.Sprintf("/admin/api/documents/%d", docID), nil, ""); r["_status"] != float64(404) {
 		t.Errorf("document should be gone with its store: %v", r)
+	}
+}
+
+func TestRolesRateLimitAndAudit(t *testing.T) {
+	e := newEnv(t, testdb.Config(t))
+	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
+	me := e.call("GET", "/admin/api/me", nil, "")
+	if me["role"] != "admin" || me["is_active"] != true {
+		t.Fatalf("bootstrap user should be an active admin: %v", me)
+	}
+	adminID := int64(me["id"].(float64))
+
+	// Admin creates an editor and a viewer.
+	ed := e.call("POST", "/admin/api/users", map[string]any{"username": "ed", "password": "editorpass", "role": "editor"}, "")
+	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewerpass", "role": "viewer"}, "")
+	if status(ed) != 201 || status(vw) != 201 || ed["role"] != "editor" || vw["role"] != "viewer" {
+		t.Fatalf("create users: %v %v", ed, vw)
+	}
+	editorID, viewerID := int64(ed["id"].(float64)), int64(vw["id"].(float64))
+	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "bad", "password": "x", "role": "owner"}, ""); status(r) != 400 {
+		t.Errorf("bad role/password should be rejected: %v", r)
+	}
+	editorTok := e.login("ed", "editorpass")
+	viewerTok := e.login("vw", "viewerpass")
+	if r := e.call("GET", "/admin/api/me", nil, editorTok); r["role"] != "editor" || r["last_login_at"] == nil {
+		t.Errorf("editor /me: %v", r)
+	}
+
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "m", "provider_type": "ollama", "model_name": "x"}, "")
+	connID := int64(conn["id"].(float64))
+
+	// Editor creates project A (auto-member); admin creates project B without the editor.
+	pa := e.call("POST", "/admin/api/projects", map[string]any{"name": "A", "model_connection_id": connID, "member_user_ids": []int64{viewerID}}, editorTok)
+	if status(pa) != 201 {
+		t.Fatalf("editor create project: %v", pa)
+	}
+	projA := pa["project"].(map[string]any)
+	idA := int64(projA["id"].(float64))
+	if ids := projA["member_ids"].([]any); len(ids) != 2 {
+		t.Errorf("project A members should be editor + viewer: %v", ids)
+	}
+	pb := e.call("POST", "/admin/api/projects", map[string]any{"name": "B", "model_connection_id": connID}, "")
+	idB := int64(pb["project"].(map[string]any)["id"].(float64))
+
+	// Visibility: editor lists only A and gets 404 for B on every project route.
+	if l := e.call("GET", "/admin/api/projects", nil, editorTok)["_list"].([]any); len(l) != 1 || l[0].(map[string]any)["name"] != "A" {
+		t.Errorf("editor project list: %v", l)
+	}
+	if l := e.call("GET", "/admin/api/projects", nil, "")["_list"].([]any); len(l) != 2 {
+		t.Errorf("admin project list: %v", l)
+	}
+	for _, c := range []struct{ method, path string }{
+		{"GET", fmt.Sprintf("/admin/api/projects/%d", idB)},
+		{"PUT", fmt.Sprintf("/admin/api/projects/%d", idB)},
+		{"DELETE", fmt.Sprintf("/admin/api/projects/%d", idB)},
+		{"POST", fmt.Sprintf("/admin/api/projects/%d/rotate-key", idB)},
+		{"GET", fmt.Sprintf("/admin/api/projects/%d/metrics", idB)},
+		{"GET", fmt.Sprintf("/admin/api/projects/%d/members", idB)},
+		{"GET", fmt.Sprintf("/admin/api/metrics/requests?project_id=%d", idB)},
+	} {
+		if r := e.call(c.method, c.path, map[string]any{"name": "B2", "model_connection_id": connID}, editorTok); status(r) != 404 {
+			t.Errorf("editor %s %s on foreign project: %v", c.method, c.path, r)
+		}
+	}
+	if r := e.call("GET", fmt.Sprintf("/admin/api/projects/%d", idA), nil, editorTok); status(r) != 200 {
+		t.Errorf("editor own project: %v", r)
+	}
+	if r := e.call("POST", fmt.Sprintf("/admin/api/projects/%d/rotate-key", idA), nil, editorTok); status(r) != 200 {
+		t.Errorf("editor rotate own key: %v", r)
+	}
+
+	// Members: editor may not remove themselves; admin may.
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d/members", idA), map[string]any{"user_ids": []int64{viewerID}}, editorTok); status(r) != 400 {
+		t.Errorf("editor removing self: %v", r)
+	}
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d/members", idA), map[string]any{"user_ids": []int64{editorID, 99999}}, editorTok); status(r) != 400 {
+		t.Errorf("unknown member: %v", r)
+	}
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d/members", idA), map[string]any{"user_ids": []int64{editorID}}, ""); status(r) != 200 || len(r["_list"].([]any)) != 1 {
+		t.Errorf("admin set members: %v", r)
+	}
+	if r := e.call("GET", fmt.Sprintf("/admin/api/projects/%d", idA), nil, viewerTok); status(r) != 404 {
+		t.Errorf("viewer removed from A should get 404: %v", r)
+	}
+
+	// Viewer: reads allowed, writes forbidden.
+	if r := e.call("GET", "/admin/api/models", nil, viewerTok); status(r) != 200 {
+		t.Errorf("viewer GET /models: %v", r)
+	}
+	for _, c := range []struct{ method, path string }{
+		{"POST", "/admin/api/models"}, {"PUT", fmt.Sprintf("/admin/api/models/%d", connID)},
+		{"DELETE", fmt.Sprintf("/admin/api/models/%d", connID)}, {"POST", "/admin/api/rag-stores"},
+		{"POST", "/admin/api/projects"}, {"GET", "/admin/api/users"}, {"GET", "/admin/api/audit"},
+	} {
+		r := e.call(c.method, c.path, map[string]any{"name": "n", "provider_type": "ollama", "model_name": "x"}, viewerTok)
+		if status(r) != 403 || r["error"].(map[string]any)["type"] != "forbidden" {
+			t.Errorf("viewer %s %s: %v", c.method, c.path, r)
+		}
+	}
+	if r := e.call("GET", "/admin/api/users/lite", nil, viewerTok); status(r) != 403 {
+		t.Errorf("viewer users/lite: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/users/lite", nil, editorTok); status(r) != 200 || len(r["_list"].([]any)) != 3 {
+		t.Errorf("editor users/lite: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/users", nil, editorTok); status(r) != 403 {
+		t.Errorf("editor GET /users: %v", r)
+	}
+	// Non-admin global metrics are scoped to member projects (empty here, but must not fail).
+	if r := e.call("GET", "/admin/api/metrics/summary", nil, viewerTok); status(r) != 200 || r["window"].(map[string]any)["requests"] != float64(0) {
+		t.Errorf("viewer metrics summary: %v", r)
+	}
+
+	// Rate limit: five wrong passwords lock the username for a minute, even with the right one.
+	for i := 0; i < 5; i++ {
+		if r := e.call("POST", "/admin/api/login", map[string]string{"username": "vw", "password": "wrong"}, "x"); status(r) != 401 {
+			t.Fatalf("attempt %d: %v", i+1, r)
+		}
+	}
+	r6, hdr := e.callRaw("POST", "/admin/api/login", map[string]string{"username": "vw", "password": "viewerpass"}, "x")
+	if status(r6) != 429 || r6["error"].(map[string]any)["type"] != "rate_limited" || hdr.Get("Retry-After") != "60" {
+		t.Errorf("6th login should be rate limited: %v %v", r6, hdr)
+	}
+	// Other users from the same address are still fine below the IP budget.
+	e.login("ed", "editorpass")
+
+	// Audit log.
+	audit := e.call("GET", "/admin/api/audit?limit=200", nil, "")["_list"].([]any)
+	seen := map[string]bool{}
+	for _, a := range audit {
+		seen[a.(map[string]any)["action"].(string)] = true
+	}
+	for _, want := range []string{"login.success", "login.failure", "user.create", "project.create", "project.rotate_key", "project.members_update", "model.create"} {
+		if !seen[want] {
+			t.Errorf("audit log missing %s (have %v)", want, seen)
+		}
+	}
+	filtered := e.call("GET", "/admin/api/audit?action=login.failure", nil, "")["_list"].([]any)
+	if len(filtered) != 5 {
+		t.Errorf("login.failure entries = %d, want 5", len(filtered))
+	}
+	if d := filtered[0].(map[string]any); d["details"].(map[string]any)["username"] != "vw" || d["actor_user_id"] != nil {
+		t.Errorf("login.failure entry: %v", d)
+	}
+	newest := audit[0].(map[string]any)["created_at"].(string)
+	older := e.call("GET", "/admin/api/audit?before="+newest, nil, "")["_list"].([]any)
+	if len(older) >= len(audit) {
+		t.Errorf("before cursor should exclude the newest entries: %d vs %d", len(older), len(audit))
+	}
+
+	// Deactivation invalidates existing sessions; the user can no longer log in.
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/users/%d", editorID), map[string]any{"is_active": false}, ""); status(r) != 200 || r["is_active"] != false {
+		t.Fatalf("deactivate editor: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/me", nil, editorTok); status(r) != 401 {
+		t.Errorf("deactivated session should be rejected: %v", r)
+	}
+	if r := e.call("POST", "/admin/api/login", map[string]string{"username": "ed", "password": "editorpass"}, "x"); status(r) != 401 {
+		t.Errorf("deactivated login: %v", r)
+	}
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/users/%d", editorID), map[string]any{"is_active": true}, ""); status(r) != 200 {
+		t.Fatalf("reactivate editor: %v", r)
+	}
+
+	// Reset password revokes sessions; the new password works.
+	editorTok = e.login("ed", "editorpass")
+	if r := e.call("POST", fmt.Sprintf("/admin/api/users/%d/reset-password", editorID), map[string]any{"new_password": "newpass123"}, ""); status(r) != 200 {
+		t.Fatalf("reset password: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/me", nil, editorTok); status(r) != 401 {
+		t.Errorf("session should be revoked after password reset: %v", r)
+	}
+	editorTok = e.login("ed", "newpass123")
+	if r := e.call("POST", fmt.Sprintf("/admin/api/users/%d/sessions/revoke", editorID), nil, ""); status(r) != 200 {
+		t.Fatalf("revoke sessions: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/me", nil, editorTok); status(r) != 401 {
+		t.Errorf("session should be revoked: %v", r)
+	}
+
+	// Last-admin protection and self-protection.
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/users/%d", adminID), map[string]any{"role": "editor"}, ""); status(r) != 409 {
+		t.Errorf("demoting the last admin: %v", r)
+	}
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/users/%d", adminID), map[string]any{"is_active": false}, ""); status(r) != 400 {
+		t.Errorf("deactivating yourself: %v", r)
+	}
+	if r := e.call("DELETE", fmt.Sprintf("/admin/api/users/%d", adminID), nil, ""); status(r) != 400 {
+		t.Errorf("deleting yourself: %v", r)
+	}
+	a2 := e.call("POST", "/admin/api/users", map[string]any{"username": "admin2", "password": "adminpass2", "role": "admin"}, "")
+	admin2ID := int64(a2["id"].(float64))
+	admin2Tok := e.login("admin2", "adminpass2")
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/users/%d", adminID), map[string]any{"role": "editor"}, admin2Tok); status(r) != 200 || r["role"] != "editor" {
+		t.Errorf("demoting one of two admins: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/users", nil, ""); status(r) != 403 {
+		t.Errorf("demoted admin should lose user management immediately: %v", r)
+	}
+	if r := e.call("DELETE", fmt.Sprintf("/admin/api/users/%d", admin2ID), nil, admin2Tok); status(r) != 400 {
+		t.Errorf("admin2 deleting itself: %v", r)
+	}
+	if r := e.call("DELETE", fmt.Sprintf("/admin/api/users/%d", viewerID), nil, admin2Tok); status(r) != 200 {
+		t.Errorf("delete viewer: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/me", nil, viewerTok); status(r) != 401 {
+		t.Errorf("deleted user's session: %v", r)
+	}
+	// Audit rows written by the deleted user keep the username; the actor id is nulled.
+	if l := e.call("GET", "/admin/api/audit?action=user.delete", nil, admin2Tok)["_list"].([]any); len(l) != 1 {
+		t.Errorf("user.delete audit: %v", l)
 	}
 }

@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -44,9 +46,29 @@ type MetricsSummary struct {
 	RAGRequests      int     `json:"rag_requests"`
 }
 
-// Summarize computes totals for a project (or all projects when projectID is
-// nil) since the given time.
-func (s *Store) Summarize(ctx context.Context, projectID *int64, since time.Time) (*MetricsSummary, error) {
+// MetricsFilter narrows metric queries. A nil ProjectID means every project;
+// a non-nil UserID restricts to projects the user is a member of.
+type MetricsFilter struct {
+	ProjectID *int64
+	UserID    *int64
+}
+
+// where renders the filter as SQL predicates; args are appended after base.
+func (f MetricsFilter) where(base []any) (string, []any) {
+	var sb strings.Builder
+	if f.ProjectID != nil {
+		base = append(base, *f.ProjectID)
+		fmt.Fprintf(&sb, " AND project_id = $%d", len(base))
+	}
+	if f.UserID != nil {
+		base = append(base, *f.UserID)
+		fmt.Fprintf(&sb, " AND project_id IN (SELECT project_id FROM project_members WHERE user_id = $%d)", len(base))
+	}
+	return sb.String(), base
+}
+
+// Summarize computes totals matching the filter since the given time.
+func (s *Store) Summarize(ctx context.Context, f MetricsFilter, since time.Time) (*MetricsSummary, error) {
 	q := `SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
@@ -54,12 +76,9 @@ func (s *Store) Summarize(ctx context.Context, projectID *int64, since time.Time
 		COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::float8,
 		COALESCE(SUM(CASE WHEN rag_used THEN 1 ELSE 0 END), 0)
 		FROM request_logs WHERE created_at >= $1`
-	args := []any{since.UTC()}
-	if projectID != nil {
-		q += " AND project_id = $2"
-		args = append(args, *projectID)
-	}
-	m := &MetricsSummary{ProjectID: projectID}
+	cond, args := f.where([]any{since.UTC()})
+	q += cond
+	m := &MetricsSummary{ProjectID: f.ProjectID}
 	var p95 float64
 	if err := s.pool.QueryRow(ctx, q, args...).Scan(&m.Requests, &m.Errors, &m.PromptTokens,
 		&m.CompletionTokens, &m.AvgLatencyMs, &p95, &m.RAGRequests); err != nil {
@@ -69,24 +88,16 @@ func (s *Store) Summarize(ctx context.Context, projectID *int64, since time.Time
 	return m, nil
 }
 
-// RecentRequests returns the newest request logs for a project.
-func (s *Store) RecentRequests(ctx context.Context, projectID *int64, limit int) ([]*RequestLog, error) {
+// RecentRequests returns the newest request logs matching the filter.
+func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) ([]*RequestLog, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
 	q := `SELECT id, project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated,
-		latency_ms, streamed, rag_used, error, created_at FROM request_logs`
-	args := []any{}
-	if projectID != nil {
-		q += " WHERE project_id = $1"
-		args = append(args, *projectID)
-	}
-	if projectID != nil {
-		q += " ORDER BY id DESC LIMIT $2"
-	} else {
-		q += " ORDER BY id DESC LIMIT $1"
-	}
+		latency_ms, streamed, rag_used, error, created_at FROM request_logs WHERE true`
+	cond, args := f.where(nil)
 	args = append(args, limit)
+	q += cond + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -116,7 +127,7 @@ type DailyBucket struct {
 }
 
 // DailySeries returns per-day totals for the last n days.
-func (s *Store) DailySeries(ctx context.Context, projectID *int64, days int) ([]DailyBucket, error) {
+func (s *Store) DailySeries(ctx context.Context, f MetricsFilter, days int) ([]DailyBucket, error) {
 	if days <= 0 {
 		days = 14
 	}
@@ -125,12 +136,8 @@ func (s *Store) DailySeries(ctx context.Context, projectID *int64, days int) ([]
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
 		FROM request_logs WHERE created_at >= $1`
-	args := []any{since}
-	if projectID != nil {
-		q += " AND project_id = $2"
-		args = append(args, *projectID)
-	}
-	q += " GROUP BY day ORDER BY day"
+	cond, args := f.where([]any{since})
+	q += cond + " GROUP BY day ORDER BY day"
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
