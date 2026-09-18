@@ -4,9 +4,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -36,6 +39,9 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "rotate-key" {
+		os.Exit(rotateKey(os.Args[2:]))
+	}
 	healthcheck := flag.Bool("healthcheck", false, "probe the running server and exit (for container HEALTHCHECK)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -147,7 +153,8 @@ func run(cfg config.Config) error {
 	}
 	retriever := rag.NewRetriever(st, embedders)
 
-	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true"}
+	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",
+		TrustProxy: cfg.TrustProxyHeaders}
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20, Limiter: usage}
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
@@ -156,13 +163,19 @@ func run(cfg config.Config) error {
 		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage,
 		ProviderConfig: provCfg, AllowPrivateUpstreams: cfg.AllowPrivateUpstreams, PrivateAllowlist: cfg.PrivateUpstreamAllowlist}
 
+	scriptHash, err := dashboardScriptHash(web.FS)
+	if err != nil {
+		return err
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	if cfg.TrustProxyHeaders {
-		r.Use(realIP)
+		r.Use(realIP(cfg.TrustedProxyCIDRs))
 	}
 	r.Use(requestLogger(log))
 	r.Use(middleware.Recoverer)
+	r.Use(securityHeaders(scriptHash))
 	if len(cfg.CORSOrigins) > 0 {
 		r.Use(cors(cfg.CORSOrigins))
 	}
@@ -285,23 +298,114 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 }
 
 // realIP replaces RemoteAddr with the client address a trusted reverse proxy
-// reported in X-Real-IP or the first X-Forwarded-For entry. It is only
-// installed when TRUST_PROXY_HEADERS is set, because any client can send
-// these headers when the gateway is reachable directly.
-func realIP(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := strings.TrimSpace(r.Header.Get("X-Real-IP"))
-		if ip == "" {
-			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-				ip, _, _ = strings.Cut(xff, ",")
-				ip = strings.TrimSpace(ip)
+// reported. It is only installed when TRUST_PROXY_HEADERS is set, because any
+// client can send these headers when the gateway is reachable directly.
+//
+// X-Forwarded-For is read from the right: proxies append the address they
+// accepted the connection from (nginx's $proxy_add_x_forwarded_for), so the
+// last entry is the one written by the nearest proxy and the only one a
+// client cannot forge. With trusted networks configured, headers are honoured
+// only for connections from those networks, and entries that are themselves
+// trusted proxies are skipped so the first untrusted hop wins. X-Real-IP is a
+// fallback for proxies that do not set X-Forwarded-For at all.
+func realIP(trusted []*net.IPNet) func(http.Handler) http.Handler {
+	isTrusted := func(ip net.IP) bool {
+		for _, n := range trusted {
+			if n.Contains(ip) {
+				return true
 			}
 		}
-		if ip != "" && net.ParseIP(ip) != nil {
-			r.RemoteAddr = ip
+		return false
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ip := forwardedClientIP(r, trusted, isTrusted); ip != "" {
+				r.RemoteAddr = ip
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// forwardedClientIP returns the proxy-reported client address, or "" when
+// the headers must not be trusted or carry nothing usable.
+func forwardedClientIP(r *http.Request, trusted []*net.IPNet, isTrusted func(net.IP) bool) string {
+	if len(trusted) > 0 {
+		peer := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(peer); err == nil {
+			peer = host
 		}
-		next.ServeHTTP(w, r)
-	})
+		if p := net.ParseIP(peer); p == nil || !isTrusted(p) {
+			return ""
+		}
+	}
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		for _, e := range strings.Split(v, ",") {
+			if e = strings.TrimSpace(e); e != "" {
+				hops = append(hops, e)
+			}
+		}
+	}
+	if len(hops) == 0 {
+		if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+			return ip.String()
+		}
+		return ""
+	}
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(hops[i])
+		if ip == nil {
+			return "" // a malformed hop: keep the peer address
+		}
+		if len(trusted) > 0 && i > 0 && isTrusted(ip) {
+			continue // one of our own proxies; look further left
+		}
+		return ip.String()
+	}
+	return ""
+}
+
+// dashboardScriptHash returns the CSP sha256 source of the single inline
+// script in the embedded dashboard, so the page can run under a policy that
+// forbids every other script.
+func dashboardScriptHash(webFS fs.FS) (string, error) {
+	page, err := fs.ReadFile(webFS, "index.html")
+	if err != nil {
+		return "", fmt.Errorf("read dashboard: %w", err)
+	}
+	html := string(page)
+	if strings.Count(html, "<script") != 1 {
+		return "", errors.New("dashboard must contain exactly one <script> block for the CSP hash")
+	}
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < start {
+		return "", errors.New("dashboard <script> block not found")
+	}
+	sum := sha256.Sum256([]byte(html[start+len("<script>") : end]))
+	return "sha256-" + base64.StdEncoding.EncodeToString(sum[:]), nil
+}
+
+// securityHeaders adds the browser hardening headers to every response and a
+// Content-Security-Policy to the dashboard pages (not the JSON API). The
+// dashboard uses inline style attributes and one inline <style>, so styles
+// stay unrestricted; scripts are pinned to the embedded one by hash.
+func securityHeaders(scriptHash string) func(http.Handler) http.Handler {
+	csp := "default-src 'self'; script-src '" + scriptHash + "'; style-src 'unsafe-inline'; " +
+		"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := w.Header()
+			h.Set("X-Content-Type-Options", "nosniff")
+			h.Set("Referrer-Policy", "no-referrer")
+			h.Set("X-Frame-Options", "DENY")
+			if strings.HasPrefix(r.URL.Path, "/admin") && !strings.HasPrefix(r.URL.Path, "/admin/api") {
+				h.Set("Content-Security-Policy", csp)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func cors(origins []string) func(http.Handler) http.Handler {

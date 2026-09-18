@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
@@ -46,6 +47,10 @@ const (
 	statusClientClosed = 499
 	errClientClosed    = "client closed request"
 )
+
+// bodyReadDeadline bounds reading a chat request body; it is cleared once the
+// body is in memory so streaming responses are never cut short by it.
+const bodyReadDeadline = 60 * time.Second
 
 // Routes mounts /v1 handlers on the router.
 func (g *Gateway) Routes(r chi.Router) {
@@ -135,7 +140,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if max <= 0 {
 		max = 4 << 20
 	}
+	httpx.Deadline(w, bodyReadDeadline)
 	body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
+	httpx.Deadline(w, 0)
 	if err != nil || int64(len(body)) > max {
 		writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
 		return
@@ -158,7 +165,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	prov, err := g.Providers(conn)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		// The factory error names the provider type or URL; clients only
+		// need to know the project is misconfigured.
+		log.Error("provider setup", "connection", conn.ID, "err", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
 		return
 	}
 	if clientModel == "" {
@@ -271,8 +281,19 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	out := make(chan provider.StreamChunk, 16)
 	errc := make(chan error, 1)
 	go func() {
-		errc <- prov.ChatStream(ctx, req, out)
-		close(out)
+		// A panic inside a provider adapter would otherwise kill the process
+		// (the HTTP server's recover does not cover this goroutine). Turn it
+		// into a stream error and always close out exactly once.
+		var err error
+		defer func() {
+			if p := recover(); p != nil {
+				g.Log.Error("provider stream panicked", "project", rec.ProjectID, "panic", p)
+				err = fmt.Errorf("provider stream panicked: %v", p)
+			}
+			errc <- err
+			close(out)
+		}()
+		err = prov.ChatStream(ctx, req, out)
 	}()
 
 	headersSent := false

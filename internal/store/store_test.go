@@ -379,3 +379,144 @@ func TestBackupInfoCountsVectorTablesAndDocumentBytes(t *testing.T) {
 		t.Errorf("backup info after ingest: %+v", info)
 	}
 }
+
+func TestLastAdminGuardIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	a, err := s.CreateUser(ctx, "a", "h", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.CreateUser(ctx, "b", "h", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two concurrent demotions: exactly one must succeed.
+	results := make(chan error, 2)
+	for _, id := range []int64{a.ID, b.ID} {
+		go func(id int64) {
+			_, err := s.UpdateUser(ctx, id, "editor", true)
+			results <- err
+		}(id)
+	}
+	var failed, ok int
+	for i := 0; i < 2; i++ {
+		switch err := <-results; {
+		case err == nil:
+			ok++
+		case errors.Is(err, store.ErrLastAdmin):
+			failed++
+		default:
+			t.Fatal(err)
+		}
+	}
+	if ok != 1 || failed != 1 {
+		t.Errorf("ok=%d lastadmin=%d, want one of each", ok, failed)
+	}
+	if n, _ := s.CountActiveAdmins(ctx); n != 1 {
+		t.Errorf("active admins = %d", n)
+	}
+	// Deactivating or deleting the survivor fails too; a non-admin change passes.
+	for _, u := range []*store.User{a, b} {
+		if _, err := s.UpdateUser(ctx, u.ID, "admin", false); errors.Is(err, store.ErrLastAdmin) {
+			if err := s.DeleteUser(ctx, u.ID); !errors.Is(err, store.ErrLastAdmin) {
+				t.Errorf("deleting the last admin: %v", err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		} else if _, err := s.UpdateUser(ctx, u.ID, "viewer", true); err != nil {
+			t.Errorf("changing a non-admin: %v", err)
+		}
+	}
+	if _, err := s.UpdateUser(ctx, 999999, "admin", true); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("unknown user: %v", err)
+	}
+	if err := s.DeleteUser(ctx, 999999); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("delete unknown user: %v", err)
+	}
+}
+
+func TestCreateProjectWithMembersIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	u, err := s.CreateUser(ctx, "u", "h", "editor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "c", ProviderType: "ollama", ModelName: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &store.Project{Name: "p", ModelConnectionID: conn.ID}
+	if _, _, err := s.CreateProjectWithMembers(ctx, p, []int64{u.ID, 424242}); !store.IsForeignKeyViolation(err) {
+		t.Fatalf("unknown member should fail with a foreign key violation: %v", err)
+	}
+	if list, _ := s.ListProjects(ctx); len(list) != 0 {
+		t.Errorf("failed create left a project behind: %v", list)
+	}
+	out, key, err := s.CreateProjectWithMembers(ctx, p, []int64{u.ID, u.ID})
+	if err != nil || key == "" || len(out.MemberIDs) != 1 || out.MemberIDs[0] != u.ID {
+		t.Fatalf("create with members: %v %+v", err, out)
+	}
+}
+
+func TestDeleteUserSessionsExcept(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	u, err := s.CreateUser(ctx, "u", "h", "viewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tok := range []string{"keep", "drop1", "drop2"} {
+		if err := s.CreateSession(ctx, u.ID, tok, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.DeleteUserSessionsExcept(ctx, u.ID, store.HashToken("keep")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserBySession(ctx, "keep"); err != nil {
+		t.Errorf("current session dropped: %v", err)
+	}
+	for _, tok := range []string{"drop1", "drop2"} {
+		if _, err := s.UserBySession(ctx, tok); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("%s should be gone: %v", tok, err)
+		}
+	}
+}
+
+func TestReencryptConnections(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	s := testdb.OpenWith(t, cfg)
+	for _, k := range []string{"sk-one", "", "sk-three"} {
+		if _, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "c" + k, ProviderType: "openai", ModelName: "m", APIKey: k}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.ReencryptConnections(ctx, "not-hex"); err == nil {
+		t.Error("bad key should be rejected")
+	}
+	newKey := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	n, err := s.ReencryptConnections(ctx, newKey)
+	if err != nil || n != 3 {
+		t.Fatalf("reencrypt: n=%d err=%v", n, err)
+	}
+	// The old key can no longer read the rows; the new one can.
+	if _, err := s.ListConnections(ctx); err == nil {
+		t.Error("old key should fail to decrypt after rotation")
+	}
+	cfg.SecretKeyHex = newKey
+	s2 := testdb.OpenWith(t, cfg)
+	list, err := s2.ListConnections(ctx)
+	if err != nil || len(list) != 3 {
+		t.Fatalf("list with new key: %v %d", err, len(list))
+	}
+	got := map[string]string{}
+	for _, c := range list {
+		got[c.Name] = c.APIKey
+	}
+	if got["csk-one"] != "sk-one" || got["c"] != "" || got["csk-three"] != "sk-three" {
+		t.Errorf("keys after rotation: %v", got)
+	}
+}

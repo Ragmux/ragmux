@@ -5,6 +5,7 @@
 #
 # See docs/backup-restore.md for the full runbook.
 set -euo pipefail
+umask 077
 
 usage() {
   cat <<'USAGE'
@@ -54,6 +55,22 @@ USAGE
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >&2; }
 die() { log "error: $1"; exit "${2:-1}"; }
+
+# login_json USER PASSWORD prints the login request body with the credentials
+# properly JSON-escaped. Uses jq or python3 when available, otherwise escapes
+# backslashes, double quotes and control characters by hand.
+login_json() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -cn --arg u "$1" --arg p "$2" '{username: $u, password: $p, bearer: true}'
+  elif command -v python3 >/dev/null 2>&1; then
+    RAGMUX_U="$1" RAGMUX_P="$2" python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({"username": os.environ["RAGMUX_U"], "password": os.environ["RAGMUX_P"], "bearer": True}))'
+  else
+    local u p
+    u="$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037')"
+    p="$(printf '%s' "$2" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037')"
+    printf '{"username":"%s","password":"%s","bearer":true}' "$u" "$p"
+  fi
+}
 
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-}"
 yes=0
@@ -166,18 +183,25 @@ done
 log "gateway healthy"
 
 if [ -n "${ADMIN_USER:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
-  body="$(printf '{"username":"%s","password":"%s"}' "$ADMIN_USER" "$ADMIN_PASSWORD")"
-  token="$(curl -fsS -m 10 -H 'Content-Type: application/json' -d "$body" "$RAGMUX_URL/admin/api/login" 2>/dev/null \
+  # Credentials never appear on a command line (visible in `ps` and shell
+  # history): the login body goes through stdin and the bearer header
+  # through a private temp file that curl reads with -H @file.
+  hdr="$(mktemp "${TMPDIR:-/tmp}/ragmux-restore-hdr.XXXXXX")"
+  trap 'rm -f "$errlog" "$hdr"' EXIT
+  token="$(login_json "$ADMIN_USER" "$ADMIN_PASSWORD" \
+    | curl -fsS -m 10 -H 'Content-Type: application/json' -d @- "$RAGMUX_URL/admin/api/login" 2>/dev/null \
     | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' || true)"
   if [ -z "$token" ]; then
     log "warning: login as $ADMIN_USER failed; skipping the /admin/api/system check"
   else
-    sys="$(curl -fsS -m 10 -H "Authorization: Bearer $token" "$RAGMUX_URL/admin/api/system" || true)"
+    printf 'Authorization: Bearer %s\n' "$token" >"$hdr"
+    sys="$(curl -fsS -m 10 -H "@$hdr" "$RAGMUX_URL/admin/api/system" || true)"
     mig="$(printf '%s' "$sys" | sed -n 's/.*"migrations_version":\([0-9]*\).*/\1/p')"
     tables="$(printf '%s' "$sys" | sed -n 's/.*"tables":\([0-9]*\).*/\1/p')"
     docs="$(printf '%s' "$sys" | sed -n 's/.*"documents_bytes":\([0-9]*\).*/\1/p')"
     log "system: migrations_version=${mig:-?} vector_tables=${tables:-?} documents_bytes=${docs:-?}"
-    curl -fsS -m 10 -X POST -H "Authorization: Bearer $token" "$RAGMUX_URL/admin/api/logout" >/dev/null 2>&1 || true
+    curl -fsS -m 10 -X POST -H "@$hdr" "$RAGMUX_URL/admin/api/logout" >/dev/null 2>&1 || true
+    unset token
   fi
 fi
 log "done: restore complete"

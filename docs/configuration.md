@@ -8,8 +8,10 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | *(required)* | PostgreSQL connection string, e.g. `postgres://user:pass@host:5432/ragmux?sslmode=require`. The `vector` extension is created on first start if the role may do so; otherwise run `CREATE EXTENSION vector` beforehand. |
-| `SECRET_KEY` | *(file fallback)* | 32-byte AES-256-GCM key as 64 hex characters that encrypts provider API keys at rest. Generate once with `openssl rand -hex 32` and keep it with your backups. Any other length or non-hex value is rejected. When unset, the gateway generates and reads `DATA_DIR/secret.key` and logs a warning; that fallback is meant for local development only. |
+| `DATABASE_URL` | *(required)* | PostgreSQL connection string, e.g. `postgres://user:pass@host:5432/ragmux?sslmode=require`. The `vector` extension is created on first start if the role may do so; otherwise run `CREATE EXTENSION vector` beforehand (see [Database privileges](#database-privileges)). |
+| `DATABASE_URL_FILE` | *(none)* | Path of a file whose trimmed content is used when `DATABASE_URL` is unset (Docker/Compose secrets). |
+| `SECRET_KEY` | *(file fallback)* | 32-byte AES-256-GCM key as 64 hex characters that encrypts provider API keys at rest. Generate once with `openssl rand -hex 32` and keep it with your backups. Any other length or non-hex value is rejected. When unset, the gateway generates and reads `DATA_DIR/secret.key` and logs a warning; that fallback is meant for local development only. Rotate with `ragmux rotate-key` (see [Backup and restore](backup-restore.md#rotating-secret_key)). |
+| `SECRET_KEY_FILE` | *(none)* | Path of a file holding the key, used when `SECRET_KEY` is unset. |
 | `DB_MAX_CONNS` | `10` | Connection pool size (must be `>= 1`). |
 | `DATA_DIR` | `/app/data` | Only used for the `secret.key` fallback when `SECRET_KEY` is unset. |
 | `PORT` | `8080` | HTTP listen port (`1`-`65535`). Also read by `-healthcheck`. |
@@ -26,8 +28,9 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `PRIVATE_UPSTREAM_ALLOWLIST` | *(empty)* | Comma-separated hostnames (case-insensitive) that may resolve to private addresses while `ALLOW_PRIVATE_UPSTREAMS` stays `false`, e.g. `host.docker.internal,ollama`. |
 | `STREAM_MAX_DURATION` | `30m` | Wall-time limit for one streaming provider response (Go duration). The stream ends with a `504 timeout` error when it is reached. |
 | `STREAM_MAX_BYTES_MB` | `256` | Maximum bytes read from one streaming provider response in MiB (`>= 1`). |
-| `SECURE_COOKIES` | `false` | `true` marks the `ragmux_session` cookie `Secure`. Set it when the dashboard is served over HTTPS. |
-| `TRUST_PROXY_HEADERS` | `false` | `true` takes the client address from `X-Real-IP` or the first `X-Forwarded-For` entry (used by login limits and the audit log). Enable only behind a reverse proxy that overwrites those headers. |
+| `SECURE_COOKIES` | `false` | `true` marks the `ragmux_session` cookie `Secure` unconditionally. The flag is set anyway when the request arrived over TLS, or when `TRUST_PROXY_HEADERS` is on and the proxy sends `X-Forwarded-Proto: https`. |
+| `TRUST_PROXY_HEADERS` | `false` | `true` takes the client address from the **last** `X-Forwarded-For` entry (the one appended by the nearest proxy), or from `X-Real-IP` when there is no `X-Forwarded-For`. Used by login limits, the audit log and the `Secure` cookie flag. Enable only behind a reverse proxy; see [Behind a reverse proxy](#behind-a-reverse-proxy). |
+| `TRUSTED_PROXY_CIDRS` | *(none)* | Comma-separated networks (`10.0.0.0/8,172.16.0.0/12`, single addresses allowed). When set, proxy headers are honoured only for connections from these networks, and `X-Forwarded-For` is walked from the right past addresses inside them, so the first hop that is not one of your proxies wins. |
 | `LOGIN_RATE_LIMIT_PER_MIN` | `10` | Failed logins allowed per minute from one IP address (`0` disables). |
 | `LOGIN_USER_LIMIT_PER_MIN` | `5` | Failed logins allowed per minute for one username (`0` disables). |
 | `LOGIN_LOCKOUT_FAILURES` | `20` | Failures within `LOGIN_LOCKOUT_MINUTES` that lock a username out (`0` disables). |
@@ -85,7 +88,14 @@ starts listening.
 These are not configurable:
 
 - `/v1/chat/completions` request bodies are limited to 4 MiB; admin JSON bodies to 1 MiB.
-- HTTP `ReadHeaderTimeout` is 20 s and `IdleTimeout` 120 s.
+- HTTP `ReadHeaderTimeout` is 20 s and `IdleTimeout` 120 s. Request bodies must arrive
+  within a per-route budget: 10 s for `/admin/api/login`, 30 s for other admin JSON
+  routes, 5 min for document uploads and 60 s for `/v1/chat/completions`. There is no
+  write timeout, so streaming responses run as long as the completion takes.
+- Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`
+  and `X-Frame-Options: DENY`; `/admin/api` responses add `Cache-Control: no-store` and
+  an `X-Request-Id`; the dashboard pages carry a `Content-Security-Policy` that pins the
+  embedded script by hash (`script-src 'sha256-…'`, `frame-ancestors 'none'`).
 - Upstream connections: dial timeout 15 s, TLS handshake 15 s, up to 100 idle connections
   (20 per host), idle timeout 90 s, at most 3 same-host redirects.
 - Document parsing: PDFs are read for at most 60 s and 2000 pages; a DOCX
@@ -104,16 +114,39 @@ These are not configurable:
 | Variable | Default | Used by |
 |---|---|---|
 | `SECRET_KEY` | *(required)* | gateway; Compose refuses to start without it |
-| `POSTGRES_PASSWORD` | `ragmux` | the bundled `postgres` service and the `DATABASE_URL` Compose builds for the gateway (`postgres://ragmux:<password>@postgres:5432/ragmux?sslmode=disable`) |
+| `POSTGRES_PASSWORD` | *(required)* | the bundled `postgres` service and the `DATABASE_URL` Compose builds for the gateway (`postgres://ragmux:<password>@postgres:5432/ragmux?sslmode=disable`); Compose refuses to start without it. Use characters that are safe in a URL (`openssl rand -hex 16`) |
 | `VERSION` | `dev` | build argument stamped into `ragmux -version` when the image is built locally |
-| `ADMIN_USER`, `ADMIN_PASSWORD`, `LOG_LEVEL`, `CORS_ORIGINS`, `LOGIN_*` | as above | gateway |
+| `ADMIN_USER`, `ADMIN_PASSWORD`, `LOG_LEVEL`, `CORS_ORIGINS`, `LOGIN_*`, `TRUST_PROXY_HEADERS`, `TRUSTED_PROXY_CIDRS`, `SECURE_COOKIES` | as above | gateway |
 | `PRIVATE_UPSTREAM_ALLOWLIST`, `ALLOW_PRIVATE_UPSTREAMS` | *(empty)*, `false` | gateway; needed for Ollama and other local model servers (see [Private upstreams](#private-upstreams)) |
 | `BACKUP_SCHEDULE` | `@daily` | `backup` profile (see [Backup and restore](backup-restore.md)) |
 | `BACKUP_KEEP_DAYS`, `BACKUP_KEEP_WEEKS`, `BACKUP_KEEP_MONTHS` | `7`, `4`, `6` | `backup` profile |
 
 Every other variable from the table above can be added to `.env` as well; the gateway
-service loads the whole file through `env_file`. The gateway listens on `8080:8080`,
-the database is not published. All state lives in the `pgdata` volume plus `SECRET_KEY`.
+service loads the whole file through `env_file`. The gateway is published on
+`127.0.0.1:8080` only, so it is reachable from the host but not from the network; put a
+TLS-terminating reverse proxy in front of it (below) or change the mapping to
+`8080:8080` deliberately. The database is not published. All state lives in the
+`pgdata` volume plus `SECRET_KEY`.
+
+To keep the secrets out of `.env`, mount them as Compose secrets and point the `_FILE`
+variables at them:
+
+```yaml
+services:
+  ragmux:
+    secrets: [ragmux_secret_key, ragmux_database_url]
+    environment:
+      SECRET_KEY_FILE: /run/secrets/ragmux_secret_key
+      DATABASE_URL_FILE: /run/secrets/ragmux_database_url
+secrets:
+  ragmux_secret_key:
+    file: ./secrets/secret_key        # 64 hex characters
+  ragmux_database_url:
+    file: ./secrets/database_url      # postgres://ragmux:<password>@postgres:5432/ragmux?sslmode=disable
+```
+
+The gateway reads each file once at startup and trims surrounding whitespace; the plain
+variable wins when both are set.
 
 Published images: `ghcr.io/ragmux/ragmux:<version>` (also `:<major>.<minor>` and
 `:latest`, `linux/amd64` and `linux/arm64`), built by the release workflow on every
@@ -121,12 +154,35 @@ Published images: `ghcr.io/ragmux/ragmux:<version>` (also `:<major>.<minor>` and
 
 ## Behind a reverse proxy
 
-- **Client addresses.** Set `TRUST_PROXY_HEADERS=true` only when the proxy sets
-  `X-Forwarded-For` / `X-Real-IP` itself and strips client-supplied values; otherwise
-  anyone can spoof the address used for login rate limiting and the audit log.
-- **Cookies.** Set `SECURE_COOKIES=true` when the dashboard is reached over HTTPS so
-  the session cookie is never sent over plain HTTP. The cookie is `HttpOnly`,
-  `SameSite=Lax` and scoped to `/`.
+- **Client addresses.** Proxies *append* the address they accepted the connection from
+  to `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`),
+  so a request that passes through one proxy arrives as `X-Forwarded-For: <whatever the
+  client sent>, <client address>`. With `TRUST_PROXY_HEADERS=true` the gateway therefore
+  uses the **last** entry, which the client cannot forge, and ignores `X-Real-IP` unless
+  `X-Forwarded-For` is absent. Set `TRUSTED_PROXY_CIDRS` to the proxy's network(s) so the
+  headers are only honoured on connections from the proxy and so a chain of your own
+  proxies (a load balancer in front of nginx) is skipped when walking the header:
+
+  ```
+  TRUST_PROXY_HEADERS=true
+  TRUSTED_PROXY_CIDRS=172.18.0.0/16      # the Compose network, or the LB's range
+  ```
+
+  Without `TRUSTED_PROXY_CIDRS`, anyone who can reach the gateway directly can spoof the
+  address used for login rate limiting and the audit log; keep the port bound to
+  loopback or a private network in that case.
+- **Cookies.** Send `X-Forwarded-Proto` from the proxy (nginx: `proxy_set_header
+  X-Forwarded-Proto $scheme;`); with `TRUST_PROXY_HEADERS=true` the session cookie is then
+  marked `Secure` on HTTPS requests. `SECURE_COOKIES=true` forces the flag regardless.
+  The cookie is `HttpOnly`, `SameSite=Lax` and scoped to `/`.
+- **Host header.** Cookie-authenticated writes to `/admin/api` are accepted only when
+  the browser reports `Sec-Fetch-Site: same-origin` or, on older browsers, when the
+  `Origin` host matches the request `Host`. Pass the original host through
+  (`proxy_set_header Host $host;`); rewriting it breaks the dashboard's writes.
+- **Body timeouts.** The gateway gives clients 10 s to deliver a login body, 30 s for
+  other admin JSON, 5 min for uploads and 60 s for a chat request. nginx buffers
+  request bodies itself; set `client_body_timeout` (default 60 s) to at most those
+  values so a stalled client is dropped at the proxy rather than holding both.
 - **Streaming.** SSE responses from `/v1/chat/completions` must not be buffered. The
   gateway already sends `X-Accel-Buffering: no`, `Cache-Control: no-cache` and
   `Connection: keep-alive`, which nginx honours for `proxy_pass` upstreams. On other
@@ -139,3 +195,27 @@ Published images: `ghcr.io/ragmux/ragmux:<version>` (also `:<major>.<minor>` and
   gateway answers preflight `OPTIONS` requests itself with
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS` and
   `Access-Control-Allow-Headers: Authorization, Content-Type`.
+
+## Database privileges
+
+The gateway does not need a superuser. It needs one thing a plain role usually lacks:
+the `vector` extension. Create it once as a superuser, then run the gateway as a role
+that owns its database and may create tables in `public` (the per-dimension
+`chunk_embeddings_<dims>` tables are created at runtime when a new embedding width
+appears):
+
+```sql
+-- as a superuser, once per database
+CREATE ROLE ragmux LOGIN PASSWORD '...';
+CREATE DATABASE ragmux OWNER ragmux;
+\c ragmux
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+GRANT CREATE, USAGE ON SCHEMA public TO ragmux;
+```
+
+On start the gateway runs `CREATE EXTENSION IF NOT EXISTS vector`, which is a no-op
+once the extension exists and succeeds without extra privileges. Migrations and the
+runtime tables only need `CREATE` on the schema plus ownership of what the role
+created. On managed Postgres (RDS, Cloud SQL, …) the extension is enabled through the
+provider's console or the `rds_superuser`-style role, and the application role is
+configured the same way.

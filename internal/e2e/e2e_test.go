@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ragmux/ragmux/internal/admin"
 	"github.com/ragmux/ragmux/internal/auth"
@@ -146,12 +147,13 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
 		Limiter: auth.DefaultLoginLimiter(st), Usage: usage, ProviderConfig: provCfg, AllowPrivateUpstreams: true}
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
 	r.Route("/v1", gw.Routes)
 	r.Route("/admin", adm.Routes)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, srv: srv, store: st, usage: usage}
-	res := e.call("POST", "/admin/api/login", map[string]string{"username": "admin", "password": "password123"}, "")
+	res := e.call("POST", "/admin/api/login", map[string]any{"username": "admin", "password": "password123", "bearer": true}, "")
 	e.session = res["token"].(string)
 	return e
 }
@@ -195,7 +197,7 @@ func (e *env) callRaw(method, path string, body any, bearer string) (map[string]
 
 func (e *env) login(username, password string) string {
 	e.t.Helper()
-	r := e.call("POST", "/admin/api/login", map[string]string{"username": username, "password": password}, "x")
+	r := e.call("POST", "/admin/api/login", map[string]any{"username": username, "password": password, "bearer": true}, "x")
 	if r["_status"] != float64(200) {
 		e.t.Fatalf("login %s: %v", username, r)
 	}
@@ -480,6 +482,7 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 		{"POST", "/admin/api/models"}, {"PUT", fmt.Sprintf("/admin/api/models/%d", connID)},
 		{"DELETE", fmt.Sprintf("/admin/api/models/%d", connID)}, {"POST", "/admin/api/rag-stores"},
 		{"POST", "/admin/api/projects"}, {"GET", "/admin/api/users"}, {"GET", "/admin/api/audit"},
+		{"POST", fmt.Sprintf("/admin/api/models/%d/test", connID)},
 	} {
 		r := e.call(c.method, c.path, map[string]any{"name": "n", "provider_type": "ollama", "model_name": "x"}, viewerTok)
 		if status(r) != 403 || r["error"].(map[string]any)["type"] != "forbidden" {
@@ -937,5 +940,110 @@ func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
 	}
 	if r := search(map[string]any{"query": "apple zyxquux", "rerank": false}); !hasContent(r, "zyxquux") {
 		t.Errorf("search after reprocess: %v", hitContents(r))
+	}
+}
+
+// TestLoginSurfaceAndSessions covers the login hardening: the token is only
+// returned on request, cookie sessions need same-origin JSON requests,
+// oversized credentials are refused before any work, and a password change
+// signs the other sessions out.
+func TestLoginSurfaceAndSessions(t *testing.T) {
+	e := newEnv(t, testdb.Config(t))
+	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
+
+	// Without "bearer": true the body has no token; the cookie carries the session.
+	req, _ := http.NewRequest("POST", e.srv.URL+"/admin/api/login", strings.NewReader(`{"username":" admin ","password":"password123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || body["token"] != nil || body["user"] == nil {
+		t.Fatalf("cookie login: %d %v", resp.StatusCode, body)
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("X-Request-Id") == "" {
+		t.Errorf("api response headers: %v", resp.Header)
+	}
+	var cookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == auth.CookieName {
+			cookie = c
+		}
+	}
+	if cookie == nil || !cookie.HttpOnly {
+		t.Fatalf("session cookie not set: %v", resp.Cookies())
+	}
+	do := func(method, path, body, contentType, origin string) (int, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, e.srv.URL+path, strings.NewReader(body))
+		req.AddCookie(cookie)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	if st, out := do("GET", "/admin/api/me", "", "", "https://evil.example"); st != 200 || out["username"] != "admin" {
+		t.Errorf("cookie GET: %d %v", st, out)
+	}
+	same := "http://" + strings.TrimPrefix(e.srv.URL, "http://")
+	if st, _ := do("POST", "/admin/api/models", `{"name":"m","provider_type":"ollama","model_name":"x"}`, "application/json", "https://evil.example"); st != 403 {
+		t.Errorf("cookie + foreign origin should be refused: %d", st)
+	}
+	if st, _ := do("POST", "/admin/api/models", `{"name":"m","provider_type":"ollama","model_name":"x"}`, "text/plain", same); st != 415 {
+		t.Errorf("cookie + non-JSON content type should be refused: %d", st)
+	}
+	if st, out := do("POST", "/admin/api/models", `{"name":"m","provider_type":"ollama","model_name":"x"}`, "application/json; charset=utf-8", same); st != 201 {
+		t.Errorf("cookie + same origin JSON: %d %v", st, out)
+	}
+	// Login itself needs the JSON content type but no origin check.
+	if st, _ := do("POST", "/admin/api/login", `{"username":"admin","password":"password123"}`, "text/plain", "https://evil.example"); st != 415 {
+		t.Errorf("login with a non-JSON content type: %d", st)
+	}
+
+	// Field limits are enforced before the limiter or bcrypt run: none of
+	// these count as failed attempts.
+	for _, c := range []map[string]any{
+		{"username": "", "password": "password123"},
+		{"username": "admin", "password": ""},
+		{"username": strings.Repeat("a", 65), "password": "password123"},
+		{"username": "admin", "password": strings.Repeat("p", 1025)},
+	} {
+		if r := e.call("POST", "/admin/api/login", c, "x"); status(r) != 400 {
+			t.Errorf("login %v: %v", c, r)
+		}
+	}
+	if byUser, _, _ := e.store.CountFailedLoginAttempts(context.Background(), "admin", "", time.Now().Add(-time.Hour)); byUser != 0 {
+		t.Errorf("rejected logins were recorded as attempts: %d", byUser)
+	}
+	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "long", "password": strings.Repeat("p", 73)}, ""); status(r) != 400 {
+		t.Errorf("password over bcrypt's 72 bytes must be refused: %v", r)
+	}
+
+	// Changing the password keeps the current session and drops the others.
+	other := e.login("admin", "password123")
+	if r := e.call("POST", "/admin/api/me/password", map[string]any{"current_password": "password123", "new_password": "password456"}, ""); status(r) != 200 {
+		t.Fatalf("change password: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/me", nil, ""); status(r) != 200 {
+		t.Errorf("current session should survive the password change: %v", r)
+	}
+	if r := e.call("GET", "/admin/api/me", nil, other); status(r) != 401 {
+		t.Errorf("other session should be revoked: %v", r)
+	}
+	if st, _ := do("GET", "/admin/api/me", "", "", ""); st != 401 {
+		t.Errorf("cookie session should be revoked: %d", st)
 	}
 }

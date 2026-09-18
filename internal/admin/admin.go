@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ragmux/ragmux/internal/auth"
+	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/netguard"
 	"github.com/ragmux/ragmux/internal/provider"
@@ -54,70 +56,20 @@ type Admin struct {
 	PrivateAllowlist      map[string]bool
 }
 
+// Body read budgets. JSON handlers get a short one; login shorter still so a
+// slow-loris cannot pin the bcrypt path; uploads get room for a large file.
+const (
+	loginReadDeadline  = 10 * time.Second
+	jsonReadDeadline   = 30 * time.Second
+	uploadReadDeadline = 5 * time.Minute
+)
+
 // Routes mounts /admin handlers.
 func (a *Admin) Routes(r chi.Router) {
-	r.Post("/api/login", a.login)
 	r.Group(func(r chi.Router) {
-		r.Use(a.Auth.Middleware)
-		editor := r.With(auth.RequireRole(auth.RoleEditor))
-		adminOnly := r.With(auth.RequireRole(auth.RoleAdmin))
-
-		r.Post("/api/logout", a.logout)
-		r.Get("/api/me", a.me)
-		r.Post("/api/me/password", a.changePassword)
-
-		r.Get("/api/provider-types", a.providerTypes)
-
-		// Model connections: viewers may read and test, editors mutate.
-		r.Get("/api/models", a.listConnections)
-		editor.Post("/api/models", a.createConnection)
-		r.Get("/api/models/{id}", a.getConnection)
-		editor.Put("/api/models/{id}", a.updateConnection)
-		editor.Delete("/api/models/{id}", a.deleteConnection)
-		r.Post("/api/models/{id}/test", a.testConnection)
-
-		// RAG stores and documents: same split; search is a read.
-		r.Get("/api/rag-stores", a.listRAGStores)
-		editor.Post("/api/rag-stores", a.createRAGStore)
-		r.Get("/api/rag-stores/{id}", a.getRAGStore)
-		editor.Put("/api/rag-stores/{id}", a.updateRAGStore)
-		editor.Delete("/api/rag-stores/{id}", a.deleteRAGStore)
-		r.Get("/api/rag-stores/{id}/documents", a.listDocuments)
-		editor.Post("/api/rag-stores/{id}/documents", a.uploadDocument)
-		r.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
-		editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
-		r.Get("/api/documents/{id}", a.getDocument)
-		editor.Delete("/api/documents/{id}", a.deleteDocument)
-		editor.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
-
-		// Projects: membership is checked inside the handlers (404 for
-		// non-members); mutation additionally needs the editor role.
-		r.Get("/api/projects", a.listProjects)
-		editor.Post("/api/projects", a.createProject)
-		r.Get("/api/projects/{id}", a.getProject)
-		editor.Put("/api/projects/{id}", a.updateProject)
-		editor.Delete("/api/projects/{id}", a.deleteProject)
-		editor.Post("/api/projects/{id}/rotate-key", a.rotateKey)
-		r.Get("/api/projects/{id}/metrics", a.projectMetrics)
-		r.Get("/api/projects/{id}/usage", a.projectUsage)
-		r.Get("/api/projects/{id}/members", a.listMembers)
-		editor.Put("/api/projects/{id}/members", a.setMembers)
-
-		r.Get("/api/metrics/summary", a.metricsSummary)
-		r.Get("/api/metrics/requests", a.recentRequests)
-		r.Get("/api/system", a.systemInfo)
-
-		// User management and the audit trail are admin-only; the lite user
-		// list lets editors pick project members.
-		editor.Get("/api/users/lite", a.listUsersLite)
-		adminOnly.Get("/api/users", a.listUsers)
-		adminOnly.Post("/api/users", a.createUser)
-		adminOnly.Get("/api/users/{id}", a.getUser)
-		adminOnly.Put("/api/users/{id}", a.updateUser)
-		adminOnly.Delete("/api/users/{id}", a.deleteUser)
-		adminOnly.Post("/api/users/{id}/reset-password", a.resetPassword)
-		adminOnly.Post("/api/users/{id}/sessions/revoke", a.revokeSessions)
-		adminOnly.Get("/api/audit", a.listAudit)
+		r.Use(requestIDHeader, httpx.NoStore, httpx.ReadDeadline(jsonReadDeadline))
+		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/login", a.login)
+		r.Group(a.authenticated)
 	})
 	if a.WebFS != nil {
 		fileServer := http.FileServer(http.FS(a.WebFS))
@@ -129,6 +81,82 @@ func (a *Admin) Routes(r chi.Router) {
 			http.StripPrefix("/admin", fileServer).ServeHTTP(w, r)
 		})
 	}
+}
+
+// requestIDHeader echoes chi's request id so error responses and logs can
+// be matched; fail reads it back from the header.
+func requestIDHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if id := middleware.GetReqID(r.Context()); id != "" {
+			w.Header().Set("X-Request-Id", id)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// authenticated mounts every route behind the session middleware.
+func (a *Admin) authenticated(r chi.Router) {
+	r.Use(a.Auth.Middleware)
+	editor := r.With(auth.RequireRole(auth.RoleEditor))
+	adminOnly := r.With(auth.RequireRole(auth.RoleAdmin))
+
+	r.Post("/api/logout", a.logout)
+	r.Get("/api/me", a.me)
+	r.Post("/api/me/password", a.changePassword)
+
+	r.Get("/api/provider-types", a.providerTypes)
+
+	// Model connections: viewers may read, editors mutate and test (a
+	// test spends provider quota and is audited as a write).
+	r.Get("/api/models", a.listConnections)
+	editor.Post("/api/models", a.createConnection)
+	r.Get("/api/models/{id}", a.getConnection)
+	editor.Put("/api/models/{id}", a.updateConnection)
+	editor.Delete("/api/models/{id}", a.deleteConnection)
+	editor.Post("/api/models/{id}/test", a.testConnection)
+
+	// RAG stores and documents: same split; search is a read.
+	r.Get("/api/rag-stores", a.listRAGStores)
+	editor.Post("/api/rag-stores", a.createRAGStore)
+	r.Get("/api/rag-stores/{id}", a.getRAGStore)
+	editor.Put("/api/rag-stores/{id}", a.updateRAGStore)
+	editor.Delete("/api/rag-stores/{id}", a.deleteRAGStore)
+	r.Get("/api/rag-stores/{id}/documents", a.listDocuments)
+	editor.With(httpx.ReadDeadline(uploadReadDeadline)).Post("/api/rag-stores/{id}/documents", a.uploadDocument)
+	r.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
+	editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
+	r.Get("/api/documents/{id}", a.getDocument)
+	editor.Delete("/api/documents/{id}", a.deleteDocument)
+	editor.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
+
+	// Projects: membership is checked inside the handlers (404 for
+	// non-members); mutation additionally needs the editor role.
+	r.Get("/api/projects", a.listProjects)
+	editor.Post("/api/projects", a.createProject)
+	r.Get("/api/projects/{id}", a.getProject)
+	editor.Put("/api/projects/{id}", a.updateProject)
+	editor.Delete("/api/projects/{id}", a.deleteProject)
+	editor.Post("/api/projects/{id}/rotate-key", a.rotateKey)
+	r.Get("/api/projects/{id}/metrics", a.projectMetrics)
+	r.Get("/api/projects/{id}/usage", a.projectUsage)
+	r.Get("/api/projects/{id}/members", a.listMembers)
+	editor.Put("/api/projects/{id}/members", a.setMembers)
+
+	r.Get("/api/metrics/summary", a.metricsSummary)
+	r.Get("/api/metrics/requests", a.recentRequests)
+	r.Get("/api/system", a.systemInfo)
+
+	// User management and the audit trail are admin-only; the lite user
+	// list lets editors pick project members.
+	editor.Get("/api/users/lite", a.listUsersLite)
+	adminOnly.Get("/api/users", a.listUsers)
+	adminOnly.Post("/api/users", a.createUser)
+	adminOnly.Get("/api/users/{id}", a.getUser)
+	adminOnly.Put("/api/users/{id}", a.updateUser)
+	adminOnly.Delete("/api/users/{id}", a.deleteUser)
+	adminOnly.Post("/api/users/{id}/reset-password", a.resetPassword)
+	adminOnly.Post("/api/users/{id}/sessions/revoke", a.revokeSessions)
+	adminOnly.Get("/api/audit", a.listAudit)
 }
 
 // ---- helpers ----
@@ -143,17 +171,23 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": http.StatusText(status)}})
 }
 
+// fail maps store errors to status codes. Unexpected errors are logged with
+// the request id and answered with a fixed message that carries only that id,
+// so internal details (SQL, hosts, paths) never reach the client.
 func (a *Admin) fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not found")
+	case errors.Is(err, store.ErrLastAdmin):
+		writeErr(w, http.StatusConflict, "cannot remove the last active admin")
 	case store.IsUniqueViolation(err):
 		writeErr(w, http.StatusConflict, "an item with that name already exists")
 	case store.IsForeignKeyViolation(err):
 		writeErr(w, http.StatusConflict, "item is still referenced by a project or RAG store")
 	default:
-		a.Log.Error("admin request failed", "err", err)
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		reqID := w.Header().Get("X-Request-Id")
+		a.Log.Error("admin request failed", "err", err, "req_id", reqID)
+		writeErr(w, http.StatusInternalServerError, "internal error (request id "+reqID+")")
 	}
 }
 
@@ -161,20 +195,64 @@ func idParam(r *http.Request) (int64, error) {
 	return strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 }
 
+// errUnsupportedMediaType is returned by decode when a cookie-authenticated
+// request (or a login) does not declare a JSON body. Browsers cannot send
+// application/json cross-origin without a CORS preflight, so requiring it
+// closes the simple-request CSRF path for good measure.
+var errUnsupportedMediaType = errors.New("Content-Type must be application/json")
+
 func decode(r *http.Request, v any) error {
+	if !auth.IsBearer(r) && !isJSON(r) {
+		return errUnsupportedMediaType
+	}
 	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	return dec.Decode(v)
 }
 
+func isJSON(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "application/json")
+}
+
+// badBody answers a failed decode: 415 for a missing JSON content type,
+// otherwise 400.
+func badBody(w http.ResponseWriter, err error) {
+	if errors.Is(err, errUnsupportedMediaType) {
+		writeErr(w, http.StatusUnsupportedMediaType, err.Error())
+		return
+	}
+	writeErr(w, http.StatusBadRequest, "invalid body")
+}
+
 // ---- auth ----
+
+// Login field limits, checked before any database or bcrypt work.
+const (
+	maxUsernameLen      = 64
+	maxLoginPasswordLen = 1024
+	// maxPasswordLen is bcrypt's input limit; longer passwords are refused
+	// when set rather than silently truncated.
+	maxPasswordLen = 72
+)
 
 func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		// Bearer asks for the token in the body (API clients); the dashboard
+		// relies on the cookie alone so the token never touches page scripts.
+		Bearer bool `json:"bearer"`
 	}
-	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+	if err := decodeLogin(r, &in); err != nil {
+		badBody(w, err)
+		return
+	}
+	in.Username = strings.TrimSpace(in.Username)
+	if in.Username == "" || len(in.Username) > maxUsernameLen || in.Password == "" || len(in.Password) > maxLoginPasswordLen {
+		writeErr(w, http.StatusBadRequest, "username (1-64 characters) and password (1-1024 characters) are required")
 		return
 	}
 	ctx := r.Context()
@@ -216,13 +294,26 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 		a.Log.Error("touch last login", "err", err)
 	}
 	a.auditAs(r, u, "login.success", "user", &u.ID, nil)
-	a.Auth.SetCookie(w, tok)
-	writeJSON(w, http.StatusOK, map[string]any{"token": tok, "user": u})
+	a.Auth.SetCookie(w, r, tok)
+	out := map[string]any{"user": u}
+	if in.Bearer {
+		out["token"] = tok
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// decodeLogin is decode for the one endpoint that has no session yet: the
+// JSON content type is required regardless of an Authorization header.
+func decodeLogin(r *http.Request, v any) error {
+	if !isJSON(r) {
+		return errUnsupportedMediaType
+	}
+	return json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(v)
 }
 
 func (a *Admin) logout(w http.ResponseWriter, r *http.Request) {
 	_ = a.Auth.Logout(r.Context(), r)
-	a.Auth.ClearCookie(w)
+	a.Auth.ClearCookie(w, r)
 	a.audit(r, "logout", "user", nil, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -265,12 +356,16 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		Current string `json:"current_password"`
 		New     string `json:"new_password"`
 	}
-	if err := decode(r, &in); err != nil || len(in.New) < 8 {
-		writeErr(w, http.StatusBadRequest, "new_password must be at least 8 characters")
+	if err := decode(r, &in); err != nil {
+		badBody(w, err)
+		return
+	}
+	if msg := checkNewPassword(in.New); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	u := auth.UserFrom(r.Context())
-	if !auth.CheckPassword(u.PasswordHash, in.Current) {
+	if len(in.Current) > maxLoginPasswordLen || !auth.CheckPassword(u.PasswordHash, in.Current) {
 		writeErr(w, http.StatusForbidden, "current password is wrong")
 		return
 	}
@@ -280,6 +375,12 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Store.UpdateUserPassword(r.Context(), u.ID, h); err != nil {
+		a.fail(w, err)
+		return
+	}
+	// Every other session of the account is revoked: a changed password is
+	// how users react to a suspected leak, and the leaked session must die.
+	if err := a.Store.DeleteUserSessionsExcept(r.Context(), u.ID, store.HashToken(auth.TokenFromRequest(r))); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -372,7 +473,7 @@ func (a *Admin) listConnections(w http.ResponseWriter, r *http.Request) {
 func (a *Admin) createConnection(w http.ResponseWriter, r *http.Request) {
 	var in connInput
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	if err := in.validate(r.Context(), a); err != nil {
@@ -404,7 +505,7 @@ func (a *Admin) updateConnection(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
 	var in connInput
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	if err := in.validate(r.Context(), a); err != nil {
@@ -589,7 +690,7 @@ func (a *Admin) listRAGStores(w http.ResponseWriter, r *http.Request) {
 func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
 	var in ragInput
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	if err := a.validateRAG(r, &in); err != nil {
@@ -619,7 +720,7 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
 	var in ragInput
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	if err := a.validateRAG(r, &in); err != nil {
@@ -985,7 +1086,7 @@ func (a *Admin) listProjects(w http.ResponseWriter, r *http.Request) {
 func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 	var in projectInput
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	if err := a.validateProject(r, &in); err != nil {
@@ -993,22 +1094,15 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := auth.UserFrom(r.Context())
-	p, key, err := a.Store.CreateProject(r.Context(), in.project())
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	// The creator is always a member so editors keep access to what they made.
+	// The creator is always a member so editors keep access to what they
+	// made; project and members are written in one transaction.
 	members := append([]int64{u.ID}, in.MemberUserIDs...)
-	if err := a.Store.SetProjectMembers(r.Context(), p.ID, members); err != nil {
+	p, key, err := a.Store.CreateProjectWithMembers(r.Context(), in.project(), members)
+	if err != nil {
 		if store.IsForeignKeyViolation(err) {
 			writeErr(w, http.StatusBadRequest, "member_user_ids contains an unknown user")
 			return
 		}
-		a.fail(w, err)
-		return
-	}
-	if p, err = a.Store.GetProject(r.Context(), p.ID); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -1032,7 +1126,7 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
 	var in projectInput
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	if err := a.validateProject(r, &in); err != nil {
@@ -1113,7 +1207,7 @@ func (a *Admin) setMembers(w http.ResponseWriter, r *http.Request) {
 		UserIDs []int64 `json:"user_ids"`
 	}
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	u := auth.UserFrom(r.Context())

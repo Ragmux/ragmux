@@ -84,17 +84,43 @@ func keyPrefix(k string) string {
 // CreateProject inserts a project and returns it plus the plaintext key,
 // which is never stored and cannot be retrieved later.
 func (s *Store) CreateProject(ctx context.Context, p *Project) (*Project, string, error) {
+	return s.CreateProjectWithMembers(ctx, p, nil)
+}
+
+// CreateProjectWithMembers inserts a project and its member list in one
+// transaction, so an unknown member id (foreign key violation) leaves no
+// half-created project behind.
+func (s *Store) CreateProjectWithMembers(ctx context.Context, p *Project, memberIDs []int64) (*Project, string, error) {
 	key, err := GenerateProjectKey()
 	if err != nil {
 		return nil, "", err
 	}
-	out, err := scanProject(s.pool.QueryRow(ctx, `INSERT INTO projects
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	var id int64
+	err = tx.QueryRow(ctx, `INSERT INTO projects
 		(name, model_connection_id, rag_store_id, api_key_hash, api_key_prefix, system_prompt,
 		rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING `+projCols,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt,
-		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens))
+		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens).Scan(&id)
 	if err != nil {
+		return nil, "", err
+	}
+	for _, uid := range memberIDs {
+		if _, err := tx.Exec(ctx, `INSERT INTO project_members (project_id, user_id) VALUES ($1, $2)
+			ON CONFLICT DO NOTHING`, id, uid); err != nil {
+			return nil, "", err
+		}
+	}
+	out, err := scanProject(tx.QueryRow(ctx, "SELECT "+projCols+" FROM projects WHERE id = $1", id))
+	if err != nil {
+		return nil, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, "", err
 	}
 	return out, key, nil

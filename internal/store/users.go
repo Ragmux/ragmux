@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // User is a dashboard/management account.
@@ -84,22 +87,72 @@ func (s *Store) ListUsers(ctx context.Context) ([]*User, error) {
 	return out, rows.Err()
 }
 
-// UpdateUser changes the role and active flag of an account.
+// ErrLastAdmin is returned when a change would leave no active admin.
+var ErrLastAdmin = errors.New("cannot remove the last active admin")
+
+// lockAdminChange serialises every change that can reduce the number of
+// active admins, so two concurrent demotions cannot both pass the count.
+const lockAdminChange int64 = 0x7261676d75780002
+
+// UpdateUser changes the role and active flag of an account. Removing admin
+// rights (by role or deactivation) from the last active admin fails with
+// ErrLastAdmin; the check and the update run in one transaction under an
+// advisory lock so concurrent requests cannot race past it.
 func (s *Store) UpdateUser(ctx context.Context, id int64, role string, isActive bool) (*User, error) {
-	return scanUser(s.pool.QueryRow(ctx,
-		"UPDATE users SET role = $1, is_active = $2 WHERE id = $3 RETURNING "+userCols, role, isActive, id))
+	var out *User
+	err := s.adminGuardedTx(ctx, id, func(tx pgx.Tx) error {
+		u, err := scanUser(tx.QueryRow(ctx,
+			"UPDATE users SET role = $1, is_active = $2 WHERE id = $3 RETURNING "+userCols, role, isActive, id))
+		out = u
+		return err
+	})
+	return out, err
 }
 
 // DeleteUser removes an account; its sessions and memberships cascade.
+// Deleting the last active admin fails with ErrLastAdmin.
 func (s *Store) DeleteUser(ctx context.Context, id int64) error {
-	res, err := s.pool.Exec(ctx, "DELETE FROM users WHERE id = $1", id)
+	return s.adminGuardedTx(ctx, id, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, "DELETE FROM users WHERE id = $1", id)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// adminGuardedTx runs fn in a transaction that holds the admin-change lock
+// and refuses to commit when the target was the last active admin and fn
+// left no active admin behind.
+func (s *Store) adminGuardedTx(ctx context.Context, id int64, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if res.RowsAffected() == 0 {
-		return ErrNotFound
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockAdminChange); err != nil {
+		return err
 	}
-	return nil
+	var wasAdmin bool
+	if err := tx.QueryRow(ctx, "SELECT role = 'admin' AND is_active FROM users WHERE id = $1", id).Scan(&wasAdmin); err != nil {
+		return scanErr(err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if wasAdmin {
+		var n int
+		if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active").Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrLastAdmin
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // UpdateUserPassword replaces the stored hash.
@@ -146,6 +199,13 @@ func (s *Store) DeleteSession(ctx context.Context, token string) error {
 // DeleteUserSessions revokes every session of one user.
 func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) error {
 	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", userID)
+	return err
+}
+
+// DeleteUserSessionsExcept revokes every session of one user except the one
+// with the given token hash (the session performing the change).
+func (s *Store) DeleteUserSessionsExcept(ctx context.Context, userID int64, tokenHash string) error {
+	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2", userID, tokenHash)
 	return err
 }
 

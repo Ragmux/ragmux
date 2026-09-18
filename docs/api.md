@@ -15,24 +15,40 @@ the embedded dashboard.
 
 ### Management API
 
-`POST /admin/api/login` with `{"username": "...", "password": "..."}` returns
+`POST /admin/api/login` with `{"username": "...", "password": "...", "bearer": true}`
+returns
 
 ```json
 {"token": "…", "user": {"id": 1, "username": "admin", "role": "admin", "is_active": true,
                           "last_login_at": "2026-09-18T10:00:00Z", "created_at": "…"}}
 ```
 
-and sets the `ragmux_session` cookie (`HttpOnly`, `SameSite=Lax`, `Secure` when
-`SECURE_COOKIES=true`). Every other `/admin/api` route accepts either that cookie or
-`Authorization: Bearer <token>`; the bearer header wins when both are present. Sessions
-expire after `SESSION_TTL` (default 24 h) and are revoked by `POST /admin/api/logout`,
-a password reset, a session revoke or deactivation of the account.
+and sets the `ragmux_session` cookie (`HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS or
+with `SECURE_COOKIES=true`). The `token` field is only included when the request sets
+`"bearer": true`; the dashboard omits it and relies on the cookie alone. Every other
+`/admin/api` route accepts either that cookie or `Authorization: Bearer <token>`; the
+bearer header wins when both are present. Sessions expire after `SESSION_TTL` (default
+24 h) and are revoked by `POST /admin/api/logout`, a password change (all other
+sessions of the account), a password reset, a session revoke or deactivation of the
+account.
 
 ```bash
 TOKEN=$(curl -s localhost:8080/admin/api/login -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"YOUR_PASSWORD"}' | jq -r .token)
+  -d '{"username":"admin","password":"YOUR_PASSWORD","bearer":true}' | jq -r .token)
 AUTH="Authorization: Bearer $TOKEN"
 ```
+
+Requests authenticated by the **cookie** are subject to two browser-oriented checks
+that bearer requests skip: state-changing methods (`POST`, `PUT`, `DELETE`) must come
+from the same origin (`Sec-Fetch-Site: same-origin`/`none`, or an `Origin` whose host
+equals the request `Host`; otherwise `403 {"error":{"message":"cross-site request
+rejected","type":"forbidden"}}`), and JSON bodies must be sent as
+`Content-Type: application/json` (otherwise `415`). The login request itself always
+needs the JSON content type. Scripts should use the bearer token.
+
+Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-Id`;
+unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
+and log the detail under that id.
 
 Login failures answer `401 {"error":{"message":"invalid username or password","type":"Unauthorized"}}`;
 too many failures answer `429 {"error":{"message":"too many login attempts, try again later","type":"rate_limited"}}`
@@ -81,10 +97,10 @@ All paths are relative to `/admin/api`.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| POST | `/login` | — | `{username, password}` → `{token, user}` |
+| POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` |
-| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters) → `{"ok": true}`; `403` when the current password is wrong |
+| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key` |
 
 ### Model connections
@@ -96,7 +112,7 @@ All paths are relative to `/admin/api`.
 | GET | `/models/{id}` | viewer | Read one |
 | PUT | `/models/{id}` | editor | Update; an empty `api_key` keeps the stored key |
 | DELETE | `/models/{id}` | editor | Delete → `{"ok": true}`; `409` while a project or RAG store uses it |
-| POST | `/models/{id}/test` | viewer | `{"mode": "chat"}` (default) or `{"mode": "embedding"}` |
+| POST | `/models/{id}/test` | editor | `{"mode": "chat"}` (default) or `{"mode": "embedding"}`; spends provider quota, so it is a write |
 
 Request body for create and update:
 
@@ -259,7 +275,7 @@ again.
 |---|---|---|---|
 | GET | `/users/lite` | editor | Active users as `[{id, username, role}]` (for member pickers) |
 | GET | `/users` | admin | All users |
-| POST | `/users` | admin | `{username, password, role}` → `201` user (`role` defaults to `viewer`, password 8+ characters, username ≤ 64) |
+| POST | `/users` | admin | `{username, password, role}` → `201` user (`role` defaults to `viewer`, password 8+ characters and ≤ 72 bytes, username ≤ 64) |
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
 | DELETE | `/users/{id}` | admin | Delete → `{"ok": true}` |
@@ -350,7 +366,8 @@ Status codes:
 | `413` | body larger than 4 MiB |
 | `429` | project rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly"}}` |
 | `4xx`/`5xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted) |
-| `502` | transport failure, or a provider error without a status; mid-stream failures are logged as `502` |
+| `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
+| `502` | transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
 
 ### `GET /v1/models` and `GET /v1/models/{id}`

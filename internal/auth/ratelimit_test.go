@@ -58,8 +58,10 @@ func TestLoginLimiter(t *testing.T) {
 	mustAllow("alice", "10.0.0.1", true)
 	mustAllow("carol", "10.0.0.1", true)
 
-	// Lockout: 20 failures inside 15 minutes lock the username out until the
-	// oldest failure leaves the window, regardless of the minute budget.
+	// Lockout: 20 failures inside 15 minutes from one address lock that
+	// username/address pair out until the oldest failure leaves the window,
+	// regardless of the minute budget. The same user from another address is
+	// not locked, so an attacker cannot deny a user their own login.
 	fail("dave", "10.0.0.3", 20)
 	clock = clock.Add(2 * time.Minute)
 	allowed, retry, locked, err := l.Check(ctx, "dave", "10.0.0.3")
@@ -68,6 +70,9 @@ func TestLoginLimiter(t *testing.T) {
 	}
 	if retry <= 0 || retry > 15*time.Minute {
 		t.Errorf("lockout Retry-After = %s, want within (0, 15m]", retry)
+	}
+	if allowed, _, locked, err := l.Check(ctx, "dave", "10.0.0.4"); err != nil || !allowed || locked {
+		t.Errorf("dave from another address: allowed=%v locked=%v err=%v, want allowed", allowed, locked, err)
 	}
 	clock = clock.Add(14 * time.Minute)
 	mustAllow("dave", "10.0.0.3", true)

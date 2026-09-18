@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -616,5 +617,40 @@ func TestProviderErrorMapping(t *testing.T) {
 	}
 	if ceilSeconds(1500*time.Millisecond) != 2 || ceilSeconds(0) != 0 {
 		t.Error("ceilSeconds")
+	}
+}
+
+// panicProvider blows up inside ChatStream, as a buggy adapter would.
+type panicProvider struct{}
+
+func (panicProvider) Chat(context.Context, provider.ChatRequest) (*provider.ChatResponse, error) {
+	panic("chat boom")
+}
+
+func (panicProvider) ChatStream(context.Context, provider.ChatRequest, chan<- provider.StreamChunk) error {
+	panic("stream boom")
+}
+
+func TestStreamPanicIsRecovered(t *testing.T) {
+	e := newEnv(t, nil)
+	e.gw.Providers = func(*store.ModelConnection) (provider.Provider, error) { return panicProvider{}, nil }
+	resp, out := e.chat(map[string]any{"messages": userMsg, "stream": true})
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(errorField(t, out, "message").(string), "panicked") {
+		t.Errorf("panic should become a 502: %d %v", resp.StatusCode, out)
+	}
+	if rec := e.lastLog(); rec.StatusCode != http.StatusBadGateway {
+		t.Errorf("log = %+v", rec)
+	}
+}
+
+func TestProviderFactoryErrorIsGeneric(t *testing.T) {
+	e := newEnv(t, nil)
+	e.gw.Providers = func(*store.ModelConnection) (provider.Provider, error) {
+		return nil, errors.New("dial http://internal-host:11434: secret detail")
+	}
+	resp, out := e.chat(map[string]any{"messages": userMsg})
+	msg := errorField(t, out, "message").(string)
+	if resp.StatusCode != http.StatusInternalServerError || msg != "model connection unavailable" {
+		t.Errorf("factory error leaked: %d %q", resp.StatusCode, msg)
 	}
 }
