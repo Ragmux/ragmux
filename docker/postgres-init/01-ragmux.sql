@@ -1,18 +1,22 @@
--- Least-privilege application role for the bundled Postgres service.
+-- Least-privilege application role for the Ragmux database.
 --
--- Run once per database as a superuser. The official image runs it through
--- 01-ragmux.sh on the first start of an empty data volume; against an
--- existing or external server run it by hand:
+-- Run once per database as a superuser. Both bundled layouts use this one
+-- file: the split stack (docker-compose.split.yml) runs it through
+-- 01-ragmux.sh on the first start of an empty data volume with the role's
+-- password in the psql variable "pw"; the all-in-one image
+-- (docker/aio/entrypoint.sh) runs it without "pw", because there the role
+-- logs in over the container-local unix socket with trust authentication and
+-- no password exists. Against an existing or external server run it by hand:
 --
 --   psql -v ON_ERROR_STOP=1 -v pw="$RAGMUX_DB_PASSWORD" -v db=ragmux \
 --        -U postgres -d ragmux -f docker/postgres-init/01-ragmux.sql
 --
 -- :'pw' and :"db" are psql variables; psql quotes them as a string literal
 -- and an identifier, so the password may contain any character. The
--- gateway then connects as ragmux_app (see DATABASE_URL in
--- docker-compose.yml). The role may create tables in "public" (migrations
--- and the per-dimension chunk_embeddings_<dims> tables) and nothing else:
--- no superuser, no CREATEDB, no CREATEROLE, and it cannot create extensions.
+-- gateway then connects as ragmux_app (see DATABASE_URL in the Compose
+-- files). The role may create tables in "public" (migrations and the
+-- per-dimension chunk_embeddings_<dims> tables) and nothing else: no
+-- superuser, no CREATEDB, no CREATEROLE, and it cannot create extensions.
 
 -- The extension needs a superuser; the gateway only checks that it exists.
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
@@ -25,8 +29,12 @@ BEGIN
 END
 $$;
 
-ALTER ROLE ragmux_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
-    PASSWORD :'pw';
+ALTER ROLE ragmux_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+-- The password is only set when the caller passed one (-v pw=...); the
+-- all-in-one image authenticates over the unix socket and skips it.
+\if :{?pw}
+ALTER ROLE ragmux_app WITH PASSWORD :'pw';
+\endif
 ALTER ROLE ragmux_app SET search_path = public;
 
 GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO ragmux_app;

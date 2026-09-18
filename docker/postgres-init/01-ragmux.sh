@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# First-start hook of the bundled Postgres service (docker-compose.yml mounts
+# First-start hook of the split stack's Postgres service (docker-compose.split.yml mounts
 # it into /docker-entrypoint-initdb.d, the official image runs it once on an
 # empty data volume as the superuser POSTGRES_USER). It creates the vector
 # extension and the least-privilege role ragmux_app the gateway connects as.

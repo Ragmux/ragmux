@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+#
+# All-in-one image: the ragmux gateway and a PostgreSQL 17 + pgvector server in
+# one container, supervised by docker/aio/entrypoint.sh. The gateway alone (a
+# distroless image for use with an external database) is built by ./Dockerfile.
+
+# ---- build stage -----------------------------------------------------------
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+ARG VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+    -o /out/ragmux ./cmd/ragmux
+
+# ---- runtime stage ---------------------------------------------------------
+# pg17: Debian bookworm with PostgreSQL 17 and pgvector; resolve a new digest
+# with `docker buildx imagetools inspect pgvector/pgvector:pg17`.
+FROM pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+
+# Unprivileged system user the gateway runs as; postgres (uid 999) comes with
+# the base image. The entrypoint starts as root, prepares /data and drops
+# privileges with gosu for both processes.
+RUN groupadd --system ragmux && useradd --system --gid ragmux --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin ragmux \
+    && mkdir -p /data/pg /data/ragmux /var/run/postgresql \
+    && chown postgres:postgres /data/pg /var/run/postgresql \
+    && chown ragmux:ragmux /data/ragmux \
+    && chmod 700 /data/pg /data/ragmux
+
+COPY --from=build /out/ragmux /usr/local/bin/ragmux
+COPY docker/postgres-init/01-ragmux.sql /usr/local/share/ragmux/init.sql
+COPY docker/aio/entrypoint.sh /usr/local/bin/ragmux-aio
+RUN chmod 0755 /usr/local/bin/ragmux-aio /usr/local/bin/ragmux
+
+ENV PGDATA=/data/pg \
+    DATA_DIR=/data/ragmux \
+    PORT=8765 \
+    PG_SHARED_BUFFERS=128MB
+
+# Everything persistent lives under /data: /data/pg (PGDATA) and /data/ragmux
+# (the secret.key fallback). PostgreSQL only listens on a unix socket inside
+# the container, so 8765 is the only port.
+VOLUME ["/data"]
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["/usr/local/bin/ragmux", "-healthcheck"]
+
+# The base image's ENTRYPOINT/CMD (docker-entrypoint.sh postgres) are replaced.
+ENTRYPOINT ["/usr/local/bin/ragmux-aio"]
+CMD []
