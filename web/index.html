@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Ragmux Gateway</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <style>
 /* Self-hosted fonts (SIL OFL, see fonts/OFL-*.txt). Latin + latin-ext subsets. */
 @font-face{font-family:"Bricolage Grotesque";font-style:normal;font-weight:600 700;font-display:swap;src:url(fonts/bricolage-grotesque-latin.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
@@ -44,7 +45,7 @@ button{cursor:pointer}
 .side{width:236px;flex:none;display:flex;flex-direction:column;background:#0a0d13;border-right:1px solid var(--line);position:sticky;top:0;height:100vh;z-index:3}
 .side::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 260px at 20% -10%,rgba(242,182,50,.16),transparent 70%);pointer-events:none}
 .brand{display:flex;align-items:center;gap:12px;padding:24px 20px 18px;position:relative}
-.mark{width:38px;height:38px;flex:none;border-radius:11px;background:var(--amber);color:var(--amber-ink);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 24px rgba(242,182,50,.28)}
+.mark{width:38px;height:38px;flex:none;border-radius:11px;background:#0b0c0e;color:#e2543a;border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 24px rgba(226,84,58,.22)}
 .brand-name{font-family:var(--disp);font-size:20px;font-weight:700;letter-spacing:-.02em;line-height:1}
 .brand-sub{font-size:11px;color:var(--tx3);margin-top:4px;font-family:var(--mono)}
 .nav{display:flex;flex-direction:column;gap:4px;padding:8px 12px;position:relative}
@@ -262,7 +263,7 @@ td.json{font-family:var(--mono);font-size:11.5px;color:var(--tx2);max-width:360p
 <div id="auth" class="auth hidden"></div>
 <div id="shell" class="shell hidden">
   <aside class="side">
-    <div class="brand"><div class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18V7l4 5 4-5v11"/><path d="M15 18V6l5 4-5 4"/></svg></div><div><div class="brand-name">Ragmux</div><div class="brand-sub" id="brandSub">gateway</div></div></div>
+    <div class="brand"><div class="mark" aria-hidden="true"><svg viewBox="0 0 120 96" width="22" height="18" fill="currentColor"><path d="M26 19h12l2 77H24Z"/><path d="M82 19h12l2 77H80Z"/><rect x="16" y="31" width="88" height="8"/><rect x="55.5" y="19" width="9" height="12"/><path d="M2 10h116l-6 9H8Z"/></svg></div><div><div class="brand-name">Ragmux</div><div class="brand-sub" id="brandSub">gateway</div></div></div>
     <nav class="nav" id="nav" aria-label="Main">
       <div class="nav-label">Operate</div>
       <button class="nav-item" data-tab="overview" title="Overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span class="nav-text">Overview</span></button>
@@ -518,7 +519,7 @@ $('#btnPassword').onclick = () => {
 // ---------------------------------------------------------------------------
 const heroHtml = () => `<section class="auth-hero"><div class="glow"></div>
   <svg class="deco" viewBox="0 0 640 900" preserveAspectRatio="xMidYMid slice" fill="none" aria-hidden="true"><g stroke="#232b39" stroke-width="1"><path d="M0 150H640M0 300H640M0 450H640M0 600H640M0 750H640"/><path d="M160 0V900M320 0V900M480 0V900"/></g><g stroke="#f2b632" stroke-width="1.5" opacity=".9"><path d="M80 640 C 200 560, 260 700, 380 520 S 560 400, 600 300"/></g><g fill="#f2b632"><circle cx="80" cy="640" r="4"/><circle cx="380" cy="520" r="4"/><circle cx="600" cy="300" r="5"/></g><g fill="#3fd0a4" opacity=".8"><circle cx="220" cy="240" r="3"/><circle cx="470" cy="180" r="3"/><circle cx="300" cy="820" r="3"/></g></svg>
-  <div class="brand" style="padding:0"><div class="mark" style="width:44px;height:44px" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18V7l4 5 4-5v11"/><path d="M15 18V6l5 4-5 4"/></svg></div><div><div class="brand-name" style="font-size:24px">Ragmux</div><div class="brand-sub">self-hosted AI gateway</div></div></div>
+  <div class="brand" style="padding:0"><div class="mark" style="width:44px;height:44px" aria-hidden="true"><svg viewBox="0 0 120 96" width="22" height="18" fill="currentColor"><path d="M26 19h12l2 77H24Z"/><path d="M82 19h12l2 77H80Z"/><rect x="16" y="31" width="88" height="8"/><rect x="55.5" y="19" width="9" height="12"/><path d="M2 10h116l-6 9H8Z"/></svg></div><div><div class="brand-name" style="font-size:24px">Ragmux</div><div class="brand-sub">self-hosted AI gateway</div></div></div>
   <div class="stack" style="gap:18px;max-width:460px"><h1>One endpoint.<br>Every model.<br>Your documents.</h1>
     <p class="lede" style="font-size:15px">OpenAI-compatible proxy over OpenAI, Anthropic, Gemini, DeepSeek and Ollama, with hybrid RAG, per-project keys and budgets, on your own PostgreSQL.</p>
     <div class="row wrap" style="gap:8px"><span class="pill">AGPL-3.0</span><span class="pill" id="heroVersion">${state.system && state.system.version ? 'v' + esc(state.system.version) : 'gateway'}</span><span class="pill">pgvector</span><span class="pill">AES-GCM sealed keys</span></div></div>
