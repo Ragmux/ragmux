@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +44,10 @@ type Config struct {
 	// LoginLockoutFailures failures within LoginLockoutMinutes lock a username out.
 	LoginLockoutFailures int
 	LoginLockoutMinutes  int
+	// TrustedProxyCIDRs limits TrustProxyHeaders to connections from these
+	// networks. Empty means every peer is trusted, which is only safe when the
+	// gateway cannot be reached without going through the proxy.
+	TrustedProxyCIDRs []*net.IPNet
 	// TrustProxyHeaders enables X-Forwarded-For / X-Real-IP as the client
 	// address for login limits and audit entries.
 	TrustProxyHeaders bool
@@ -53,10 +59,18 @@ type Config struct {
 
 // Load reads configuration from the environment, applying defaults.
 func Load() (Config, error) {
+	dbURL, err := envOrFile("DATABASE_URL")
+	if err != nil {
+		return Config{}, err
+	}
+	secretKey, err := envOrFile("SECRET_KEY")
+	if err != nil {
+		return Config{}, err
+	}
 	c := Config{
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		DatabaseURL:     dbURL,
 		DBMaxConns:      10,
-		SecretKeyHex:    strings.TrimSpace(os.Getenv("SECRET_KEY")),
+		SecretKeyHex:    secretKey,
 		DataDir:         env("DATA_DIR", "/app/data"),
 		Port:            8080,
 		AdminUser:       env("ADMIN_USER", "admin"),
@@ -76,7 +90,7 @@ func Load() (Config, error) {
 		AuditRetentionDays: 365,
 	}
 	if c.DatabaseURL == "" {
-		return c, errors.New("DATABASE_URL is required (e.g. postgres://user:pass@host:5432/ragmux?sslmode=disable)")
+		return c, errors.New("DATABASE_URL (or DATABASE_URL_FILE) is required (e.g. postgres://user:pass@host:5432/ragmux?sslmode=disable)")
 	}
 	if c.SecretKeyHex != "" {
 		key, err := hex.DecodeString(c.SecretKeyHex)
@@ -151,7 +165,45 @@ func Load() (Config, error) {
 			*v.dst = n
 		}
 	}
+	if v := os.Getenv("TRUSTED_PROXY_CIDRS"); v != "" {
+		for _, raw := range strings.Split(v, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			if !strings.Contains(raw, "/") {
+				if strings.Contains(raw, ":") {
+					raw += "/128"
+				} else {
+					raw += "/32"
+				}
+			}
+			_, n, err := net.ParseCIDR(raw)
+			if err != nil {
+				return c, fmt.Errorf("invalid TRUSTED_PROXY_CIDRS entry %q", raw)
+			}
+			c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, n)
+		}
+	}
 	return c, nil
+}
+
+// envOrFile returns the trimmed value of NAME, or the trimmed content of the
+// file named by NAME_FILE when NAME is unset (the Docker/Compose secrets
+// convention).
+func envOrFile(name string) (string, error) {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v, nil
+	}
+	path := os.Getenv(name + "_FILE")
+	if path == "" {
+		return "", nil
+	}
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return "", fmt.Errorf("read %s_FILE: %w", name, err)
+	}
+	return strings.TrimSpace(string(raw)), nil
 }
 
 // PortFromEnv reads PORT (default 8080). It is separate from Load so the
