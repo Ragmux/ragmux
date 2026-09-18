@@ -385,7 +385,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(6) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(7) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
