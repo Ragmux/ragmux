@@ -1,7 +1,12 @@
+# Default deployment: one container with the gateway and its PostgreSQL 17 +
+# pgvector server (Dockerfile.aio). All state lives in the ragmux-data volume.
+# For a separate or external database use docker-compose.split.yml instead;
+# see docs/configuration.md#deployment-layouts.
 services:
   ragmux:
     build:
       context: .
+      dockerfile: Dockerfile.aio
       args:
         VERSION: ${VERSION:-dev}
     image: ragmux/ragmux:latest
@@ -16,14 +21,17 @@ services:
       - path: .env
         required: false
     environment:
-      # The gateway connects as the least-privilege role ragmux_app that
-      # docker/postgres-init creates on the first start; POSTGRES_PASSWORD
-      # (the superuser) is only used by that init step, backups and restores.
-      DATABASE_URL: postgres://ragmux_app:${RAGMUX_DB_PASSWORD:?Set RAGMUX_DB_PASSWORD in .env}@postgres:5432/ragmux?sslmode=disable
-      # Generate once with: openssl rand -hex 32. Keep it: it decrypts the
-      # provider credentials stored in Postgres.
-      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (openssl rand -hex 32)}
+      # Nothing is required. SECRET_KEY (openssl rand -hex 32) is recommended:
+      # without it the gateway generates /data/ragmux/secret.key inside the
+      # volume, which then has to be backed up together with the database.
+      SECRET_KEY: ${SECRET_KEY:-}
       PORT: "8765"
+      # Set DATABASE_URL to use your own PostgreSQL; the embedded server is
+      # then not started (EMBEDDED_POSTGRES=false does the same explicitly).
+      DATABASE_URL: ${DATABASE_URL:-}
+      EMBEDDED_POSTGRES: ${EMBEDDED_POSTGRES:-}
+      PG_SHARED_BUFFERS: ${PG_SHARED_BUFFERS:-128MB}
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-10}
       # Passed through from the shell or .env; empty values fall back to defaults.
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -41,45 +49,23 @@ services:
       # or allowed wholesale.
       PRIVATE_UPSTREAM_ALLOWLIST: ${PRIVATE_UPSTREAM_ALLOWLIST:-}
       ALLOW_PRIVATE_UPSTREAMS: ${ALLOW_PRIVATE_UPSTREAMS:-false}
-    depends_on:
-      postgres:
-        condition: service_healthy
+    volumes:
+      # /data/pg is the PostgreSQL cluster, /data/ragmux the secret.key
+      # fallback. This volume plus SECRET_KEY is the whole state.
+      - ragmux-data:/data
+      # The Postgres unix socket, shared with the backup profile only.
+      - ragmux-pgsocket:/var/run/postgresql
     healthcheck:
-      test: ["CMD", "/app/ragmux", "-healthcheck"]
+      test: ["CMD", "/usr/local/bin/ragmux", "-healthcheck"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      start_period: 30s
       retries: 3
 
-  postgres:
-    image: pgvector/pgvector:pg17
-    container_name: ragmux-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ragmux
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: ragmux
-      # Password of the ragmux_app role created by docker/postgres-init on
-      # the first start (empty data volume only). Use a hex value: it is
-      # interpolated into DATABASE_URL above, so URL-reserved characters
-      # (@ / : ? # %) and "$" would break the connection string.
-      RAGMUX_DB_PASSWORD: ${RAGMUX_DB_PASSWORD:?Set RAGMUX_DB_PASSWORD in .env}
-    volumes:
-      # All persistent state (models, projects, documents, vectors, metrics).
-      - pgdata:/var/lib/postgresql/data
-      # First-start init: vector extension + ragmux_app role. The .sql is
-      # mounted outside initdb.d so the entrypoint runs it only through the
-      # wrapper, which passes the password as a psql variable.
-      - ./docker/postgres-init/01-ragmux.sh:/docker-entrypoint-initdb.d/01-ragmux.sh:ro
-      - ./docker/postgres-init/01-ragmux.sql:/ragmux-init/01-ragmux.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ragmux -d ragmux"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-
   # Optional scheduled logical backups (pg_dump) into ./backups. Start with
-  # `docker compose --profile backup up -d`; see docs/backup-restore.md.
+  # `docker compose --profile backup up -d`; see docs/backup-restore.md. It
+  # reaches the embedded server over the shared unix socket (trust
+  # authentication, so POSTGRES_PASSWORD is a placeholder the image insists on).
   backup:
     image: prodrigestivill/postgres-backup-local:17
     container_name: ragmux-backup
@@ -87,10 +73,10 @@ services:
     profiles: ["backup"]
     user: postgres:postgres
     environment:
-      POSTGRES_HOST: postgres
+      POSTGRES_HOST: /var/run/postgresql
       POSTGRES_DB: ragmux
-      POSTGRES_USER: ragmux
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: unused-socket-trust
       SCHEDULE: ${BACKUP_SCHEDULE:-@daily}
       BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
       BACKUP_KEEP_WEEKS: ${BACKUP_KEEP_WEEKS:-4}
@@ -98,9 +84,11 @@ services:
       HEALTHCHECK_PORT: "8081"
     volumes:
       - ./backups:/backups
+      - ragmux-pgsocket:/var/run/postgresql
     depends_on:
-      postgres:
+      ragmux:
         condition: service_healthy
 
 volumes:
-  pgdata:
+  ragmux-data:
+  ragmux-pgsocket:

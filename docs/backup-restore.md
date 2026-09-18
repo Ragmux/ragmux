@@ -9,10 +9,13 @@ and how to rehearse a disaster.
 
 | Where | What |
 |---|---|
-| PostgreSQL (`pgdata` volume in Compose) | users and sessions, model connections (provider API keys, AES-256-GCM encrypted), RAG stores, documents (the uploaded files as `bytea`), chunks, one `chunk_embeddings_<dims>` table per embedding width (HNSW vector indexes), projects and their hashed `sk-proj-…` keys, request logs, usage counters, login attempts, audit log, `schema_migrations` |
+| PostgreSQL (`ragmux-data` volume, `/data/pg`, with the default all-in-one file; `pgdata` volume with `docker-compose.split.yml`) | users and sessions, model connections (provider API keys, AES-256-GCM encrypted), RAG stores, documents (the uploaded files as `bytea`), chunks, one `chunk_embeddings_<dims>` table per embedding width (HNSW vector indexes), projects and their hashed `sk-proj-…` keys, request logs, usage counters, login attempts, audit log, `schema_migrations` |
 | `SECRET_KEY` | the 32-byte key (64 hex characters) that decrypts the provider API keys stored in the database |
+| `/data/ragmux/secret.key` (all-in-one, only when `SECRET_KEY` is unset) | the generated fallback key; it lives in the same volume as the database, so a volume backup covers it, a `pg_dump` does not |
 
-The gateway container itself is stateless: it can be deleted and recreated at any time.
+With the split layout the gateway container itself is stateless: it can be deleted and
+recreated at any time. With the all-in-one layout the container is disposable too, as
+long as the `ragmux-data` volume stays.
 
 **Without `SECRET_KEY` a restored database is still usable** — users, projects, documents
 and vectors all come back — but every model connection fails with
@@ -40,10 +43,19 @@ overview. `ragmux -version` prints the binary version.
 ## Logical backups with pg_dump
 
 The recommended format is `pg_dump -Fc` (custom format): compressed, verifiable with
-`pg_restore --list`, and restorable selectively. With the bundled Compose stack:
+`pg_restore --list`, and restorable selectively. By hand, with the default all-in-one
+container (Postgres is reached over the container-local unix socket as `postgres`):
 
 ```bash
-docker compose exec -T postgres pg_dump -Fc --no-owner --no-privileges -U ragmux -d ragmux \
+docker compose exec -T -u postgres ragmux pg_dump -Fc --no-owner --no-privileges -d ragmux \
+  > backups/ragmux-$(date +%Y%m%d-%H%M%S).dump
+```
+
+and with the split stack:
+
+```bash
+docker compose -f docker-compose.split.yml exec -T postgres \
+  pg_dump -Fc --no-owner --no-privileges -U ragmux -d ragmux \
   > backups/ragmux-$(date +%Y%m%d-%H%M%S).dump
 ```
 
@@ -58,7 +70,8 @@ Notes:
   running. Documents that are being ingested at that moment are restored in their
   `pending`/`processing` state and the gateway resumes them after restart.
 - Use the same major version of `pg_dump`/`pg_restore` as the server (17). Running the
-  tools *inside* the `postgres` container guarantees that.
+  tools *inside* the container that holds Postgres (`ragmux` in the all-in-one layout,
+  `postgres` in the split one) guarantees that.
 
 ## Scripts
 
@@ -74,10 +87,16 @@ private header file, so neither shows up in `ps` or shell history).
 1. If `DATABASE_URL` is set **and** `pg_dump`/`pg_restore` are on `PATH`, the scripts use
    the local tools against that URL (external or managed Postgres, or the binary
    without Compose).
-2. Otherwise they run `docker compose exec -T <POSTGRES_SERVICE> …`. Run them from the
-   directory holding `docker-compose.yml`, or set `COMPOSE_FILE`. The Compose project
-   is chosen the usual way: `-p NAME`, `COMPOSE_PROJECT` or the standard
-   `COMPOSE_PROJECT_NAME` environment variable, which `docker compose` honours by itself.
+2. Otherwise they use `docker compose`. Run them from the directory holding
+   `docker-compose.yml`, or set `COMPOSE_FILE` (`COMPOSE_FILE=docker-compose.split.yml`
+   for the split stack). The Compose project is chosen the usual way: `-p NAME`,
+   `COMPOSE_PROJECT` or the standard `COMPOSE_PROJECT_NAME` environment variable, which
+   `docker compose` honours by itself. The layout is detected from the project
+   (`LAYOUT=auto`): when it has a `<POSTGRES_SERVICE>` service (`postgres`) the scripts
+   run `docker compose exec -T postgres …` as before (*split*); otherwise they treat the
+   `<RAGMUX_SERVICE>` container (`ragmux`) as the all-in-one image and run the tools
+   inside it as the `postgres` user over the unix socket (*aio*). `LAYOUT=split|aio`
+   overrides the detection.
 
 ### `scripts/backup.sh`
 
@@ -91,8 +110,10 @@ make backup                             # same as scripts/backup.sh
 |---|---|---|
 | `BACKUP_DIR` | `./backups` | output directory (created with mode `700` if missing) |
 | `KEEP_DAYS` | `14` | delete `ragmux-*.dump` / `.key` files older than N days; `0` keeps everything |
-| `POSTGRES_SERVICE` | `postgres` | Compose service that runs Postgres |
-| `POSTGRES_DB`, `POSTGRES_USER` | `ragmux` | database and role |
+| `LAYOUT` | `auto` | `split` or `aio` to skip the detection described above |
+| `POSTGRES_SERVICE`, `RAGMUX_SERVICE` | `postgres`, `ragmux` | Compose service that runs Postgres (split) / the all-in-one container |
+| `POSTGRES_DB` | `ragmux` | database |
+| `POSTGRES_USER` | `ragmux` (split), `postgres` (aio) | superuser the dump runs as |
 | `DATABASE_URL` | unset | use local `pg_dump` against this URL instead of Compose |
 | `INCLUDE_SECRET_KEY` | `0` | `1` writes `SECRET_KEY` (from the environment, else from `.env`) to `SECRET_KEY_DIR/<name>.key` with mode `600` |
 | `SECRET_KEY_DIR` | `BACKUP_DIR` | where the `.key` file goes. **Keep it apart from the dumps**: a dump and its key on the same disk let anyone who reads that disk decrypt every provider credential. The script warns when both land in the same directory |
@@ -118,8 +139,10 @@ make restore FILE=backups/ragmux-20260918-153455.dump YES=1
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `LAYOUT` | `auto` | `split` or `aio` to skip the layout detection |
 | `POSTGRES_SERVICE`, `RAGMUX_SERVICE` | `postgres`, `ragmux` | Compose services |
-| `POSTGRES_DB`, `POSTGRES_USER` | `ragmux` | database and role |
+| `POSTGRES_DB` | `ragmux` | database |
+| `POSTGRES_USER` | `ragmux` (split), `postgres` (aio) | superuser the restore runs as |
 | `DATABASE_URL` | unset | use local `pg_restore` against this URL instead of Compose |
 | `STOP_CMD`, `START_CMD` | unset | in `DATABASE_URL` mode: shell commands run before and after the restore (e.g. `systemctl stop ragmux`) |
 | `APP_ROLE` | `ragmux_app` | role that receives ownership of the restored tables (step 4) |
@@ -129,16 +152,38 @@ make restore FILE=backups/ragmux-20260918-153455.dump YES=1
 
 Steps, in order:
 
-1. Verify the file with `pg_restore --list`.
+1. Verify the file with `pg_restore --list` (in the all-in-one layout through a
+   throwaway `docker compose run --rm --entrypoint pg_restore ragmux --list`, before
+   anything is stopped).
 2. Stop the gateway (`docker compose stop ragmux`; in `DATABASE_URL` mode run `STOP_CMD`
    or warn). This matters: `--clean` drops tables and blocks on open connections.
-3. `pg_restore --clean --if-exists --no-owner --no-privileges -d ragmux`. Every object
-   in the dump is dropped and recreated, so the target does not need to be empty.
+   **All-in-one:** stopping the `ragmux` service stops the embedded Postgres too, so
+   the script then starts a one-off container on the same volume that runs Postgres
+   alone: `docker compose run -d --rm --no-deps ragmux postgres-only`, and waits for
+   `pg_isready` inside it (up to 90 s).
+3. `pg_restore --clean --if-exists --no-owner --no-privileges -d ragmux`, through
+   `docker compose exec -T postgres` (split) or `docker exec -i -u postgres <one-off>`
+   (aio). Every object in the dump is dropped and recreated, so the target does not
+   need to be empty.
 4. Hand the restored tables to the application role (`APP_ROLE`, default `ragmux_app`),
    see *Ownership* below.
 5. Start the gateway (`docker compose up -d ragmux`; `START_CMD` in direct mode).
-   Migrations run at startup.
+   All-in-one: the one-off container is stopped first (`docker stop`, a clean
+   `pg_ctl stop -m fast`), then the normal service comes up. Migrations run at startup.
 6. Poll `/healthz` and, if admin credentials are set, print the system info.
+
+When the restore fails the gateway is left stopped (and, all-in-one, the one-off
+container is stopped as well) so you can investigate before migrations run on a
+half-restored schema. Done by hand, the all-in-one sequence is:
+
+```bash
+docker compose stop ragmux
+cid=$(docker compose run -d --rm --no-deps ragmux postgres-only)
+until docker exec -u postgres "$cid" pg_isready -q; do sleep 1; done
+docker exec -i -u postgres "$cid" pg_restore --clean --if-exists --no-owner --no-privileges -d ragmux < <dump>
+docker stop "$cid"          # clean Postgres shutdown; the container removes itself
+docker compose up -d ragmux # the entrypoint re-runs 01-ragmux.sql: tables handed to ragmux_app
+```
 
 **Ownership.** `pg_restore` runs as the superuser (`POSTGRES_USER`) with `--no-owner`,
 so every restored table belongs to the superuser, while the gateway connects as the
@@ -149,10 +194,12 @@ the script changes the owner of every table and sequence in `public` to `APP_ROL
 the role does not exist (a deployment that still uses the superuser `DATABASE_URL`), and
 in `DATABASE_URL` mode it needs `psql` on `PATH` (otherwise a warning tells you to run it
 by hand: `ALTER TABLE ... OWNER TO ragmux_app` for each table, or simply re-run
-`docker/postgres-init/01-ragmux.sql`, whose last block does the same).
+`docker/postgres-init/01-ragmux.sql`, whose last block does the same). The all-in-one
+entrypoint runs that SQL on every start anyway, so a restore done by hand there is
+fixed up by the next `docker compose up -d`.
 
 **Extension errors.** The dump contains `DROP EXTENSION IF EXISTS vector` and
-`CREATE EXTENSION vector`. On the bundled Postgres the restore runs as the superuser,
+`CREATE EXTENSION vector`. On the bundled Postgres (either layout) the restore runs as the superuser,
 so both succeed silently. On servers where the extension was created by a superuser and
 the restore runs as a plain role (managed Postgres, shared clusters) the drop fails and
 the create then reports `extension "vector" already exists`. `pg_restore` marks any failed statement with a
@@ -168,13 +215,18 @@ drop it by hand if you want a tidy schema.
 
 ## Scheduled backups (Compose profile)
 
-`docker-compose.yml` ships a `backup` service under the `backup` profile that runs
+Both Compose files ship a `backup` service under the `backup` profile that runs
 [`prodrigestivill/postgres-backup-local:17`](https://github.com/prodrigestivill/docker-postgres-backup-local):
 
 ```bash
-docker compose --profile backup up -d          # starts ragmux, postgres and backup
+docker compose --profile backup up -d          # starts ragmux (and postgres) plus backup
 docker compose --profile backup exec backup /backup.sh   # trigger a run right now
 ```
+
+With the default all-in-one file the backup container reaches the embedded Postgres
+over the unix socket shared through the `ragmux-pgsocket` volume (`POSTGRES_HOST=/var/run/postgresql`,
+user `postgres`, trust authentication; the `POSTGRES_PASSWORD` the image insists on is a
+placeholder). With the split file it connects over TCP with `POSTGRES_PASSWORD`.
 
 It dumps `ragmux` on `SCHEDULE` (default `@daily`, cron syntax accepted) into
 `./backups/{last,daily,weekly,monthly}/ragmux-<stamp>.sql.gz` and keeps
@@ -183,19 +235,31 @@ these and `BACKUP_SCHEDULE` in `.env`. The image's own healthcheck listens on 80
 inside the container (not published).
 
 These files are **plain SQL, gzip-compressed**, not the custom format `restore.sh`
-expects. Restore one with `psql` after stopping the gateway:
+expects. Restore one with `psql` after stopping the gateway; split stack:
+
+```bash
+docker compose -f docker-compose.split.yml stop ragmux
+gunzip -c backups/daily/ragmux-20260918.sql.gz \
+  | docker compose -f docker-compose.split.yml exec -T postgres psql -v ON_ERROR_STOP=0 -U ragmux -d ragmux
+docker compose -f docker-compose.split.yml up -d ragmux
+```
+
+All-in-one (a one-off Postgres on the volume, as `restore.sh` does it):
 
 ```bash
 docker compose stop ragmux
+cid=$(docker compose run -d --rm --no-deps ragmux postgres-only)
+until docker exec -u postgres "$cid" pg_isready -q; do sleep 1; done
 gunzip -c backups/daily/ragmux-20260918.sql.gz \
-  | docker compose exec -T postgres psql -v ON_ERROR_STOP=0 -U ragmux -d ragmux
+  | docker exec -i -u postgres "$cid" psql -v ON_ERROR_STOP=0 -d ragmux
+docker stop "$cid"
 docker compose up -d ragmux
 ```
 
 The scheduled dumps use `CREATE EXTENSION IF NOT EXISTS`, but they do not `DROP` existing
 tables, so restore them into an empty database (`docker compose down -v` first, or a
 fresh `CREATE DATABASE`). Point the `backups` directory (or an rsync/object-storage job
-reading it) at storage that is not on the same disk as `pgdata`.
+reading it) at storage that is not on the same disk as the database volume.
 
 ## Physical backups and point-in-time recovery
 
@@ -218,15 +282,19 @@ outside the provider. Enable the `vector` extension on the target before restori
 ## Restore runbook
 
 Prerequisites: a dump, the matching `SECRET_KEY`, the Ragmux image version you intend
-to run, and a Postgres 17 with pgvector.
+to run, and a Postgres 17 with pgvector (the all-in-one image brings its own).
 
 1. **Stop the gateway** so nothing writes during the restore:
-   `docker compose stop ragmux`.
+   `docker compose stop ragmux` (all-in-one: this stops the embedded Postgres too;
+   `restore.sh` brings a Postgres-only container up for the restore).
 2. **Restore**: `scripts/restore.sh --yes <dump>` (it stops and starts the gateway for
-   you), or by hand
+   you in either layout), or by hand as shown under
+   [`scripts/restore.sh`](#scriptsrestoresh): split stack
    `docker compose exec -T postgres pg_restore --clean --if-exists --no-owner --no-privileges -U ragmux -d ragmux < <dump>`
    followed by the ownership hand-over the script performs (re-running
-   `docker/postgres-init/01-ragmux.sql` as in [Database privileges](configuration.md#database-privileges) does it).
+   `docker/postgres-init/01-ragmux.sql` as in [Database privileges](configuration.md#database-privileges) does it);
+   all-in-one, the `postgres-only` sequence, after which the entrypoint's own start
+   does the hand-over.
 3. **Start** with the right `SECRET_KEY` in `.env`: `docker compose up -d ragmux`.
    Migrations run automatically under an advisory lock.
    - Restoring an **older dump into a newer Ragmux** is supported: `schema_migrations`
@@ -251,7 +319,8 @@ Rehearse on a scratch project at least quarterly and before every major upgrade:
 
 - [ ] `scripts/backup.sh` on production (or fetch the latest scheduled dump).
 - [ ] On a clean machine or with a different Compose project name
-      (`COMPOSE_PROJECT_NAME=ragmux-drill`, different `ports:`), `docker compose up -d`.
+      (`COMPOSE_PROJECT_NAME=ragmux-drill`, different `ports:`), `docker compose up -d`
+      (a fresh `ragmux-data` volume; the dump may come from either layout).
 - [ ] `scripts/restore.sh --yes <dump>` with the production `SECRET_KEY`.
 - [ ] Run the verification checklist above; record how long the restore took (your RTO).
 - [ ] Restore once **without** the key to see the decryption error, so the team knows
@@ -274,6 +343,29 @@ Rules of thumb:
 - Alert when the newest dump is older than twice the schedule.
 - Keep dumps from before a `SECRET_KEY` rotation together with the old key.
 
+## Moving between layouts
+
+The all-in-one volume (`ragmux-data`, `/data/pg`) and the split stack's `pgdata` volume
+have different names and directory structures, and nothing converts one into the other:
+moving between the layouts (including from the 0.3.0 two-container `docker-compose.yml`
+to the default single-container one) is a dump and a restore.
+
+1. Take a dump on the old layout: `scripts/backup.sh` (it detects the layout; add
+   `-f docker-compose.split.yml` / `COMPOSE_FILE` when the split file is the old one).
+2. Stop the old stack: `docker compose [-f docker-compose.split.yml] down` (keep the
+   volume until the new layout is verified).
+3. Start the new layout on a fresh volume with the **same `SECRET_KEY`** in `.env`:
+   `docker compose [-f docker-compose.split.yml] up -d` (the split file also needs
+   `POSTGRES_PASSWORD` and `RAGMUX_DB_PASSWORD`).
+4. `scripts/restore.sh --yes <dump>`, then the verification checklist above.
+5. Once verified, remove the old volume (`docker volume rm <project>_pgdata` or
+   `<project>_ragmux-data`).
+
+A deployment that used the secret.key fallback (all-in-one without `SECRET_KEY`) must
+copy `/data/ragmux/secret.key` out of the volume first
+(`docker compose cp ragmux:/data/ragmux/secret.key ./secret.key`) and set its content as
+`SECRET_KEY` on the new layout.
+
 ## Rotating SECRET_KEY
 
 Rotate the key when it may have leaked, when someone who knew it leaves, or on a
@@ -292,6 +384,10 @@ the number of rows changed. It needs the **current** key in the environment
    docker compose run --rm ragmux rotate-key --new "$NEW_KEY"
    # rotate-key: re-encrypted 3 model connection(s); start the gateway with the new SECRET_KEY
    ```
+
+   In the all-in-one layout that one-off container starts the embedded Postgres on
+   the volume for the duration of the command and shuts it down cleanly afterwards
+   (the stopped service must not be running at the same time, hence step 2).
 
    With the binary: `SECRET_KEY=<old> DATABASE_URL=… ragmux rotate-key --new "$NEW_KEY"`.
 4. Put the new key into `.env` (or the secret file) and start the gateway:

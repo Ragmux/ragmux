@@ -39,7 +39,8 @@ In scope:
 - the gateway binary (`/v1` client API, `/admin` management API, background jobs)
 - the embedded dashboard (`web/index.html`)
 - the scripts in `scripts/` (backup, restore, dev helpers)
-- the published Docker image, `Dockerfile` and `docker-compose.yml`
+- the published Docker images (all-in-one and `-app`), `Dockerfile`, `Dockerfile.aio`,
+  `docker/aio/entrypoint.sh`, `docker-compose.yml` and `docker-compose.split.yml`
 
 Out of scope:
 
@@ -73,12 +74,41 @@ cosign verify ghcr.io/ragmux/ragmux:<tag> \
 
 A successful run prints the signature payload and the certificate's identity, which must
 be `release.yml` in this repository running for a `v*` tag; anything else means the image
-did not come from our release pipeline. The signature is attached to the manifest digest,
-so it also covers the `:<major>.<minor>` and `:latest` tags that point at the same
-release. Pinning deployments to the digest reported by `cosign verify` (or by
+did not come from our release pipeline. Both images are signed the same way: the
+all-in-one image under `:<version>` / `:latest` and the gateway-only image under
+`:<version>-app` / `:latest-app`. The signature is attached to the manifest digest,
+so it also covers the `:<major>.<minor>` and `:latest` (`-app`) tags that point at the
+same release. Pinning deployments to the digest reported by `cosign verify` (or by
 `docker buildx imagetools inspect`) protects against a tag being moved later. The same
 check works for `docker.io/ragmux/ragmux` when the Docker Hub mirror is published.
 Releases before 0.3.1 carry no signature.
+
+## The all-in-one image
+
+The default image (`ghcr.io/ragmux/ragmux:<version>`) bundles PostgreSQL 17 with
+pgvector next to the gateway on a Debian base (`pgvector/pgvector:pg17`, pinned by
+digest in `Dockerfile.aio`). Two consequences for your threat model:
+
+- **Trust authentication on the unix socket.** The embedded server has no TCP listener
+  (`listen_addresses = ''`) and `pg_hba.conf` is `local all all trust` plus
+  `host all all all reject`. Anything that can open `/var/run/postgresql` inside the
+  container is the database superuser. That is acceptable because the container runs
+  nothing but the gateway (as the unprivileged `ragmux` user), Postgres (as `postgres`)
+  and the entrypoint, and because the socket is only exposed through the optional
+  `ragmux-pgsocket` volume that the `backup` profile mounts. Do not mount that volume
+  into other services, and treat `docker exec` into the container as superuser access.
+  Deployments that need password or TLS authentication between gateway and database
+  belong on the split layout (`docker-compose.split.yml`) or an external database with
+  the `-app` image.
+- **A full Debian userland.** Unlike the distroless `-app` image, the all-in-one image
+  contains a shell, `apt`-installed libraries and the PostgreSQL toolchain, so it has
+  a larger CVE surface. Scan it with the same tooling you use for the
+  `pgvector/pgvector` / `postgres` images (Trivy, Grype, Docker Scout); the SBOM and
+  provenance attestations are attached to both images by the release workflow. Rebuilds
+  of the base image are picked up when we bump the digest in `Dockerfile.aio`.
+
+The `-app` image stays distroless (`gcr.io/distroless/static-debian12:nonroot`, a
+single static binary, no shell) for environments where that matters.
 
 ## Hardening pointers
 
@@ -91,6 +121,8 @@ of [Configuration](docs/configuration.md):
   `TRUST_PROXY_HEADERS`, `TRUSTED_PROXY_CIDRS`, `SECURE_COOKIES`
 - [Database privileges](docs/configuration.md#database-privileges): the minimum the
   gateway's role needs
+- [Deployment layouts](docs/configuration.md#deployment-layouts): what the all-in-one
+  container does with `/data`, and when to prefer the split layout
 - [Environment variables](docs/configuration.md#environment-variables) and
   [Docker Compose variables](docs/configuration.md#docker-compose-variables): keeping
   `SECRET_KEY` and `DATABASE_URL` in secrets files (`*_FILE`) instead of `.env`

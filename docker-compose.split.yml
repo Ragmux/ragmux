@@ -1,0 +1,107 @@
+services:
+  ragmux:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: ragmux/ragmux:latest-app
+    container_name: ragmux
+    restart: unless-stopped
+    ports:
+      # Bound to loopback: put a TLS-terminating reverse proxy (nginx, Caddy,
+      # Traefik) in front and set TRUST_PROXY_HEADERS / SECURE_COOKIES. To
+      # expose the gateway directly change this to "8765:8765".
+      - "127.0.0.1:8765:8765"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # The gateway connects as the least-privilege role ragmux_app that
+      # docker/postgres-init creates on the first start; POSTGRES_PASSWORD
+      # (the superuser) is only used by that init step, backups and restores.
+      DATABASE_URL: postgres://ragmux_app:${RAGMUX_DB_PASSWORD:?Set RAGMUX_DB_PASSWORD in .env}@postgres:5432/ragmux?sslmode=disable
+      # Generate once with: openssl rand -hex 32. Keep it: it decrypts the
+      # provider credentials stored in Postgres.
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (openssl rand -hex 32)}
+      PORT: "8765"
+      # Passed through from the shell or .env; empty values fall back to defaults.
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      LOGIN_RATE_LIMIT_PER_MIN: ${LOGIN_RATE_LIMIT_PER_MIN:-}
+      LOGIN_USER_LIMIT_PER_MIN: ${LOGIN_USER_LIMIT_PER_MIN:-}
+      LOGIN_LOCKOUT_FAILURES: ${LOGIN_LOCKOUT_FAILURES:-}
+      LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      SECURE_COOKIES: ${SECURE_COOKIES:-}
+      # Outbound SSRF guard: provider base URLs may not point at private or
+      # local addresses unless listed here (e.g. "host.docker.internal,ollama")
+      # or allowed wholesale.
+      PRIVATE_UPSTREAM_ALLOWLIST: ${PRIVATE_UPSTREAM_ALLOWLIST:-}
+      ALLOW_PRIVATE_UPSTREAMS: ${ALLOW_PRIVATE_UPSTREAMS:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/ragmux", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ragmux-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ragmux
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ragmux
+      # Password of the ragmux_app role created by docker/postgres-init on
+      # the first start (empty data volume only). Use a hex value: it is
+      # interpolated into DATABASE_URL above, so URL-reserved characters
+      # (@ / : ? # %) and "$" would break the connection string.
+      RAGMUX_DB_PASSWORD: ${RAGMUX_DB_PASSWORD:?Set RAGMUX_DB_PASSWORD in .env}
+    volumes:
+      # All persistent state (models, projects, documents, vectors, metrics).
+      - pgdata:/var/lib/postgresql/data
+      # First-start init: vector extension + ragmux_app role (shared with the
+      # all-in-one image, which runs it without a password). The .sql is
+      # mounted outside initdb.d so the entrypoint runs it only through the
+      # wrapper, which passes the password as a psql variable.
+      - ./docker/postgres-init/01-ragmux.sh:/docker-entrypoint-initdb.d/01-ragmux.sh:ro
+      - ./docker/postgres-init/01-ragmux.sql:/ragmux-init/01-ragmux.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragmux -d ragmux"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Optional scheduled logical backups (pg_dump) into ./backups. Start with
+  # `docker compose --profile backup up -d`; see docs/backup-restore.md.
+  backup:
+    image: prodrigestivill/postgres-backup-local:17
+    container_name: ragmux-backup
+    restart: unless-stopped
+    profiles: ["backup"]
+    user: postgres:postgres
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ragmux
+      POSTGRES_USER: ragmux
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      SCHEDULE: ${BACKUP_SCHEDULE:-@daily}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
+      BACKUP_KEEP_WEEKS: ${BACKUP_KEEP_WEEKS:-4}
+      BACKUP_KEEP_MONTHS: ${BACKUP_KEEP_MONTHS:-6}
+      HEALTHCHECK_PORT: "8081"
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
