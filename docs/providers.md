@@ -34,7 +34,17 @@ is sent as a single escaped path segment.
 
 `POST /admin/api/models/{id}/test` with `{"mode":"chat"}` or `{"mode":"embedding"}`
 sends a ping through the connection and reports the reply, or the dimensions for
-embeddings, together with latency.
+embeddings, together with latency; the outcome is kept on the connection
+(`last_test_at`, `last_test_ok`, `last_test_latency_ms`, `last_test_error`). The same
+test runs on a connection that is not saved yet through `POST /admin/api/models/test`,
+which takes the create body plus `mode` and, with an empty `api_key`, a `connection_id`
+whose stored key is reused. Each connection also reports `private_upstream`: whether its
+`base_url` pointed at a loopback, private or link-local address when it was saved. See
+[REST API reference](api.md#model-connections).
+
+`GET /admin/api/provider-types` lists the types with their capabilities:
+`supports_embeddings`, `requires_api_key`, `supports_streaming` (every adapter) and
+`supports_tools` (every adapter except `gemini`, see below).
 
 ## OpenAI-compatible (`openai`, `deepseek`, `custom_openai`)
 

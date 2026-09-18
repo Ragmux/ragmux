@@ -6,6 +6,24 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `POST /admin/api/models/test` tests a connection before it is saved, with the same
+  validation, private-address check and credential redaction as create; `connection_id`
+  with an empty `api_key` reuses the stored key of an existing connection.
+- Connection test outcomes are recorded: `POST /models/{id}/test` writes `last_test_at`,
+  `last_test_ok`, `last_test_latency_ms` and `last_test_error` (redacted, at most 512
+  characters), returned by the list and get endpoints (migration `0009`).
+- Connections report `private_upstream`: whether `base_url` points at `localhost`, a
+  loopback, private or link-local address (hostnames are classified when the connection is
+  saved and cached in `upstream_private`; the provider default URL counts as public).
+- `GET /admin/api/provider-types` reports `supports_tools` (false for `gemini`) and
+  `supports_streaming`.
+- Documents carry `page_count` (PDF pages, `null` for other formats) and
+  `progress_percent` (10 after parsing, 20 after chunking, then per embedding batch up to
+  100 when ready; a failed document keeps its last value).
+- `POST /admin/api/rag-stores/{id}/search` returns `retrieval_latency_ms` and
+  `rerank_latency_ms` (`null` when reranking did not run) next to `latency_ms`.
+
 ## [0.2.3] — 2026-09-18
 
 ### Changed
