@@ -12,6 +12,19 @@ import (
 
 // ---- users (admin only, except the lite listing) ----
 
+// checkNewPassword returns the validation message for a password being set,
+// or "" when it is acceptable: 8 characters at least, and at most bcrypt's
+// 72-byte input limit so nothing is silently truncated.
+func checkNewPassword(pw string) string {
+	if len(pw) < 8 {
+		return "password must be at least 8 characters"
+	}
+	if len(pw) > maxPasswordLen {
+		return "password must be at most 72 bytes"
+	}
+	return ""
+}
+
 type liteUser struct {
 	ID       int64  `json:"id"`
 	Username string `json:"username"`
@@ -50,7 +63,7 @@ func (a *Admin) createUser(w http.ResponseWriter, r *http.Request) {
 		Role     string `json:"role"`
 	}
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	in.Username = strings.TrimSpace(in.Username)
@@ -58,8 +71,8 @@ func (a *Admin) createUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "username is required (max 64 characters)")
 		return
 	}
-	if len(in.Password) < 8 {
-		writeErr(w, http.StatusBadRequest, "password must be at least 8 characters")
+	if msg := checkNewPassword(in.Password); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	if in.Role == "" {
@@ -102,7 +115,7 @@ func (a *Admin) updateUser(w http.ResponseWriter, r *http.Request) {
 		IsActive *bool  `json:"is_active"`
 	}
 	if err := decode(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
+		badBody(w, err)
 		return
 	}
 	target, err := a.Store.GetUser(r.Context(), id)
@@ -191,8 +204,12 @@ func (a *Admin) resetPassword(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		New string `json:"new_password"`
 	}
-	if err := decode(r, &in); err != nil || len(in.New) < 8 {
-		writeErr(w, http.StatusBadRequest, "new_password must be at least 8 characters")
+	if err := decode(r, &in); err != nil {
+		badBody(w, err)
+		return
+	}
+	if msg := checkNewPassword(in.New); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	target, err := a.Store.GetUser(r.Context(), id)
