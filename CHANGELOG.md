@@ -6,6 +6,18 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **Signed container images.** The release workflow signs the pushed image digest of
+  `ghcr.io/ragmux/ragmux` (and the Docker Hub mirror when configured) with cosign, keyless
+  through GitHub OIDC. Verify with `cosign verify` as documented in
+  [SECURITY.md](SECURITY.md#verifying-the-container-image); images from v0.3.1 onward carry
+  a signature.
+- Every GitHub Action used by CI and the release workflow is pinned to a full commit SHA
+  (with the release tag as a comment for Dependabot) instead of a floating major tag.
+- Workflow permissions start at `contents: read`; the release job alone gains
+  `contents: write`, `packages: write` and `id-token: write`. CI cancels superseded runs
+  of the same ref.
+
 ## [0.3.0] — 2026-09-18
 
 ### Added

@@ -153,7 +153,9 @@ variable wins when both are set.
 
 Published images: `ghcr.io/ragmux/ragmux:<version>` (also `:<major>.<minor>` and
 `:latest`, `linux/amd64` and `linux/arm64`), built by the release workflow on every
-`v*` tag.
+`v*` tag. From v0.3.1 on the images are signed with cosign; see
+[Verifying the container image](../SECURITY.md#verifying-the-container-image) for the
+`cosign verify` command to run before deploying.
 
 ## Behind a reverse proxy
 
