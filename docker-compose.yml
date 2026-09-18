@@ -23,6 +23,10 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
+      LOGIN_RATE_LIMIT_PER_MIN: ${LOGIN_RATE_LIMIT_PER_MIN:-}
+      LOGIN_USER_LIMIT_PER_MIN: ${LOGIN_USER_LIMIT_PER_MIN:-}
+      LOGIN_LOCKOUT_FAILURES: ${LOGIN_LOCKOUT_FAILURES:-}
+      LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-}
     depends_on:
       postgres:
         condition: service_healthy

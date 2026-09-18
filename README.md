@@ -37,7 +37,10 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 - **Observability:** per-request logs (prompt/completion tokens, latency, status, streaming,
   RAG usage), per-project and global summaries, daily series.
 - **Dashboard:** embedded single-page UI at `/admin/` for models, RAG stores, documents,
-  projects, metrics and a playground. Everything is also available as a REST API.
+  projects, metrics, users, the audit log and a playground. Everything is also available
+  as a REST API.
+- **Users and roles:** `admin`, `editor` and `viewer` accounts, per-project membership,
+  login rate limiting with lockout, and an audit trail of every management action.
 - **Persistence:** everything in PostgreSQL + pgvector; uploaded files are kept as `bytea`
   so no volume is needed on the gateway. Unfinished document ingestion resumes
   automatically after a restart.
@@ -105,6 +108,10 @@ still there. If `SECRET_KEY` is unset the gateway falls back to generating and r
 | `INGEST_WORKERS`   | `2`          | Parallel document ingestion jobs |
 | `MAX_UPLOAD_MB`    | `50`         | Max upload size |
 | `SECURE_COOKIES`   | `false`      | Mark the session cookie `Secure` (behind HTTPS) |
+| `LOGIN_RATE_LIMIT_PER_MIN` | `10` | Failed logins allowed per minute from one IP address (`0` disables) |
+| `LOGIN_USER_LIMIT_PER_MIN` | `5`  | Failed logins allowed per minute for one username (`0` disables) |
+| `LOGIN_LOCKOUT_FAILURES`   | `20` | Failures within `LOGIN_LOCKOUT_MINUTES` that lock a username out (`0` disables) |
+| `LOGIN_LOCKOUT_MINUTES`    | `15` | Lockout window |
 
 ## Using the gateway
 
@@ -193,29 +200,79 @@ the response so SDKs stay happy. When a RAG store is linked, the last user messa
 embedded, the top-k chunks are fetched and injected into the system prompt inside a
 `<context>` block before the request reaches the provider.
 
+## Users, roles and projects
+
+The first-run account is an `admin`. Admins create further users in the dashboard
+(**Users** tab) or via the API. Every user has one role:
+
+| Role     | Model connections, RAG stores, documents | Projects | Users, audit log |
+|----------|------------------------------------------|----------|------------------|
+| `admin`  | full access | all projects, all metrics | full access |
+| `editor` | create, edit, delete, upload, test, search | create (becomes a member); read, edit, delete, rotate key, metrics and members only for projects it belongs to | — |
+| `viewer` | read, test and search only | read and metrics only for projects it belongs to | — |
+
+Projects have a member list (`member_ids`). Non-admins only see projects they are a member
+of; any other project id answers `404`, and the global metrics endpoints are limited to
+their projects. Editors keep themselves in the member list of projects they manage.
+Writes that the role does not allow answer `403 {"error":{"type":"forbidden"}}`.
+
+Deactivated users cannot sign in and their existing sessions stop working immediately.
+The last active admin cannot be demoted or deactivated, and nobody can deactivate or
+delete their own account.
+
+### Login protection
+
+Every login attempt is recorded in the database (so all replicas share the counters).
+After `LOGIN_USER_LIMIT_PER_MIN` failures for a username or `LOGIN_RATE_LIMIT_PER_MIN`
+failures from an IP within a minute, and after `LOGIN_LOCKOUT_FAILURES` failures for a
+username within `LOGIN_LOCKOUT_MINUTES`, `/admin/api/login` answers
+`429 {"error":{"type":"rate_limited"}}` with a `Retry-After` header. Successful logins do
+not reset the counters; the windows simply expire. Attempts older than 24 hours are purged
+hourly. The client IP is taken from `X-Forwarded-For` / `X-Real-IP` when present, so run
+the gateway behind a proxy that sets them or make sure clients cannot spoof them.
+
+### Audit log
+
+Logins (success, failure, lockout), logouts, password changes and every create, update,
+delete, key rotation, upload, reprocess, member change and connection test are written to
+`audit_logs` with the actor, target, IP and a small JSON `details` object that never
+contains credentials. Admins read it with
+`GET /admin/api/audit?limit=100&action=project.&actor_user_id=1&before=2026-09-18T10:00:00Z`
+(`action` is a prefix match, `before` pages backwards).
+
 ## REST API summary
 
 All management endpoints are under `/admin/api` and need a session (cookie or
-`Authorization: Bearer <token>` from `/admin/api/login`).
+`Authorization: Bearer <token>` from `/admin/api/login`). The **Role** column is the
+minimum role; `member` means the project membership rule above applies too.
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/login`, `/logout` | Session management |
-| GET / POST | `/models` | List / create model connections |
-| GET / PUT / DELETE | `/models/{id}` | Read / update / delete |
-| POST | `/models/{id}/test` | Ping the provider |
-| GET / POST | `/rag-stores` | List / create RAG stores |
-| GET / PUT / DELETE | `/rag-stores/{id}` | Read / update / delete (cascades documents + vectors) |
-| GET / POST | `/rag-stores/{id}/documents` | List / upload (`multipart`, field `file`) |
-| POST | `/rag-stores/{id}/search` | Vector search `{query, top_k}` |
-| GET / DELETE | `/documents/{id}` | Document status / delete |
-| POST | `/documents/{id}/reprocess` | Re-chunk and re-embed |
-| GET / POST | `/projects` | List / create (returns key once) |
-| GET / PUT / DELETE | `/projects/{id}` | Read / update / delete |
-| POST | `/projects/{id}/rotate-key` | Issue a new key |
-| GET | `/projects/{id}/metrics?window=24h` | Summary, daily series, recent requests |
-| GET | `/metrics/summary`, `/metrics/requests` | Global metrics |
-| GET | `/system` | Postgres / pgvector / migration versions, DB size, key source, version |
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| POST | `/login`, `/logout` | — | Session management (login returns `token` and `user` with `role`) |
+| GET | `/me` | viewer | Current user (`role`, `is_active`, `last_login_at`) |
+| POST | `/me/password` | viewer | Change own password `{current_password, new_password}` |
+| GET / POST | `/models` | viewer / editor | List / create model connections |
+| GET / PUT / DELETE | `/models/{id}` | viewer / editor / editor | Read / update / delete |
+| POST | `/models/{id}/test` | viewer | Ping the provider |
+| GET / POST | `/rag-stores` | viewer / editor | List / create RAG stores |
+| GET / PUT / DELETE | `/rag-stores/{id}` | viewer / editor / editor | Read / update / delete (cascades documents + vectors) |
+| GET / POST | `/rag-stores/{id}/documents` | viewer / editor | List / upload (`multipart`, field `file`) |
+| POST | `/rag-stores/{id}/search` | viewer | Vector search `{query, top_k}` |
+| GET / DELETE | `/documents/{id}` | viewer / editor | Document status / delete |
+| POST | `/documents/{id}/reprocess` | editor | Re-chunk and re-embed |
+| GET / POST | `/projects` | member / editor | List own projects (admin: all) / create (`member_user_ids` optional, returns key once) |
+| GET / PUT / DELETE | `/projects/{id}` | member (+editor for writes) | Read / update / delete |
+| POST | `/projects/{id}/rotate-key` | member + editor | Issue a new key |
+| GET / PUT | `/projects/{id}/members` | member (+editor for PUT) | List / replace members `{"user_ids":[...]}` |
+| GET | `/projects/{id}/metrics?window=24h` | member | Summary, daily series, recent requests |
+| GET | `/metrics/summary`, `/metrics/requests` | viewer | Metrics over the projects the user can see |
+| GET | `/users/lite` | editor | `{id, username, role}` of active users (for member pickers) |
+| GET / POST | `/users` | admin | List / create users `{username, password, role}` |
+| GET / PUT / DELETE | `/users/{id}` | admin | Read / update `{role, is_active}` / delete |
+| POST | `/users/{id}/reset-password` | admin | `{new_password}`; revokes the user's sessions |
+| POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
+| GET | `/audit` | admin | Audit log (`limit`, `action`, `actor_user_id`, `before`) |
+| GET | `/system` | viewer | Postgres / pgvector / migration versions, DB size, key source, version |
 
 Public: `GET /healthz`. Client API: `POST /v1/chat/completions`, `GET /v1/models`.
 
@@ -255,8 +312,8 @@ web/index.html       dashboard (vanilla JS, embedded in the binary)
 
 ## Roadmap / not yet
 
-Multi-user roles, per-project rate limits, Gemini tool calling, reranking, DOCX/HTML
-ingestion, prompt caching passthrough.
+Per-project rate limits, Gemini tool calling, reranking, DOCX/HTML ingestion, prompt
+caching passthrough.
 
 ## License
 

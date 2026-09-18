@@ -15,8 +15,16 @@ All notable changes to Ragmux are documented here. The format follows
   `secret.key` fallback remains for development.
 
 ### Added
-- Roles (`admin`, `editor`, `viewer`), user management API and dashboard, project membership.
-- Login rate limiting and account lockout; audit log.
+- Roles (`admin`, `editor`, `viewer`), user management API (`/admin/api/users…`) and a
+  **Users** dashboard tab, project membership (`member_ids`, `/projects/{id}/members`).
+  Non-admins only see their projects; foreign project ids answer 404. Existing accounts
+  become `admin` on upgrade.
+- Login rate limiting per username and per IP plus a lockout window, stored in Postgres
+  (`LOGIN_RATE_LIMIT_PER_MIN`, `LOGIN_USER_LIMIT_PER_MIN`, `LOGIN_LOCKOUT_FAILURES`,
+  `LOGIN_LOCKOUT_MINUTES`); `429` with `Retry-After`.
+- Audit log of logins and every management action, `GET /admin/api/audit` and an **Audit**
+  dashboard tab.
+- `GET /admin/api/me` and the login response include `role`, `is_active` and `last_login_at`.
 - Per-project requests-per-minute / tokens-per-minute limits and daily / monthly token budgets
   with OpenAI-style `x-ratelimit-*` headers.
 - RAG: hybrid BM25 + vector search (RRF), section/page aware chunks, optional LLM reranking,
