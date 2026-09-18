@@ -19,9 +19,26 @@ listed in the [API reference](api.md#rag-stores-and-documents).
 | `rerank_candidates` | `15` | Candidates sent to the reranker (1-100) |
 | `max_distance` | `0` | Cosine distance cut-off (0-2, `0` = off) |
 | `contextual_chunks` | `true` | Prefix the file name and section to the text that is embedded |
+| `max_documents` | `0` | Upload quota: documents the store may hold (`0` = unlimited) |
+| `max_bytes` | `0` | Upload quota: sum of uploaded file sizes in bytes (`0` = unlimited) |
 
 Each embedding width gets its own `chunk_embeddings_<dims>` table with an HNSW cosine
 index, created on the first ingest; the store records its `dimensions` at that point.
+
+### Quotas
+
+Every upload costs storage (the original file is kept in the database) and embedding
+calls, and any editor can upload. `max_documents` and `max_bytes` cap a store; the
+instance-wide `MAX_DOCUMENTS_PER_STORE` and `MAX_BYTES_PER_STORE_MB` (see
+[Configuration](configuration.md#environment-variables)) are ceilings an admin sets once
+for every store, and the effective limit is the smaller non-zero of the two. The check
+runs before anything is written: an upload that would push the store over either limit
+is rejected with `422` and `code: "store_quota"` (`store quota exceeded: 10 of 10
+documents`, `... bytes used, upload of N bytes does not fit`); in a multi-file upload the
+files accepted earlier in the same request count towards the total, so the first file
+that does not fit fails the request and the earlier ones stay. Reprocessing does not
+add documents or bytes and is never blocked. The store list shows `document_count` and
+`bytes_used` (documents in any status, sum of their `size_bytes`) against the limits.
 
 ## Formats and parsing
 

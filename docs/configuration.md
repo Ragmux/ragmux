@@ -24,6 +24,8 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `INGEST_WORKERS` | `2` | Parallel document ingestion jobs (`>= 1`). |
 | `MAX_UPLOAD_MB` | `50` | Maximum size of one document upload request in MiB (`>= 1`). |
 | `MAX_CHUNKS_PER_DOCUMENT` | `20000` | A document that splits into more chunks than this is marked `failed` before anything is embedded (`>= 1`). Bounds the memory and embedding cost of one document. |
+| `MAX_DOCUMENTS_PER_STORE` | `0` | Instance-wide ceiling on the documents one RAG store may hold (`0` = unlimited). A store's own `max_documents` can only lower it; uploads over the limit get `422 store_quota`. See [Quotas](rag.md#quotas). |
+| `MAX_BYTES_PER_STORE_MB` | `0` | Instance-wide ceiling on the summed upload size of one RAG store in MiB (`0` = unlimited); combined with the store's `max_bytes` the same way. |
 | `ALLOW_PRIVATE_UPSTREAMS` | `false` | `true` lets provider `base_url`s point at loopback, link-local and private networks and re-enables `HTTP_PROXY`/`HTTPS_PROXY` for provider calls. See [Private upstreams](#private-upstreams). |
 | `PRIVATE_UPSTREAM_ALLOWLIST` | *(empty)* | Comma-separated hostnames (case-insensitive) that may resolve to private addresses while `ALLOW_PRIVATE_UPSTREAMS` stays `false`, e.g. `host.docker.internal,ollama`. |
 | `STREAM_MAX_DURATION` | `30m` | Wall-time limit for one streaming provider response (Go duration). The stream ends with a `504 timeout` error when it is reached. |

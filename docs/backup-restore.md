@@ -224,7 +224,9 @@ to run, and a Postgres 17 with pgvector.
    `docker compose stop ragmux`.
 2. **Restore**: `scripts/restore.sh --yes <dump>` (it stops and starts the gateway for
    you), or by hand
-   `docker compose exec -T postgres pg_restore --clean --if-exists --no-owner --no-privileges -U ragmux -d ragmux < <dump>`.
+   `docker compose exec -T postgres pg_restore --clean --if-exists --no-owner --no-privileges -U ragmux -d ragmux < <dump>`
+   followed by the ownership hand-over the script performs (re-running
+   `docker/postgres-init/01-ragmux.sql` as in [Database privileges](configuration.md#database-privileges) does it).
 3. **Start** with the right `SECRET_KEY` in `.env`: `docker compose up -d ragmux`.
    Migrations run automatically under an advisory lock.
    - Restoring an **older dump into a newer Ragmux** is supported: `schema_migrations`

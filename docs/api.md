@@ -145,13 +145,13 @@ for embeddings, or `{"ok": false, "error": "...", "latency_ms": …}`.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/rag-stores` | viewer | List stores (with `document_count`, `chunk_count`, `dimensions`) |
+| GET | `/rag-stores` | viewer | List stores (with `document_count`, `bytes_used`, `chunk_count`, `dimensions`) |
 | POST | `/rag-stores` | editor | Create → `201` store |
 | GET | `/rag-stores/{id}` | viewer | Read one |
 | PUT | `/rag-stores/{id}` | editor | Update → store plus `reprocess_recommended` |
 | DELETE | `/rag-stores/{id}` | editor | Delete the store, its documents and vectors; projects linked to it lose the link |
 | GET | `/rag-stores/{id}/documents` | viewer | List documents, newest first |
-| POST | `/rag-stores/{id}/documents` | editor | Upload (`multipart/form-data`, one or more `file` fields) → `202` document or array of documents |
+| POST | `/rag-stores/{id}/documents` | editor | Upload (`multipart/form-data`, one or more `file` fields) → `202` document or array of documents; `422` with `code: "store_quota"` when the store's `max_documents` / `max_bytes` or the instance ceiling would be exceeded |
 | POST | `/rag-stores/{id}/search` | viewer | Retrieval test |
 | POST | `/rag-stores/{id}/reprocess` | editor | Re-parse, re-chunk and re-embed every document → `202 {"ok": true, "documents": n}` |
 | GET | `/documents/{id}` | viewer | Document status |
@@ -165,14 +165,17 @@ retrieval semantics are explained in [Retrieval (RAG)](rag.md)):
 {"name": "handbook", "embedding_connection_id": 2,
  "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
  "search_mode": "hybrid", "fts_config": "simple",
- "rerank": false, "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true}
+ "rerank": false, "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true,
+ "max_documents": 0, "max_bytes": 0}
 ```
 
 Validation: `chunk_size` 200-20000, `chunk_overlap` ≥ 0 and smaller than `chunk_size`,
 `top_k` ≤ 50, `search_mode` `vector` or `hybrid`, `fts_config` must exist in
-`pg_ts_config`, `rerank_candidates` 1-100, `max_distance` 0-2. The embedding connection
-must be of a type that supports embeddings and cannot be changed while the store has
-chunks (`400`).
+`pg_ts_config`, `rerank_candidates` 1-100, `max_distance` 0-2, `max_documents` and
+`max_bytes` ≥ 0 (`0` = unlimited, see [Quotas](rag.md#quotas)). The embedding
+connection must be of a type that supports embeddings and cannot be changed while the
+store has chunks (`400`). Responses carry the usage the quotas are checked against:
+`document_count` and `bytes_used`.
 
 Documents look like
 
