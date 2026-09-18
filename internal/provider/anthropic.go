@@ -431,7 +431,7 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				} `json:"error"`
 			}
 			_ = json.Unmarshal([]byte(ev.Data), &e) // best effort; an empty message is still an error
-			streamErr = &Error{Status: http.StatusBadGateway, Type: e.Error.Type, Message: e.Error.Message}
+			streamErr = &Error{Status: http.StatusBadGateway, Type: e.Error.Type, Message: RedactWith(e.Error.Message, p.cfg.APIKey)}
 			return false
 		}
 		return true

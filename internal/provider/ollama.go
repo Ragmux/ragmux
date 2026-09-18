@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -269,7 +270,7 @@ func (p *ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, err
 	}
 	if or.Error != "" {
-		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: Redact(or.Error)}
+		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: RedactWith(or.Error, p.cfg.APIKey)}
 	}
 	msg := ResponseMessage{Role: "assistant", Content: strPtr(or.Message.Content)}
 	msg.ToolCalls = ollamaToolCallsJSON(or.Message.ToolCalls, false)
@@ -316,7 +317,7 @@ func (p *ollama) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 			continue
 		}
 		if or.Error != "" {
-			return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: Redact(or.Error)}
+			return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: RedactWith(or.Error, p.cfg.APIKey)}
 		}
 		delta := Delta{}
 		if !sentRole {
@@ -346,7 +347,11 @@ func (p *ollama) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "read upstream stream: " + err.Error()}
+		var pe *Error
+		if errors.As(err, &pe) {
+			return pe
+		}
+		return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "read upstream stream: " + RedactWith(err.Error(), p.cfg.APIKey)}
 	}
 	return io.ErrUnexpectedEOF
 }
