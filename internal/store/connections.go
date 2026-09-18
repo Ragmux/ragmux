@@ -18,9 +18,25 @@ type ModelConnection struct {
 	APIKey       string `json:"-"`
 	APIKeyMasked string `json:"api_key_masked"`
 	ModelName    string `json:"model_name"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	// PrivateUpstream reports whether the base URL points at a loopback,
+	// private or link-local address. It is computed when the connection is
+	// saved (see UpstreamPrivate) and never on read.
+	PrivateUpstream bool `json:"private_upstream"`
+	// UpstreamPrivate is the value to store on create/update: nil when it
+	// could not be determined (kept as NULL and reported as false).
+	UpstreamPrivate *bool `json:"-"`
+	// Last test outcome as recorded by RecordConnectionTest; all nil/empty
+	// until the connection has been tested.
+	LastTestAt        *string `json:"last_test_at"`
+	LastTestOK        *bool   `json:"last_test_ok"`
+	LastTestLatencyMS *int    `json:"last_test_latency_ms"`
+	LastTestError     string  `json:"last_test_error"`
+	CreatedAt         string  `json:"created_at"`
+	UpdatedAt         string  `json:"updated_at"`
 }
+
+// MaxTestError caps the stored last_test_error.
+const MaxTestError = 512
 
 // ValidProviderTypes lists the supported provider identifiers.
 var ValidProviderTypes = []string{"openai", "anthropic", "gemini", "deepseek", "ollama", "custom_openai"}
@@ -46,17 +62,27 @@ func MaskKey(k string) string {
 	return k[:3] + "..." + k[len(k)-4:]
 }
 
-const connCols = "id, name, provider_type, base_url, api_key_enc, key_version, model_name, created_at, updated_at"
+const connCols = "id, name, provider_type, base_url, api_key_enc, key_version, model_name, upstream_private, " +
+	"last_test_at, last_test_ok, last_test_latency_ms, last_test_error, created_at, updated_at"
 
 func (s *Store) scanConn(row interface{ Scan(...any) error }) (*ModelConnection, error) {
 	c := &ModelConnection{}
 	var enc []byte
 	var version int16
 	var created, updated time.Time
-	if err := row.Scan(&c.ID, &c.Name, &c.ProviderType, &c.BaseURL, &enc, &version, &c.ModelName, &created, &updated); err != nil {
+	var private *bool
+	var testAt *time.Time
+	if err := row.Scan(&c.ID, &c.Name, &c.ProviderType, &c.BaseURL, &enc, &version, &c.ModelName, &private,
+		&testAt, &c.LastTestOK, &c.LastTestLatencyMS, &c.LastTestError, &created, &updated); err != nil {
 		return nil, scanErr(err)
 	}
 	c.CreatedAt, c.UpdatedAt = ts(created), ts(updated)
+	c.UpstreamPrivate = private
+	c.PrivateUpstream = private != nil && *private
+	if testAt != nil {
+		t := ts(*testAt)
+		c.LastTestAt = &t
+	}
 	key, err := s.decryptKey(c.ID, version, enc)
 	if err != nil {
 		return nil, err
@@ -90,8 +116,9 @@ func (s *Store) CreateConnection(ctx context.Context, c *ModelConnection) (*Mode
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 	var id int64
 	if err := tx.QueryRow(ctx, `INSERT INTO model_connections
-		(name, provider_type, base_url, api_key_enc, key_version, model_name) VALUES ($1, $2, $3, NULL, $4, $5)
-		RETURNING id`, c.Name, c.ProviderType, c.BaseURL, keyVersionBound, c.ModelName).Scan(&id); err != nil {
+		(name, provider_type, base_url, api_key_enc, key_version, model_name, upstream_private)
+		VALUES ($1, $2, $3, NULL, $4, $5, $6)
+		RETURNING id`, c.Name, c.ProviderType, c.BaseURL, keyVersionBound, c.ModelName, c.UpstreamPrivate).Scan(&id); err != nil {
 		return nil, err
 	}
 	enc, err := s.cipher.encrypt(c.APIKey, connectionAAD(id))
@@ -113,8 +140,8 @@ func (s *Store) CreateConnection(ctx context.Context, c *ModelConnection) (*Mode
 func (s *Store) UpdateConnection(ctx context.Context, c *ModelConnection) (*ModelConnection, error) {
 	if c.APIKey == "" {
 		_, err := s.pool.Exec(ctx, `UPDATE model_connections SET name=$1, provider_type=$2, base_url=$3,
-			model_name=$4, updated_at=now() WHERE id=$5`,
-			c.Name, c.ProviderType, c.BaseURL, c.ModelName, c.ID)
+			model_name=$4, upstream_private=$5, updated_at=now() WHERE id=$6`,
+			c.Name, c.ProviderType, c.BaseURL, c.ModelName, c.UpstreamPrivate, c.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -124,8 +151,8 @@ func (s *Store) UpdateConnection(ctx context.Context, c *ModelConnection) (*Mode
 			return nil, err
 		}
 		_, err = s.pool.Exec(ctx, `UPDATE model_connections SET name=$1, provider_type=$2, base_url=$3,
-			api_key_enc=$4, key_version=$5, model_name=$6, updated_at=now() WHERE id=$7`,
-			c.Name, c.ProviderType, c.BaseURL, enc, keyVersionBound, c.ModelName, c.ID)
+			api_key_enc=$4, key_version=$5, model_name=$6, upstream_private=$7, updated_at=now() WHERE id=$8`,
+			c.Name, c.ProviderType, c.BaseURL, enc, keyVersionBound, c.ModelName, c.UpstreamPrivate, c.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -154,6 +181,23 @@ func (s *Store) ListConnections(ctx context.Context) ([]*ModelConnection, error)
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// RecordConnectionTest stores the outcome of a connection test. errMsg is
+// expected to be redacted already; it is cut to MaxTestError bytes.
+func (s *Store) RecordConnectionTest(ctx context.Context, id int64, ok bool, latencyMS int64, errMsg string) error {
+	if len(errMsg) > MaxTestError {
+		errMsg = errMsg[:MaxTestError]
+	}
+	res, err := s.pool.Exec(ctx, `UPDATE model_connections SET last_test_at=now(), last_test_ok=$1,
+		last_test_latency_ms=$2, last_test_error=$3 WHERE id=$4`, ok, latencyMS, errMsg, id)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DeleteConnection removes a connection; fails if projects or stores use it.

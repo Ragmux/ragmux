@@ -184,7 +184,7 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, "UPDATE documents SET status=$1, error='', chunk_count=$2, updated_at=now() WHERE id=$3",
+	if _, err := tx.Exec(ctx, "UPDATE documents SET status=$1, error='', chunk_count=$2, progress_percent=100, updated_at=now() WHERE id=$3",
 		DocReady, len(chunks), doc.ID); err != nil {
 		return err
 	}

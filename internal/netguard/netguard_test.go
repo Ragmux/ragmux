@@ -136,3 +136,20 @@ func TestCheckRedirect(t *testing.T) {
 		t.Errorf("hops: %v", err)
 	}
 }
+
+func TestHostIsPrivate(t *testing.T) {
+	ctx := context.Background()
+	for host, want := range map[string]bool{
+		"localhost": true, "LOCALHOST.": true, "app.localhost": true,
+		"127.0.0.1": true, "[::1]": true, "10.0.0.5": true, "169.254.169.254": true,
+		"8.8.8.8": false, "2606:4700:4700::1111": false,
+	} {
+		got, err := HostIsPrivate(ctx, host)
+		if err != nil || got != want {
+			t.Errorf("HostIsPrivate(%q) = %v, %v; want %v", host, got, err, want)
+		}
+	}
+	if _, err := HostIsPrivate(ctx, "does-not-exist.invalid"); err == nil {
+		t.Error("expected a lookup error for an unresolvable host")
+	}
+}

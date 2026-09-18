@@ -173,6 +173,32 @@ func CheckHost(ctx context.Context, host string, allowPrivate bool, allowHosts m
 	return nil
 }
 
+// HostIsPrivate classifies a base URL host the way the dialer would: true
+// for "localhost", for an IP literal in a disallowed range, and for a
+// hostname whose every current address is disallowed. A lookup failure is
+// returned as an error so the caller can record "unknown" rather than a
+// guess. Policy (allowlists) plays no part: this is classification only.
+func HostIsPrivate(ctx context.Context, host string) (bool, error) {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true, nil
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return IsDisallowedIP(ip), nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := resolve(ctx, host)
+	var ne *Error
+	if errors.As(err, &ne) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // CheckRedirect is an http.Client CheckRedirect policy: at most maxHops
 // redirects, http/https only and never to a different host, so an upstream
 // cannot bounce the gateway to somewhere its base URL was not allowed to
