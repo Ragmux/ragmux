@@ -24,6 +24,8 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `INGEST_WORKERS` | `2` | Parallel document ingestion jobs (`>= 1`). |
 | `MAX_UPLOAD_MB` | `50` | Maximum size of one document upload request in MiB (`>= 1`). |
 | `MAX_CHUNKS_PER_DOCUMENT` | `20000` | A document that splits into more chunks than this is marked `failed` before anything is embedded (`>= 1`). Bounds the memory and embedding cost of one document. |
+| `MAX_DOCUMENTS_PER_STORE` | `0` | Instance-wide ceiling on the documents one RAG store may hold (`0` = unlimited). A store's own `max_documents` can only lower it; uploads over the limit get `422 store_quota`. See [Quotas](rag.md#quotas). |
+| `MAX_BYTES_PER_STORE_MB` | `0` | Instance-wide ceiling on the summed upload size of one RAG store in MiB (`0` = unlimited); combined with the store's `max_bytes` the same way. |
 | `ALLOW_PRIVATE_UPSTREAMS` | `false` | `true` lets provider `base_url`s point at loopback, link-local and private networks and re-enables `HTTP_PROXY`/`HTTPS_PROXY` for provider calls. See [Private upstreams](#private-upstreams). |
 | `PRIVATE_UPSTREAM_ALLOWLIST` | *(empty)* | Comma-separated hostnames (case-insensitive) that may resolve to private addresses while `ALLOW_PRIVATE_UPSTREAMS` stays `false`, e.g. `host.docker.internal,ollama`. |
 | `STREAM_MAX_DURATION` | `30m` | Wall-time limit for one streaming provider response (Go duration). The stream ends with a `504 timeout` error when it is reached. |
@@ -114,7 +116,8 @@ These are not configurable:
 | Variable | Default | Used by |
 |---|---|---|
 | `SECRET_KEY` | *(required)* | gateway; Compose refuses to start without it |
-| `POSTGRES_PASSWORD` | *(required)* | the bundled `postgres` service and the `DATABASE_URL` Compose builds for the gateway (`postgres://ragmux:<password>@postgres:5432/ragmux?sslmode=disable`); Compose refuses to start without it. Use characters that are safe in a URL (`openssl rand -hex 16`) |
+| `POSTGRES_PASSWORD` | *(required)* | superuser password of the bundled `postgres` service. Only the first-start init script, the `backup` profile and `scripts/backup.sh` / `restore.sh` use it; the gateway never sees it. Compose refuses to start without it (`openssl rand -hex 16`) |
+| `RAGMUX_DB_PASSWORD` | *(required)* | password of the least-privilege role `ragmux_app` the gateway connects as; Compose builds `DATABASE_URL` from it (`postgres://ragmux_app:<password>@postgres:5432/ragmux?sslmode=disable`). Use characters that are safe in a URL and in `.env` (`openssl rand -hex 16`); see [Database privileges](#database-privileges) |
 | `VERSION` | `dev` | build argument stamped into `ragmux -version` when the image is built locally |
 | `ADMIN_USER`, `ADMIN_PASSWORD`, `LOG_LEVEL`, `CORS_ORIGINS`, `LOGIN_*`, `TRUST_PROXY_HEADERS`, `TRUSTED_PROXY_CIDRS`, `SECURE_COOKIES` | as above | gateway |
 | `PRIVATE_UPSTREAM_ALLOWLIST`, `ALLOW_PRIVATE_UPSTREAMS` | *(empty)*, `false` | gateway; needed for Ollama and other local model servers (see [Private upstreams](#private-upstreams)) |
@@ -198,24 +201,54 @@ Published images: `ghcr.io/ragmux/ragmux:<version>` (also `:<major>.<minor>` and
 
 ## Database privileges
 
-The gateway does not need a superuser. It needs one thing a plain role usually lacks:
-the `vector` extension. Create it once as a superuser, then run the gateway as a role
-that owns its database and may create tables in `public` (the per-dimension
-`chunk_embeddings_<dims>` tables are created at runtime when a new embedding width
-appears):
+The gateway does not need a superuser. It needs the `vector` extension, which only a
+superuser can create, plus the right to create tables in `public`: migrations create the
+schema, and ingestion creates one `chunk_embeddings_<dims>` table per embedding width at
+runtime.
+
+**Bundled Compose stack.** `docker-compose.yml` mounts `docker/postgres-init/01-ragmux.sh`
+into the Postgres image's `/docker-entrypoint-initdb.d`. On the first start of an empty
+data volume it runs `docker/postgres-init/01-ragmux.sql` as the superuser (`ragmux`,
+`POSTGRES_PASSWORD`): it creates the extension, the role `ragmux_app` with the password
+from `RAGMUX_DB_PASSWORD` (`LOGIN`, no superuser, `CREATEDB` or `CREATEROLE`,
+`search_path = public`), grants it `CONNECT` on the database and `CREATE, USAGE` on
+schema `public`, and hands over any tables that already exist. The gateway's
+`DATABASE_URL` uses that role; the superuser password stays with the init step, the
+`backup` profile and the backup/restore scripts. Init scripts only run on an **empty**
+data volume: a deployment upgraded from 0.2.2 keeps its superuser `DATABASE_URL` and
+keeps working. To switch it, run the SQL once by hand and then set `RAGMUX_DB_PASSWORD`:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U ragmux -d ragmux \
+  -v pw="$RAGMUX_DB_PASSWORD" -v db=ragmux < docker/postgres-init/01-ragmux.sql
+docker compose up -d ragmux
+```
+
+The script is idempotent (`CREATE ROLE` only when missing, `ALTER ROLE` otherwise) and
+its last block changes the owner of every table and sequence in `public` to
+`ragmux_app`, which is what lets later migrations `ALTER TABLE`.
+
+**External Postgres.** Create the extension as a superuser once, then a plain role that
+may create objects in `public`; the same file works there with the role name adjusted
+in the SQL, or by hand:
 
 ```sql
 -- as a superuser, once per database
-CREATE ROLE ragmux LOGIN PASSWORD '...';
-CREATE DATABASE ragmux OWNER ragmux;
+CREATE ROLE ragmux_app LOGIN PASSWORD '...';
+CREATE DATABASE ragmux;
 \c ragmux
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
-GRANT CREATE, USAGE ON SCHEMA public TO ragmux;
+GRANT CONNECT, TEMPORARY ON DATABASE ragmux TO ragmux_app;
+GRANT CREATE, USAGE ON SCHEMA public TO ragmux_app;
+ALTER ROLE ragmux_app SET search_path = public;
 ```
 
-On start the gateway runs `CREATE EXTENSION IF NOT EXISTS vector`, which is a no-op
-once the extension exists and succeeds without extra privileges. Migrations and the
-runtime tables only need `CREATE` on the schema plus ownership of what the role
-created. On managed Postgres (RDS, Cloud SQL, …) the extension is enabled through the
-provider's console or the `rds_superuser`-style role, and the application role is
-configured the same way.
+On start the gateway looks the extension up in `pg_extension` and only issues
+`CREATE EXTENSION vector` when it is missing; a permission error at that point stops the
+start with `the vector extension is missing and the database role may not create it; run
+"CREATE EXTENSION vector" as a superuser`. Migrations and the runtime tables need
+`CREATE` on the schema plus ownership of what the role created. On managed Postgres
+(RDS, Cloud SQL, …) the extension is enabled through the provider's console or the
+`rds_superuser`-style role, and the application role is configured the same way. After
+a `pg_restore` run as another role, hand the tables back to the application role (see
+[Backup and restore](backup-restore.md#scriptsrestoresh)).

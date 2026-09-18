@@ -6,6 +6,32 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **Least-privilege database role in the bundled deployment.** `docker-compose.yml`
+  now runs the gateway as `ragmux_app`, a plain `LOGIN` role (no superuser, `CREATEDB` or
+  `CREATEROLE`) with `CONNECT` on the database and `CREATE, USAGE` on schema `public`,
+  created on the first start by `docker/postgres-init/01-ragmux.sh` / `01-ragmux.sql`
+  from the new required `RAGMUX_DB_PASSWORD`. `POSTGRES_PASSWORD` (the superuser) is
+  only used by that init step, the `backup` profile and `scripts/backup.sh` /
+  `restore.sh`; `restore.sh` hands the restored tables to the application role
+  afterwards (`APP_ROLE`). The gateway checks `pg_extension` before
+  `CREATE EXTENSION vector` and turns a permission error into
+  `the vector extension is missing and the database role may not create it; run
+  "CREATE EXTENSION vector" as a superuser`. Deployments upgrading from 0.2.2 keep their
+  superuser `DATABASE_URL` and keep working (init scripts only run on an empty data
+  volume); switching is optional but recommended: run
+  `docker/postgres-init/01-ragmux.sql` once by hand, which also grants and hands over the
+  existing tables, then set `RAGMUX_DB_PASSWORD`
+  (see [Database privileges](docs/configuration.md#database-privileges)).
+- **Per-store upload quotas.** RAG stores gain `max_documents` and `max_bytes`
+  (migration `0005`, `0` = unlimited) and the instance-wide ceilings
+  `MAX_DOCUMENTS_PER_STORE` / `MAX_BYTES_PER_STORE_MB`; the effective limit is the
+  smaller non-zero of the two. Uploads that would exceed it are rejected before anything
+  is written with `422` and `code: "store_quota"` (multi-file uploads check the running
+  total; reprocessing is unaffected). Store responses carry `bytes_used`; the dashboard
+  form has "Max documents" / "Max size (MB)" fields and the store table shows usage
+  against the quotas. Bounds the storage and embedding cost an editor can cause.
+
 ## [0.2.2] — 2026-09-18
 
 ### Security

@@ -46,7 +46,8 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 ```bash
 cp .env.example .env
 echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env         # encrypts provider keys; keep it with your backups
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> .env  # password of the bundled Postgres
+echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> .env  # superuser of the bundled Postgres (init, backups)
+echo "RAGMUX_DB_PASSWORD=$(openssl rand -hex 16)" >> .env # least-privilege role the gateway connects as
 docker compose up -d
 ```
 

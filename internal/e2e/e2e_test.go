@@ -120,7 +120,11 @@ type env struct {
 // newEnv wires the whole application against the schema described by cfg.
 // Calling it twice with the same cfg is the test's equivalent of restarting
 // the container against the same database.
-func newEnv(t *testing.T, cfg store.OpenConfig) *env {
+func newEnv(t *testing.T, cfg store.OpenConfig) *env { return newEnvWith(t, cfg, nil) }
+
+// newEnvWith is newEnv with a hook that adjusts the admin before it is
+// served, for settings main.go takes from the configuration.
+func newEnvWith(t *testing.T, cfg store.OpenConfig, tune func(*admin.Admin)) *env {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	st := testdb.OpenWith(t, cfg)
@@ -146,6 +150,9 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	// check would otherwise reject.
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
 		Limiter: auth.DefaultLoginLimiter(st), Usage: usage, ProviderConfig: provCfg, AllowPrivateUpstreams: true}
+	if tune != nil {
+		tune(adm)
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Route("/v1", gw.Routes)
@@ -369,7 +376,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(4) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(5) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
@@ -1045,5 +1052,127 @@ func TestLoginSurfaceAndSessions(t *testing.T) {
 	}
 	if st, _ := do("GET", "/admin/api/me", "", "", ""); st != 401 {
 		t.Errorf("cookie session should be revoked: %d", st)
+	}
+}
+
+// TestStoreQuotas covers the per-store upload quotas: the store's own
+// max_documents / max_bytes, the instance-wide ceiling, multi-file uploads
+// and the fact that reprocessing is never blocked.
+func TestStoreQuotas(t *testing.T) {
+	up := mockUpstream(t)
+	defer up.Close()
+	cfg := testdb.Config(t)
+	e := newEnvWith(t, cfg, func(a *admin.Admin) { a.MaxDocumentsPerStore = 3 })
+	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
+
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	connID := int64(conn["id"].(float64))
+	errCode := func(r map[string]any) string {
+		if e, ok := r["error"].(map[string]any); ok {
+			c, _ := e["code"].(string)
+			return c
+		}
+		return ""
+	}
+	errMsg := func(r map[string]any) string {
+		if e, ok := r["error"].(map[string]any); ok {
+			m, _ := e["message"].(string)
+			return m
+		}
+		return ""
+	}
+
+	if r := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "neg", "embedding_connection_id": connID, "max_documents": -1}, ""); status(r) != 400 {
+		t.Fatalf("negative max_documents should be rejected: %v", r)
+	}
+
+	// max_documents: 1 -> the second upload is refused before anything is written.
+	one := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "one", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "max_documents": 1}, "")
+	if status(one) != 201 || one["max_documents"] != float64(1) || one["max_bytes"] != float64(0) || one["bytes_used"] != float64(0) {
+		t.Fatalf("create store: %v", one)
+	}
+	oneID := int64(one["id"].(float64))
+	first := e.upload(oneID, "a.md", "# Apples\n\nApples are red.")
+	if status(first) != 202 {
+		t.Fatalf("first upload: %v", first)
+	}
+	e.waitReady(int64(first["id"].(float64)))
+	second := e.upload(oneID, "b.md", "# Bananas\n\nBananas are yellow.")
+	if status(second) != 422 || errCode(second) != "store_quota" || !strings.Contains(errMsg(second), "1 of 1 documents") {
+		t.Fatalf("second upload should hit the document quota: %v", second)
+	}
+	got := e.call("GET", fmt.Sprintf("/admin/api/rag-stores/%d", oneID), nil, "")
+	if got["document_count"] != float64(1) || got["bytes_used"] != float64(len("# Apples\n\nApples are red.")) {
+		t.Fatalf("usage after refused upload: %v", got)
+	}
+	// Reprocessing adds nothing and is never blocked, even at the limit.
+	if r := e.call("POST", fmt.Sprintf("/admin/api/rag-stores/%d/reprocess", oneID), nil, ""); status(r) != 202 {
+		t.Fatalf("reprocess at quota: %v", r)
+	}
+	e.waitReady(int64(first["id"].(float64)))
+	// Deleting frees the slot.
+	e.call("DELETE", fmt.Sprintf("/admin/api/documents/%d", int64(first["id"].(float64))), nil, "")
+	if r := e.upload(oneID, "b.md", "# Bananas\n\nBananas are yellow."); status(r) != 202 {
+		t.Fatalf("upload after delete: %v", r)
+	}
+
+	// max_bytes small -> an oversized upload is refused, a fitting one accepted.
+	small := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "small", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "max_bytes": 40}, "")
+	if status(small) != 201 || small["max_bytes"] != float64(40) {
+		t.Fatalf("create store: %v", small)
+	}
+	smallID := int64(small["id"].(float64))
+	if r := e.upload(smallID, "big.md", "# Big\n\n"+strings.Repeat("Cherries are sweet. ", 5)); status(r) != 422 || errCode(r) != "store_quota" || !strings.Contains(errMsg(r), "bytes") {
+		t.Fatalf("oversized upload: %v", r)
+	}
+	if r := e.upload(smallID, "ok.md", "# Ok\n\nCherries are sweet."); status(r) != 202 {
+		t.Fatalf("fitting upload: %v", r)
+	}
+	if r := e.upload(smallID, "ok2.md", "# Ok\n\nCherries are sweet."); status(r) != 422 || errCode(r) != "store_quota" {
+		t.Fatalf("second upload should exceed the byte quota with the running total: %v", r)
+	}
+
+	// Instance ceiling (MaxDocumentsPerStore = 3) applies to a store without
+	// its own quota, and a multi-file upload checks the running total: the
+	// third file of one request does not fit, the first two stay.
+	open := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "open", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0}, "")
+	openID := int64(open["id"].(float64))
+	if r := e.upload(openID, "a.md", "# A\n\nApples are red."); status(r) != 202 {
+		t.Fatalf("upload 1: %v", r)
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for _, name := range []string{"b.md", "c.md", "d.md"} {
+		fw, _ := mw.CreateFormFile("file", name)
+		fw.Write([]byte("# " + name + "\n\nBananas are yellow."))
+	}
+	mw.Close()
+	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/admin/api/rag-stores/%d/documents", e.srv.URL, openID), &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+e.session)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var multi map[string]any
+	json.NewDecoder(resp.Body).Decode(&multi)
+	resp.Body.Close()
+	if resp.StatusCode != 422 || errCode(multi) != "store_quota" || !strings.Contains(errMsg(multi), "3 of 3 documents") {
+		t.Fatalf("multi-file upload over the instance ceiling: %d %v", resp.StatusCode, multi)
+	}
+	if got := e.call("GET", fmt.Sprintf("/admin/api/rag-stores/%d", openID), nil, ""); got["document_count"] != float64(3) {
+		t.Fatalf("the files that fit should have been kept: %v", got)
+	}
+	// A store quota below the ceiling wins; one above it is capped by the ceiling.
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/rag-stores/%d", openID), map[string]any{"name": "open", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "max_documents": 10}, ""); status(r) != 200 || r["max_documents"] != float64(10) {
+		t.Fatalf("raise store quota: %v", r)
+	}
+	if r := e.upload(openID, "e.md", "# E\n\nApples are red."); status(r) != 422 || !strings.Contains(errMsg(r), "3 of 3 documents") {
+		t.Fatalf("instance ceiling should still apply: %v", r)
 	}
 }

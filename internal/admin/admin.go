@@ -54,6 +54,11 @@ type Admin struct {
 	// rejected when it is saved rather than on first use.
 	AllowPrivateUpstreams bool
 	PrivateAllowlist      map[string]bool
+	// MaxDocumentsPerStore and MaxBytesPerStore are instance-wide ceilings
+	// on a RAG store's contents (0 = unlimited); a store's own max_documents
+	// / max_bytes can only lower them. Checked on upload, not on reprocess.
+	MaxDocumentsPerStore int
+	MaxBytesPerStore     int64
 }
 
 // Body read budgets. JSON handlers get a short one; login shorter still so a
@@ -169,6 +174,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": http.StatusText(status)}})
+}
+
+// writeErrCode is writeErr with a machine-readable code clients can branch on.
+func writeErrCode(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": http.StatusText(status), "code": code}})
 }
 
 // fail maps store errors to status codes. Unexpected errors are logged with
@@ -609,6 +619,9 @@ type ragInput struct {
 	MaxDistance           *float64 `json:"max_distance"`
 	// ContextualChunks defaults to true when omitted.
 	ContextualChunks *bool `json:"contextual_chunks"`
+	// MaxDocuments and MaxBytes are per-store upload quotas; 0 = unlimited.
+	MaxDocuments int   `json:"max_documents"`
+	MaxBytes     int64 `json:"max_bytes"`
 }
 
 func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
@@ -661,6 +674,12 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 		t := true
 		in.ContextualChunks = &t
 	}
+	if in.MaxDocuments < 0 {
+		return errors.New("max_documents must be >= 0 (0 = unlimited)")
+	}
+	if in.MaxBytes < 0 {
+		return errors.New("max_bytes must be >= 0 (0 = unlimited)")
+	}
 	conn, err := a.Store.GetConnection(r.Context(), in.EmbeddingConnectionID)
 	if err != nil {
 		return errors.New("embedding_connection_id does not reference an existing model connection")
@@ -675,7 +694,61 @@ func (in *ragInput) toStore(id int64) *store.RAGStore {
 	return &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
 		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK,
 		SearchMode: in.SearchMode, FTSConfig: in.FTSConfig, Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
-		MaxDistance: *in.MaxDistance, ContextualChunks: *in.ContextualChunks}
+		MaxDistance: *in.MaxDistance, ContextualChunks: *in.ContextualChunks,
+		MaxDocuments: in.MaxDocuments, MaxBytes: in.MaxBytes}
+}
+
+// effectiveLimit combines a store's own quota with the instance ceiling: the
+// smaller non-zero value wins, 0 means unlimited.
+func effectiveLimit(store, instance int64) int64 {
+	switch {
+	case store == 0:
+		return instance
+	case instance == 0:
+		return store
+	case instance < store:
+		return instance
+	default:
+		return store
+	}
+}
+
+// storeQuota is the per-upload state of the quota check: the effective
+// limits plus the running usage, so a multi-file upload is checked file by
+// file against the total it would reach.
+type storeQuota struct {
+	maxDocs, docs   int64
+	maxBytes, bytes int64
+}
+
+func (a *Admin) storeQuota(ctx context.Context, rs *store.RAGStore) (*storeQuota, error) {
+	q := &storeQuota{
+		maxDocs:  effectiveLimit(int64(rs.MaxDocuments), int64(a.MaxDocumentsPerStore)),
+		maxBytes: effectiveLimit(rs.MaxBytes, a.MaxBytesPerStore),
+	}
+	if q.maxDocs == 0 && q.maxBytes == 0 {
+		return q, nil
+	}
+	docs, bytes, err := a.Store.StoreUsage(ctx, rs.ID)
+	if err != nil {
+		return nil, err
+	}
+	q.docs, q.bytes = int64(docs), bytes
+	return q, nil
+}
+
+// add reserves one document of size bytes; the error message names the
+// limit that would be exceeded.
+func (q *storeQuota) add(size int64) error {
+	if q.maxDocs > 0 && q.docs+1 > q.maxDocs {
+		return fmt.Errorf("store quota exceeded: %d of %d documents", q.docs, q.maxDocs)
+	}
+	if q.maxBytes > 0 && q.bytes+size > q.maxBytes {
+		return fmt.Errorf("store quota exceeded: %d of %d bytes used, upload of %d bytes does not fit", q.bytes, q.maxBytes, size)
+	}
+	q.docs++
+	q.bytes += size
+	return nil
 }
 
 func (a *Admin) listRAGStores(w http.ResponseWriter, r *http.Request) {
@@ -892,7 +965,13 @@ func (a *Admin) listDocuments(w http.ResponseWriter, r *http.Request) {
 
 func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
-	if _, err := a.Store.GetRAGStore(r.Context(), id); err != nil {
+	rs, err := a.Store.GetRAGStore(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	quota, err := a.storeQuota(r.Context(), rs)
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -935,6 +1014,13 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		}
 		if !rag.SniffOK(name, data) {
 			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q does not look like a %s file", name, strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")))
+			return
+		}
+		// Checked before anything is written; files accepted earlier in the
+		// same request already count towards the total.
+		if err := quota.add(int64(len(data))); err != nil {
+			a.audit(r, "document.upload", "rag_store", ptr(id), map[string]any{"filename": name, "size_bytes": len(data), "error": err.Error()})
+			writeErrCode(w, http.StatusUnprocessableEntity, "store_quota", err.Error())
 			return
 		}
 		doc, err := a.Store.CreateDocument(r.Context(), &store.Document{RAGStoreID: id, Filename: name,

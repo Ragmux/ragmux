@@ -241,9 +241,9 @@ function renderRAG(){
   const embModels = state.models.filter(m => (state.providerTypes.find(t=>t.type===m.provider_type)||{}).supports_embeddings);
   const w = can('editor');
   app.innerHTML = `<div class="card"><div class="row between"><h2>RAG stores</h2>${w?`<button class="primary" id="addStore" ${embModels.length?'':'disabled title="Add an embedding-capable model connection first"'}>+ Add store</button>`:''}</div>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Embedding model</th><th>Chunking</th><th>Top-k</th><th>Retrieval</th><th>Dims</th><th>Docs / chunks</th><th></th></tr></thead><tbody>
-    ${state.rag.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(modelName(r.embedding_connection_id))}</td><td>${r.chunk_size} / ${r.chunk_overlap}${r.contextual_chunks?' <span class="pill" title="Contextual chunks: filename and section are embedded with the text">ctx</span>':''}</td><td>${r.top_k}</td><td class="muted" style="white-space:nowrap">${esc(retrievalSummary(r))}</td><td>${r.dimensions||'—'}</td><td>${r.document_count} / ${r.chunk_count}</td>
-      <td style="white-space:nowrap"><button class="small primary" data-open="${r.id}">Documents</button>${w?` <button class="small" data-edit="${r.id}">Edit</button> <button class="small danger" data-del="${r.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="muted">No RAG stores yet.</td></tr>'}
+    <div class="tbl"><table><thead><tr><th>Name</th><th>Embedding model</th><th>Chunking</th><th>Top-k</th><th>Retrieval</th><th>Dims</th><th>Docs / chunks</th><th>Quota</th><th></th></tr></thead><tbody>
+    ${state.rag.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(modelName(r.embedding_connection_id))}</td><td>${r.chunk_size} / ${r.chunk_overlap}${r.contextual_chunks?' <span class="pill" title="Contextual chunks: filename and section are embedded with the text">ctx</span>':''}</td><td>${r.top_k}</td><td class="muted" style="white-space:nowrap">${esc(retrievalSummary(r))}</td><td>${r.dimensions||'—'}</td><td>${r.document_count} / ${r.chunk_count}</td><td class="muted" style="white-space:nowrap" title="documents / max · MB used / max (∞ = unlimited)">${esc(quotaSummary(r))}</td>
+      <td style="white-space:nowrap"><button class="small primary" data-open="${r.id}">Documents</button>${w?` <button class="small" data-edit="${r.id}">Edit</button> <button class="small danger" data-del="${r.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="9" class="muted">No RAG stores yet.</td></tr>'}
     </tbody></table></div></div><div id="storePanel"></div>`;
   if (w) $('#addStore').onclick=()=>storeForm(null, embModels);
   app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>storeForm(state.rag.find(r=>r.id==b.dataset.edit), embModels));
@@ -254,6 +254,9 @@ function renderRAG(){
 }
 // "hybrid (english) · rerank 15 · dist ≤ 0.6" summary of a store's retrieval settings.
 const retrievalSummary = r => [r.search_mode==='vector'?'vector':`hybrid (${r.fts_config||'simple'})`, r.rerank?`rerank ${r.rerank_candidates}`:'', r.max_distance?`dist ≤ ${r.max_distance}`:''].filter(Boolean).join(' · ');
+// "3/10 docs · 1.2/50 MB" usage against the store's own quotas (∞ = unlimited).
+const mb = b => (b/1048576).toFixed(b && b < 1048576 ? 2 : 1);
+const quotaSummary = r => `${r.document_count}/${r.max_documents||'∞'} docs · ${mb(r.bytes_used||0)}/${r.max_bytes?mb(r.max_bytes):'∞'} MB`;
 const checkbox = (name, checked, label) => `<label class="row" style="gap:6px;align-items:center;font-weight:normal"><input type="checkbox" name="${name}" ${checked?'checked':''} style="width:auto">${esc(label)}</label>`;
 function storeForm(r, embModels){
   modal(r?'Edit RAG store':'New RAG store', `
@@ -270,9 +273,13 @@ function storeForm(r, embModels){
     <div style="flex:1">${field('Rerank candidates', input('rerank_candidates', r?.rerank_candidates||15, 'type=number min=1 max=100'))}</div>
     <div style="flex:1">${field('Max distance (0 = off)', input('max_distance', r?.max_distance||0, 'type=number min=0 max=2 step=0.01'))}</div></div>
     <p class="muted" style="margin-top:-6px">Reranking sends the candidate passages to the chat model on every request (extra latency and tokens). Max distance drops passages whose cosine distance to the query exceeds it.</p>
+    <div class="row"><div style="flex:1">${field('Max documents (0 = unlimited)', input('max_documents', r?.max_documents||0, 'type=number min=0 step=1'))}</div>
+    <div style="flex:1">${field('Max size (MB, 0 = unlimited)', input('max_mb', r&&r.max_bytes?Math.ceil(r.max_bytes/1048576):0, 'type=number min=0 step=1'))}</div></div>
+    <p class="muted" style="margin-top:-6px">Upload quotas for this store; uploads that would exceed them are rejected. An instance-wide ceiling (MAX_DOCUMENTS_PER_STORE / MAX_BYTES_PER_STORE_MB) may apply on top.</p>
     ${r&&r.chunk_count?'<p class="muted">Embedding connection is locked while the store has chunks.</p>':''}`,
     async d => { const body={...d, embedding_connection_id:Number(d.embedding_connection_id), chunk_size:Number(d.chunk_size), chunk_overlap:Number(d.chunk_overlap), top_k:Number(d.top_k),
-        contextual_chunks:d.contextual_chunks==='on', rerank:d.rerank==='on', rerank_candidates:Number(d.rerank_candidates)||15, max_distance:Number(d.max_distance)||0};
+        contextual_chunks:d.contextual_chunks==='on', rerank:d.rerank==='on', rerank_candidates:Number(d.rerank_candidates)||15, max_distance:Number(d.max_distance)||0,
+        max_documents:Number(d.max_documents)||0, max_bytes:(Number(d.max_mb)||0)*1048576}; delete body.max_mb;
       let res; if (r) res=await api('/rag-stores/'+r.id,{method:'PUT',body}); else res=await api('/rag-stores',{method:'POST',body});
       toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3500);
       await loadAll(); render(); });

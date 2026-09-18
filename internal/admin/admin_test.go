@@ -50,3 +50,28 @@ func TestConnInputValidate(t *testing.T) {
 		}
 	}
 }
+
+func TestEffectiveLimitAndStoreQuota(t *testing.T) {
+	cases := []struct{ store, instance, want int64 }{
+		{0, 0, 0}, {10, 0, 10}, {0, 10, 10}, {5, 10, 5}, {10, 5, 5},
+	}
+	for _, c := range cases {
+		if got := effectiveLimit(c.store, c.instance); got != c.want {
+			t.Errorf("effectiveLimit(%d, %d) = %d, want %d", c.store, c.instance, got, c.want)
+		}
+	}
+	q := &storeQuota{maxDocs: 2, docs: 1, maxBytes: 100, bytes: 60}
+	if err := q.add(30); err != nil {
+		t.Fatalf("first file should fit: %v", err)
+	}
+	if err := q.add(5); err == nil || !strings.Contains(err.Error(), "2 of 2 documents") {
+		t.Errorf("document limit: %v", err)
+	}
+	q = &storeQuota{maxBytes: 100, bytes: 60}
+	if err := q.add(41); err == nil || !strings.Contains(err.Error(), "60 of 100 bytes") {
+		t.Errorf("byte limit: %v", err)
+	}
+	if err := (&storeQuota{}).add(1 << 40); err != nil {
+		t.Errorf("unlimited: %v", err)
+	}
+}

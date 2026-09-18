@@ -32,17 +32,25 @@ type RAGStore struct {
 	MaxDistance float64 `json:"max_distance"`
 	// ContextualChunks prefixes the document title and section to the text
 	// that is embedded (not to the stored content).
-	ContextualChunks bool   `json:"contextual_chunks"`
-	Dimensions       int    `json:"dimensions"`
-	DocumentCount    int    `json:"document_count"`
-	ChunkCount       int    `json:"chunk_count"`
-	CreatedAt        string `json:"created_at"`
+	ContextualChunks bool `json:"contextual_chunks"`
+	// MaxDocuments and MaxBytes cap what editors may upload into the store;
+	// 0 means unlimited. Instance-wide ceilings apply on top (see admin).
+	MaxDocuments int   `json:"max_documents"`
+	MaxBytes     int64 `json:"max_bytes"`
+	Dimensions   int   `json:"dimensions"`
+	// DocumentCount and BytesUsed are the current usage the quotas are
+	// checked against (documents in any status, sum of their size_bytes).
+	DocumentCount int    `json:"document_count"`
+	BytesUsed     int64  `json:"bytes_used"`
+	ChunkCount    int    `json:"chunk_count"`
+	CreatedAt     string `json:"created_at"`
 }
 
 const ragCols = `r.id, r.name, r.embedding_connection_id, r.chunk_size, r.chunk_overlap, r.top_k,
 	r.search_mode, r.fts_config, r.rerank, r.rerank_candidates, r.max_distance, r.contextual_chunks,
-	r.dimensions, r.created_at,
+	r.max_documents, r.max_bytes, r.dimensions, r.created_at,
 	(SELECT COUNT(*) FROM documents d WHERE d.rag_store_id = r.id),
+	COALESCE((SELECT SUM(d.size_bytes) FROM documents d WHERE d.rag_store_id = r.id), 0),
 	(SELECT COUNT(*) FROM chunks c WHERE c.rag_store_id = r.id)`
 
 func scanRAG(row interface{ Scan(...any) error }) (*RAGStore, error) {
@@ -51,7 +59,7 @@ func scanRAG(row interface{ Scan(...any) error }) (*RAGStore, error) {
 	var maxDist float32
 	err := row.Scan(&r.ID, &r.Name, &r.EmbeddingConnectionID, &r.ChunkSize, &r.ChunkOverlap, &r.TopK,
 		&r.SearchMode, &r.FTSConfig, &r.Rerank, &r.RerankCandidates, &maxDist, &r.ContextualChunks,
-		&r.Dimensions, &created, &r.DocumentCount, &r.ChunkCount)
+		&r.MaxDocuments, &r.MaxBytes, &r.Dimensions, &created, &r.DocumentCount, &r.BytesUsed, &r.ChunkCount)
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -80,10 +88,12 @@ func (s *Store) CreateRAGStore(ctx context.Context, r *RAGStore) (*RAGStore, err
 	var id int64
 	err := s.pool.QueryRow(ctx, `INSERT INTO rag_stores
 		(name, embedding_connection_id, chunk_size, chunk_overlap, top_k,
-		 search_mode, fts_config, rerank, rerank_candidates, max_distance, contextual_chunks)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+		 search_mode, fts_config, rerank, rerank_candidates, max_distance, contextual_chunks,
+		 max_documents, max_bytes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
 		r.Name, r.EmbeddingConnectionID, r.ChunkSize, r.ChunkOverlap, r.TopK,
-		r.SearchMode, r.FTSConfig, r.Rerank, r.RerankCandidates, float32(r.MaxDistance), r.ContextualChunks).Scan(&id)
+		r.SearchMode, r.FTSConfig, r.Rerank, r.RerankCandidates, float32(r.MaxDistance), r.ContextualChunks,
+		r.MaxDocuments, r.MaxBytes).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
@@ -104,9 +114,10 @@ func (s *Store) UpdateRAGStore(ctx context.Context, r *RAGStore) (*RAGStore, err
 	applyRAGDefaults(r)
 	_, err = s.pool.Exec(ctx, `UPDATE rag_stores SET name=$1, embedding_connection_id=$2, chunk_size=$3,
 		chunk_overlap=$4, top_k=$5, search_mode=$6, fts_config=$7, rerank=$8, rerank_candidates=$9,
-		max_distance=$10, contextual_chunks=$11 WHERE id=$12`,
+		max_distance=$10, contextual_chunks=$11, max_documents=$12, max_bytes=$13 WHERE id=$14`,
 		r.Name, r.EmbeddingConnectionID, r.ChunkSize, r.ChunkOverlap, r.TopK,
-		r.SearchMode, r.FTSConfig, r.Rerank, r.RerankCandidates, float32(r.MaxDistance), r.ContextualChunks, r.ID)
+		r.SearchMode, r.FTSConfig, r.Rerank, r.RerankCandidates, float32(r.MaxDistance), r.ContextualChunks,
+		r.MaxDocuments, r.MaxBytes, r.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +157,14 @@ func (s *Store) DeleteRAGStore(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// StoreUsage returns how many documents a store holds (in any status) and
+// the sum of their uploaded sizes; the quota check in uploads runs on it.
+func (s *Store) StoreUsage(ctx context.Context, storeID int64) (docs int, bytes int64, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)
+		FROM documents WHERE rag_store_id = $1`, storeID).Scan(&docs, &bytes)
+	return docs, bytes, err
 }
 
 // SetRAGStoreDimensions records the embedding width once it is known.

@@ -57,8 +57,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.MigrationsVersion != 4 {
-		t.Errorf("migrations version = %d, want 4", info.MigrationsVersion)
+	if info.MigrationsVersion != 5 {
+		t.Errorf("migrations version = %d, want 5", info.MigrationsVersion)
 	}
 }
 
@@ -518,5 +518,51 @@ func TestReencryptConnections(t *testing.T) {
 	}
 	if got["csk-one"] != "sk-one" || got["c"] != "" || got["csk-three"] != "sk-three" {
 		t.Errorf("keys after rotation: %v", got)
+	}
+}
+
+func TestStoreUsageAndQuotaFields(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "emb", ProviderType: "openai", ModelName: "e"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.CreateRAGStore(ctx, &store.RAGStore{Name: "docs", EmbeddingConnectionID: conn.ID, ChunkSize: 100, ChunkOverlap: 10, TopK: 3,
+		MaxDocuments: 5, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.MaxDocuments != 5 || r.MaxBytes != 1<<20 || r.DocumentCount != 0 || r.BytesUsed != 0 {
+		t.Fatalf("fresh store: %+v", r)
+	}
+	if docs, bytes, err := s.StoreUsage(ctx, r.ID); err != nil || docs != 0 || bytes != 0 {
+		t.Fatalf("usage of empty store = %d, %d, %v", docs, bytes, err)
+	}
+	for i, body := range []string{"hello", "hello world"} {
+		if _, err := s.CreateDocument(ctx, &store.Document{RAGStoreID: r.ID, Filename: "a.txt", SizeBytes: int64(len(body))}, []byte(body)); err != nil {
+			t.Fatalf("document %d: %v", i, err)
+		}
+	}
+	docs, bytes, err := s.StoreUsage(ctx, r.ID)
+	if err != nil || docs != 2 || bytes != 16 {
+		t.Fatalf("usage = %d docs, %d bytes, %v; want 2, 16", docs, bytes, err)
+	}
+	got, err := s.GetRAGStore(ctx, r.ID)
+	if err != nil || got.DocumentCount != 2 || got.BytesUsed != 16 {
+		t.Fatalf("store after uploads: %+v, %v", got, err)
+	}
+	list, err := s.ListRAGStores(ctx)
+	if err != nil || len(list) != 1 || list[0].BytesUsed != 16 || list[0].MaxDocuments != 5 {
+		t.Fatalf("list: %+v, %v", list, err)
+	}
+	r.MaxDocuments, r.MaxBytes = 0, 0
+	if upd, err := s.UpdateRAGStore(ctx, r); err != nil || upd.MaxDocuments != 0 || upd.MaxBytes != 0 {
+		t.Fatalf("update to unlimited: %+v, %v", upd, err)
+	}
+	// The CHECK constraints refuse negative quotas even when the API layer is bypassed.
+	r.MaxBytes = -1
+	if _, err := s.UpdateRAGStore(ctx, r); err == nil {
+		t.Error("negative max_bytes should violate the check constraint")
 	}
 }

@@ -183,8 +183,8 @@ func (s *Store) BackupInfo(ctx context.Context) (*BackupInfo, error) {
 // serialise instead of racing on DDL.
 func migrate(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
 	err := withLockedTx(ctx, conn, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public"); err != nil {
-			return fmt.Errorf("create vector extension: %w", err)
+		if err := ensureVectorExtension(ctx, tx); err != nil {
+			return err
 		}
 		_, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    INT PRIMARY KEY,
@@ -243,6 +243,28 @@ func migrate(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
 		if applied {
 			log.Info("applied migration", "name", name)
 		}
+	}
+	return nil
+}
+
+// ensureVectorExtension makes sure pgvector is installed. The check comes
+// first because CREATE EXTENSION IF NOT EXISTS is not a no-op for a
+// non-superuser role: on some servers it fails with a permission error even
+// when the extension already exists. Only a missing extension is created,
+// and a permission failure at that point is reported as an operator action.
+func ensureVectorExtension(ctx context.Context, tx pgx.Tx) error {
+	var exists bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')").Scan(&exists); err != nil {
+		return fmt.Errorf("check vector extension: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public"); err != nil {
+		if pgCode(err) == "42501" { // insufficient_privilege
+			return errors.New(`the vector extension is missing and the database role may not create it; run "CREATE EXTENSION vector" as a superuser`)
+		}
+		return fmt.Errorf("create vector extension: %w", err)
 	}
 	return nil
 }

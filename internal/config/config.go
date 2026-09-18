@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -68,6 +69,11 @@ type Config struct {
 	// MaxChunksPerDocument fails ingestion of documents that split into more
 	// chunks than this, bounding memory and embedding cost per document.
 	MaxChunksPerDocument int
+	// MaxDocumentsPerStore and MaxBytesPerStore are instance-wide ceilings
+	// on what a RAG store may hold; 0 means unlimited. A store's own
+	// max_documents / max_bytes can only lower them.
+	MaxDocumentsPerStore int
+	MaxBytesPerStore     int64
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -228,6 +234,20 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid MAX_CHUNKS_PER_DOCUMENT %q", v)
 		}
 		c.MaxChunksPerDocument = n
+	}
+	if v := os.Getenv("MAX_DOCUMENTS_PER_STORE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return c, fmt.Errorf("invalid MAX_DOCUMENTS_PER_STORE %q", v)
+		}
+		c.MaxDocumentsPerStore = n
+	}
+	if v := os.Getenv("MAX_BYTES_PER_STORE_MB"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > math.MaxInt64>>20 {
+			return c, fmt.Errorf("invalid MAX_BYTES_PER_STORE_MB %q", v)
+		}
+		c.MaxBytesPerStore = int64(n) << 20
 	}
 	return c, nil
 }
