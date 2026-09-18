@@ -59,6 +59,27 @@ We follow coordinated disclosure: the fix is released first, then the advisory i
 published with credit to the reporter in the release notes (unless you prefer to stay
 anonymous). Please give us the response window above before publishing details.
 
+## Verifying the container image
+
+Images published from **v0.3.1 onward** are signed with [cosign](https://docs.sigstore.dev/)
+(keyless, Sigstore/Fulcio through the release workflow's GitHub OIDC identity). Verify
+a tag before pulling it into production:
+
+```sh
+cosign verify ghcr.io/ragmux/ragmux:<tag> \
+  --certificate-identity-regexp '^https://github.com/ragmux/ragmux/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+A successful run prints the signature payload and the certificate's identity, which must
+be `release.yml` in this repository running for a `v*` tag; anything else means the image
+did not come from our release pipeline. The signature is attached to the manifest digest,
+so it also covers the `:<major>.<minor>` and `:latest` tags that point at the same
+release. Pinning deployments to the digest reported by `cosign verify` (or by
+`docker buildx imagetools inspect`) protects against a tag being moved later. The same
+check works for `docker.io/ragmux/ragmux` when the Docker Hub mirror is published.
+Releases before 0.3.1 carry no signature.
+
 ## Hardening pointers
 
 The defaults are conservative, but a production deployment should read these sections
