@@ -23,8 +23,8 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 
 ## Features
 
-- **Providers:** `openai`, `anthropic`, `gemini`, `deepseek`, `ollama`, `custom_openai`
-  (vLLM, LM Studio, LiteLLM, any OpenAI-compatible server).
+- **Providers:** `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` (native `/api/chat`),
+  `custom_openai` (vLLM, LM Studio, LiteLLM, Ollama's `/v1` shim, any OpenAI-compatible server).
 - **OpenAI-compatible proxy:** `/v1/chat/completions` (JSON + SSE streaming), `/v1/models`.
   Works with the official OpenAI SDKs by changing `base_url` and `api_key`.
 - **Format translation:** Anthropic Messages API and Gemini `generateContent` requests and
@@ -36,7 +36,7 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
   optional RAG store. Provider credentials are AES-256-GCM encrypted at rest and never leave
   the server.
 - **Observability:** per-request logs (prompt/completion tokens, latency, status, streaming,
-  RAG usage), per-project and global summaries, daily series.
+  RAG usage), per-project and global summaries, daily series, configurable retention.
 - **Dashboard:** embedded single-page UI at `/admin/` for models, RAG stores, documents,
   projects, metrics, users, the audit log and a playground. Everything is also available
   as a REST API.
@@ -132,6 +132,9 @@ must be re-entered.
 | `INGEST_WORKERS`   | `2`          | Parallel document ingestion jobs |
 | `MAX_UPLOAD_MB`    | `50`         | Max upload size |
 | `SECURE_COOKIES`   | `false`      | Mark the session cookie `Secure` (behind HTTPS) |
+| `TRUST_PROXY_HEADERS` | `false`   | Take the client IP from `X-Forwarded-For` / `X-Real-IP` (only behind a proxy that sets them) |
+| `LOG_RETENTION_DAYS`   | `90`     | Delete request logs older than this many days (`0` keeps them forever) |
+| `AUDIT_RETENTION_DAYS` | `365`    | Delete audit entries older than this many days (`0` keeps them forever) |
 | `LOGIN_RATE_LIMIT_PER_MIN` | `10` | Failed logins allowed per minute from one IP address (`0` disables) |
 | `LOGIN_USER_LIMIT_PER_MIN` | `5`  | Failed logins allowed per minute for one username (`0` disables) |
 | `LOGIN_LOCKOUT_FAILURES`   | `20` | Failures within `LOGIN_LOCKOUT_MINUTES` that lock a username out (`0` disables) |
@@ -161,11 +164,24 @@ curl -s localhost:8080/admin/api/models -H "$AUTH" -H 'Content-Type: application
   "name": "openai-embed", "provider_type": "openai",
   "api_key": "sk-...", "model_name": "text-embedding-3-small"}'
 
-# Local vLLM / Ollama
+# Local vLLM / LM Studio (any OpenAI-compatible server)
 curl -s localhost:8080/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
   "name": "local-qwen", "provider_type": "custom_openai",
   "base_url": "http://host.docker.internal:8000/v1", "model_name": "qwen2.5-7b"}'
+
+# Ollama (native API; base_url defaults to http://localhost:11434)
+curl -s localhost:8080/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "name": "ollama-llama", "provider_type": "ollama",
+  "base_url": "http://host.docker.internal:11434", "model_name": "llama3.1"}'
 ```
+
+The `ollama` type talks to Ollama's own `/api/chat` and `/api/embed` endpoints, so the
+extra request fields `keep_alive`, `num_ctx` and `options` (any Ollama model option, merged
+with `temperature`, `top_p`, `max_tokens` → `num_predict` and `stop`) pass through, tools
+and tool calls are translated, and a trailing `/v1` in `base_url` is stripped. An `api_key`
+is sent as `Authorization: Bearer` for Ollama behind an authenticating proxy. To use
+Ollama's OpenAI-compatible `/v1` endpoint instead, create a `custom_openai` connection
+with `base_url` ending in `/v1`.
 
 `POST /admin/api/models/{id}/test` with `{"mode":"chat"}` or `{"mode":"embedding"}` sends a
 ping through the connection.
@@ -350,8 +366,9 @@ failures from an IP within a minute, and after `LOGIN_LOCKOUT_FAILURES` failures
 username within `LOGIN_LOCKOUT_MINUTES`, `/admin/api/login` answers
 `429 {"error":{"type":"rate_limited"}}` with a `Retry-After` header. Successful logins do
 not reset the counters; the windows simply expire. Attempts older than 24 hours are purged
-hourly. The client IP is taken from `X-Forwarded-For` / `X-Real-IP` when present, so run
-the gateway behind a proxy that sets them or make sure clients cannot spoof them.
+hourly. The client IP is the TCP peer address unless `TRUST_PROXY_HEADERS=true`, in which
+case `X-Real-IP` or the first `X-Forwarded-For` entry is used; only enable it behind a
+reverse proxy that overwrites those headers.
 
 ### Audit log
 
@@ -423,6 +440,27 @@ usage fall back to the same character estimate.
 Minute rows are purged after two hours, day rows after 400 days and month rows after
 three years by the hourly retention job.
 
+## Metrics and retention
+
+Every chat completion is written to `request_logs` with the status the client received
+plus two gateway-internal codes:
+
+| Status | Meaning |
+|---|---|
+| `2xx` | completed; tokens from the provider's usage block, or an estimate (`estimated: true`) |
+| `429` | rejected by the project's rate limit or budget (`rate_limited` in summaries) |
+| `499` | the client disconnected before the completion finished; the upstream call was cancelled. Counted as an error in summaries, never sent on the wire |
+| `502` / `504` | upstream failure or timeout, including streams that died mid-way |
+| other `4xx` / `5xx` | relayed from the provider |
+
+Upstream error messages are stored and logged with anything that looks like an API key
+(`sk-…`, `sk-ant-…`, `AIza…`, `Bearer …`) replaced by `[redacted]`.
+
+A retention job runs one minute after start and then hourly: request logs older than
+`LOG_RETENTION_DAYS` (default 90) and audit entries older than `AUDIT_RETENTION_DAYS`
+(default 365) are deleted, `0` keeps a table forever. The same pass removes login attempts
+older than 24 hours, expired dashboard sessions and stale usage counters.
+
 ## REST API summary
 
 All management endpoints are under `/admin/api` and need a session (cookie or
@@ -472,6 +510,9 @@ make backup               # scripts/backup.sh against the compose stack
 make restore FILE=backups/ragmux-<stamp>.dump YES=1   # scripts/restore.sh (without YES=1: plan only)
 ```
 
+`golangci-lint run ./...` (v2, config in `.golangci.yml`) and
+`go run golang.org/x/vuln/cmd/govulncheck@latest ./...` run in CI as well.
+
 Requires Go 1.27+ and Docker for the database. Tests read `TEST_DATABASE_URL` (the
 Makefile defaults it to `postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable`)
 and create a throwaway schema per test, so they can run in parallel against one server;
@@ -490,10 +531,11 @@ cmd/ragmux/          entrypoint, HTTP server, admin bootstrap
 internal/config/     environment configuration
 internal/store/      PostgreSQL schema, migrations, encryption, pgvector search
 internal/testdb/     per-test schemas on TEST_DATABASE_URL
-internal/provider/   OpenAI-compatible, Anthropic, Gemini adapters + embedders
+internal/provider/   OpenAI-compatible, Anthropic, Gemini, Ollama adapters + embedders
 internal/rag/        parsing (PDF/DOCX/HTML/TXT/MD), chunking, ingestion worker, retrieval, reranking
 internal/gateway/    /v1 proxy, RAG injection, metrics
 internal/limits/     per-project rate limits, token budgets, usage counters
+internal/maintenance/ hourly retention job (request logs, audit log, sessions, login attempts)
 internal/admin/      /admin REST API + dashboard hosting
 web/index.html       dashboard (vanilla JS, embedded in the binary)
 ```

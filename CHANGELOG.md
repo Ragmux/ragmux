@@ -42,11 +42,28 @@ All notable changes to Ragmux are documented here. The format follows
   `/healthz`), `make backup` / `make restore`, a scheduled `backup` Compose profile
   (`prodrigestivill/postgres-backup-local`), `docs/backup-restore.md`, a `backup` block in
   `GET /admin/api/system` and `ragmux -version`.
-- Data retention jobs, gateway test suite, native Ollama adapter, CI (lint, vet, tests, vuln scan)
-  and release workflow publishing `ghcr.io/ragmux/ragmux`.
+- Retention job (`internal/maintenance`): request logs older than `LOG_RETENTION_DAYS`
+  (default 90) and audit entries older than `AUDIT_RETENTION_DAYS` (default 365) are deleted
+  hourly (`0` keeps forever), together with day-old login attempts, expired sessions and
+  stale usage counters.
+- Native Ollama adapter: the `ollama` provider type uses `/api/chat` (NDJSON streaming, tools
+  and tool calls, `keep_alive` / `num_ctx` / `options` passthrough, optional bearer key for
+  proxies); `custom_openai` still covers Ollama's `/v1` shim.
+- Request logs record `499` when the client disconnects mid-completion; the upstream call is
+  cancelled in both the JSON and streaming paths.
+- Upstream error messages are scrubbed of API-key-looking strings before they reach logs,
+  the request log or clients.
+- `TRUST_PROXY_HEADERS` gates the use of `X-Forwarded-For` / `X-Real-IP` as the client address.
+- Graceful shutdown: HTTP drains for 15 s, in-flight ingestion jobs get 30 s, then the
+  retention job and the pool stop.
+- Gateway test suite (auth, validation, error relay, streaming failures, disconnects, degraded
+  RAG, rate limit headers), Ollama adapter and retention tests, golangci-lint v2 in CI,
+  release workflow publishing `ghcr.io/ragmux/ragmux`.
 
 ### Changed
 - License: AGPL-3.0-or-later.
+- The client IP for login limits and the audit log is the TCP peer address unless
+  `TRUST_PROXY_HEADERS=true`; previously proxy headers were always trusted.
 - `GET /admin/api/system` now returns `database` (Postgres, pgvector and migration versions,
   size) and `secret_key_source` instead of `data_dir`, `db_size_bytes` and `vector_engine`.
 - `docker-compose.dev.yml` and `make dev-db` start a local pgvector Postgres for tests.
