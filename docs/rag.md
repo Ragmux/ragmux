@@ -63,7 +63,10 @@ the limit for such documents. One ingestion job may run for 15 minutes.
 
 Uploaded files are stored as `bytea` in the database, so a document can always be
 re-parsed. Ingestion runs in the background (`INGEST_WORKERS` jobs in parallel); a
-document's `status` goes `pending` → `processing` → `ready` or `failed` (with `error`).
+document's `status` goes `pending` → `processing` → `ready` or `failed` (with `error`),
+and `progress_percent` reports how far a job got: `10` after parsing, `20` after chunking,
+then the share of embedding batches done, `100` when ready (a failed document keeps its
+last value). PDFs also report `page_count` once parsed; other formats leave it `null`.
 Jobs interrupted by a restart resume automatically. The queue holds 1024 documents; when
 it is full an upload or reprocess request answers `503 ingestion queue is full, retry
 later` and the affected documents are marked `failed` with that message.
@@ -202,11 +205,13 @@ only get the header. Every request also records the number of injected passages 
 (everything but `query` optional; unset fields use the store settings) and returns
 
 ```json
-{"mode":"hybrid","reranked":true,"latency_ms":412,
+{"mode":"hybrid","reranked":true,"latency_ms":412,"retrieval_latency_ms":180,"rerank_latency_ms":230,
  "hits":[{"chunk_id":8,"document_id":2,"filename":"handbook.pdf","index":3,"section":"Leave > Vacation","page":12,
           "content":"…","distance":0.18,"score":0.0325,"vector_rank":1,"fts_rank":2}]}
 ```
 
-`vector_rank` / `fts_rank` are 0 when the chunk was not a candidate on that side. The
+`vector_rank` / `fts_rank` are 0 when the chunk was not a candidate on that side.
+`retrieval_latency_ms` covers the query embedding and the database search,
+`rerank_latency_ms` the reranker (`null` when reranking did not run). The
 overrides only affect this call, which makes the endpoint (and the dashboard's search
 test built on it) a way to try settings before saving them.

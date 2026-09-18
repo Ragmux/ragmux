@@ -113,7 +113,7 @@ case setup is already complete (see [Configuration](configuration.md#environment
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` |
 | POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked |
-| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key` |
+| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools` (false for `gemini`), `supports_streaming` |
 
 ### Model connections
 
@@ -124,7 +124,8 @@ case setup is already complete (see [Configuration](configuration.md#environment
 | GET | `/models/{id}` | viewer | Read one |
 | PUT | `/models/{id}` | editor | Update; an empty `api_key` keeps the stored key |
 | DELETE | `/models/{id}` | editor | Delete → `{"ok": true}`; `409` while a project or RAG store uses it |
-| POST | `/models/{id}/test` | editor | `{"mode": "chat"}` (default) or `{"mode": "embedding"}`; spends provider quota, so it is a write |
+| POST | `/models/{id}/test` | editor | `{"mode": "chat"}` (default) or `{"mode": "embedding"}`; spends provider quota, so it is a write; the outcome is recorded on the connection |
+| POST | `/models/test` | editor | Test an unsaved connection: the create body plus `mode` and optionally `connection_id` (reuse that connection's stored key when `api_key` is empty); nothing is recorded |
 
 Request body for create and update:
 
@@ -144,14 +145,36 @@ never contains the key:
 
 ```json
 {"id": 1, "name": "claude", "provider_type": "anthropic", "base_url": "",
- "api_key_masked": "sk-ant-…abcd", "model_name": "claude-sonnet-4-5",
+ "api_key_masked": "sk-ant-…abcd", "model_name": "claude-sonnet-4-5", "private_upstream": false,
+ "last_test_at": "2026-09-18T10:05:00Z", "last_test_ok": true, "last_test_latency_ms": 812, "last_test_error": "",
  "created_at": "2026-09-18T10:00:00.000Z", "updated_at": "2026-09-18T10:00:00.000Z"}
 ```
 
+`private_upstream` is true when `base_url` points at `localhost`, a loopback, private or
+link-local address, or a hostname that resolved only to such addresses when the
+connection was saved (it is computed on create and update, never on read; the provider
+default URL counts as public). `last_test_*` describe the most recent
+`POST /models/{id}/test`: all `null` / empty until the connection has been tested.
+
 `POST /models/{id}/test` always answers `200` and reports the outcome in the body:
 `{"ok": true, "reply": "pong", "usage": {…}, "latency_ms": 812}` for chat (the model is asked to reply
-with the word `pong`, `max_tokens` 16), `{"ok": true, "dimensions": 1536, "latency_ms": 240}`
-for embeddings, or `{"ok": false, "error": "...", "latency_ms": …}`.
+with the word `pong`, `max_tokens` 256), `{"ok": true, "dimensions": 1536, "latency_ms": 240}`
+for embeddings, or `{"ok": false, "error": "...", "latency_ms": …}`. The result is stored on
+the connection as `last_test_at`, `last_test_ok`, `last_test_latency_ms` and
+`last_test_error` (credentials redacted, at most 512 characters).
+
+`POST /models/test` runs the same test on a connection that has not been saved:
+
+```json
+{"provider_type": "custom_openai", "base_url": "http://vllm:8000/v1", "api_key": "",
+ "model_name": "llama-3", "mode": "chat", "connection_id": 4}
+```
+
+`base_url`, `provider_type` and `model_name` are validated exactly like create (including
+the private-address check → `400`); `name` is not required. With `connection_id` set and
+`api_key` empty the stored key of that connection is used, so an edit form can try a
+changed URL or model without re-entering the key. The response has the same shape as
+`/models/{id}/test`; nothing is recorded.
 
 ### RAG stores and documents
 
@@ -194,10 +217,14 @@ Documents look like
 ```json
 {"id": 7, "rag_store_id": 1, "filename": "handbook.pdf", "mime": "application/pdf",
  "size_bytes": 1048576, "status": "ready", "error": "", "chunk_count": 42,
- "created_at": "…", "updated_at": "…"}
+ "page_count": 12, "progress_percent": 100, "created_at": "…", "updated_at": "…"}
 ```
 
 with `status` moving `pending` → `processing` → `ready` (or `failed` with `error` set).
+`progress_percent` follows ingestion: `10` once parsed, `20` once chunked, then the share
+of embedding batches completed, `100` when ready; a failed document keeps the value it
+reached. `page_count` is the number of pages of a PDF and `null` for other formats (and
+until the document has been parsed).
 Accepted extensions: `.pdf`, `.docx`, `.html`, `.htm`, `.md`, `.markdown`, `.txt`; the
 request body is limited to `MAX_UPLOAD_MB`. Upload and reprocess answer
 `503 ingestion queue is full, retry later` when the background queue (1024 documents) is
@@ -210,13 +237,17 @@ POST /admin/api/rag-stores/1/search
 {"query": "vacation policy", "top_k": 3, "mode": "hybrid", "rerank": true, "max_distance": 0.6}
 
 {"mode": "hybrid", "reranked": true, "latency_ms": 412,
+ "retrieval_latency_ms": 180, "rerank_latency_ms": 230,
  "hits": [{"chunk_id": 8, "document_id": 2, "filename": "handbook.pdf", "index": 3,
            "section": "Leave > Vacation", "page": 12, "content": "…",
            "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2}]}
 ```
 
 Everything but `query` is optional and overrides the store setting for this call only;
-`top_k` is clamped to 1-50 (`0` or absent uses the store's `top_k`).
+`top_k` is clamped to 1-50 (`0` or absent uses the store's `top_k`). `latency_ms` is the
+whole call, `retrieval_latency_ms` covers embedding the query and the database search,
+and `rerank_latency_ms` the reranker (`null` when reranking is off or no chat connection
+is available for it).
 A `502` is returned when the embedding call fails.
 
 ### Projects

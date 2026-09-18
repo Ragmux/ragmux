@@ -24,21 +24,28 @@ type Document struct {
 	Status     string `json:"status"`
 	Error      string `json:"error"`
 	ChunkCount int    `json:"chunk_count"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
+	// PageCount is known for PDFs once parsed; nil for other formats.
+	PageCount *int `json:"page_count"`
+	// ProgressPercent moves 0 -> 100 while the document is ingested and
+	// keeps its last value when ingestion fails.
+	ProgressPercent int    `json:"progress_percent"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
 }
 
-const docCols = "id, rag_store_id, filename, mime, size_bytes, status, error, chunk_count, created_at, updated_at"
+const docCols = "id, rag_store_id, filename, mime, size_bytes, status, error, chunk_count, page_count, progress_percent, created_at, updated_at"
 
 func scanDoc(row interface{ Scan(...any) error }) (*Document, error) {
 	d := &Document{}
 	var created, updated time.Time
+	var progress int16
 	err := row.Scan(&d.ID, &d.RAGStoreID, &d.Filename, &d.Mime, &d.SizeBytes, &d.Status, &d.Error,
-		&d.ChunkCount, &created, &updated)
+		&d.ChunkCount, &d.PageCount, &progress, &created, &updated)
 	if err != nil {
 		return nil, scanErr(err)
 	}
 	d.CreatedAt, d.UpdatedAt = ts(created), ts(updated)
+	d.ProgressPercent = int(progress)
 	return d, nil
 }
 
@@ -109,6 +116,26 @@ func collectDocs(rows interface {
 func (s *Store) SetDocumentStatus(ctx context.Context, id int64, status, errMsg string) error {
 	_, err := s.pool.Exec(ctx, "UPDATE documents SET status=$1, error=$2, updated_at=now() WHERE id=$3",
 		status, errMsg, id)
+	return err
+}
+
+// StartDocumentProcessing marks a document processing and resets the
+// progress fields of a previous run in the same write.
+func (s *Store) StartDocumentProcessing(ctx context.Context, id int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE documents SET status=$1, error='', progress_percent=0, page_count=NULL,
+		updated_at=now() WHERE id=$2`, DocProcessing, id)
+	return err
+}
+
+// SetDocumentProgress records ingestion progress (clamped to 0..100). With
+// pageCount set the page count is stored as well.
+func (s *Store) SetDocumentProgress(ctx context.Context, id int64, percent int, pageCount *int) error {
+	percent = max(0, min(100, percent))
+	if pageCount != nil {
+		_, err := s.pool.Exec(ctx, "UPDATE documents SET progress_percent=$1, page_count=$2 WHERE id=$3", int16(percent), *pageCount, id)
+		return err
+	}
+	_, err := s.pool.Exec(ctx, "UPDATE documents SET progress_percent=$1 WHERE id=$2", int16(percent), id)
 	return err
 }
 
