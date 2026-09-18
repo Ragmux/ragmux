@@ -73,7 +73,7 @@ func TestLoginLimiter(t *testing.T) {
 	mustAllow("dave", "10.0.0.3", true)
 
 	// Purging old rows does not touch recent ones.
-	if err := s.DeleteLoginAttemptsBefore(ctx, time.Now().Add(-24*time.Hour)); err != nil {
+	if _, err := s.DeleteLoginAttemptsBefore(ctx, time.Now().Add(-24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, byIP, _ := s.CountFailedLoginAttempts(ctx, "x", "10.0.0.3", time.Now().Add(-time.Hour)); byIP != 20 {

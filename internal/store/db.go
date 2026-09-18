@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -87,11 +88,11 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 	}
 	var version string
 	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version')").Scan(&version); err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("query server version: %w", err)
 	}
 	if err := migrate(ctx, conn, log); err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		return nil, err
 	}
 	if err := conn.Close(ctx); err != nil {
@@ -101,6 +102,9 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 	pc, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	if cfg.MaxConns < 1 || cfg.MaxConns > math.MaxInt32 {
+		return nil, fmt.Errorf("max connections %d out of range", cfg.MaxConns)
 	}
 	pc.MaxConns = int32(cfg.MaxConns)
 	pc.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
@@ -248,7 +252,7 @@ func withLockedTx(ctx context.Context, conn *pgx.Conn, fn func(tx pgx.Tx) error)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockMigrations); err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}

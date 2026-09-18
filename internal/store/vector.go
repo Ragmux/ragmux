@@ -59,12 +59,18 @@ type SearchOptions struct {
 // vecTable names the embedding table for one vector width. Embeddings of
 // different models have different dimensions and pgvector needs a fixed
 // width per column, hence one table per dimension.
+// maxVectorDims is pgvector's limit for the vector type.
+const maxVectorDims = 16000
+
 func vecTable(dims int) string { return fmt.Sprintf("chunk_embeddings_%d", dims) }
 
 // ensureVecTable creates the embedding table and its indexes for a dimension
 // if they do not exist yet. DDL is serialised with an advisory lock so
 // concurrent ingesters on several replicas do not race.
 func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
+	if dims < 1 || dims > maxVectorDims {
+		return fmt.Errorf("embedding dimension %d out of range (1-%d)", dims, maxVectorDims)
+	}
 	if _, ok := s.vecTables.Load(dims); ok {
 		return nil
 	}
@@ -72,7 +78,7 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", lockVecTables, int32(dims)); err != nil {
 		return err
 	}
@@ -131,7 +137,7 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 
 	// Old embeddings go away through ON DELETE CASCADE.
 	if _, err := tx.Exec(ctx, "DELETE FROM chunks WHERE document_id = $1", doc.ID); err != nil {
@@ -153,7 +159,7 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 	br := tx.SendBatch(ctx, batch)
 	for _, c := range chunks {
 		if err := br.QueryRow().Scan(&c.ID); err != nil {
-			br.Close()
+			_ = br.Close()
 			return fmt.Errorf("insert chunk: %w", err)
 		}
 		c.DocumentID, c.RAGStoreID = doc.ID, doc.RAGStoreID
@@ -170,7 +176,7 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 	br = tx.SendBatch(ctx, batch)
 	for range chunks {
 		if _, err := br.Exec(); err != nil {
-			br.Close()
+			_ = br.Close()
 			return fmt.Errorf("insert embedding: %w", err)
 		}
 	}
@@ -220,7 +226,7 @@ func (s *Store) Search(ctx context.Context, storeID int64, query string, queryVe
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 	// HNSW returns at most ef_search candidates; keep it comfortably above N.
 	efSearch := opts.Candidates * 4
 	if efSearch < 40 {

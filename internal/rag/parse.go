@@ -249,7 +249,7 @@ func extractDOCX(data []byte) (*Parsed, error) {
 				return nil, fmt.Errorf("open docx: %w", err)
 			}
 			docXML, err = io.ReadAll(io.LimitReader(rc, 256<<20))
-			rc.Close()
+			_ = rc.Close()
 			if err != nil {
 				return nil, fmt.Errorf("read docx: %w", err)
 			}

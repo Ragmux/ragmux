@@ -16,12 +16,16 @@ type EmbedderFactory func(conn *store.ModelConnection) (provider.Embedder, error
 
 // Ingester processes uploaded documents in the background.
 type Ingester struct {
-	store     *store.Store
-	factory   EmbedderFactory
-	log       *slog.Logger
-	queue     chan int64
-	wg        sync.WaitGroup
-	cancel    context.CancelFunc
+	store   *store.Store
+	factory EmbedderFactory
+	log     *slog.Logger
+	queue   chan int64
+	wg      sync.WaitGroup
+	cancel  context.CancelFunc
+	// stopping is closed by Stop so workers finish their current job and
+	// leave the remaining queue for the next process (see Resume).
+	stopping  chan struct{}
+	stopOnce  sync.Once
 	batchSize int
 }
 
@@ -34,10 +38,11 @@ func NewIngester(ctx context.Context, st *store.Store, factory EmbedderFactory, 
 		log = slog.Default()
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	ing := &Ingester{store: st, factory: factory, log: log, queue: make(chan int64, 1024), cancel: cancel, batchSize: 32}
+	ing := &Ingester{store: st, factory: factory, log: log, queue: make(chan int64, 1024), cancel: cancel,
+		stopping: make(chan struct{}), batchSize: 32}
 	for i := 0; i < workers; i++ {
 		ing.wg.Add(1)
-		go ing.worker(ctx)
+		go ing.worker(ctx) //nolint:gosec // G118: the worker runs on the caller's context; Background is only used to record a failure after cancellation
 	}
 	return ing
 }
@@ -66,10 +71,38 @@ func (ing *Ingester) Resume(ctx context.Context) error {
 	return nil
 }
 
-// Stop halts workers and waits for in-flight jobs.
+// Stop cancels the workers immediately and waits for them to return; a job
+// in progress is aborted and left for Resume on the next start.
 func (ing *Ingester) Stop() {
+	ing.stop(0)
+}
+
+// StopWithTimeout waits up to d for in-flight jobs, then cancels the worker
+// context so a stuck embedding call cannot hold shutdown up. It reports
+// whether every job finished in time.
+func (ing *Ingester) StopWithTimeout(d time.Duration) bool {
+	return ing.stop(d)
+}
+
+func (ing *Ingester) stop(d time.Duration) bool {
+	ing.stopOnce.Do(func() { close(ing.stopping) })
+	done := make(chan struct{})
+	go func() {
+		ing.wg.Wait()
+		close(done)
+	}()
+	graceful := true
+	if d > 0 {
+		select {
+		case <-done:
+		case <-time.After(d):
+			graceful = false
+			ing.log.Warn("ingestion jobs still running after grace period; cancelling", "grace", d)
+		}
+	}
 	ing.cancel()
-	ing.wg.Wait()
+	<-done
+	return graceful
 }
 
 func (ing *Ingester) worker(ctx context.Context) {
@@ -77,6 +110,8 @@ func (ing *Ingester) worker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-ing.stopping:
 			return
 		case id := <-ing.queue:
 			if err := ing.Process(ctx, id); err != nil {

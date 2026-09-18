@@ -42,6 +42,13 @@ type Config struct {
 	// LoginLockoutFailures failures within LoginLockoutMinutes lock a username out.
 	LoginLockoutFailures int
 	LoginLockoutMinutes  int
+	// TrustProxyHeaders enables X-Forwarded-For / X-Real-IP as the client
+	// address for login limits and audit entries.
+	TrustProxyHeaders bool
+	// LogRetentionDays is how long request logs are kept; 0 keeps them forever.
+	LogRetentionDays int
+	// AuditRetentionDays is how long audit entries are kept; 0 keeps them forever.
+	AuditRetentionDays int
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -64,6 +71,9 @@ func Load() (Config, error) {
 		LoginUserLimitPerMin: 5,
 		LoginLockoutFailures: 20,
 		LoginLockoutMinutes:  15,
+
+		LogRetentionDays:   90,
+		AuditRetentionDays: 365,
 	}
 	if c.DatabaseURL == "" {
 		return c, errors.New("DATABASE_URL is required (e.g. postgres://user:pass@host:5432/ragmux?sslmode=disable)")
@@ -86,6 +96,7 @@ func Load() (Config, error) {
 		return c, err
 	}
 	c.Port = p
+	c.TrustProxyHeaders = os.Getenv("TRUST_PROXY_HEADERS") == "true"
 	if v := os.Getenv("CORS_ORIGINS"); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {
@@ -129,6 +140,8 @@ func Load() (Config, error) {
 		{"LOGIN_USER_LIMIT_PER_MIN", &c.LoginUserLimitPerMin},
 		{"LOGIN_LOCKOUT_FAILURES", &c.LoginLockoutFailures},
 		{"LOGIN_LOCKOUT_MINUTES", &c.LoginLockoutMinutes},
+		{"LOG_RETENTION_DAYS", &c.LogRetentionDays},
+		{"AUDIT_RETENTION_DAYS", &c.AuditRetentionDays},
 	} {
 		if raw := os.Getenv(v.name); raw != "" {
 			n, err := strconv.Atoi(raw)

@@ -92,3 +92,13 @@ func (s *Store) ListAuditLogs(ctx context.Context, f AuditFilter) ([]*AuditLog, 
 	}
 	return out, rows.Err()
 }
+
+// DeleteAuditLogsBefore removes audit entries older than t and reports how
+// many rows were removed.
+func (s *Store) DeleteAuditLogsBefore(ctx context.Context, t time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM audit_logs WHERE created_at < $1", t.UTC())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

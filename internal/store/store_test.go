@@ -328,7 +328,7 @@ func TestSessions(t *testing.T) {
 	if _, err := s.UserBySession(ctx, "old"); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("expired session should not resolve: %v", err)
 	}
-	if err := s.PurgeExpiredSessions(ctx); err != nil {
+	if _, err := s.PurgeExpiredSessions(ctx, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DeleteSession(ctx, "tok"); err != nil {

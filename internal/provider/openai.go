@@ -12,12 +12,11 @@ import (
 const (
 	openAIBase   = "https://api.openai.com/v1"
 	deepSeekBase = "https://api.deepseek.com/v1"
-	ollamaBase   = "http://localhost:11434/v1"
 )
 
 // openAICompat handles every provider that speaks the OpenAI wire format:
-// openai, deepseek, ollama (its /v1 endpoint) and custom_openai (vLLM, LM
-// Studio, LiteLLM, ...).
+// openai, deepseek and custom_openai (vLLM, LM Studio, LiteLLM, Ollama's
+// /v1 shim, ...). The ollama type uses the native adapter in ollama.go.
 type openAICompat struct {
 	cfg  Config
 	base string
@@ -25,11 +24,8 @@ type openAICompat struct {
 
 func newOpenAICompat(cfg Config) *openAICompat {
 	def := openAIBase
-	switch cfg.ProviderType {
-	case "deepseek":
+	if cfg.ProviderType == "deepseek" {
 		def = deepSeekBase
-	case "ollama":
-		def = ollamaBase
 	}
 	base := cfg.baseURL(def)
 	// Users often paste the host without /v1 for Ollama/vLLM. Add it when the
@@ -49,7 +45,7 @@ func (p *openAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	req.Stream = false
 	req.StreamOptions = nil
 	var out ChatResponse
-	if err := doJSON(ctx, p.cfg, http.MethodPost, p.base+"/chat/completions", p.headers(), req, &out); err != nil {
+	if err := doJSON(ctx, p.cfg, p.base+"/chat/completions", p.headers(), req, &out); err != nil {
 		return nil, err
 	}
 	if out.ID == "" {
@@ -74,7 +70,7 @@ func (p *openAICompat) ChatStream(ctx context.Context, req ChatRequest, out chan
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var streamErr error
 	err = readSSE(resp.Body, func(ev sseEvent) bool {
 		data := strings.TrimSpace(ev.Data)

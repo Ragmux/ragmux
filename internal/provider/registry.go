@@ -8,8 +8,10 @@ import (
 // New returns the chat adapter for a connection configuration.
 func New(cfg Config) (Provider, error) {
 	switch cfg.ProviderType {
-	case "openai", "deepseek", "ollama", "custom_openai":
+	case "openai", "deepseek", "custom_openai":
 		return newOpenAICompat(cfg), nil
+	case "ollama":
+		return newOllama(cfg), nil
 	case "anthropic":
 		return newAnthropic(cfg), nil
 	case "gemini":
@@ -32,7 +34,7 @@ func NewEmbedder(cfg Config) (Embedder, error) {
 		}
 		return &openAIEmbedder{cfg: cfg, base: base}, nil
 	case "ollama":
-		base := strings.TrimSuffix(cfg.baseURL("http://localhost:11434"), "/v1")
+		base := strings.TrimSuffix(cfg.baseURL(ollamaNativeBase), "/v1")
 		return &ollamaEmbedder{cfg: cfg, base: base}, nil
 	case "gemini":
 		return &geminiEmbedder{cfg: cfg, base: cfg.baseURL(geminiBase)}, nil

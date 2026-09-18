@@ -46,7 +46,7 @@ func (s *Service) Login(ctx context.Context, username, password string) (*store.
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// Burn similar time to a real comparison.
-			bcrypt.CompareHashAndPassword([]byte("$2a$10$7EqJtq98hPqEX7fNZaFWoOhi5XKnb6.7YyN5m9uI0dKJmB9Zxy1Pa"), []byte(password))
+			_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$7EqJtq98hPqEX7fNZaFWoOhi5XKnb6.7YyN5m9uI0dKJmB9Zxy1Pa"), []byte(password))
 			return nil, "", ErrInvalidCredentials
 		}
 		return nil, "", err
@@ -74,7 +74,7 @@ func (s *Service) Logout(ctx context.Context, r *http.Request) error {
 
 // SetCookie writes the session cookie.
 func (s *Service) SetCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure follows SECURE_COOKIES so plain-HTTP deployments keep working
 		Name: CookieName, Value: token, Path: "/", HttpOnly: true, Secure: s.Secure,
 		SameSite: http.SameSiteLaxMode, MaxAge: int(s.TTL.Seconds()),
 	})
@@ -82,7 +82,9 @@ func (s *Service) SetCookie(w http.ResponseWriter, token string) {
 
 // ClearCookie expires the session cookie.
 func (s *Service) ClearCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: CookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure follows SECURE_COOKIES so plain-HTTP deployments keep working
+		Name: CookieName, Value: "", Path: "/", HttpOnly: true, Secure: s.Secure, SameSite: http.SameSiteLaxMode, MaxAge: -1,
+	})
 }
 
 func tokenFromRequest(r *http.Request) string {
@@ -127,5 +129,5 @@ func UserFrom(ctx context.Context) *store.User {
 func unauthorized(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
-	w.Write([]byte(`{"error":{"message":"authentication required","type":"unauthorized"}}`))
+	_, _ = w.Write([]byte(`{"error":{"message":"authentication required","type":"unauthorized"}}`))
 }

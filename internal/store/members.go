@@ -42,7 +42,7 @@ func (s *Store) SetProjectMembers(ctx context.Context, projectID int64, userIDs 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 	if _, err := tx.Exec(ctx, "DELETE FROM project_members WHERE project_id = $1", projectID); err != nil {
 		return err
 	}
