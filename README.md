@@ -53,13 +53,11 @@ docker compose up -d
 
 Open <http://localhost:8080/admin/> (the port is published on loopback only; put a
 TLS-terminating reverse proxy in front for network access, see
-[Configuration](docs/configuration.md#behind-a-reverse-proxy)). On first start an
-`admin` user is created; if `ADMIN_PASSWORD` is not set in `.env`, a random password is
-printed **once**:
-
-```bash
-docker logs ragmux 2>&1 | grep -A3 "Initial admin"
-```
+[Configuration](docs/configuration.md#behind-a-reverse-proxy)). On a fresh database the
+dashboard asks you to **create the first administrator** (username and a password of at
+least 12 characters); that form only works while no user exists. For unattended installs
+set `ADMIN_USER` / `ADMIN_PASSWORD` in `.env` instead and the account is created on
+first start (see [Configuration](docs/configuration.md#environment-variables)).
 
 Running models locally? Provider URLs on private networks (Ollama on the Docker host,
 a vLLM service in the same Compose network) are refused by default as an SSRF guard;
@@ -148,6 +146,11 @@ for chunk in resp:
 | [Providers](docs/providers.md) | provider types and endpoints, Anthropic / Gemini / Ollama translation details, request passthrough, model echo |
 | [Backup and restore](docs/backup-restore.md) | what to back up, `scripts/backup.sh` and `scripts/restore.sh`, scheduled backups, PITR, restore runbook |
 | [Changelog](CHANGELOG.md) | release notes |
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for supported versions, how to report a vulnerability
+(GitHub private reporting or `security@ragmux.com`) and hardening pointers.
 
 ## Development
 

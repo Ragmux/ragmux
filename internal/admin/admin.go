@@ -74,6 +74,9 @@ func (a *Admin) Routes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(requestIDHeader, httpx.NoStore, httpx.ReadDeadline(jsonReadDeadline))
 		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/login", a.login)
+		// First-run setup: unauthenticated by design, refuses once any user exists.
+		r.Get("/api/setup", a.setupStatus)
+		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/setup", a.setup)
 		r.Group(a.authenticated)
 	})
 	if a.WebFS != nil {
@@ -267,23 +270,8 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	ip := clientIP(r)
-	if a.Limiter != nil {
-		allowed, retryAfter, locked, err := a.Limiter.Check(ctx, in.Username, ip)
-		if err != nil {
-			a.fail(w, err)
-			return
-		}
-		if !allowed {
-			action := "login.rate_limited"
-			if locked {
-				action = "login.locked"
-			}
-			a.auditAs(r, nil, action, "user", nil, map[string]any{"username": in.Username})
-			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{
-				"message": "too many login attempts, try again later", "type": "rate_limited"}})
-			return
-		}
+	if !a.allowAttempt(w, r, in.Username, ip) {
+		return
 	}
 	u, tok, err := a.Auth.Login(ctx, in.Username, in.Password)
 	if a.Limiter != nil {
@@ -310,6 +298,37 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 		out["token"] = tok
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// allowAttempt consults the login limiter for a username/address pair and
+// answers 429 when the pair is throttled or locked out. It returns false
+// when the caller must stop. A nil limiter allows everything.
+func (a *Admin) allowAttempt(w http.ResponseWriter, r *http.Request, username, ip string) bool {
+	if a.Limiter == nil {
+		return true
+	}
+	allowed, retryAfter, locked, err := a.Limiter.Check(r.Context(), username, ip)
+	if err != nil {
+		a.fail(w, err)
+		return false
+	}
+	if allowed {
+		return true
+	}
+	a.throttled(w, r, username, retryAfter, locked)
+	return false
+}
+
+// throttled writes the 429 response (with Retry-After) and audits it.
+func (a *Admin) throttled(w http.ResponseWriter, r *http.Request, username string, retryAfter time.Duration, locked bool) {
+	action := "login.rate_limited"
+	if locked {
+		action = "login.locked"
+	}
+	a.auditAs(r, nil, action, "user", nil, map[string]any{"username": username})
+	w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{
+		"message": "too many login attempts, try again later", "type": "rate_limited"}})
 }
 
 // decodeLogin is decode for the one endpoint that has no session yet: the

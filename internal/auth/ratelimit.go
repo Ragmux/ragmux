@@ -61,6 +61,23 @@ func (l *LoginLimiter) Check(ctx context.Context, username, ip string) (allowed 
 	return true, 0, false, nil
 }
 
+// CheckAddress applies only the per-address budget, for endpoints that have
+// no username to key on (the first-run setup). Failures are still recorded
+// with Record under a synthetic username.
+func (l *LoginLimiter) CheckAddress(ctx context.Context, ip string) (allowed bool, retryAfter time.Duration, err error) {
+	if l.PerIP <= 0 {
+		return true, 0, nil
+	}
+	_, byIP, err := l.Store.CountFailedLoginAttempts(ctx, "", ip, l.now().Add(-time.Minute))
+	if err != nil {
+		return false, 0, err
+	}
+	if byIP >= l.PerIP {
+		return false, time.Minute, nil
+	}
+	return true, 0, nil
+}
+
 // lockoutRemaining approximates the time until the oldest counted failure
 // leaves the lockout window. Without a per-row timestamp lookup the whole
 // window is reported, which is the safe upper bound.

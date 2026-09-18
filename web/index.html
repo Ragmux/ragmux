@@ -101,7 +101,7 @@ const $ = (s, el=document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtN = n => (n ?? 0).toLocaleString();
 const fmtDate = s => s ? new Date(s).toLocaleString() : '';
-const state = { user:null, tab:'overview', models:[], rag:[], projects:[], providerTypes:[], users:[], playground:{key:'', msgs:[]} };
+const state = { user:null, needsSetup:false, tab:'overview', models:[], rag:[], projects:[], providerTypes:[], users:[], playground:{key:'', msgs:[]} };
 const ROLE_RANK = { viewer:1, editor:2, admin:3 };
 // can('editor') is true for editors and admins; the API enforces the same matrix.
 const can = role => !!state.user && (ROLE_RANK[state.user.role]||0) >= (ROLE_RANK[role]||99);
@@ -146,10 +146,31 @@ const multiSelect = (name, opts, vals=[]) => `<select name="${name}" multiple>${
 const ROLES = [{value:'viewer',label:'viewer — read only'},{value:'editor',label:'editor — manage models, RAG and own projects'},{value:'admin',label:'admin — everything incl. users'}];
 async function confirmDialog(msg){ return new Promise(res => { modal('Confirm', `<p>${esc(msg)}</p>`, async()=>res(true), 'Confirm'); $('#mCancel').addEventListener('click', ()=>res(false)); }); }
 
+// ---------- first-run setup ----------
+// Shown instead of the login form while the users table is empty (GET
+// /setup says needs_setup). The server refuses the request once any user
+// exists, so a stale page cannot create a second administrator.
+function renderSetup(app){
+  app.innerHTML = `<div class="card login"><h2>Create the first administrator</h2>
+    <p class="muted">No accounts exist yet. This account gets the admin role; you can add more users afterwards.</p>
+    <form id="setupForm">
+      ${field('Username', input('username','','required autocomplete=username pattern="[a-z0-9._-]{3,64}" title="3-64 characters: a-z, 0-9, . _ -"'))}
+      ${field('Password (min 12)', input('password','','type=password required minlength=12 maxlength=72 autocomplete=new-password'))}
+      ${field('Confirm password', input('confirm','','type=password required minlength=12 maxlength=72 autocomplete=new-password'))}
+      <button class="primary" style="width:100%">Create administrator</button></form></div>`;
+  $('#setupForm').onsubmit = async e => { e.preventDefault(); const d=Object.fromEntries(new FormData(e.target).entries());
+    if (d.password !== d.confirm) { toast('Passwords do not match'); return; }
+    const btn=$('button', e.target); btn.disabled=true;
+    try { const r = await api('/setup',{method:'POST',body:{username:d.username, password:d.password}}); state.needsSetup=false; state.user=r.user; await loadAll(); render(); }
+    catch(err){ toast(err.message); if (/already completed/.test(err.message)) { state.needsSetup=false; render(); } }
+    finally { btn.disabled=false; } };
+}
+
 // ---------- render ----------
 function render(){
   const nav=$('#nav'); const app=$('#app');
   if (!state.user){ nav.classList.add('hidden'); $('#btnLogout').classList.add('hidden'); $('#btnPassword').classList.add('hidden'); $('#whoami').textContent='';
+    if (state.needsSetup){ renderSetup(app); return; }
     app.innerHTML = `<div class="card login"><h2>Sign in</h2><form id="loginForm">
       ${field('Username', input('username','admin','autocomplete=username'))}
       ${field('Password', input('password','','type=password autocomplete=current-password'))}
@@ -465,6 +486,7 @@ $('#btnPassword').onclick = ()=> modal('Change password', `${field('Current pass
 (async function init(){
   try { state.user = await api('/me'); } catch(e) { state.user=null; if (e.message!=='session expired') toast('Could not load session: '+e.message); }
   if (state.user) { try { await loadAll(); } catch(e) { toast(e.message); } }
+  else { try { state.needsSetup = !!(await api('/setup')).needs_setup; } catch(e) { state.needsSetup=false; } }
   render();
 })();
 </script>

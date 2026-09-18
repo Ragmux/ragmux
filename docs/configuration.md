@@ -15,8 +15,8 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `DB_MAX_CONNS` | `10` | Connection pool size (must be `>= 1`). |
 | `DATA_DIR` | `/app/data` | Only used for the `secret.key` fallback when `SECRET_KEY` is unset. |
 | `PORT` | `8080` | HTTP listen port (`1`-`65535`). Also read by `-healthcheck`. |
-| `ADMIN_USER` | `admin` | Username of the account created on first start (only when the `users` table is empty). |
-| `ADMIN_PASSWORD` | *(random)* | Password of that account. When unset, a 20-character random password is printed **once** to stderr; find it with `docker logs ragmux 2>&1 | grep -A3 "Initial admin"`. |
+| `ADMIN_USER` | `admin` | Username of the administrator pre-created on first start when `ADMIN_PASSWORD` is set and the `users` table is empty. Ignored otherwise. |
+| `ADMIN_PASSWORD` | *(none)* | Set it for unattended installs: the account is created once with this password and the log says `admin user created from ADMIN_PASSWORD`. When unset, nothing is created; the log says `no users yet: open /admin/ to create the first administrator` and the dashboard shows the first-run setup form (see [`/setup`](api.md#first-run-setup)) until the first account exists. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are JSON lines on stdout; unknown values fall back to `info`. |
 | `CORS_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call the API (`*` allows all). Unset means no CORS headers at all. |
 | `SESSION_TTL` | `24h` | Dashboard session lifetime (Go duration such as `12h`, `30m`). |

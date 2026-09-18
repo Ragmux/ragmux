@@ -6,7 +6,27 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **First-run setup replaces the generated password.** A fresh database no longer gets an
+  `admin` account with a random password printed to the logs. The dashboard now shows a
+  "Create the first administrator" form (username, password of at least 12 characters)
+  backed by `GET`/`POST /admin/api/setup`, which only work while the `users` table is
+  empty and refuse with `409` afterwards; the creation is serialised so two concurrent
+  requests cannot both succeed, failed attempts count against the per-address login
+  limit and the result is audited as `setup.complete`. `ADMIN_USER` / `ADMIN_PASSWORD`
+  still pre-create the account for unattended installs; without `ADMIN_PASSWORD` the log
+  says `no users yet: open /admin/ to create the first administrator`.
+
+### Added
+- `SECURITY.md`: supported versions, how to report a vulnerability, response targets,
+  scope and hardening pointers.
+
 ### Security
+- **Provider keys are bound to their connection.** `api_key_enc` is now sealed with the
+  connection id as AES-GCM associated data (`key_version = 1`), so a ciphertext copied
+  onto another row by someone with database write access no longer decrypts there.
+  Rows written by earlier releases (`key_version = 0`) are re-sealed once on the next
+  start with the same `SECRET_KEY`; `ragmux rotate-key` also writes the bound form.
 - **Least-privilege database role in the bundled deployment.** `docker-compose.yml`
   now runs the gateway as `ragmux_app`, a plain `LOGIN` role (no superuser, `CREATEDB` or
   `CREATEROLE`) with `CONNECT` on the database and `CREATE, USAGE` on schema `public`,

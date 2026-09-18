@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +16,9 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ragmux/ragmux/internal/admin"
+	"github.com/ragmux/ragmux/internal/auth"
+	"github.com/ragmux/ragmux/internal/config"
+	"github.com/ragmux/ragmux/internal/testdb"
 	"github.com/ragmux/ragmux/web"
 )
 
@@ -124,5 +130,43 @@ func TestDashboardCSPMatchesEmbeddedScript(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.Header.Get("Content-Security-Policy") != "" || resp2.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Errorf("api headers: %v", resp2.Header)
+	}
+}
+
+func TestBootstrapAdmin(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Without ADMIN_PASSWORD nothing is created: setup happens in the dashboard.
+	st := testdb.Open(t)
+	if err := bootstrapAdmin(ctx, st, config.Config{AdminUser: "admin"}, log); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := st.CountUsers(ctx); n != 0 {
+		t.Fatalf("bootstrap without a password created %d user(s)", n)
+	}
+
+	// With it the account is created once, as an active admin, and later
+	// starts leave the table alone.
+	cfg := config.Config{AdminUser: "ops", AdminPassword: "preset-password-1"}
+	for i := 0; i < 2; i++ {
+		if err := bootstrapAdmin(ctx, st, cfg, log); err != nil {
+			t.Fatal(err)
+		}
+	}
+	users, err := st.ListUsers(ctx)
+	if err != nil || len(users) != 1 {
+		t.Fatalf("users after bootstrap: %v %+v", err, users)
+	}
+	u := users[0]
+	if u.Username != "ops" || u.Role != "admin" || !u.IsActive || !auth.CheckPassword(u.PasswordHash, "preset-password-1") {
+		t.Errorf("bootstrapped user: %+v", u)
+	}
+	// An existing table is never touched, even with a different ADMIN_USER.
+	if err := bootstrapAdmin(ctx, st, config.Config{AdminUser: "other", AdminPassword: "another-password-1"}, log); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := st.CountUsers(ctx); n != 1 {
+		t.Errorf("bootstrap on a populated table created users: %d", n)
 	}
 }

@@ -59,6 +59,44 @@ func (s *Store) CreateUser(ctx context.Context, username, passwordHash, role str
 		username, passwordHash, role))
 }
 
+// ErrSetupDone is returned by CreateFirstUser when a user already exists.
+var ErrSetupDone = errors.New("setup already completed")
+
+// lockSetup serialises first-user creation across replicas and requests.
+const lockSetup int64 = 0x7261676d75780002 // "ragmux" + 2
+
+// CreateFirstUser inserts the initial account only while the users table is
+// empty. The count and the insert run in one transaction under an advisory
+// lock, so two concurrent setup requests (or a replica bootstrapping at the
+// same time) cannot both succeed.
+func (s *Store) CreateFirstUser(ctx context.Context, username, passwordHash, role string) (*User, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockSetup); err != nil {
+		return nil, err
+	}
+	var n int
+	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&n); err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		return nil, ErrSetupDone
+	}
+	u, err := scanUser(tx.QueryRow(ctx,
+		"INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING "+userCols,
+		username, passwordHash, role))
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
 // GetUser fetches a user by id.
 func (s *Store) GetUser(ctx context.Context, id int64) (*User, error) {
 	return scanUser(s.pool.QueryRow(ctx, "SELECT "+userCols+" FROM users WHERE id = $1", id))

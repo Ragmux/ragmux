@@ -120,15 +120,21 @@ type env struct {
 // newEnv wires the whole application against the schema described by cfg.
 // Calling it twice with the same cfg is the test's equivalent of restarting
 // the container against the same database.
-func newEnv(t *testing.T, cfg store.OpenConfig) *env { return newEnvWith(t, cfg, nil) }
+func newEnv(t *testing.T, cfg store.OpenConfig) *env {
+	return newEnvWith(t, cfg, true, nil)
+}
 
-// newEnvWith is newEnv with a hook that adjusts the admin before it is
-// served, for settings main.go takes from the configuration.
-func newEnvWith(t *testing.T, cfg store.OpenConfig, tune func(*admin.Admin)) *env {
+// newEnvWith is newEnv with control over the bootstrap admin: with
+// bootstrap false the users table is left as it is (empty for a fresh
+// schema) and no session is opened, which is how the first-run setup flow
+// is exercised.
+// tune, when set, adjusts the admin before it is served (settings main.go
+// takes from the configuration).
+func newEnvWith(t *testing.T, cfg store.OpenConfig, bootstrap bool, tune func(*admin.Admin)) *env {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	st := testdb.OpenWith(t, cfg)
-	if n, _ := st.CountUsers(ctx); n == 0 {
+	if n, _ := st.CountUsers(ctx); n == 0 && bootstrap {
 		h, _ := auth.HashPassword("password123")
 		if _, err := st.CreateUser(ctx, "admin", h, "admin"); err != nil {
 			t.Fatal(err)
@@ -160,6 +166,9 @@ func newEnvWith(t *testing.T, cfg store.OpenConfig, tune func(*admin.Admin)) *en
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, srv: srv, store: st, usage: usage}
+	if !bootstrap {
+		return e
+	}
 	res := e.call("POST", "/admin/api/login", map[string]any{"username": "admin", "password": "password123", "bearer": true}, "")
 	e.session = res["token"].(string)
 	return e
@@ -376,7 +385,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(5) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(6) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
@@ -1062,7 +1071,7 @@ func TestStoreQuotas(t *testing.T) {
 	up := mockUpstream(t)
 	defer up.Close()
 	cfg := testdb.Config(t)
-	e := newEnvWith(t, cfg, func(a *admin.Admin) { a.MaxDocumentsPerStore = 3 })
+	e := newEnvWith(t, cfg, true, func(a *admin.Admin) { a.MaxDocumentsPerStore = 3 })
 	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
 
 	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
