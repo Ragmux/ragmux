@@ -17,7 +17,10 @@ script only prints what it would do and exits 2.
 Steps:
   1. verify the dump with pg_restore --list
   2. stop the gateway (compose: `docker compose stop <RAGMUX_SERVICE>`,
-     direct: STOP_CMD if set)
+     direct: STOP_CMD if set). In the all-in-one layout this also stops the
+     embedded Postgres; the script then starts a one-off container
+     (`docker compose run -d --rm <RAGMUX_SERVICE> postgres-only`) that runs
+     Postgres alone and restores into it over the unix socket
   3. pg_restore --clean --if-exists --no-owner --no-privileges
      Errors about the vector extension (already exists / cannot drop / must
      be owner) are expected when the target already has it and are ignored;
@@ -30,13 +33,16 @@ Steps:
      the next migration (ALTER TABLE needs ownership). Skipped with a note
      when the role does not exist (deployments still using the superuser URL).
   5. start the gateway (compose: `docker compose up -d <RAGMUX_SERVICE>`,
-     direct: START_CMD if set); migrations run automatically
+     direct: START_CMD if set); migrations run automatically. All-in-one:
+     the one-off container is stopped first (clean Postgres shutdown)
   6. wait for RAGMUX_URL/healthz, then print migrations_version from
      /admin/api/system when ADMIN_USER and ADMIN_PASSWORD are set
 
 Where the restore goes (first match wins):
   1. DATABASE_URL is set and pg_restore is on PATH -> local pg_restore
-  2. otherwise                                      -> docker compose exec <POSTGRES_SERVICE> pg_restore
+  2. the compose project has a <POSTGRES_SERVICE>  -> docker compose exec <POSTGRES_SERVICE> pg_restore
+     service (docker-compose.split.yml)
+  3. otherwise (all-in-one, docker-compose.yml)    -> one-off postgres-only container, see step 2
 
 Options:
   --yes     actually run (required)
@@ -45,10 +51,12 @@ Options:
   -h        show this help
 
 Environment:
+  LAYOUT             auto | split | aio: which compose layout to assume
+                     (default auto: split when <POSTGRES_SERVICE> exists)
   POSTGRES_SERVICE   compose service running Postgres    (default postgres)
   RAGMUX_SERVICE     compose service running the gateway (default ragmux)
   POSTGRES_DB        database name                       (default ragmux)
-  POSTGRES_USER      database role                       (default ragmux)
+  POSTGRES_USER      database superuser (default ragmux; postgres in aio)
   APP_ROLE           role the gateway connects as; owner of the restored
                      tables after step 4                  (default ragmux_app)
   DATABASE_URL       use local pg_restore against this URL instead of compose
@@ -99,10 +107,10 @@ done
 [ -f "$dump" ] || die "dump file not found: $dump" 2
 [ -s "$dump" ] || die "dump file is empty: $dump" 2
 
+LAYOUT="${LAYOUT:-auto}"
 POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
 RAGMUX_SERVICE="${RAGMUX_SERVICE:-ragmux}"
 POSTGRES_DB="${POSTGRES_DB:-ragmux}"
-POSTGRES_USER="${POSTGRES_USER:-ragmux}"
 APP_ROLE="${APP_ROLE:-ragmux_app}"
 RAGMUX_URL="${RAGMUX_URL:-http://localhost:8765}"
 case "$APP_ROLE" in
@@ -130,28 +138,86 @@ else
   command -v docker >/dev/null 2>&1 || die "docker not found and DATABASE_URL/pg_restore not usable" 2
   compose=(docker compose)
   [ -n "$COMPOSE_PROJECT" ] && compose+=(-p "$COMPOSE_PROJECT")
-  if ! "${compose[@]}" ps --status running --services 2>/dev/null | grep -qx "$POSTGRES_SERVICE"; then
-    die "compose service '$POSTGRES_SERVICE' is not running (run from the directory holding docker-compose.yml, or set COMPOSE_FILE / -p)" 2
+  if [ "$LAYOUT" = auto ]; then
+    if "${compose[@]}" config --services 2>/dev/null | grep -qx "$POSTGRES_SERVICE"; then
+      LAYOUT="split"
+    else
+      LAYOUT="aio"
+    fi
   fi
-  list_cmd() { "${compose[@]}" exec -T "$POSTGRES_SERVICE" pg_restore --list >/dev/null <"$dump"; }
-  restore_cmd() {
-    "${compose[@]}" exec -T "$POSTGRES_SERVICE" \
-      pg_restore --clean --if-exists --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB" <"$dump"
-  }
-  psql_cmd() {
-    "${compose[@]}" exec -T "$POSTGRES_SERVICE" \
-      psql -v ON_ERROR_STOP=1 -qAt -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"
-  }
-  stop_app() { "${compose[@]}" stop "$RAGMUX_SERVICE"; }
-  start_app() { "${compose[@]}" up -d --no-build "$RAGMUX_SERVICE"; }
+  case "$LAYOUT" in
+    split)
+      POSTGRES_USER="${POSTGRES_USER:-ragmux}"
+      if ! "${compose[@]}" ps --status running --services 2>/dev/null | grep -qx "$POSTGRES_SERVICE"; then
+        die "compose service '$POSTGRES_SERVICE' is not running (run from the directory holding docker-compose.yml, or set COMPOSE_FILE / -p)" 2
+      fi
+      list_cmd() { "${compose[@]}" exec -T "$POSTGRES_SERVICE" pg_restore --list >/dev/null <"$dump"; }
+      restore_cmd() {
+        "${compose[@]}" exec -T "$POSTGRES_SERVICE" \
+          pg_restore --clean --if-exists --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB" <"$dump"
+      }
+      psql_cmd() {
+        "${compose[@]}" exec -T "$POSTGRES_SERVICE" \
+          psql -v ON_ERROR_STOP=1 -qAt -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"
+      }
+      stop_app() { "${compose[@]}" stop "$RAGMUX_SERVICE"; }
+      start_app() { "${compose[@]}" up -d --no-build "$RAGMUX_SERVICE"; }
+      ;;
+    aio)
+      # Postgres lives inside the gateway container and only listens on a
+      # unix socket. The container is stopped as a whole, a one-off copy of
+      # the service runs Postgres alone on the same volume, the restore goes
+      # through `docker exec` into it, and the normal service comes back up.
+      POSTGRES_USER="${POSTGRES_USER:-postgres}"
+      "${compose[@]}" config --services 2>/dev/null | grep -qx "$RAGMUX_SERVICE" \
+        || die "compose service '$RAGMUX_SERVICE' not found (run from the directory holding docker-compose.yml, or set COMPOSE_FILE / -p)" 2
+      oneoff=""
+      stop_oneoff() {
+        if [ -n "$oneoff" ]; then
+          log "stopping the postgres-only container"
+          docker stop -t 90 "$oneoff" >/dev/null || log "warning: could not stop container $oneoff"
+          oneoff=""
+        fi
+      }
+      list_cmd() {
+        # Verifies with the image's own pg_restore before anything is stopped.
+        "${compose[@]}" run --rm -T --no-deps --entrypoint pg_restore "$RAGMUX_SERVICE" --list >/dev/null <"$dump"
+      }
+      stop_app() {
+        "${compose[@]}" stop "$RAGMUX_SERVICE" || return 1
+        log "starting a postgres-only container on the data volume"
+        oneoff="$("${compose[@]}" run -d --rm --no-deps "$RAGMUX_SERVICE" postgres-only)" || return 1
+        local deadline=$(( $(date +%s) + 90 ))
+        until docker exec -u postgres "$oneoff" pg_isready -q -U postgres 2>/dev/null; do
+          if ! docker inspect -f '{{.State.Running}}' "$oneoff" 2>/dev/null | grep -q true; then
+            oneoff=""; log "the postgres-only container exited (docker compose logs shows why)"; return 1
+          fi
+          [ "$(date +%s)" -lt "$deadline" ] || { log "postgres did not become ready within 90s"; return 1; }
+          sleep 1
+        done
+      }
+      restore_cmd() {
+        docker exec -i -u postgres "$oneoff" \
+          pg_restore --clean --if-exists --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB" <"$dump"
+      }
+      psql_cmd() {
+        docker exec -i -u postgres "$oneoff" \
+          psql -v ON_ERROR_STOP=1 -qAt -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"
+      }
+      start_app() { stop_oneoff; "${compose[@]}" up -d --no-build "$RAGMUX_SERVICE"; }
+      ;;
+    *) die "LAYOUT must be auto, split or aio, got '$LAYOUT'" 2 ;;
+  esac
+  mode="compose/$LAYOUT"
 fi
+POSTGRES_USER="${POSTGRES_USER:-ragmux}"
 
 size="$(wc -c <"$dump" | tr -d ' ')"
 cat >&2 <<PLAN
 Restore plan (mode=$mode):
   dump:      $dump ($size bytes)
   database:  $POSTGRES_DB as $POSTGRES_USER$( [ "$mode" = direct ] && printf ' (DATABASE_URL)' )
-  gateway:   $( [ "$mode" = compose ] && printf 'compose service %s' "$RAGMUX_SERVICE" || printf 'STOP_CMD/START_CMD' ), health at $RAGMUX_URL/healthz
+  gateway:   $( [ "$mode" != direct ] && printf 'compose service %s' "$RAGMUX_SERVICE" || printf 'STOP_CMD/START_CMD' ), health at $RAGMUX_URL/healthz
   action:    stop gateway -> pg_restore --clean --if-exists --no-owner --no-privileges -> start gateway
   WARNING:   every table in the database is dropped and replaced by the dump's content.
 PLAN
@@ -168,7 +234,12 @@ stop_app || die "could not stop the gateway"
 
 log "restoring"
 errlog="$(mktemp "${TMPDIR:-/tmp}/ragmux-restore.XXXXXX")"
-trap 'rm -f "$errlog"' EXIT
+hdr=""
+cleanup() {
+  rm -f "$errlog" "$hdr"
+  if [ "$mode" = compose/aio ]; then stop_oneoff; fi
+}
+trap cleanup EXIT
 status=0
 restore_cmd 2>"$errlog" || status=$?
 
@@ -184,7 +255,7 @@ fi
 if [ -n "$real_errors" ] || { [ "$status" -ne 0 ] && [ -z "$ext_errors" ]; }; then
   log "pg_restore failed (exit $status):"
   grep -Ev '^pg_restore: error:.*extension|^pg_restore: warning: errors ignored' "$errlog" >&2 || true
-  die "restore failed; the gateway was left stopped"
+  die "restore failed; the gateway was left stopped$( [ "$mode" = compose/aio ] && printf ' (the postgres-only container is stopped too; the data volume keeps whatever pg_restore wrote)' )"
 fi
 log "restore finished"
 
@@ -251,7 +322,6 @@ if [ -n "${ADMIN_USER:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
   # history): the login body goes through stdin and the bearer header
   # through a private temp file that curl reads with -H @file.
   hdr="$(mktemp "${TMPDIR:-/tmp}/ragmux-restore-hdr.XXXXXX")"
-  trap 'rm -f "$errlog" "$hdr"' EXIT
   token="$(login_json "$ADMIN_USER" "$ADMIN_PASSWORD" \
     | curl -fsS -m 10 -H 'Content-Type: application/json' -d @- "$RAGMUX_URL/admin/api/login" 2>/dev/null \
     | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' || true)"
