@@ -54,5 +54,29 @@ services:
       timeout: 5s
       retries: 20
 
+  # Optional scheduled logical backups (pg_dump) into ./backups. Start with
+  # `docker compose --profile backup up -d`; see docs/backup-restore.md.
+  backup:
+    image: prodrigestivill/postgres-backup-local:17
+    container_name: ragmux-backup
+    restart: unless-stopped
+    profiles: ["backup"]
+    user: postgres:postgres
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ragmux
+      POSTGRES_USER: ragmux
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragmux}
+      SCHEDULE: ${BACKUP_SCHEDULE:-@daily}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
+      BACKUP_KEEP_WEEKS: ${BACKUP_KEEP_WEEKS:-4}
+      BACKUP_KEEP_MONTHS: ${BACKUP_KEEP_MONTHS:-6}
+      HEALTHCHECK_PORT: "8081"
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   pgdata:
