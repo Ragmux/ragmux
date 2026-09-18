@@ -102,9 +102,75 @@ func (s *Store) GetUser(ctx context.Context, id int64) (*User, error) {
 	return scanUser(s.pool.QueryRow(ctx, "SELECT "+userCols+" FROM users WHERE id = $1", id))
 }
 
-// GetUserByUsername fetches a user by login name.
+// GetUserByUsername fetches a user by login name. The match is
+// case-insensitive; the stored casing is what comes back.
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*User, error) {
-	return scanUser(s.pool.QueryRow(ctx, "SELECT "+userCols+" FROM users WHERE username = $1", username))
+	return scanUser(s.pool.QueryRow(ctx, "SELECT "+userCols+" FROM users WHERE lower(username) = lower($1)", username))
+}
+
+// CreateUserWithProjects inserts a user and its project memberships in one
+// transaction. Unknown project ids fail with a foreign key violation and
+// nothing is written.
+func (s *Store) CreateUserWithProjects(ctx context.Context, username, passwordHash, role string, projectIDs []int64) (*User, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	u, err := scanUser(tx.QueryRow(ctx,
+		"INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING "+userCols,
+		username, passwordHash, role))
+	if err != nil {
+		return nil, err
+	}
+	for _, pid := range projectIDs {
+		if _, err := tx.Exec(ctx, `INSERT INTO project_members (project_id, user_id) VALUES ($1, $2)
+			ON CONFLICT DO NOTHING`, pid, u.ID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// UserStats is a user with the counters the admin listing shows.
+type UserStats struct {
+	*User
+	ProjectCount   int `json:"project_count"`
+	ActiveSessions int `json:"active_sessions"`
+}
+
+// ListUsersWithStats returns every account ordered by name together with
+// its number of project memberships and unexpired sessions.
+func (s *Store) ListUsersWithStats(ctx context.Context) ([]*UserStats, error) {
+	rows, err := s.pool.Query(ctx, "SELECT "+userCols+`,
+		(SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = users.id),
+		(SELECT COUNT(*) FROM sessions se WHERE se.user_id = users.id AND se.expires_at > now())
+		FROM users ORDER BY username`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*UserStats{}
+	for rows.Next() {
+		u := &User{}
+		st := &UserStats{User: u}
+		var created time.Time
+		var lastLogin *time.Time
+		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.IsActive, &lastLogin, &created,
+			&st.ProjectCount, &st.ActiveSessions); err != nil {
+			return nil, err
+		}
+		if lastLogin != nil {
+			t := lastLogin.UTC()
+			u.LastLoginAt = &t
+		}
+		u.CreatedAt = ts(created)
+		out = append(out, st)
+	}
+	return out, rows.Err()
 }
 
 // ListUsers returns every account ordered by name.
@@ -222,10 +288,28 @@ func (s *Store) CreateSession(ctx context.Context, userID int64, token string, t
 // UserBySession resolves a raw session token to its user, if still valid.
 // Sessions of deactivated accounts do not resolve.
 func (s *Store) UserBySession(ctx context.Context, token string) (*User, error) {
-	return scanUser(s.pool.QueryRow(ctx, `
-		SELECT u.id, u.username, u.password_hash, u.role, u.is_active, u.last_login_at, u.created_at
+	u, _, err := s.UserAndExpiryBySession(ctx, token)
+	return u, err
+}
+
+// UserAndExpiryBySession is UserBySession plus the session's expiry time.
+func (s *Store) UserAndExpiryBySession(ctx context.Context, token string) (*User, time.Time, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT u.id, u.username, u.password_hash, u.role, u.is_active, u.last_login_at, u.created_at, se.expires_at
 		FROM sessions se JOIN users u ON u.id = se.user_id
-		WHERE se.token_hash = $1 AND se.expires_at > now() AND u.is_active`, HashToken(token)))
+		WHERE se.token_hash = $1 AND se.expires_at > now() AND u.is_active`, HashToken(token))
+	u := &User{}
+	var created, expires time.Time
+	var lastLogin *time.Time
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.IsActive, &lastLogin, &created, &expires); err != nil {
+		return nil, time.Time{}, scanErr(err)
+	}
+	if lastLogin != nil {
+		t := lastLogin.UTC()
+		u.LastLoginAt = &t
+	}
+	u.CreatedAt = ts(created)
+	return u, expires.UTC(), nil
 }
 
 // DeleteSession revokes a raw session token.
