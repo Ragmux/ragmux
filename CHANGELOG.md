@@ -6,6 +6,8 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-09-18
+
 ### Changed
 - **First-run setup replaces the generated password.** A fresh database no longer gets an
   `admin` account with a random password printed to the logs. The dashboard now shows a
@@ -215,6 +217,7 @@ for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over P
 projects with `sk-proj-` keys, metrics and an embedded dashboard.
 
 [Unreleased]: https://github.com/ragmux/ragmux/compare/v0.2.0...HEAD
+[0.2.3]: https://github.com/ragmux/ragmux/releases/tag/v0.2.3
 [0.2.2]: https://github.com/ragmux/ragmux/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ragmux/ragmux/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ragmux/ragmux/releases/tag/v0.2.0
