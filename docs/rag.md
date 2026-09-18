@@ -1,0 +1,143 @@
+# Retrieval (RAG)
+
+A RAG store is a set of documents embedded with one model connection. Projects link to
+at most one store; when they do, every `/v1/chat/completions` request is augmented with
+the passages that best match the last user message. Endpoints and field validation are
+listed in the [API reference](api.md#rag-stores-and-documents).
+
+## Store settings
+
+| Field | Default | Meaning |
+|---|---|---|
+| `embedding_connection_id` | — | Model connection used to embed chunks and queries (`openai`, `gemini`, `ollama`, `custom_openai` or `deepseek` type). Fixed once the store has chunks |
+| `chunk_size` | `1000` | Characters per chunk (100-20000) |
+| `chunk_overlap` | `200` | Characters carried over between consecutive chunks (`< chunk_size`) |
+| `top_k` | `5` | Passages injected per request (≤ 50) |
+| `search_mode` | `hybrid` | `vector` or `hybrid` |
+| `fts_config` | `simple` | PostgreSQL text search configuration used to parse the query in hybrid mode |
+| `rerank` | `false` | LLM reranking of the candidates |
+| `rerank_candidates` | `15` | Candidates sent to the reranker (1-100) |
+| `max_distance` | `0` | Cosine distance cut-off (0-2, `0` = off) |
+| `contextual_chunks` | `true` | Prefix the file name and section to the text that is embedded |
+
+Each embedding width gets its own `chunk_embeddings_<dims>` table with an HNSW cosine
+index, created on the first ingest; the store records its `dimensions` at that point.
+
+## Formats and parsing
+
+| Format | Extensions | What becomes a block |
+|--------|------------|----------------------|
+| PDF | `.pdf` | paragraphs per page; the page number is kept |
+| Word | `.docx` | paragraphs; `Heading 1-9` / `Title` styles form the section path; table rows become `cell | cell` lines |
+| HTML | `.html`, `.htm` | `p`, `li`, `td`, `pre`, `blockquote`, `div`…; `h1`-`h3` form the section path; `script`, `style`, `nav`, `header`, `footer`, `svg` are dropped; `<title>` is the document title |
+| Markdown | `.md`, `.markdown` | paragraphs; `#` headings form the section path |
+| Text | `.txt` | paragraphs |
+
+No external tools are needed: DOCX is read from `word/document.xml`, HTML with
+`golang.org/x/net/html`. Uploads are checked by extension and, for DOCX, by the zip
+signature. Scanned PDFs without a text layer are rejected (there is no OCR).
+
+Uploaded files are stored as `bytea` in the database, so a document can always be
+re-parsed. Ingestion runs in the background (`INGEST_WORKERS` jobs in parallel); a
+document's `status` goes `pending` → `processing` → `ready` or `failed` (with `error`).
+Jobs interrupted by a restart resume automatically.
+
+## Chunking and contextual chunks
+
+Blocks are packed into chunks of `chunk_size` characters with `chunk_overlap` characters
+carried over between consecutive chunks. A chunk never spans two sections or two pages, so
+every chunk has exactly one section path (the last two heading levels, e.g.
+`Install > Docker`) and page. Blocks larger than `chunk_size` are split on sentence or word
+boundaries.
+
+With `contextual_chunks` (default on) the text that is *embedded* is
+`<filename> · <section>` followed by the chunk content, so the vector reflects where the
+passage sits in the document; the stored content and the context sent to the model stay
+unchanged. Changing `chunk_size`, `chunk_overlap` or `contextual_chunks` on a store with
+documents returns `"reprocess_recommended": true` — use **Reprocess all**
+(`POST /admin/api/rag-stores/{id}/reprocess`) to re-parse, re-chunk and re-embed every
+document, or `POST /admin/api/documents/{id}/reprocess` for a single one.
+
+## Search modes
+
+- `vector` — cosine nearest neighbours on the pgvector HNSW index (`hnsw.ef_search` is
+  raised to at least four times the candidate count, minimum 40).
+- `hybrid` (default) — the vector top-N and a PostgreSQL full-text top-N are fused with
+  reciprocal rank fusion: `score = 1/(60+vector_rank) + 1/(60+fts_rank)`. A chunk that is
+  close in embedding space *and* contains the query terms ranks first; an exact product name,
+  error code or identifier the embedding model does not know still surfaces through the
+  full-text side. Hybrid retrieves `3 × top_k` candidates before fusing (with reranking on,
+  `max(top_k, rerank_candidates)`).
+
+Full-text indexing always uses the `simple` configuration (language-agnostic, no stemming,
+no stop words) because the index column is generated once per chunk. `fts_config` only
+selects the configuration used to parse the *query* (`websearch_to_tsquery`), which makes a
+difference when it drops stop words or stems: with `english`, "policies" is looked up as
+`polici` — which will not match an index built with `simple`. Keep `fts_config = simple`
+unless you know your corpus benefits; any configuration listed in `pg_ts_config` is accepted.
+
+`websearch_to_tsquery` ANDs all words, so a natural-language question would only match
+chunks containing every word. Ragmux therefore OR-s the words of a plain query
+(`what is the return policy` becomes `what or is or the or return or policy`);
+`ts_rank_cd` still ranks chunks matching more terms higher. Queries that already use
+websearch syntax — quoted phrases, the word `or`, or a leading `-term` — are passed through
+unchanged. A query that parses to nothing simply leaves the full-text side empty.
+
+`max_distance` (0-2, default 0 = off) drops every candidate whose cosine distance to the
+query exceeds it, in both modes and before reranking. Use it to keep unrelated passages out
+of the prompt when a question has no answer in the store; the right value depends on the
+embedding model (try the dashboard's search test: it shows the distance of every hit).
+
+## Reranking
+
+With `rerank` on, the top `rerank_candidates` (default 15) fused hits are sent to the
+project's chat model in one listwise prompt (each passage cut to 800 characters,
+`temperature 0`, `max_tokens 200`); the model returns the passage numbers ordered by
+relevance and the result is cut to `top_k`. Passages the model omits are appended in their
+original order, so nothing is lost. This costs one extra model call per request (roughly
+`rerank_candidates × chunk_size / 4` prompt tokens) and adds its latency; failures,
+unparseable replies and timeouts (10 s) fall back to the fused order and are logged at
+warn level. Reranking is skipped when fewer than two candidates remain. From the admin
+search endpoint reranking uses the chat model of the first project linked to the store;
+without such a project the search runs unreranked.
+
+## Context injection
+
+For a chat request the last `user` message is the query. The hits are rendered as
+
+```
+Use the following retrieved context to answer the user's request. If the context does not contain the answer, say so rather than guessing. Cite passages by their [n] label when useful.
+
+<context>
+[1] (handbook.pdf · Leave > Vacation · p.12)
+…chunk text…
+
+[2] (policies.docx · Benefits)
+…chunk text…
+
+</context>
+```
+
+and prepended to the first `system` (or `developer`) message; when the request has none,
+a `system` message is inserted. The project's own `system_prompt` is injected the same
+way, ahead of the context. The label carries only the parts that exist (file name,
+section, page).
+
+`x-ragmux-rag-hits: <n>` is set on every chat response of a project with a linked store
+(`0` when nothing matched; absent when the project has no store). If the embedding call
+fails the request continues without context and a warning is logged.
+
+## Search endpoint
+
+`POST /admin/api/rag-stores/{id}/search` takes `{query, top_k, mode, rerank, max_distance}`
+(everything but `query` optional; unset fields use the store settings) and returns
+
+```json
+{"mode":"hybrid","reranked":true,"latency_ms":412,
+ "hits":[{"chunk_id":8,"document_id":2,"filename":"handbook.pdf","index":3,"section":"Leave > Vacation","page":12,
+          "content":"…","distance":0.18,"score":0.0325,"vector_rank":1,"fts_rank":2}]}
+```
+
+`vector_rank` / `fts_rank` are 0 when the chunk was not a candidate on that side. The
+overrides only affect this call, which makes the endpoint (and the dashboard's search
+test built on it) a way to try settings before saving them.
