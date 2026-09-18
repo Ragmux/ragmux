@@ -33,6 +33,8 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Default tags (<version>, <major>.<minor>, latest): the all-in-one image
+      # with the embedded PostgreSQL (Dockerfile.aio).
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
@@ -49,6 +51,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          file: Dockerfile.aio
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -66,6 +69,45 @@ jobs:
         if: ${{ env.DOCKERHUB_USERNAME != '' }}
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "docker.io/ragmux/ragmux@${DIGEST}"
+      # "-app" tags (<version>-app, <major>.<minor>-app, latest-app): the
+      # gateway alone on a distroless base, for an external database.
+      - name: Image metadata (app-only)
+        id: meta_app
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: |
+            ghcr.io/ragmux/ragmux
+            ${{ env.DOCKERHUB_USERNAME != '' && 'docker.io/ragmux/ragmux' || '' }}
+          flavor: |
+            suffix=-app,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - name: Build and push (app-only)
+        id: build_app
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta_app.outputs.tags }}
+          labels: ${{ steps.meta_app.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Sign image (GHCR, app-only)
+        env:
+          DIGEST: ${{ steps.build_app.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/ragmux/ragmux@${DIGEST}"
+      - name: Sign image (Docker Hub, app-only)
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        env:
+          DIGEST: ${{ steps.build_app.outputs.digest }}
         run: cosign sign --yes "docker.io/ragmux/ragmux@${DIGEST}"
       - name: GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

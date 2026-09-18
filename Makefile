@@ -5,7 +5,7 @@ IMAGE   ?= ragmux/ragmux:latest
 TEST_DATABASE_URL ?= postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable
 export TEST_DATABASE_URL
 
-.PHONY: build run test vet dev-db dev-db-down docker-build docker-run backup restore clean
+.PHONY: build run test vet dev-db dev-db-down docker-build docker-build-app docker-run backup restore clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o bin/ragmux ./cmd/ragmux
@@ -26,8 +26,13 @@ dev-db:
 dev-db-down:
 	docker compose -f docker-compose.dev.yml down
 
+# All-in-one image (gateway + embedded PostgreSQL), what docker-compose.yml runs.
 docker-build:
-	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE) .
+	docker build -f Dockerfile.aio --build-arg VERSION=$(VERSION) -t $(IMAGE) .
+
+# Gateway-only distroless image for an external database (published as *-app).
+docker-build-app:
+	docker build -f Dockerfile --build-arg VERSION=$(VERSION) -t $(IMAGE)-app .
 
 docker-run: docker-build
 	docker compose up -d
