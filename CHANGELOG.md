@@ -6,6 +6,8 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-18
+
 ### Added
 - **All-in-one container image** (`Dockerfile.aio`, published as `ghcr.io/ragmux/ragmux:<version>`
   and `:latest`): PostgreSQL 17 with pgvector and the gateway in one container, supervised by
@@ -363,7 +365,8 @@ Initial release: single-container gateway with SQLite + sqlite-vec, OpenAI-compa
 for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over PDF/TXT/MD,
 projects with `sk-proj-` keys, metrics and an embedded dashboard.
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ragmux/ragmux/releases/tag/v0.3.1
 [0.3.0]: https://github.com/ragmux/ragmux/releases/tag/v0.3.0
 [0.2.3]: https://github.com/ragmux/ragmux/releases/tag/v0.2.3
 [0.2.2]: https://github.com/ragmux/ragmux/releases/tag/v0.2.2
