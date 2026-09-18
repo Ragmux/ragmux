@@ -44,6 +44,8 @@ type MetricsSummary struct {
 	AvgLatencyMs     float64 `json:"avg_latency_ms"`
 	P95LatencyMs     int64   `json:"p95_latency_ms"`
 	RAGRequests      int     `json:"rag_requests"`
+	// RateLimited counts requests answered 429 by the gateway's limiter.
+	RateLimited int `json:"rate_limited"`
 }
 
 // MetricsFilter narrows metric queries. A nil ProjectID means every project;
@@ -74,14 +76,15 @@ func (s *Store) Summarize(ctx context.Context, f MetricsFilter, since time.Time)
 		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
 		COALESCE(AVG(latency_ms), 0)::float8,
 		COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::float8,
-		COALESCE(SUM(CASE WHEN rag_used THEN 1 ELSE 0 END), 0)
+		COALESCE(SUM(CASE WHEN rag_used THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status_code = 429 THEN 1 ELSE 0 END), 0)
 		FROM request_logs WHERE created_at >= $1`
 	cond, args := f.where([]any{since.UTC()})
 	q += cond
 	m := &MetricsSummary{ProjectID: f.ProjectID}
 	var p95 float64
 	if err := s.pool.QueryRow(ctx, q, args...).Scan(&m.Requests, &m.Errors, &m.PromptTokens,
-		&m.CompletionTokens, &m.AvgLatencyMs, &p95, &m.RAGRequests); err != nil {
+		&m.CompletionTokens, &m.AvgLatencyMs, &p95, &m.RAGRequests, &m.RateLimited); err != nil {
 		return nil, err
 	}
 	m.P95LatencyMs = int64(math.Round(p95))
