@@ -42,6 +42,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "rotate-key" {
 		os.Exit(rotateKey(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "pdf-extract" {
+		// Internal: the ingester runs this on itself to parse PDFs out of
+		// process (see rag.PDFWorker).
+		os.Exit(rag.RunPDFWorker(os.Stdin, os.Stdout, os.Stderr))
+	}
 	healthcheck := flag.Bool("healthcheck", false, "probe the running server and exit (for container HEALTHCHECK)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -153,6 +158,11 @@ func run(cfg config.Config) error {
 	providers := func(c *store.ModelConnection) (provider.Provider, error) { return provider.New(provCfg(c)) }
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) { return provider.NewEmbedder(provCfg(c)) }
 
+	if exe, err := os.Executable(); err == nil {
+		rag.PDFWorker = []string{exe, "pdf-extract"}
+	} else {
+		log.Warn("pdf parsing stays in-process: cannot locate own executable", "err", err)
+	}
 	ingester := rag.NewIngester(bgCtx, st, embedders, cfg.IngestWorkers, log)
 	ingester.MaxChunksPerDocument = cfg.MaxChunksPerDocument
 	defer ingester.Stop()

@@ -95,6 +95,9 @@ of [Configuration](docs/configuration.md):
   [Docker Compose variables](docs/configuration.md#docker-compose-variables): keeping
   `SECRET_KEY` and `DATABASE_URL` in secrets files (`*_FILE`) instead of `.env`
 
+- [Formats and parsing](docs/rag.md#formats-and-parsing): uploaded documents are parsed
+  under size, page and time caps and PDFs in a disposable child process; keep
+  `MAX_UPLOAD_MB` modest and give upload rights only to members you trust
 - [Login protection](docs/users-and-limits.md#login-protection) and the
   [audit log](docs/users-and-limits.md#audit-log): the limiter's counters
   (`GET /admin/api/security/logins`) and the NDJSON export for keeping the trail beyond

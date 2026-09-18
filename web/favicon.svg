@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Ragmux">
 	<rect width="32" height="32" rx="7" fill="#0B0C0E"/>
-	<g fill="#E2543A" transform="translate(4 7) scale(0.2)">
+	<g fill="#F2B632" transform="translate(4 7) scale(0.2)">
 		<path d="M26 19h12l2 77H24Z"/>
 		<path d="M82 19h12l2 77H80Z"/>
 		<rect x="16" y="31" width="88" height="8"/>
