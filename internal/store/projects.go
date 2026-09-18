@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"math/big"
+	"time"
 )
 
 // Project maps a client API key to a model connection and optional RAG store.
@@ -22,11 +23,13 @@ const projCols = "id, name, model_connection_id, rag_store_id, api_key_prefix, s
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	p := &Project{}
+	var created, updated time.Time
 	err := row.Scan(&p.ID, &p.Name, &p.ModelConnectionID, &p.RAGStoreID, &p.APIKeyPrefix, &p.SystemPrompt,
-		&p.CreatedAt, &p.UpdatedAt)
+		&created, &updated)
 	if err != nil {
 		return nil, scanErr(err)
 	}
+	p.CreatedAt, p.UpdatedAt = ts(created), ts(updated)
 	return p, nil
 }
 
@@ -69,23 +72,21 @@ func (s *Store) CreateProject(ctx context.Context, p *Project) (*Project, string
 	if err != nil {
 		return nil, "", err
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO projects
+	out, err := scanProject(s.pool.QueryRow(ctx, `INSERT INTO projects
 		(name, model_connection_id, rag_store_id, api_key_hash, api_key_prefix, system_prompt)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt)
+		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+projCols,
+		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt))
 	if err != nil {
 		return nil, "", err
 	}
-	id, _ := res.LastInsertId()
-	out, err := s.GetProject(ctx, id)
-	return out, key, err
+	return out, key, nil
 }
 
 // UpdateProject changes mutable fields (not the key).
 func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error) {
-	_, err := s.db.ExecContext(ctx, `UPDATE projects SET name=?, model_connection_id=?, rag_store_id=?,
-		system_prompt=?, updated_at=? WHERE id=?`,
-		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt, now(), p.ID)
+	_, err := s.pool.Exec(ctx, `UPDATE projects SET name=$1, model_connection_id=$2, rag_store_id=$3,
+		system_prompt=$4, updated_at=now() WHERE id=$5`,
+		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt, p.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -98,12 +99,12 @@ func (s *Store) RotateProjectKey(ctx context.Context, id int64) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	res, err := s.db.ExecContext(ctx, "UPDATE projects SET api_key_hash=?, api_key_prefix=?, updated_at=? WHERE id=?",
-		HashToken(key), keyPrefix(key), now(), id)
+	res, err := s.pool.Exec(ctx, "UPDATE projects SET api_key_hash=$1, api_key_prefix=$2, updated_at=now() WHERE id=$3",
+		HashToken(key), keyPrefix(key), id)
 	if err != nil {
 		return "", err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if res.RowsAffected() == 0 {
 		return "", ErrNotFound
 	}
 	return key, nil
@@ -111,17 +112,17 @@ func (s *Store) RotateProjectKey(ctx context.Context, id int64) (string, error) 
 
 // GetProject fetches one project.
 func (s *Store) GetProject(ctx context.Context, id int64) (*Project, error) {
-	return scanProject(s.db.QueryRowContext(ctx, "SELECT "+projCols+" FROM projects WHERE id = ?", id))
+	return scanProject(s.pool.QueryRow(ctx, "SELECT "+projCols+" FROM projects WHERE id = $1", id))
 }
 
 // GetProjectByKey resolves a plaintext client key.
 func (s *Store) GetProjectByKey(ctx context.Context, key string) (*Project, error) {
-	return scanProject(s.db.QueryRowContext(ctx, "SELECT "+projCols+" FROM projects WHERE api_key_hash = ?", HashToken(key)))
+	return scanProject(s.pool.QueryRow(ctx, "SELECT "+projCols+" FROM projects WHERE api_key_hash = $1", HashToken(key)))
 }
 
 // ListProjects lists all projects.
 func (s *Store) ListProjects(ctx context.Context) ([]*Project, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+projCols+" FROM projects ORDER BY name")
+	rows, err := s.pool.Query(ctx, "SELECT "+projCols+" FROM projects ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -139,11 +140,11 @@ func (s *Store) ListProjects(ctx context.Context) ([]*Project, error) {
 
 // DeleteProject removes a project and its request logs.
 func (s *Store) DeleteProject(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, "DELETE FROM projects WHERE id = ?", id)
+	res, err := s.pool.Exec(ctx, "DELETE FROM projects WHERE id = $1", id)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if res.RowsAffected() == 0 {
 		return ErrNotFound
 	}
 	return nil

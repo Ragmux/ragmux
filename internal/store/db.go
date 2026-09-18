@@ -1,29 +1,24 @@
-// Package store is the embedded persistence layer: SQLite (via a cgo-free wasm
-// build) with the sqlite-vec extension for vector search. Everything lives
-// under a single data directory so a volume mount captures all state.
+// Package store is the persistence layer: PostgreSQL with the pgvector
+// extension for vector search. Provider credentials are encrypted with a key
+// supplied via SECRET_KEY (or a secret.key file as a development fallback).
 package store
 
 import (
 	"context"
-	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	// Registers the sqlite-vec enabled wasm build of SQLite.
-	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
-	"github.com/ncruces/go-sqlite3"
-	_ "github.com/ncruces/go-sqlite3/driver"
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/experimental"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	pgxvec "github.com/pgvector/pgvector-go/pgx"
 )
 
 //go:embed migrations/*.sql
@@ -32,106 +27,147 @@ var migrationFS embed.FS
 // ErrNotFound is returned when a lookup matches no row.
 var ErrNotFound = errors.New("not found")
 
-func init() {
-	// The sqlite-vec wasm build uses atomic instructions; enable the threads
-	// feature so wazero can validate and run it.
-	sqlite3.RuntimeConfig = wazero.NewRuntimeConfig().
-		WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesThreads)
-}
+// Advisory lock keys. Application-wide DDL is serialised on these so several
+// replicas can start (or create a new embedding table) at the same time.
+const (
+	lockMigrations int64 = 0x7261676d75780001 // "ragmux" + 1
+	lockVecTables  int32 = 0x72616701
+)
 
-// Store wraps the database handle plus filesystem locations.
-type Store struct {
-	db      *sql.DB
+// OpenConfig carries everything Open needs.
+type OpenConfig struct {
+	// DatabaseURL is a PostgreSQL connection string.
+	DatabaseURL string
+	// MaxConns caps the pool size (default 10).
+	MaxConns int
+	// SecretKeyHex is the 32-byte credential key as hex. When empty the key
+	// is read from (or created at) DataDir/secret.key.
+	SecretKeyHex string
+	// DataDir is only used for the secret.key fallback.
 	DataDir string
-	// UploadsDir holds raw uploaded documents.
-	UploadsDir string
-	// VecAvailable reports whether the sqlite-vec extension loaded. When it
-	// did not, similarity search falls back to a brute-force scan in Go.
-	VecAvailable bool
-	cipher       *cipher
-	log          *slog.Logger
 }
 
-// Open initialises the data directory, opens the database, runs migrations
-// and loads (or creates) the secret key used to encrypt provider credentials.
-func Open(ctx context.Context, dataDir string, log *slog.Logger) (*Store, error) {
+// Store wraps the connection pool and the credential cipher.
+type Store struct {
+	pool *pgxpool.Pool
+	// ServerVersion is the PostgreSQL server_version reported at Open.
+	ServerVersion string
+	// SecretKeySource is "env" or "file", depending on where the key came from.
+	SecretKeySource string
+	cipher          *cipher
+	log             *slog.Logger
+	// vecTables remembers which chunk_embeddings_<dims> tables exist.
+	vecTables sync.Map
+}
+
+// Open connects to PostgreSQL, ensures the vector extension exists, runs
+// migrations and loads the secret key used to encrypt provider credentials.
+func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	if err := os.MkdirAll(dataDir, 0o750); err != nil {
-		return nil, fmt.Errorf("create data dir: %w", err)
+	if cfg.DatabaseURL == "" {
+		return nil, errors.New("database URL is empty")
 	}
-	uploads := filepath.Join(dataDir, "uploads")
-	if err := os.MkdirAll(uploads, 0o750); err != nil {
-		return nil, fmt.Errorf("create uploads dir: %w", err)
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = 10
 	}
 
-	dsn := "file:" + filepath.Join(dataDir, "ragmux.db") +
-		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
-	db, err := sql.Open("sqlite3", dsn)
+	c, source, err := loadCipher(cfg.SecretKeyHex, cfg.DataDir, log)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	// SQLite is single-writer; keep the pool small to avoid lock churn.
-	db.SetMaxOpenConns(4)
-	db.SetConnMaxLifetime(0)
-
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("ping sqlite: %w", err)
-	}
-
-	s := &Store{db: db, DataDir: dataDir, UploadsDir: uploads, log: log}
-
-	var vecVersion string
-	if err := db.QueryRowContext(ctx, "SELECT vec_version()").Scan(&vecVersion); err == nil {
-		s.VecAvailable = true
-		log.Info("sqlite-vec loaded", "version", vecVersion)
-	} else {
-		log.Warn("sqlite-vec unavailable; using brute-force vector search", "err", err)
-	}
-
-	if err := s.migrate(ctx); err != nil {
-		db.Close()
 		return nil, err
 	}
 
-	c, err := loadOrCreateCipher(filepath.Join(dataDir, "secret.key"))
+	// Schema setup runs on a plain connection before the pool exists: the
+	// pool's AfterConnect registers the vector type, which only resolves once
+	// the extension has been created.
+	conn, err := pgx.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
-		db.Close()
+		return nil, fmt.Errorf("connect to postgres: %w", err)
+	}
+	var version string
+	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version')").Scan(&version); err != nil {
+		conn.Close(ctx)
+		return nil, fmt.Errorf("query server version: %w", err)
+	}
+	if err := migrate(ctx, conn, log); err != nil {
+		conn.Close(ctx)
 		return nil, err
 	}
-	s.cipher = c
-	return s, nil
+	if err := conn.Close(ctx); err != nil {
+		return nil, err
+	}
+
+	pc, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	pc.MaxConns = int32(cfg.MaxConns)
+	pc.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		return pgxvec.RegisterTypes(ctx, conn)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, pc)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log}, nil
 }
 
-// Close releases the database handle.
-func (s *Store) Close() error { return s.db.Close() }
+// Close releases the connection pool.
+func (s *Store) Close() error {
+	s.pool.Close()
+	return nil
+}
 
-// DB exposes the raw handle for callers that need transactions.
-func (s *Store) DB() *sql.DB { return s.db }
+// DB exposes the pool for callers that need raw access (health checks).
+func (s *Store) DB() *pgxpool.Pool { return s.pool }
 
-func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (
-		version INTEGER PRIMARY KEY,
-		applied_at TEXT NOT NULL
-	)`); err != nil {
-		return fmt.Errorf("create schema_version: %w", err)
+// DatabaseInfo describes the connected database for the system endpoint.
+type DatabaseInfo struct {
+	PostgresVersion   string `json:"postgres_version"`
+	PgvectorVersion   string `json:"pgvector_version"`
+	MigrationsVersion int    `json:"migrations_version"`
+	SizeBytes         int64  `json:"size_bytes"`
+}
+
+// DatabaseInfo reports server, extension and migration versions plus size.
+func (s *Store) DatabaseInfo(ctx context.Context) (*DatabaseInfo, error) {
+	info := &DatabaseInfo{PostgresVersion: s.ServerVersion}
+	err := s.pool.QueryRow(ctx, `SELECT
+		COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'vector'), ''),
+		COALESCE((SELECT MAX(version) FROM schema_migrations), 0),
+		pg_database_size(current_database())`).
+		Scan(&info.PgvectorVersion, &info.MigrationsVersion, &info.SizeBytes)
+	if err != nil {
+		return nil, err
 	}
-	applied := map[int]bool{}
-	rows, err := s.db.QueryContext(ctx, "SELECT version FROM schema_version")
+	return info, nil
+}
+
+// migrate applies embedded migrations that have not been recorded yet. Every
+// step takes a transaction-scoped advisory lock so concurrent replicas
+// serialise instead of racing on DDL.
+func migrate(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
+	err := withLockedTx(ctx, conn, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+			return fmt.Errorf("create vector extension: %w", err)
+		}
+		_, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+			version    INT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`)
+		if err != nil {
+			return fmt.Errorf("create schema_migrations: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return err
-		}
-		applied[v] = true
-	}
-	rows.Close()
 
 	entries, err := fs.ReadDir(migrationFS, "migrations")
 	if err != nil {
@@ -149,39 +185,73 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := fmt.Sscanf(name, "%d_", &version); err != nil {
 			return fmt.Errorf("bad migration name %q", name)
 		}
-		if applied[version] {
-			continue
-		}
 		body, err := migrationFS.ReadFile("migrations/" + name)
 		if err != nil {
 			return err
 		}
-		tx, err := s.db.BeginTx(ctx, nil)
+		applied := false
+		err = withLockedTx(ctx, conn, func(tx pgx.Tx) error {
+			var exists bool
+			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)", version).Scan(&exists); err != nil {
+				return err
+			}
+			if exists {
+				return nil
+			}
+			if _, err := tx.Exec(ctx, string(body)); err != nil {
+				return fmt.Errorf("apply migration %s: %w", name, err)
+			}
+			if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", version); err != nil {
+				return err
+			}
+			applied = true
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("apply migration %s: %w", name, err)
+		if applied {
+			log.Info("applied migration", "name", name)
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
-			version, now()); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		s.log.Info("applied migration", "name", name)
 	}
 	return nil
 }
 
-func now() string { return time.Now().UTC().Format("2006-01-02T15:04:05.000Z") }
+func withLockedTx(ctx context.Context, conn *pgx.Conn, fn func(tx pgx.Tx) error) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockMigrations); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ts renders a database timestamp the way the JSON API exposes it.
+func ts(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 func scanErr(err error) error {
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	return err
+}
+
+// IsUniqueViolation reports whether err is a unique constraint failure.
+func IsUniqueViolation(err error) bool { return pgCode(err) == "23505" }
+
+// IsForeignKeyViolation reports whether err is a foreign key failure.
+func IsForeignKeyViolation(err error) bool { return pgCode(err) == "23503" }
+
+func pgCode(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
 }

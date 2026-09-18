@@ -15,45 +15,44 @@ type User struct {
 	CreatedAt    string `json:"created_at"`
 }
 
+const userCols = "id, username, password_hash, created_at"
+
+func scanUser(row interface{ Scan(...any) error }) (*User, error) {
+	u := &User{}
+	var created time.Time
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &created); err != nil {
+		return nil, scanErr(err)
+	}
+	u.CreatedAt = ts(created)
+	return u, nil
+}
+
 // CountUsers returns the number of registered users.
 func (s *Store) CountUsers(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&n)
+	err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&n)
 	return n, err
 }
 
 // CreateUser inserts a user with an already-hashed password.
 func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (*User, error) {
-	res, err := s.db.ExecContext(ctx,
-		"INSERT INTO users(username, password_hash) VALUES (?, ?)", username, passwordHash)
-	if err != nil {
-		return nil, err
-	}
-	id, _ := res.LastInsertId()
-	return s.GetUser(ctx, id)
+	return scanUser(s.pool.QueryRow(ctx,
+		"INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING "+userCols, username, passwordHash))
 }
 
 // GetUser fetches a user by id.
 func (s *Store) GetUser(ctx context.Context, id int64) (*User, error) {
-	u := &User{}
-	err := s.db.QueryRowContext(ctx,
-		"SELECT id, username, password_hash, created_at FROM users WHERE id = ?", id).
-		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
-	return u, scanErr(err)
+	return scanUser(s.pool.QueryRow(ctx, "SELECT "+userCols+" FROM users WHERE id = $1", id))
 }
 
 // GetUserByUsername fetches a user by login name.
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*User, error) {
-	u := &User{}
-	err := s.db.QueryRowContext(ctx,
-		"SELECT id, username, password_hash, created_at FROM users WHERE username = ?", username).
-		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
-	return u, scanErr(err)
+	return scanUser(s.pool.QueryRow(ctx, "SELECT "+userCols+" FROM users WHERE username = $1", username))
 }
 
 // UpdateUserPassword replaces the stored hash.
 func (s *Store) UpdateUserPassword(ctx context.Context, id int64, passwordHash string) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE users SET password_hash = ? WHERE id = ?", passwordHash, id)
+	_, err := s.pool.Exec(ctx, "UPDATE users SET password_hash = $1 WHERE id = $2", passwordHash, id)
 	return err
 }
 
@@ -65,33 +64,28 @@ func HashToken(token string) string {
 
 // CreateSession stores a session for the given raw token.
 func (s *Store) CreateSession(ctx context.Context, userID int64, token string, ttl time.Duration) error {
-	_, err := s.db.ExecContext(ctx,
-		"INSERT INTO sessions(user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-		userID, HashToken(token), time.Now().UTC().Add(ttl).Format(time.RFC3339))
+	_, err := s.pool.Exec(ctx,
+		"INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+		userID, HashToken(token), time.Now().UTC().Add(ttl))
 	return err
 }
 
 // UserBySession resolves a raw session token to its user, if still valid.
 func (s *Store) UserBySession(ctx context.Context, token string) (*User, error) {
-	u := &User{}
-	err := s.db.QueryRowContext(ctx, `
+	return scanUser(s.pool.QueryRow(ctx, `
 		SELECT u.id, u.username, u.password_hash, u.created_at
 		FROM sessions se JOIN users u ON u.id = se.user_id
-		WHERE se.token_hash = ? AND se.expires_at > ?`,
-		HashToken(token), time.Now().UTC().Format(time.RFC3339)).
-		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
-	return u, scanErr(err)
+		WHERE se.token_hash = $1 AND se.expires_at > now()`, HashToken(token)))
 }
 
 // DeleteSession revokes a raw session token.
 func (s *Store) DeleteSession(ctx context.Context, token string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE token_hash = ?", HashToken(token))
+	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE token_hash = $1", HashToken(token))
 	return err
 }
 
 // PurgeExpiredSessions removes stale sessions.
 func (s *Store) PurgeExpiredSessions(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at <= ?",
-		time.Now().UTC().Format(time.RFC3339))
+	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE expires_at <= now()")
 	return err
 }

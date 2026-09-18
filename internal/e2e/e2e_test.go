@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/testdb"
 )
 
 // mockUpstream is an OpenAI-compatible server that embeds by keyword and
@@ -87,17 +87,16 @@ type env struct {
 	t       *testing.T
 	srv     *httptest.Server
 	session string
-	dataDir string
+	store   *store.Store
 }
 
-func newEnv(t *testing.T, dataDir string, upstream string) *env {
+// newEnv wires the whole application against the schema described by cfg.
+// Calling it twice with the same cfg is the test's equivalent of restarting
+// the container against the same database.
+func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, err := store.Open(ctx, dataDir, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st := testdb.OpenWith(t, cfg)
 	if n, _ := st.CountUsers(ctx); n == 0 {
 		h, _ := auth.HashPassword("password123")
 		if _, err := st.CreateUser(ctx, "admin", h); err != nil {
@@ -121,7 +120,7 @@ func newEnv(t *testing.T, dataDir string, upstream string) *env {
 	r.Route("/admin", adm.Routes)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
-	e := &env{t: t, srv: srv, dataDir: dataDir}
+	e := &env{t: t, srv: srv, store: st}
 	res := e.call("POST", "/admin/api/login", map[string]string{"username": "admin", "password": "password123"}, "")
 	e.session = res["token"].(string)
 	return e
@@ -197,8 +196,8 @@ func (e *env) waitReady(docID int64) {
 func TestFullPipelineAndPersistence(t *testing.T) {
 	up := mockUpstream(t)
 	defer up.Close()
-	dataDir := t.TempDir()
-	e := newEnv(t, dataDir, up.URL)
+	cfg := testdb.Config(t)
+	e := newEnv(t, cfg)
 
 	// Unauthenticated admin call is rejected.
 	if r := e.call("GET", "/admin/api/models", nil, "nope"); r["_status"] != float64(401) {
@@ -223,7 +222,8 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	if doc["_status"] != float64(202) {
 		t.Fatalf("upload: %v", doc)
 	}
-	e.waitReady(int64(doc["id"].(float64)))
+	docID := int64(doc["id"].(float64))
+	e.waitReady(docID)
 
 	// Vector search returns the banana chunk for a banana query.
 	sr := e.call("POST", fmt.Sprintf("/admin/api/rag-stores/%d/search", storeID), map[string]any{"query": "tell me about banana"}, "")
@@ -292,9 +292,11 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 		t.Errorf("new key should work: %v", r)
 	}
 
-	// Simulate a container restart: reopen everything on the same data dir.
+	// Simulate a container restart: close the pool and reopen everything on
+	// the same database with the same SECRET_KEY.
 	e.srv.Close()
-	e2 := newEnv(t, dataDir, up.URL)
+	e.store.Close()
+	e2 := newEnv(t, cfg)
 	if r := e2.call("GET", "/v1/models", nil, newKey); r["_status"] != float64(200) {
 		t.Fatalf("project key lost after restart: %v", r)
 	}
@@ -303,9 +305,41 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	if !strings.Contains(c2, "Cherries are small") {
 		t.Fatalf("vectors lost after restart: %q", c2)
 	}
-	for _, f := range []string{"ragmux.db", "secret.key", "uploads"} {
-		if _, err := os.Stat(dataDir + "/" + f); err != nil {
-			t.Errorf("missing %s in data dir", f)
-		}
+	// Documents, their raw content and the encrypted provider key all live
+	// in the database and are still usable.
+	d := e2.call("GET", fmt.Sprintf("/admin/api/documents/%d", docID), nil, "")
+	if d["status"] != "ready" || d["chunk_count"] != float64(3) {
+		t.Errorf("document after restart: %v", d)
+	}
+	stored, err := e2.store.DocumentContent(context.Background(), docID)
+	if err != nil || !strings.Contains(string(stored), "# Banana") {
+		t.Errorf("document content after restart: %v %q", err, stored)
+	}
+	models := e2.call("GET", "/admin/api/models", nil, "")
+	if l := models["_list"].([]any); len(l) != 1 || l[0].(map[string]any)["api_key_masked"] != "****" {
+		t.Errorf("connections after restart: %v", models)
+	}
+	sys := e2.call("GET", "/admin/api/system", nil, "")
+	db := sys["database"].(map[string]any)
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(1) || sys["secret_key_source"] != "env" {
+		t.Errorf("system info: %v", sys)
+	}
+
+	// Reprocessing re-reads the stored bytes and rebuilds the chunks.
+	if r := e2.call("POST", fmt.Sprintf("/admin/api/documents/%d/reprocess", docID), nil, ""); r["_status"] != float64(202) {
+		t.Fatalf("reprocess: %v", r)
+	}
+	e2.waitReady(docID)
+	sr2 := e2.call("POST", fmt.Sprintf("/admin/api/rag-stores/%d/search", storeID), map[string]any{"query": "cherry"}, "")
+	if hits := sr2["hits"].([]any); len(hits) == 0 || !strings.Contains(hits[0].(map[string]any)["content"].(string), "Cherr") {
+		t.Errorf("search after reprocess: %v", hits)
+	}
+
+	// Deleting the store cascades through documents, chunks and embeddings.
+	if r := e2.call("DELETE", fmt.Sprintf("/admin/api/rag-stores/%d", storeID), nil, ""); r["_status"] != float64(200) {
+		t.Fatalf("delete store: %v", r)
+	}
+	if r := e2.call("GET", fmt.Sprintf("/admin/api/documents/%d", docID), nil, ""); r["_status"] != float64(404) {
+		t.Errorf("document should be gone with its store: %v", r)
 	}
 }

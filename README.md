@@ -2,12 +2,12 @@
 
 <https://ragmux.com>
 
-Ragmux is a single-binary, single-container AI gateway written in Go. It sits between
-your applications and LLM providers, exposes one **OpenAI-compatible API**, and can
-augment every request with **retrieval (RAG)** from documents you upload. All state
-lives in one directory (`/app/data`) backed by embedded SQLite + `sqlite-vec`, so the
-whole thing persists with a single volume mount. No Postgres, no Redis, no external
-vector database.
+Ragmux is a single-binary AI gateway written in Go. It sits between your applications
+and LLM providers, exposes one **OpenAI-compatible API**, and can augment every request
+with **retrieval (RAG)** from documents you upload. All state — models, projects,
+documents, chunks, vectors and metrics — lives in one **PostgreSQL** database with the
+[pgvector](https://github.com/pgvector/pgvector) extension. Two containers, no Redis, no
+separate vector database.
 
 ```
 client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
@@ -16,6 +16,9 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
              ├─ project → RAG store (optional): embed query → top-k chunks → inject context
              └─ adapter: OpenAI · Anthropic · Gemini · DeepSeek · Ollama · custom OpenAI (vLLM…)
                           JSON and SSE streaming, normalised to the OpenAI schema
+             │
+             └─ PostgreSQL + pgvector: users, connections (AES-256-GCM keys), projects,
+                documents (bytea), chunks, HNSW vector indexes, request logs
 ```
 
 ## Features
@@ -27,7 +30,7 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 - **Format translation:** Anthropic Messages API and Gemini `generateContent` requests and
   streams are converted to and from the OpenAI schema, including tool calls for Anthropic.
 - **RAG stores:** upload PDF / TXT / Markdown, automatic chunking (size/overlap), batch
-  embedding, vector search with `sqlite-vec` (cosine), context injection into the system prompt.
+  embedding, pgvector HNSW search (cosine), context injection into the system prompt.
 - **Projects:** each project has its own `sk-proj-…` key mapped to one model connection and an
   optional RAG store. Provider credentials are AES-256-GCM encrypted at rest and never leave
   the server.
@@ -35,20 +38,17 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
   RAG usage), per-project and global summaries, daily series.
 - **Dashboard:** embedded single-page UI at `/admin/` for models, RAG stores, documents,
   projects, metrics and a playground. Everything is also available as a REST API.
-- **Persistence:** SQLite (WAL) + vectors + uploads + encryption key under `DATA_DIR`.
-  Unfinished document ingestion resumes automatically after a restart.
+- **Persistence:** everything in PostgreSQL + pgvector; uploaded files are kept as `bytea`
+  so no volume is needed on the gateway. Unfinished document ingestion resumes
+  automatically after a restart.
 
-## Quick start (Docker)
+## Quick start (Docker Compose)
 
-```bash
-docker build -t ragmux/ragmux:latest .
-docker run -d -p 8080:8080 -v ./gateway_data:/app/data --name ragmux ragmux/ragmux:latest
-```
-
-Or with Compose:
+The Compose file runs the gateway next to a `pgvector/pgvector:pg17` database.
 
 ```bash
-cp .env.example .env      # optional: set ADMIN_PASSWORD etc.
+cp .env.example .env
+echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env   # required, see below
 docker compose up -d
 ```
 
@@ -59,29 +59,42 @@ Open <http://localhost:8080/admin/>. On first start an `admin` user is created. 
 docker logs ragmux 2>&1 | grep -A3 "Initial admin"
 ```
 
-Everything the gateway writes goes to `./gateway_data` on the host:
+To use an existing PostgreSQL server instead, run only the image and point it at your
+database (the `vector` extension is created automatically; the role needs permission to
+do that, or create it beforehand with `CREATE EXTENSION vector`):
 
+```bash
+docker build -t ragmux/ragmux:latest .
+docker run -d -p 8080:8080 --name ragmux \
+  -e DATABASE_URL='postgres://ragmux:secret@db.internal:5432/ragmux?sslmode=require' \
+  -e SECRET_KEY="$(openssl rand -hex 32)" \
+  ragmux/ragmux:latest
 ```
-gateway_data/
-├── ragmux.db (+ -wal, -shm)   relational data, chunks and vectors
-├── secret.key                 AES key for provider credentials (keep with the DB!)
-└── uploads/<doc id>/<file>    original documents
-```
 
-Stop, remove and recreate the container with the same mount and every model, project,
-document and metric is still there.
+### Data and persistence
 
-> **Permissions.** The image runs as the distroless `nonroot` user (UID 65532). Docker
-> creates a missing bind-mount directory as root, which the process cannot write to. If
-> you see a startup error about the data directory, run
-> `mkdir -p gateway_data && sudo chown 65532:65532 gateway_data`, or add
-> `--user $(id -u):$(id -g)` / `user: "1000:1000"` in Compose to run as yourself.
+The gateway itself is stateless. Two things make up your state:
+
+1. **The PostgreSQL database** (`pgdata` volume in Compose): users, model connections,
+   projects, uploaded documents (stored as `bytea`), chunks, vectors and request logs.
+   Back it up with `pg_dump` like any other Postgres database.
+2. **`SECRET_KEY`**: the 32-byte AES-256-GCM key (64 hex characters) that encrypts
+   provider API keys inside the database. Generate it once with `openssl rand -hex 32`
+   and keep it next to your backups — without it the stored credentials cannot be read.
+
+Stop, remove and recreate the gateway container as often as you like; as long as the
+database and `SECRET_KEY` are the same, every model, project, document and metric is
+still there. If `SECRET_KEY` is unset the gateway falls back to generating and reading
+`DATA_DIR/secret.key` and logs a warning; that is meant for local development only.
 
 ## Configuration
 
 | Variable           | Default      | Description |
 |--------------------|--------------|-------------|
-| `DATA_DIR`         | `/app/data`  | Directory for DB, uploads and key |
+| `DATABASE_URL`     | *(required)* | PostgreSQL connection string (`postgres://user:pass@host:5432/db?sslmode=…`) |
+| `SECRET_KEY`       | *(file fallback)* | 64 hex chars (32 bytes) encrypting provider credentials; `openssl rand -hex 32` |
+| `DB_MAX_CONNS`     | `10`         | Connection pool size |
+| `DATA_DIR`         | `/app/data`  | Only used for the `secret.key` fallback when `SECRET_KEY` is unset |
 | `PORT`             | `8080`       | HTTP port |
 | `ADMIN_USER`       | `admin`      | Username created on first run |
 | `ADMIN_PASSWORD`   | *(random)*   | Password for the first-run user |
@@ -202,31 +215,37 @@ All management endpoints are under `/admin/api` and need a session (cookie or
 | POST | `/projects/{id}/rotate-key` | Issue a new key |
 | GET | `/projects/{id}/metrics?window=24h` | Summary, daily series, recent requests |
 | GET | `/metrics/summary`, `/metrics/requests` | Global metrics |
-| GET | `/system` | Data dir, DB size, vector engine, version |
+| GET | `/system` | Postgres / pgvector / migration versions, DB size, key source, version |
 
 Public: `GET /healthz`. Client API: `POST /v1/chat/completions`, `GET /v1/models`.
 
 ## Development
 
 ```bash
-make test                 # unit + end-to-end tests (mock upstream, real sqlite-vec)
-make run                  # runs on :8080 with DATA_DIR=./data
+make dev-db               # pgvector Postgres on localhost:5433 (docker-compose.dev.yml)
+make test                 # unit + end-to-end tests (mock upstream, real Postgres)
+make run                  # runs on :8080 against the dev database
 make docker-build
 ```
 
-Requires Go 1.27+. The binary is fully static (`CGO_ENABLED=0`): SQLite and `sqlite-vec`
-run as a wasm module via `github.com/ncruces/go-sqlite3`. The `go-sqlite3` version is pinned
-to `v0.23.x` because the `sqlite-vec` wasm bindings target its wazero-based runtime; newer
-`go-sqlite3` releases (v0.33+) switched to a different execution model and cannot load the
-extension. If the extension ever fails to load, the gateway logs a warning and falls back to
-an exact brute-force cosine search over the stored embeddings, so retrieval keeps working.
+Requires Go 1.27+ and Docker for the database. Tests read `TEST_DATABASE_URL` (the
+Makefile defaults it to `postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable`)
+and create a throwaway schema per test, so they can run in parallel against one server;
+they are skipped when the variable is unset. The binary is pure Go (`CGO_ENABLED=0`, `pgx`),
+so the image is a single static executable on a distroless base.
+
+Schema changes are embedded SQL files in `internal/store/migrations/` applied at startup
+under an advisory lock, so several replicas can start against the same database. Each
+embedding width gets its own `chunk_embeddings_<dims>` table with an HNSW cosine index,
+created on first ingest.
 
 ## Layout
 
 ```
 cmd/ragmux/          entrypoint, HTTP server, admin bootstrap
 internal/config/     environment configuration
-internal/store/      SQLite schema, migrations, encryption, vector search
+internal/store/      PostgreSQL schema, migrations, encryption, pgvector search
+internal/testdb/     per-test schemas on TEST_DATABASE_URL
 internal/provider/   OpenAI-compatible, Anthropic, Gemini adapters + embedders
 internal/rag/        parsing (PDF/TXT/MD), chunking, ingestion worker, retrieval
 internal/gateway/    /v1 proxy, RAG injection, metrics

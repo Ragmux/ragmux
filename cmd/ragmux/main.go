@@ -1,6 +1,5 @@
 // Command ragmux runs the AI gateway: an OpenAI-compatible proxy in front of
-// multiple LLM providers with optional RAG, backed by an embedded SQLite +
-// sqlite-vec database under a single data directory.
+// multiple LLM providers with optional RAG, backed by PostgreSQL + pgvector.
 package main
 
 import (
@@ -37,13 +36,18 @@ func main() {
 	healthcheck := flag.Bool("healthcheck", false, "probe the running server and exit (for container HEALTHCHECK)")
 	flag.Parse()
 
+	if *healthcheck {
+		port, err := config.PortFromEnv()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config:", err)
+			os.Exit(2)
+		}
+		os.Exit(probe(port))
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(2)
-	}
-	if *healthcheck {
-		os.Exit(probe(cfg.Port))
 	}
 	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
@@ -73,11 +77,18 @@ func run(cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, cfg.DataDir, log)
+	st, err := store.Open(ctx, store.OpenConfig{
+		DatabaseURL:  cfg.DatabaseURL,
+		MaxConns:     cfg.DBMaxConns,
+		SecretKeyHex: cfg.SecretKeyHex,
+		DataDir:      cfg.DataDir,
+	}, log)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	log.Info("database: connected", "postgres_version", st.ServerVersion, "max_conns", cfg.DBMaxConns,
+		"secret_key_source", st.SecretKeySource)
 
 	if err := bootstrapAdmin(ctx, st, cfg, log); err != nil {
 		return err
@@ -120,7 +131,7 @@ func run(cfg config.Config) error {
 		r.Use(cors(cfg.CORSOrigins))
 	}
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := st.DB().PingContext(r.Context()); err != nil {
+		if err := st.DB().Ping(r.Context()); err != nil {
 			http.Error(w, "db unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -155,7 +166,7 @@ func run(cfg config.Config) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("ragmux listening", "addr", srv.Addr, "data_dir", cfg.DataDir, "version", version, "sqlite_vec", st.VecAvailable)
+		log.Info("ragmux listening", "addr", srv.Addr, "version", version)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}

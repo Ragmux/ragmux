@@ -7,15 +7,38 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
-// cipher encrypts provider credentials at rest with AES-256-GCM. The key is
-// generated on first start and kept in the data directory so an existing
-// database stays readable after the container is recreated.
+// cipher encrypts provider credentials at rest with AES-256-GCM.
 type cipher struct {
 	aead cryptocipher.AEAD
+}
+
+// loadCipher builds the credential cipher from the hex key when given, and
+// otherwise from (or into) dataDir/secret.key. It returns the source used.
+func loadCipher(keyHex, dataDir string, log *slog.Logger) (*cipher, string, error) {
+	if keyHex != "" {
+		key, err := hex.DecodeString(strings.TrimSpace(keyHex))
+		if err != nil || len(key) != 32 {
+			return nil, "", errors.New("SECRET_KEY must be 64 hex characters (32 bytes)")
+		}
+		c, err := newCipher(key)
+		return c, "env", err
+	}
+	if dataDir == "" {
+		return nil, "", errors.New("SECRET_KEY is unset and no data directory is configured for the secret.key fallback")
+	}
+	log.Warn("SECRET_KEY is not set; falling back to a key file. Set SECRET_KEY (openssl rand -hex 32) so credentials survive container recreation.",
+		"path", filepath.Join(dataDir, "secret.key"))
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
+		return nil, "", fmt.Errorf("create data dir for secret.key fallback (set SECRET_KEY to avoid this): %w", err)
+	}
+	c, err := loadOrCreateCipher(filepath.Join(dataDir, "secret.key"))
+	return c, "file", err
 }
 
 func loadOrCreateCipher(path string) (*cipher, error) {

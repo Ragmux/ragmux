@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -105,9 +104,9 @@ func (a *Admin) fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not found")
-	case strings.Contains(err.Error(), "UNIQUE constraint"):
+	case store.IsUniqueViolation(err):
 		writeErr(w, http.StatusConflict, "an item with that name already exists")
-	case strings.Contains(err.Error(), "FOREIGN KEY constraint"):
+	case store.IsForeignKeyViolation(err):
 		writeErr(w, http.StatusConflict, "item is still referenced by a project or RAG store")
 	default:
 		a.Log.Error("admin request failed", "err", err)
@@ -451,17 +450,9 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 
 func (a *Admin) deleteRAGStore(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
-	docs, err := a.Store.ListDocuments(r.Context(), id)
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
 	if err := a.Store.DeleteRAGStore(r.Context(), id); err != nil {
 		a.fail(w, err)
 		return
-	}
-	for _, d := range docs {
-		os.RemoveAll(filepath.Dir(a.Store.DocumentPath(d)))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -544,30 +535,17 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 			a.fail(w, err)
 			return
 		}
-		doc, err := a.Store.CreateDocument(r.Context(), &store.Document{RAGStoreID: id, Filename: name,
-			Mime: fh.Header.Get("Content-Type"), SizeBytes: fh.Size})
-		if err != nil {
-			src.Close()
-			a.fail(w, err)
-			return
-		}
-		path := a.Store.DocumentPath(doc)
-		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-			src.Close()
-			a.fail(w, err)
-			return
-		}
-		dst, err := os.Create(path)
-		if err != nil {
-			src.Close()
-			a.fail(w, err)
-			return
-		}
-		_, err = io.Copy(dst, src)
+		// The whole request body is already bounded by MaxBytesReader, so a
+		// single file can never exceed the upload limit.
+		data, err := io.ReadAll(io.LimitReader(src, max))
 		src.Close()
-		dst.Close()
 		if err != nil {
-			_ = a.Store.SetDocumentStatus(r.Context(), doc.ID, store.DocFailed, "write failed: "+err.Error())
+			a.fail(w, err)
+			return
+		}
+		doc, err := a.Store.CreateDocument(r.Context(), &store.Document{RAGStoreID: id, Filename: name,
+			Mime: fh.Header.Get("Content-Type"), SizeBytes: int64(len(data))}, data)
+		if err != nil {
 			a.fail(w, err)
 			return
 		}
@@ -789,15 +767,15 @@ func (a *Admin) recentRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Admin) systemInfo(w http.ResponseWriter, r *http.Request) {
-	var dbSize int64
-	if fi, err := os.Stat(filepath.Join(a.Store.DataDir, "ragmux.db")); err == nil {
-		dbSize = fi.Size()
+	info, err := a.Store.DatabaseInfo(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"data_dir":      a.Store.DataDir,
-		"db_size_bytes": dbSize,
-		"vector_engine": map[string]any{"sqlite_vec": a.Store.VecAvailable},
-		"version":       Version,
+		"database":          info,
+		"secret_key_source": a.Store.SecretKeySource,
+		"version":           Version,
 	})
 }
 

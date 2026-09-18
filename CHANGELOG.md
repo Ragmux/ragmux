@@ -27,6 +27,9 @@ All notable changes to Ragmux are documented here. The format follows
 
 ### Changed
 - License: AGPL-3.0-or-later.
+- `GET /admin/api/system` now returns `database` (Postgres, pgvector and migration versions,
+  size) and `secret_key_source` instead of `data_dir`, `db_size_bytes` and `vector_engine`.
+- `docker-compose.dev.yml` and `make dev-db` start a local pgvector Postgres for tests.
 
 ## [0.1.0] — 2026-09-18
 
