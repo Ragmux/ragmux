@@ -6,6 +6,19 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **PDF parsing is isolated and bounded.** Each PDF is parsed by a disposable child
+  process (`ragmux pdf-extract`, the gateway's own binary) that is killed at the 60 s
+  deadline, so a crafted file that makes the parser recurse without end (a
+  self-referencing object stream, previously a fatal stack overflow that took the whole
+  gateway down) or loop forever (an `/Extends` or xref `/Prev` cycle, previously a
+  goroutine spinning past the deadline) now only fails that document. The page tree is
+  walked by the gateway with a depth and node budget instead of the library's unguarded
+  walk, so `/Kids` and `/Parent` cycles end at once and `page_count` reports the pages
+  found rather than the declared `/Count`; a page yielding more than 2 MiB of text is
+  rejected. A fuzz target (`FuzzExtractPDF`) and regression cases for truncated,
+  cyclic, zero-page and oversized inputs cover the parser.
+
 ## [0.3.0] — 2026-09-18
 
 ### Added

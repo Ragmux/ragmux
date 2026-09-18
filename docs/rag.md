@@ -55,11 +55,22 @@ No external tools are needed: DOCX is read from `word/document.xml`, HTML with
 signature. Scanned PDFs without a text layer are rejected (there is no OCR).
 
 Parsing is bounded so a small upload cannot expand into unbounded work: PDFs are read
-for at most 60 s and 2000 pages, a DOCX `word/document.xml` may be at most 32 MiB and at
-most 100× its compressed size, and the extracted text of any document is capped at
-20 MiB. A document that splits into more than `MAX_CHUNKS_PER_DOCUMENT` chunks (default
-20000) is marked `failed` before anything is embedded; raise the store's `chunk_size` or
-the limit for such documents. One ingestion job may run for 15 minutes.
+for at most 60 s and 2000 pages with at most 2 MiB of text per page, a DOCX
+`word/document.xml` may be at most 32 MiB and at most 100× its compressed size, and the
+extracted text of any document is capped at 20 MiB. A document that splits into more
+than `MAX_CHUNKS_PER_DOCUMENT` chunks (default 20000) is marked `failed` before anything
+is embedded; raise the store's `chunk_size` or the limit for such documents. One
+ingestion job may run for 15 minutes.
+
+PDFs get extra care because their parser (`github.com/ledongthuc/pdf`, pure Go) runs on
+untrusted bytes. The gateway walks the page tree itself, with a depth and node budget,
+so a tree that references itself or declares a huge `/Count` ends quickly and
+`page_count` reports the pages actually found. Each PDF is then parsed by a disposable
+child process (`ragmux pdf-extract`, the gateway's own binary, so nothing else is needed
+in the image): a parser panic, a stack overflow or a loop that outlives the 60 s deadline
+kills only that process and the document is marked `failed` with the reason. Should the
+gateway fail to locate its own executable at startup it logs a warning and parses PDFs
+in-process instead, with the same caps but without process isolation.
 
 Uploaded files are stored as `bytea` in the database, so a document can always be
 re-parsed. Ingestion runs in the background (`INGEST_WORKERS` jobs in parallel); a
