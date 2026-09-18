@@ -75,7 +75,9 @@ type ChatRequest struct {
 	ResponseFormat   json.RawMessage `json:"response_format,omitempty"`
 	StreamOptions    json.RawMessage `json:"stream_options,omitempty"`
 	User             string          `json:"user,omitempty"`
-	Extra            map[string]json.RawMessage
+	// Extra holds unknown client fields; it is merged into the wire object by
+	// MarshalJSON and must never be serialised as a field itself.
+	Extra map[string]json.RawMessage `json:"-"`
 }
 
 var knownFields = map[string]bool{

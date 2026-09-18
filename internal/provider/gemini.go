@@ -58,6 +58,7 @@ type geminiResponse struct {
 	UsageMetadata struct {
 		PromptTokenCount     int `json:"promptTokenCount"`
 		CandidatesTokenCount int `json:"candidatesTokenCount"`
+		ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
 		TotalTokenCount      int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 }
@@ -200,8 +201,7 @@ func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, err
 	}
 	resp := &ChatResponse{ID: chatID(), Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
-		Usage: &Usage{PromptTokens: gr.UsageMetadata.PromptTokenCount, CompletionTokens: gr.UsageMetadata.CandidatesTokenCount,
-			TotalTokens: gr.UsageMetadata.TotalTokenCount}}
+		Usage: geminiUsage(gr)}
 	if len(gr.Candidates) == 0 {
 		resp.Choices = []Choice{{Index: 0, Message: ResponseMessage{Role: "assistant", Content: strPtr("")}, FinishReason: strPtr("content_filter")}}
 		return resp, nil
@@ -244,9 +244,7 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 			return true
 		}
 		if gr.UsageMetadata.TotalTokenCount > 0 {
-			usage.PromptTokens = gr.UsageMetadata.PromptTokenCount
-			usage.CompletionTokens = gr.UsageMetadata.CandidatesTokenCount
-			usage.TotalTokens = gr.UsageMetadata.TotalTokenCount
+			usage = geminiUsage(gr)
 		}
 		for _, c := range gr.Candidates {
 			text := geminiText(c.Content)
@@ -271,4 +269,13 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 	}
 	emit(StreamChunk{Choices: []StreamChoice{}, Usage: usage})
 	return nil
+}
+
+// geminiUsage maps usageMetadata to the OpenAI shape. Reasoning ("thoughts")
+// tokens are billed as output, so they count as completion tokens, which keeps
+// prompt + completion == total like the other providers.
+func geminiUsage(gr geminiResponse) *Usage {
+	u := gr.UsageMetadata
+	return &Usage{PromptTokens: u.PromptTokenCount, CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount,
+		TotalTokens: u.TotalTokenCount}
 }
