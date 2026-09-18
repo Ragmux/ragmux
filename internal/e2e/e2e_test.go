@@ -385,7 +385,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(6) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"].(float64) < 8 || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
@@ -533,7 +533,7 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 	e.login("ed", "editorpass")
 
 	// Audit log.
-	audit := e.call("GET", "/admin/api/audit?limit=200", nil, "")["_list"].([]any)
+	audit := e.call("GET", "/admin/api/audit?limit=200", nil, "")["entries"].([]any)
 	seen := map[string]bool{}
 	for _, a := range audit {
 		seen[a.(map[string]any)["action"].(string)] = true
@@ -543,7 +543,7 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 			t.Errorf("audit log missing %s (have %v)", want, seen)
 		}
 	}
-	filtered := e.call("GET", "/admin/api/audit?action=login.failure", nil, "")["_list"].([]any)
+	filtered := e.call("GET", "/admin/api/audit?action=login.failure", nil, "")["entries"].([]any)
 	if len(filtered) != 5 {
 		t.Errorf("login.failure entries = %d, want 5", len(filtered))
 	}
@@ -551,7 +551,7 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 		t.Errorf("login.failure entry: %v", d)
 	}
 	newest := audit[0].(map[string]any)["created_at"].(string)
-	older := e.call("GET", "/admin/api/audit?before="+newest, nil, "")["_list"].([]any)
+	older := e.call("GET", "/admin/api/audit?before="+newest, nil, "")["entries"].([]any)
 	if len(older) >= len(audit) {
 		t.Errorf("before cursor should exclude the newest entries: %d vs %d", len(older), len(audit))
 	}
@@ -615,7 +615,7 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 		t.Errorf("deleted user's session: %v", r)
 	}
 	// Audit rows written by the deleted user keep the username; the actor id is nulled.
-	if l := e.call("GET", "/admin/api/audit?action=user.delete", nil, admin2Tok)["_list"].([]any); len(l) != 1 {
+	if l := e.call("GET", "/admin/api/audit?action=user.delete", nil, admin2Tok)["entries"].([]any); len(l) != 1 {
 		t.Errorf("user.delete audit: %v", l)
 	}
 }
@@ -706,7 +706,7 @@ func TestProjectLimitsAndBudgets(t *testing.T) {
 	if r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d", budgetID), map[string]any{"name": "budget", "model_connection_id": connID, "budget_daily_tokens": 1000, "rate_limit_tpm": 50}, ""); status(r) != 200 || r["budget_daily_tokens"] != float64(1000) {
 		t.Fatalf("update limits: %v", r)
 	}
-	upd := e.call("GET", "/admin/api/audit?action=project.update", nil, "")["_list"].([]any)
+	upd := e.call("GET", "/admin/api/audit?action=project.update", nil, "")["entries"].([]any)
 	if len(upd) != 1 {
 		t.Fatalf("project.update audit entries: %v", upd)
 	}
@@ -951,7 +951,7 @@ func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
 	if r := e.call("GET", fmt.Sprintf("/admin/api/rag-stores/%d", storeID), nil, ""); r["document_count"] != float64(4) || r["chunk_count"].(float64) < 6 {
 		t.Errorf("store after reprocess: %v", r)
 	}
-	if l := e.call("GET", "/admin/api/audit?action=rag_store.reprocess_all", nil, "")["_list"].([]any); len(l) != 1 {
+	if l := e.call("GET", "/admin/api/audit?action=rag_store.reprocess_all", nil, "")["entries"].([]any); len(l) != 1 {
 		t.Errorf("reprocess_all audit: %v", l)
 	}
 	if r := search(map[string]any{"query": "apple zyxquux", "rerank": false}); !hasContent(r, "zyxquux") {

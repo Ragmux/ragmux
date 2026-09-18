@@ -32,13 +32,27 @@ const setupMinPasswordLen = 12
 // without touching any real account's counters.
 const setupLimiterUser = ""
 
+// setupStatus reports whether setup is pending plus three facts the setup
+// page shows so an operator can confirm which database the gateway is on:
+// the migration version, where SECRET_KEY came from and the database role.
+// Nothing here identifies users or hosts.
 func (a *Admin) setupStatus(w http.ResponseWriter, r *http.Request) {
 	n, err := a.Store.CountUsers(r.Context())
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"needs_setup": n == 0})
+	info, err := a.Store.SetupInfo(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"needs_setup":        n == 0,
+		"migrations_version": info.MigrationsVersion,
+		"secret_key_source":  a.Store.SecretKeySource,
+		"database_role":      info.DatabaseRole,
+	})
 }
 
 func (a *Admin) setup(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +118,11 @@ func (a *Admin) setup(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrSetupDone) {
 			recordFailure()
 			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		if store.IsUniqueViolation(err) {
+			recordFailure()
+			writeErr(w, http.StatusConflict, errUsernameTaken)
 			return
 		}
 		a.fail(w, err)
