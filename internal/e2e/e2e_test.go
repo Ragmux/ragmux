@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,11 +48,30 @@ func mockUpstream(t *testing.T) *httptest.Server {
 		case "/v1/chat/completions":
 			var req provider.ChatRequest
 			json.Unmarshal(body, &req)
-			sys := ""
+			sys, lastUser := "", ""
 			for _, m := range req.Messages {
 				if m.Role == "system" {
 					sys = m.Text()
 				}
+				if m.Role == "user" {
+					lastUser = m.Text()
+				}
+			}
+			// Rerank prompts get the passages back in reverse order.
+			if strings.Contains(lastUser, "Return only a JSON array") {
+				n := 0
+				for _, m := range passageRe.FindAllStringSubmatch(lastUser, -1) {
+					if v, _ := strconv.Atoi(m[1]); v > n {
+						n = v
+					}
+				}
+				var order []string
+				for i := n; i >= 1; i-- {
+					order = append(order, strconv.Itoa(i))
+				}
+				json.NewEncoder(w).Encode(map[string]any{"id": "r", "model": req.Model,
+					"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": "[" + strings.Join(order, ",") + "]"}, "finish_reason": "stop"}}})
+				return
 			}
 			if req.Stream {
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -67,6 +89,8 @@ func mockUpstream(t *testing.T) *httptest.Server {
 		}
 	}))
 }
+
+var passageRe = regexp.MustCompile(`(?m)^\[(\d+)\] `)
 
 func keywordVec(s string) []float32 {
 	s = strings.ToLower(s)
@@ -696,5 +720,218 @@ func TestProjectLimitsAndBudgets(t *testing.T) {
 	recent := pm["recent"].([]any)
 	if r0 := recent[0].(map[string]any); r0["status_code"] != float64(429) || r0["error"] != "rate_limit_rpm" {
 		t.Errorf("recent 429 row: %v", r0)
+	}
+}
+
+// minimalDOCX builds a Word document with a heading and paragraphs.
+func minimalDOCX(t *testing.T, heading string, paras ...string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	body := `<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>` + heading + `</w:t></w:r></w:p>`
+	for _, p := range paras {
+		body += `<w:p><w:r><w:t>` + p + `</w:t></w:r></w:p>`
+	}
+	for name, content := range map[string]string{
+		"[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`,
+		"word/document.xml":   `<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` + body + `</w:body></w:document>`,
+	} {
+		f, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Write([]byte(content))
+	}
+	zw.Close()
+	return buf.String()
+}
+
+func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
+	up := mockUpstream(t)
+	defer up.Close()
+	e := newEnv(t, testdb.Config(t))
+	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
+	hitContents := func(r map[string]any) []string {
+		var out []string
+		for _, h := range r["hits"].([]any) {
+			out = append(out, h.(map[string]any)["content"].(string))
+		}
+		return out
+	}
+	hasContent := func(r map[string]any, sub string) bool {
+		for _, c := range hitContents(r) {
+			if strings.Contains(c, sub) {
+				return true
+			}
+		}
+		return false
+	}
+
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	connID := int64(conn["id"].(float64))
+
+	// Validation of the new settings.
+	bad := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "bad", "embedding_connection_id": connID, "fts_config": "klingon"}, "")
+	if status(bad) != 400 || !strings.Contains(bad["error"].(map[string]any)["message"].(string), "fts_config") {
+		t.Fatalf("unknown fts_config should be rejected: %v", bad)
+	}
+	if r := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "bad", "embedding_connection_id": connID, "search_mode": "magic"}, ""); status(r) != 400 {
+		t.Fatalf("unknown search_mode should be rejected: %v", r)
+	}
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "docs", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 2, "fts_config": "english"}, "")
+	if status(rs) != 201 || rs["search_mode"] != "hybrid" || rs["fts_config"] != "english" || rs["contextual_chunks"] != true || rs["rerank_candidates"] != float64(15) || rs["max_distance"] != float64(0) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+	search := func(body map[string]any) map[string]any {
+		t.Helper()
+		r := e.call("POST", fmt.Sprintf("/admin/api/rag-stores/%d/search", storeID), body, "")
+		if status(r) != 200 {
+			t.Fatalf("search %v: %v", body, r)
+		}
+		return r
+	}
+
+	// Five formats ingest.
+	uploads := map[string]string{
+		"fruits.md":   "# Apple\n\nApples are red and crunchy.\n\n# Banana\n\nBananas are yellow and soft.\n\n# Cherry\n\nCherries are small and sweet.",
+		"proto.txt":   "The zyxquux protocol is an obscure handshake used by nobody.",
+		"guide.docx":  minimalDOCX(t, "Docker", "Run the container with the durian flag."),
+		"page.html":   `<html><head><title>Ops Guide</title></head><body><nav>Home</nav><h1>Deploy</h1><h2>Steps</h2><p>Ship the release on Friday.</p><script>x()</script></body></html>`,
+		"broken.docx": "<html>not a zip</html>",
+	}
+	docIDs := map[string]int64{}
+	for name, content := range uploads {
+		r := e.upload(storeID, name, content)
+		if name == "broken.docx" {
+			if status(r) != 400 {
+				t.Errorf("non-zip docx should be rejected: %v", r)
+			}
+			continue
+		}
+		if status(r) != 202 {
+			t.Fatalf("upload %s: %v", name, r)
+		}
+		docIDs[name] = int64(r["id"].(float64))
+	}
+	for name, id := range docIDs {
+		e.waitReady(id)
+		if d := e.call("GET", fmt.Sprintf("/admin/api/documents/%d", id), nil, ""); d["chunk_count"].(float64) < 1 {
+			t.Errorf("%s: %v", name, d)
+		}
+	}
+	if r := e.upload(storeID, "x.exe", "MZ"); status(r) != 400 {
+		t.Errorf("unsupported extension: %v", r)
+	}
+
+	// Section metadata comes back with hits for DOCX and HTML.
+	if r := search(map[string]any{"query": "durian", "mode": "vector"}); !hasContent(r, "durian flag") || r["hits"].([]any)[0].(map[string]any)["section"] != "Docker" || r["mode"] != "vector" {
+		t.Errorf("docx section: %v", r)
+	}
+	if r := search(map[string]any{"query": "release friday", "top_k": 10}); !hasContent(r, "Ship the release") {
+		t.Errorf("html hit: %v", r)
+	} else {
+		for _, h := range r["hits"].([]any) {
+			if hm := h.(map[string]any); strings.Contains(hm["content"].(string), "Ship the release") && hm["section"] != "Deploy > Steps" {
+				t.Errorf("html section: %v", hm)
+			}
+		}
+	}
+
+	// Hybrid finds the exact term the keyword embedder knows nothing about;
+	// vector mode does not.
+	hy := search(map[string]any{"query": "apple zyxquux"})
+	if hy["mode"] != "hybrid" || hy["reranked"] != false || !hasContent(hy, "zyxquux") || !hasContent(hy, "Apples") {
+		t.Errorf("hybrid top-2 should hold apple and zyxquux: %v", hitContents(hy))
+	}
+	for _, h := range hy["hits"].([]any) {
+		hm := h.(map[string]any)
+		if strings.Contains(hm["content"].(string), "zyxquux") && (hm["fts_rank"] != float64(1) || hm["score"].(float64) <= 0) {
+			t.Errorf("zyxquux hit ranks: %v", hm)
+		}
+	}
+	if vec := search(map[string]any{"query": "apple zyxquux", "mode": "vector"}); hasContent(vec, "zyxquux") || !strings.Contains(hitContents(vec)[0], "Apples") {
+		t.Errorf("vector mode: %v", hitContents(vec))
+	}
+
+	// The similarity threshold drops unrelated context: a query with no
+	// fruit keyword sits at distance ~1 from every fruit chunk.
+	if r := search(map[string]any{"query": "zyxquux", "max_distance": 0.5, "top_k": 10}); hasContent(r, "Apples") || hasContent(r, "Bananas") || !hasContent(r, "zyxquux") {
+		t.Errorf("max_distance: %v", hitContents(r))
+	}
+
+	// Project linked to the store: chat carries the hit count header.
+	proj := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID, "rag_store_id": storeID}, "")
+	apiKey := proj["api_key"].(string)
+	chat, hdr := e.callRaw("POST", "/v1/chat/completions", map[string]any{"messages": []map[string]string{{"role": "user", "content": "apple zyxquux"}}}, apiKey)
+	if status(chat) != 200 || hdr.Get("x-ragmux-rag-hits") != "2" {
+		t.Fatalf("chat: %v %v", chat, hdr)
+	}
+	content := chat["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["content"].(string)
+	if !strings.Contains(content, "(fruits.md · Apple)") || !strings.Contains(content, "(proto.txt)") {
+		t.Errorf("context labels: %q", content)
+	}
+	if _, h := e.callRaw("POST", "/v1/chat/completions", map[string]any{"messages": []map[string]string{{"role": "user", "content": "nothing matches this"}}}, apiKey); h.Get("x-ragmux-rag-hits") == "" {
+		t.Errorf("hit header should be present (possibly 0) when a store is linked: %v", h)
+	}
+	free := e.call("POST", "/admin/api/projects", map[string]any{"name": "free", "model_connection_id": connID}, "")
+	if _, h := e.callRaw("POST", "/v1/chat/completions", map[string]any{"messages": []map[string]string{{"role": "user", "content": "hi"}}}, free["api_key"].(string)); h.Get("x-ragmux-rag-hits") != "" {
+		t.Errorf("hit header should be absent without a store: %v", h)
+	}
+	// Streaming responses carry it too.
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/chat/completions", bytes.NewReader(mustJSON(map[string]any{"stream": true, "messages": []map[string]string{{"role": "user", "content": "banana"}}})))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("x-ragmux-rag-hits") != "2" || resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Errorf("stream headers: %v", resp.Header)
+	}
+
+	// Rerank override: the mock reverses the candidate list, so the top hit changes.
+	rr := search(map[string]any{"query": "apple zyxquux", "rerank": true})
+	if rr["reranked"] != true || hitContents(rr)[0] == hitContents(hy)[0] {
+		t.Errorf("rerank should reorder: %v vs %v", hitContents(rr), hitContents(hy))
+	}
+
+	// Updating retrieval settings; chunking changes recommend reprocessing.
+	upd := e.call("PUT", fmt.Sprintf("/admin/api/rag-stores/%d", storeID), map[string]any{"name": "docs", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 2, "rerank": true, "rerank_candidates": 5, "max_distance": 0.9, "search_mode": "hybrid", "fts_config": "simple"}, "")
+	if status(upd) != 200 || upd["rerank"] != true || upd["reprocess_recommended"] != false || upd["max_distance"].(float64) < 0.89 {
+		t.Fatalf("update store: %v", upd)
+	}
+	upd = e.call("PUT", fmt.Sprintf("/admin/api/rag-stores/%d", storeID), map[string]any{"name": "docs", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 2, "rerank": true, "contextual_chunks": false}, "")
+	if status(upd) != 200 || upd["reprocess_recommended"] != true || upd["contextual_chunks"] != false {
+		t.Fatalf("update contextual_chunks: %v", upd)
+	}
+	// With rerank stored on the store the gateway reranks with the project's chat model.
+	chat, hdr = e.callRaw("POST", "/v1/chat/completions", map[string]any{"messages": []map[string]string{{"role": "user", "content": "apple zyxquux"}}}, apiKey)
+	content = chat["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["content"].(string)
+	if status(chat) != 200 || hdr.Get("x-ragmux-rag-hits") != "2" || strings.Contains(content, "[1] (fruits.md · Apple)") {
+		t.Errorf("reranked chat should not lead with the apple chunk: %v %q", hdr, content)
+	}
+
+	// Reprocess-all flips every document to pending, then they come back ready.
+	re := e.call("POST", fmt.Sprintf("/admin/api/rag-stores/%d/reprocess", storeID), nil, "")
+	if status(re) != 202 || re["documents"] != float64(4) {
+		t.Fatalf("reprocess all: %v", re)
+	}
+	for _, id := range docIDs {
+		e.waitReady(id)
+	}
+	if r := e.call("GET", fmt.Sprintf("/admin/api/rag-stores/%d", storeID), nil, ""); r["document_count"] != float64(4) || r["chunk_count"].(float64) < 6 {
+		t.Errorf("store after reprocess: %v", r)
+	}
+	if l := e.call("GET", "/admin/api/audit?action=rag_store.reprocess_all", nil, "")["_list"].([]any); len(l) != 1 {
+		t.Errorf("reprocess_all audit: %v", l)
+	}
+	if r := search(map[string]any{"query": "apple zyxquux", "rerank": false}); !hasContent(r, "zyxquux") {
+		t.Errorf("search after reprocess: %v", hitContents(r))
 	}
 }

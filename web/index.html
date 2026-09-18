@@ -241,9 +241,9 @@ function renderRAG(){
   const embModels = state.models.filter(m => (state.providerTypes.find(t=>t.type===m.provider_type)||{}).supports_embeddings);
   const w = can('editor');
   app.innerHTML = `<div class="card"><div class="row between"><h2>RAG stores</h2>${w?`<button class="primary" id="addStore" ${embModels.length?'':'disabled title="Add an embedding-capable model connection first"'}>+ Add store</button>`:''}</div>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Embedding model</th><th>Chunking</th><th>Top-k</th><th>Dims</th><th>Docs / chunks</th><th></th></tr></thead><tbody>
-    ${state.rag.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(modelName(r.embedding_connection_id))}</td><td>${r.chunk_size} / ${r.chunk_overlap}</td><td>${r.top_k}</td><td>${r.dimensions||'—'}</td><td>${r.document_count} / ${r.chunk_count}</td>
-      <td style="white-space:nowrap"><button class="small primary" data-open="${r.id}">Documents</button>${w?` <button class="small" data-edit="${r.id}">Edit</button> <button class="small danger" data-del="${r.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">No RAG stores yet.</td></tr>'}
+    <div class="tbl"><table><thead><tr><th>Name</th><th>Embedding model</th><th>Chunking</th><th>Top-k</th><th>Retrieval</th><th>Dims</th><th>Docs / chunks</th><th></th></tr></thead><tbody>
+    ${state.rag.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(modelName(r.embedding_connection_id))}</td><td>${r.chunk_size} / ${r.chunk_overlap}${r.contextual_chunks?' <span class="pill" title="Contextual chunks: filename and section are embedded with the text">ctx</span>':''}</td><td>${r.top_k}</td><td class="muted" style="white-space:nowrap">${esc(retrievalSummary(r))}</td><td>${r.dimensions||'—'}</td><td>${r.document_count} / ${r.chunk_count}</td>
+      <td style="white-space:nowrap"><button class="small primary" data-open="${r.id}">Documents</button>${w?` <button class="small" data-edit="${r.id}">Edit</button> <button class="small danger" data-del="${r.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="muted">No RAG stores yet.</td></tr>'}
     </tbody></table></div></div><div id="storePanel"></div>`;
   if (w) $('#addStore').onclick=()=>storeForm(null, embModels);
   app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>storeForm(state.rag.find(r=>r.id==b.dataset.edit), embModels));
@@ -252,6 +252,9 @@ function renderRAG(){
   app.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{ openStore=Number(b.dataset.open); renderStorePanel(); });
   if (openStore && state.rag.some(r=>r.id===openStore)) renderStorePanel();
 }
+// "hybrid (english) · rerank 15 · dist ≤ 0.6" summary of a store's retrieval settings.
+const retrievalSummary = r => [r.search_mode==='vector'?'vector':`hybrid (${r.fts_config||'simple'})`, r.rerank?`rerank ${r.rerank_candidates}`:'', r.max_distance?`dist ≤ ${r.max_distance}`:''].filter(Boolean).join(' · ');
+const checkbox = (name, checked, label) => `<label class="row" style="gap:6px;align-items:center;font-weight:normal"><input type="checkbox" name="${name}" ${checked?'checked':''} style="width:auto">${esc(label)}</label>`;
 function storeForm(r, embModels){
   modal(r?'Edit RAG store':'New RAG store', `
     ${field('Name', input('name', r?.name||'', 'required'))}
@@ -259,9 +262,20 @@ function storeForm(r, embModels){
     <div class="row"><div style="flex:1">${field('Chunk size (chars)', input('chunk_size', r?.chunk_size||1000, 'type=number min=100 max=20000'))}</div>
     <div style="flex:1">${field('Chunk overlap', input('chunk_overlap', r?.chunk_overlap??200, 'type=number min=0'))}</div>
     <div style="flex:1">${field('Top-k', input('top_k', r?.top_k||5, 'type=number min=1 max=50'))}</div></div>
+    ${field('', checkbox('contextual_chunks', r?r.contextual_chunks:true, 'Contextual chunks — embed the filename and section together with each chunk (changing this needs a reprocess)'))}
+    <div class="row"><div style="flex:1">${field('Search mode', select('search_mode', [{value:'hybrid',label:'hybrid — vector + full-text (RRF)'},{value:'vector',label:'vector only'}], r?.search_mode||'hybrid'))}</div>
+    <div style="flex:1">${field('Full-text query config', input('fts_config', r?.fts_config||'simple', 'placeholder=simple'))}</div></div>
+    <p class="muted" style="margin-top:-6px">Postgres text search configuration used to parse queries in hybrid mode: <code>simple</code> (default, no stemming), <code>english</code>, <code>turkish</code>, <code>german</code>… Chunks are always indexed with <code>simple</code>.</p>
+    <div class="row"><div style="flex:1">${field('', checkbox('rerank', !!r?.rerank, 'Rerank with the project chat model'))}</div>
+    <div style="flex:1">${field('Rerank candidates', input('rerank_candidates', r?.rerank_candidates||15, 'type=number min=1 max=100'))}</div>
+    <div style="flex:1">${field('Max distance (0 = off)', input('max_distance', r?.max_distance||0, 'type=number min=0 max=2 step=0.01'))}</div></div>
+    <p class="muted" style="margin-top:-6px">Reranking sends the candidate passages to the chat model on every request (extra latency and tokens). Max distance drops passages whose cosine distance to the query exceeds it.</p>
     ${r&&r.chunk_count?'<p class="muted">Embedding connection is locked while the store has chunks.</p>':''}`,
-    async d => { const body={...d, embedding_connection_id:Number(d.embedding_connection_id), chunk_size:Number(d.chunk_size), chunk_overlap:Number(d.chunk_overlap), top_k:Number(d.top_k)};
-      if (r) await api('/rag-stores/'+r.id,{method:'PUT',body}); else await api('/rag-stores',{method:'POST',body}); toast('Saved'); await loadAll(); render(); });
+    async d => { const body={...d, embedding_connection_id:Number(d.embedding_connection_id), chunk_size:Number(d.chunk_size), chunk_overlap:Number(d.chunk_overlap), top_k:Number(d.top_k),
+        contextual_chunks:d.contextual_chunks==='on', rerank:d.rerank==='on', rerank_candidates:Number(d.rerank_candidates)||15, max_distance:Number(d.max_distance)||0};
+      let res; if (r) res=await api('/rag-stores/'+r.id,{method:'PUT',body}); else res=await api('/rag-stores',{method:'POST',body});
+      toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3500);
+      await loadAll(); render(); });
 }
 let pollTimer;
 async function renderStorePanel(){
@@ -270,21 +284,29 @@ async function renderStorePanel(){
   let docs=[]; try{ docs=await api(`/rag-stores/${r.id}/documents`); }catch(e){ toast(e.message); }
   const w = can('editor');
   panel.innerHTML = `<div class="card"><div class="row between"><h2>${esc(r.name)} · documents</h2>
-      ${w?'<form id="upl" class="row"><input type="file" name="file" accept=".pdf,.txt,.md,.markdown" multiple required style="width:auto"><button class="primary">Upload</button></form>':''}</div>
+      ${w?`<div class="row"><form id="upl" class="row"><input type="file" name="file" accept=".pdf,.docx,.html,.htm,.txt,.md,.markdown" multiple required style="width:auto"><button class="primary">Upload</button></form><button class="small" id="reAll" ${docs.length?'':'disabled'}>Reprocess all</button></div>`:''}</div>
+    <p class="muted">Accepted: PDF, DOCX, HTML, TXT, Markdown. Retrieval: ${esc(retrievalSummary(r))}.</p>
     <div class="tbl"><table><thead><tr><th>File</th><th>Size</th><th>Status</th><th>Chunks</th><th>Uploaded</th><th></th></tr></thead><tbody>
     ${docs.map(d=>`<tr><td>${esc(d.filename)}</td><td>${(d.size_bytes/1024).toFixed(1)} KB</td><td><span class="pill ${d.status}">${d.status}</span>${d.error?`<div class="muted" style="font-size:11px">${esc(d.error)}</div>`:''}</td><td>${d.chunk_count}</td><td>${fmtDate(d.created_at)}</td>
-      <td style="white-space:nowrap">${w?`<button class="small" data-re="${d.id}">Reprocess</button> <button class="small danger" data-del="${d.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No documents. Upload PDF, TXT or Markdown files.</td></tr>'}
+      <td style="white-space:nowrap">${w?`<button class="small" data-re="${d.id}">Reprocess</button> <button class="small danger" data-del="${d.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No documents. Upload PDF, DOCX, HTML, TXT or Markdown files.</td></tr>'}
     </tbody></table></div>
     <h3 style="margin-top:16px">Test retrieval</h3>
-    <form id="srch" class="row"><input name="q" placeholder="Ask something that should be in the documents…" style="flex:1"><button>Search</button></form>
+    <form id="srch" class="row"><input name="q" placeholder="Ask something that should be in the documents…" style="flex:1">
+      ${select('mode', [{value:'hybrid',label:'hybrid'},{value:'vector',label:'vector'}], r.search_mode||'hybrid').replace('<select','<select style="width:auto"')}
+      ${checkbox('rerank', !!r.rerank, 'rerank')}
+      <button>Search</button></form>
     <div id="hits"></div></div>`;
   if (w) $('#upl').onsubmit = async e => { e.preventDefault(); const fd=new FormData(e.target); const btn=$('button',e.target); btn.disabled=true;
     try{ await api(`/rag-stores/${r.id}/documents`,{method:'POST',body:fd}); toast('Uploaded; processing in background'); await loadAll(); renderStorePanel(); }catch(err){ toast(err.message); } finally{ btn.disabled=false; } };
   panel.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this document and its vectors?')) return; try{ await api('/documents/'+b.dataset.del,{method:'DELETE'}); await loadAll(); renderStorePanel(); }catch(e){ toast(e.message); } });
   panel.querySelectorAll('[data-re]').forEach(b=>b.onclick=async()=>{ try{ await api('/documents/'+b.dataset.re+'/reprocess',{method:'POST'}); toast('Queued'); setTimeout(renderStorePanel,800); }catch(e){ toast(e.message); } });
-  $('#srch').onsubmit = async e => { e.preventDefault(); const q=$('[name=q]',e.target).value; if(!q) return; $('#hits').innerHTML='<p class="muted">Searching…</p>';
-    try{ const res=await api(`/rag-stores/${r.id}/search`,{method:'POST',body:{query:q}});
-      $('#hits').innerHTML = `<p class="muted">${res.hits.length} hits in ${res.latency_ms} ms</p>` + res.hits.map((h,i)=>`<div class="card" style="padding:10px"><div class="row between"><b>[${i+1}] ${esc(h.filename)} · chunk ${h.index}</b><span class="muted">distance ${h.distance.toFixed(4)}</span></div><pre>${esc(h.content)}</pre></div>`).join(''); }
+  if (w) $('#reAll').onclick = async () => { if(!await confirmDialog('Re-parse, re-chunk and re-embed every document in this store? This calls the embedding model for all chunks again.')) return;
+    try{ const res=await api(`/rag-stores/${r.id}/reprocess`,{method:'POST'}); toast(`Queued ${res.documents} document(s)`); setTimeout(renderStorePanel,800); }catch(e){ toast(e.message); } };
+  $('#srch').onsubmit = async e => { e.preventDefault(); const f=e.target; const q=$('[name=q]',f).value; if(!q) return; $('#hits').innerHTML='<p class="muted">Searching…</p>';
+    try{ const res=await api(`/rag-stores/${r.id}/search`,{method:'POST',body:{query:q, mode:$('[name=mode]',f).value, rerank:$('[name=rerank]',f).checked}});
+      const where = h => [h.section, h.page?`p.${h.page}`:''].filter(Boolean).join(' · ');
+      $('#hits').innerHTML = `<p class="muted">${res.hits.length} hits in ${res.latency_ms} ms · ${esc(res.mode)}${res.reranked?' · reranked':''}</p>` + res.hits.map((h,i)=>`<div class="card" style="padding:10px"><div class="row between"><b>[${i+1}] ${esc(h.filename)}${where(h)?` · ${esc(where(h))}`:''} <span class="muted">(chunk ${h.index})</span></b>
+        <span class="muted">score ${h.score.toFixed(4)} · vector #${h.vector_rank||'—'} · fts #${h.fts_rank||'—'} · distance ${h.distance.toFixed(4)}</span></div><pre>${esc(h.content)}</pre></div>`).join(''); }
     catch(err){ $('#hits').innerHTML=`<p class="muted">Error: ${esc(err.message)}</p>`; } };
   clearTimeout(pollTimer);
   if (docs.some(d=>d.status==='pending'||d.status==='processing')) pollTimer=setTimeout(async()=>{ if(state.tab==='rag'&&openStore===r.id){ await loadAll(); renderStorePanel(); } }, 2500);
