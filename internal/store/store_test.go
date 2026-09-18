@@ -57,8 +57,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.MigrationsVersion != 6 {
-		t.Errorf("migrations version = %d, want 6", info.MigrationsVersion)
+	if info.MigrationsVersion != 7 {
+		t.Errorf("migrations version = %d, want 7", info.MigrationsVersion)
 	}
 }
 
@@ -263,7 +263,7 @@ func TestMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, l := range []store.RequestLog{
-		{StatusCode: 200, PromptTokens: 10, CompletionTokens: 5, LatencyMs: 100, RAGUsed: true, Streamed: true},
+		{StatusCode: 200, PromptTokens: 10, CompletionTokens: 5, LatencyMs: 100, RAGUsed: true, RAGHits: 3, Streamed: true},
 		{StatusCode: 200, PromptTokens: 20, CompletionTokens: 5, LatencyMs: 200, Estimated: true},
 		{StatusCode: 502, LatencyMs: 300, Error: "upstream"},
 	} {
@@ -293,8 +293,8 @@ func TestMetrics(t *testing.T) {
 		t.Errorf("recent: %+v %+v", recent[0], recent[1])
 	}
 	all, _ := s.RecentRequests(ctx, store.MetricsFilter{}, 0)
-	if len(all) != 3 || !all[2].RAGUsed || !all[2].Streamed {
-		t.Errorf("all recent: %d rows", len(all))
+	if len(all) != 3 || !all[2].RAGUsed || !all[2].Streamed || all[2].RAGHits != 3 || all[1].RAGHits != 0 {
+		t.Errorf("all recent: %d rows %+v", len(all), all)
 	}
 	daily, err := s.DailySeries(ctx, store.MetricsFilter{ProjectID: &p.ID}, 7)
 	if err != nil {
@@ -303,6 +303,91 @@ func TestMetrics(t *testing.T) {
 	today := time.Now().UTC().Format("2006-01-02")
 	if len(daily) != 1 || daily[0].Day != today || daily[0].Requests != 3 || daily[0].Errors != 1 || daily[0].PromptTokens != 30 {
 		t.Errorf("daily: %+v", daily)
+	}
+}
+
+func TestMetricsCompareByProjectAndSeriesClamp(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "m", ProviderType: "openai", ModelName: "gpt-4o"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa, _, err := s.CreateProject(ctx, &store.Project{Name: "alpha", ModelConnectionID: conn.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pb, _, err := s.CreateProject(ctx, &store.Project{Name: "beta", ModelConnectionID: conn.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := s.CreateUser(ctx, "viewer", "x", "viewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetProjectMembers(ctx, pb.ID, []int64{member.ID}); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(l store.RequestLog) {
+		t.Helper()
+		if err := s.InsertRequestLog(ctx, &l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Current window: two on alpha (one 429, one with RAG), one on beta.
+	insert(store.RequestLog{ProjectID: pa.ID, StatusCode: 200, PromptTokens: 10, CompletionTokens: 2, RAGUsed: true, RAGHits: 2})
+	insert(store.RequestLog{ProjectID: pa.ID, StatusCode: 429, Error: "rate_limit_rpm"})
+	insert(store.RequestLog{ProjectID: pb.ID, StatusCode: 200, PromptTokens: 7, CompletionTokens: 1})
+	// Previous window: one row on beta, 90 minutes back.
+	insert(store.RequestLog{ProjectID: pb.ID, StatusCode: 502, Error: "upstream"})
+	all, _ := s.RecentRequests(ctx, store.MetricsFilter{}, 0)
+	if err := s.BackdateRequestLog(ctx, all[0].ID, time.Now().Add(-90*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	cur, err := s.SummarizeBetween(ctx, store.MetricsFilter{}, now.Add(-time.Hour), time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, err := s.SummarizeBetween(ctx, store.MetricsFilter{}, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.Requests != 3 || cur.Errors != 1 || cur.RateLimited != 1 || prev.Requests != 1 || prev.Errors != 1 || prev.RateLimited != 0 {
+		t.Errorf("current %+v previous %+v", cur, prev)
+	}
+
+	by, err := s.SummarizeByProject(ctx, store.MetricsFilter{}, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(by) != 2 || by[0].ProjectID != pa.ID || by[0].Name != "alpha" || by[0].Requests != 2 || by[0].Errors != 1 ||
+		by[0].RateLimited != 1 || by[0].RAGRequests != 1 || by[0].PromptTokens != 10 || by[0].CompletionTokens != 2 ||
+		by[1].Name != "beta" || by[1].Requests != 1 {
+		t.Errorf("by project: %+v", by)
+	}
+	// A member of beta only sees beta; project filter selects one row.
+	by, err = s.SummarizeByProject(ctx, store.MetricsFilter{UserID: &member.ID}, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(by) != 1 || by[0].ProjectID != pb.ID || by[0].Requests != 1 {
+		t.Errorf("member by project: %+v", by)
+	}
+	if by, _ = s.SummarizeByProject(ctx, store.MetricsFilter{ProjectID: &pa.ID}, now.Add(-time.Hour)); len(by) != 1 || by[0].Name != "alpha" {
+		t.Errorf("project filter: %+v", by)
+	}
+	if by, _ = s.SummarizeByProject(ctx, store.MetricsFilter{}, now.Add(time.Hour)); len(by) != 0 {
+		t.Errorf("empty window lists projects: %+v", by)
+	}
+
+	// The series is capped at MaxSeriesDays; a shorter range excludes the
+	// backdated row only when it falls before the range start.
+	if daily, err := s.DailySeries(ctx, store.MetricsFilter{}, 10000); err != nil || len(daily) == 0 {
+		t.Errorf("clamped series: %v %+v", err, daily)
+	}
+	if daily, _ := s.DailySeries(ctx, store.MetricsFilter{ProjectID: &pa.ID}, 1); len(daily) != 1 || daily[0].Requests != 2 {
+		t.Errorf("one-day series: %+v", daily)
 	}
 }
 

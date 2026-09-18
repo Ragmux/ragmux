@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/ragmux/ragmux/internal/store"
 )
 
 func TestConnInputValidate(t *testing.T) {
@@ -73,5 +75,25 @@ func TestEffectiveLimitAndStoreQuota(t *testing.T) {
 	}
 	if err := (&storeQuota{}).add(1 << 40); err != nil {
 		t.Errorf("unlimited: %v", err)
+	}
+}
+
+func TestCSVRecordEscapesFormulas(t *testing.T) {
+	for in, want := range map[string]string{
+		"": "", "gpt-4o": "gpt-4o", "=cmd|' /C calc'!A0": "'=cmd|' /C calc'!A0", "+1": "'+1", "-1": "'-1",
+		"@SUM(A1)": "'@SUM(A1)", "\t=1": "'\t=1", "\r=1": "'\r=1", "plain -dash": "plain -dash",
+	} {
+		if got := csvCell(in); got != want {
+			t.Errorf("csvCell(%q) = %q, want %q", in, got, want)
+		}
+	}
+	row := &store.RequestExportRow{ProjectName: "=HYPERLINK(\"x\")"}
+	row.CreatedAt, row.ProjectID, row.ModelName, row.StatusCode = "2026-09-18T10:00:00Z", 3, "m", 200
+	row.PromptTokens, row.CompletionTokens, row.LatencyMs, row.Streamed, row.RAGUsed, row.RAGHits = 10, 2, 45, true, true, 2
+	row.Error = "-DDE"
+	got := csvRecord(row)
+	want := []string{"2026-09-18T10:00:00Z", "3", "'=HYPERLINK(\"x\")", "m", "200", "10", "2", "false", "45", "true", "true", "2", "'-DDE"}
+	if len(got) != len(csvHeader) || strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("record = %q\nwant     %q", got, want)
 	}
 }

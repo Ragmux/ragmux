@@ -1,6 +1,9 @@
 package store
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // KeyVersionBound is exported for tests that inspect key_version.
 const KeyVersionBound = keyVersionBound
@@ -17,4 +20,11 @@ func (s *Store) InsertLegacyConnection(ctx context.Context, name, key string) (i
 		(name, provider_type, base_url, api_key_enc, key_version, model_name)
 		VALUES ($1, 'openai', '', $2, 0, 'm') RETURNING id`, name, enc).Scan(&id)
 	return id, err
+}
+
+// BackdateRequestLog moves a request log's created_at so tests can populate
+// earlier windows.
+func (s *Store) BackdateRequestLog(ctx context.Context, id int64, t time.Time) error {
+	_, err := s.pool.Exec(ctx, "UPDATE request_logs SET created_at = $2 WHERE id = $1", id, t.UTC())
+	return err
 }

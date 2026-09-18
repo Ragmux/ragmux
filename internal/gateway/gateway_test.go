@@ -654,3 +654,104 @@ func TestProviderFactoryErrorIsGeneric(t *testing.T) {
 		t.Errorf("factory error leaked: %d %q", resp.StatusCode, msg)
 	}
 }
+
+func TestRAGSourcesHeaderAndIncludeContext(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	var upstreamBody atomic.Pointer[string]
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		s := string(body)
+		upstreamBody.Store(&s)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		okChat(w, r)
+	})
+	msgs := []map[string]any{{"role": "user", "content": "what colour are apples?"}}
+
+	// Without the ragmux field the body is untouched and only headers change.
+	resp, out := e.chat(map[string]any{"messages": msgs})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if _, ok := out["ragmux"]; ok {
+		t.Errorf("ragmux field without opt-in: %v", out)
+	}
+	var sources []map[string]any
+	if err := json.Unmarshal([]byte(resp.Header.Get("x-ragmux-rag-sources")), &sources); err != nil || len(sources) != 1 ||
+		sources[0]["filename"] != "a.txt" || sources[0]["document_id"] == nil || sources[0]["score"] == nil {
+		t.Errorf("sources header %q: %v %v", resp.Header.Get("x-ragmux-rag-sources"), sources, err)
+	}
+	if rec := e.lastLog(); !rec.RAGUsed || rec.RAGHits != 1 {
+		t.Errorf("log = %+v", rec)
+	}
+
+	// Opting in adds the sources and the injected context to the JSON body,
+	// and the field never reaches the upstream.
+	resp, out = e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": true}})
+	if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-sources") == "" {
+		t.Fatalf("status %d headers %v", resp.StatusCode, resp.Header)
+	}
+	rm, _ := out["ragmux"].(map[string]any)
+	if rm == nil {
+		t.Fatalf("no ragmux field: %v", out)
+	}
+	if list, _ := rm["sources"].([]any); len(list) != 1 || list[0].(map[string]any)["filename"] != "a.txt" {
+		t.Errorf("sources: %v", rm["sources"])
+	}
+	if c, _ := rm["context"].(string); !strings.Contains(c, "<context>") || !strings.Contains(c, "apples are red") {
+		t.Errorf("context: %q", rm["context"])
+	}
+	if out["choices"] == nil || out["usage"] == nil {
+		t.Errorf("OpenAI fields lost: %v", out)
+	}
+	if b := upstreamBody.Load(); b == nil || strings.Contains(*b, "ragmux") || strings.Contains(*b, "include_context") {
+		t.Errorf("ragmux field reached upstream: %v", b)
+	}
+
+	// Streaming responses carry the header but the body stays plain SSE.
+	sresp := e.post(context.Background(), "/v1/chat/completions",
+		map[string]any{"messages": msgs, "stream": true, "ragmux": map[string]any{"include_context": true}}, e.key)
+	defer sresp.Body.Close()
+	raw, _ := io.ReadAll(sresp.Body)
+	if sresp.StatusCode != 200 || sresp.Header.Get("Content-Type") != "text/event-stream" || sresp.Header.Get("x-ragmux-rag-sources") == "" {
+		t.Fatalf("stream: %d %v", sresp.StatusCode, sresp.Header)
+	}
+	if strings.Contains(string(raw), "ragmux") || !strings.HasSuffix(strings.TrimSpace(string(raw)), "data: [DONE]") {
+		t.Errorf("stream body: %s", raw)
+	}
+	if b := upstreamBody.Load(); b == nil || strings.Contains(*b, "ragmux") {
+		t.Errorf("ragmux field reached upstream on stream: %v", b)
+	}
+}
+
+func TestSourcesHeaderIsCappedToWholeEntries(t *testing.T) {
+	long := strings.Repeat("x", 300) + ".pdf"
+	var src []ragSource
+	for i := 0; i < 20; i++ {
+		src = append(src, ragSource{DocumentID: int64(i), Filename: long, Section: "Ünite " + strings.Repeat("y", 100), Page: i, Score: 0.5})
+	}
+	h := sourcesHeader(src)
+	if len(h) > maxSourcesHeaderBytes {
+		t.Fatalf("header is %d bytes", len(h))
+	}
+	var got []ragSource
+	if err := json.Unmarshal([]byte(h), &got); err != nil {
+		t.Fatalf("header is not a JSON array: %v (%q)", err, h)
+	}
+	if len(got) == 0 || len(got) >= len(src) || got[0].Filename != long || got[0].Section != src[0].Section {
+		t.Errorf("kept %d of %d entries; first %+v", len(got), len(src), got[0])
+	}
+	for _, r := range h {
+		if r >= 0x80 {
+			t.Fatalf("non-ASCII byte in header: %q", h)
+		}
+	}
+	// A single entry that is too large yields an empty array, never a cut.
+	huge := []ragSource{{Filename: strings.Repeat("z", 3000)}}
+	if h := sourcesHeader(huge); h != "[]" {
+		t.Errorf("oversized single entry: %q", h)
+	}
+	if h := sourcesHeader(nil); h != "[]" {
+		t.Errorf("nil sources: %q", h)
+	}
+}

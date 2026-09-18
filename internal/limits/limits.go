@@ -159,7 +159,20 @@ type UsageReport struct {
 	Minute      PeriodUsage `json:"minute"`
 	Day         PeriodUsage `json:"day"`
 	Month       PeriodUsage `json:"month"`
+	Forecast    Forecast    `json:"forecast"`
 }
+
+// Forecast projects when the token budgets run out if the last hour's pace
+// continues. A projection is nil when there is no budget, no recent usage,
+// or the budget outlasts its window.
+type Forecast struct {
+	DailyExhaustedAt   *time.Time `json:"daily_exhausted_at"`
+	MonthlyExhaustedAt *time.Time `json:"monthly_exhausted_at"`
+}
+
+// forecastLookback is the span the forecast rate is measured over. It must
+// stay within KeepMinuteRows or purged rows would flatten the rate.
+const forecastLookback = time.Hour
 
 // Usage reports the current minute / day / month counters against the
 // project's limits.
@@ -170,13 +183,39 @@ func (l *Limiter) Usage(ctx context.Context, p *store.Project) (*UsageReport, er
 	if err != nil {
 		return nil, err
 	}
-	return &UsageReport{
+	u := &UsageReport{
 		ProjectID:   p.ID,
 		GeneratedAt: now,
 		Minute:      period(minute, w.Minute.Add(time.Minute), p.RateLimitRPM, int64(p.RateLimitTPM)),
 		Day:         period(day, nextDay(w.Day), 0, p.BudgetDailyTokens),
 		Month:       period(month, nextMonth(w.Month), 0, p.BudgetMonthlyTokens),
-	}, nil
+	}
+	if p.BudgetDailyTokens > 0 || p.BudgetMonthlyTokens > 0 {
+		recent, err := l.Store.MinuteTokensSince(ctx, p.ID, now.Add(-forecastLookback))
+		if err != nil {
+			return nil, err
+		}
+		u.Forecast.DailyExhaustedAt = exhaustedAt(now, recent, day.Tokens(), p.BudgetDailyTokens, u.Day.ResetsAt)
+		u.Forecast.MonthlyExhaustedAt = exhaustedAt(now, recent, month.Tokens(), p.BudgetMonthlyTokens, u.Month.ResetsAt)
+	}
+	return u, nil
+}
+
+// exhaustedAt extends the lookback rate linearly until used reaches limit.
+// An already exhausted budget projects to now.
+func exhaustedAt(now time.Time, recent, used, limit int64, resetsAt time.Time) *time.Time {
+	if limit <= 0 || recent <= 0 {
+		return nil
+	}
+	remaining := limit - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	at := now.Add(time.Duration(float64(forecastLookback) * float64(remaining) / float64(recent))).Truncate(time.Second)
+	if !at.Before(resetsAt) {
+		return nil
+	}
+	return &at
 }
 
 func period(r store.UsageRow, resetsAt time.Time, reqLimit int, tokLimit int64) PeriodUsage {
