@@ -2,6 +2,8 @@
 package config
 
 import (
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -11,6 +13,14 @@ import (
 
 // Config holds every tunable the gateway reads at startup.
 type Config struct {
+	// DatabaseURL is the PostgreSQL connection string (required).
+	DatabaseURL string
+	// DBMaxConns caps the connection pool size.
+	DBMaxConns int
+	// SecretKeyHex is the AES-256 key for provider credentials as 64 hex
+	// characters. Empty means fall back to DATA_DIR/secret.key.
+	SecretKeyHex string
+	// DataDir is only used for the secret.key fallback.
 	DataDir       string
 	Port          int
 	AdminUser     string
@@ -30,6 +40,9 @@ type Config struct {
 // Load reads configuration from the environment, applying defaults.
 func Load() (Config, error) {
 	c := Config{
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		DBMaxConns:      10,
+		SecretKeyHex:    strings.TrimSpace(os.Getenv("SECRET_KEY")),
 		DataDir:         env("DATA_DIR", "/app/data"),
 		Port:            8080,
 		AdminUser:       env("ADMIN_USER", "admin"),
@@ -40,13 +53,27 @@ func Load() (Config, error) {
 		IngestWorkers:   2,
 		MaxUploadBytes:  50 << 20,
 	}
-	if v := os.Getenv("PORT"); v != "" {
-		p, err := strconv.Atoi(v)
-		if err != nil || p <= 0 || p > 65535 {
-			return c, fmt.Errorf("invalid PORT %q", v)
-		}
-		c.Port = p
+	if c.DatabaseURL == "" {
+		return c, errors.New("DATABASE_URL is required (e.g. postgres://user:pass@host:5432/ragmux?sslmode=disable)")
 	}
+	if c.SecretKeyHex != "" {
+		key, err := hex.DecodeString(c.SecretKeyHex)
+		if err != nil || len(key) != 32 {
+			return c, errors.New("SECRET_KEY must be 64 hex characters (32 bytes); generate one with: openssl rand -hex 32")
+		}
+	}
+	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("invalid DB_MAX_CONNS %q", v)
+		}
+		c.DBMaxConns = n
+	}
+	p, err := PortFromEnv()
+	if err != nil {
+		return c, err
+	}
+	c.Port = p
 	if v := os.Getenv("CORS_ORIGINS"); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {
@@ -83,6 +110,20 @@ func Load() (Config, error) {
 		c.MaxUploadBytes = int64(n) << 20
 	}
 	return c, nil
+}
+
+// PortFromEnv reads PORT (default 8080). It is separate from Load so the
+// container healthcheck can probe the server without a full configuration.
+func PortFromEnv() (int, error) {
+	v := os.Getenv("PORT")
+	if v == "" {
+		return 8080, nil
+	}
+	p, err := strconv.Atoi(v)
+	if err != nil || p <= 0 || p > 65535 {
+		return 0, fmt.Errorf("invalid PORT %q", v)
+	}
+	return p, nil
 }
 
 func env(key, def string) string {

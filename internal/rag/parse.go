@@ -5,7 +5,6 @@ package rag
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -21,33 +20,29 @@ func IsSupported(filename string) bool {
 	return SupportedExtensions[strings.ToLower(filepath.Ext(filename))]
 }
 
-// ExtractText reads a file and returns its plain text.
-func ExtractText(path string) (string, error) {
-	switch strings.ToLower(filepath.Ext(path)) {
+// ExtractText returns the plain text of an uploaded document. The file type
+// is taken from the filename extension.
+func ExtractText(filename string, data []byte) (string, error) {
+	switch strings.ToLower(filepath.Ext(filename)) {
 	case ".pdf":
-		return extractPDF(path)
+		return extractPDF(data)
 	case ".txt", ".md", ".markdown":
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return "", err
-		}
-		return normalizeText(string(b)), nil
+		return normalizeText(string(data)), nil
 	}
-	return "", fmt.Errorf("unsupported file type %q", filepath.Ext(path))
+	return "", fmt.Errorf("unsupported file type %q", filepath.Ext(filename))
 }
 
-func extractPDF(path string) (text string, err error) {
+func extractPDF(data []byte) (text string, err error) {
 	defer func() {
 		// The PDF library panics on some malformed inputs.
 		if r := recover(); r != nil {
 			err = fmt.Errorf("pdf parse failed: %v", r)
 		}
 	}()
-	f, r, err := pdf.Open(path)
+	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("open pdf: %w", err)
 	}
-	defer f.Close()
 	var buf bytes.Buffer
 	n := r.NumPage()
 	for i := 1; i <= n; i++ {

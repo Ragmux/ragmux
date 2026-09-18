@@ -2,10 +2,7 @@ package store
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
+	"time"
 )
 
 // Document status values.
@@ -16,7 +13,8 @@ const (
 	DocFailed     = "failed"
 )
 
-// Document is an uploaded file attached to a RAG store.
+// Document is an uploaded file attached to a RAG store. The raw bytes live in
+// the database and are fetched separately with DocumentContent.
 type Document struct {
 	ID         int64  `json:"id"`
 	RAGStoreID int64  `json:"rag_store_id"`
@@ -34,52 +32,48 @@ const docCols = "id, rag_store_id, filename, mime, size_bytes, status, error, ch
 
 func scanDoc(row interface{ Scan(...any) error }) (*Document, error) {
 	d := &Document{}
+	var created, updated time.Time
 	err := row.Scan(&d.ID, &d.RAGStoreID, &d.Filename, &d.Mime, &d.SizeBytes, &d.Status, &d.Error,
-		&d.ChunkCount, &d.CreatedAt, &d.UpdatedAt)
+		&d.ChunkCount, &created, &updated)
 	if err != nil {
 		return nil, scanErr(err)
 	}
+	d.CreatedAt, d.UpdatedAt = ts(created), ts(updated)
 	return d, nil
 }
 
-// DocumentPath returns where a document's raw bytes live on disk.
-func (s *Store) DocumentPath(d *Document) string {
-	return filepath.Join(s.UploadsDir, strconv.FormatInt(d.ID, 10), filepath.Base(d.Filename))
+// CreateDocument records a pending document together with its raw bytes.
+func (s *Store) CreateDocument(ctx context.Context, d *Document, content []byte) (*Document, error) {
+	if content == nil {
+		content = []byte{}
+	}
+	return scanDoc(s.pool.QueryRow(ctx, `INSERT INTO documents (rag_store_id, filename, mime, size_bytes, content, status)
+		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+docCols,
+		d.RAGStoreID, d.Filename, d.Mime, d.SizeBytes, content, DocPending))
 }
 
-// CreateDocument records a pending document; the caller writes the file to
-// DocumentPath afterwards.
-func (s *Store) CreateDocument(ctx context.Context, d *Document) (*Document, error) {
-	res, err := s.db.ExecContext(ctx, `INSERT INTO documents (rag_store_id, filename, mime, size_bytes, status)
-		VALUES (?, ?, ?, ?, ?)`, d.RAGStoreID, d.Filename, d.Mime, d.SizeBytes, DocPending)
-	if err != nil {
-		return nil, err
+// DocumentContent returns the raw uploaded bytes of a document.
+func (s *Store) DocumentContent(ctx context.Context, id int64) ([]byte, error) {
+	var content []byte
+	if err := s.pool.QueryRow(ctx, "SELECT content FROM documents WHERE id = $1", id).Scan(&content); err != nil {
+		return nil, scanErr(err)
 	}
-	id, _ := res.LastInsertId()
-	return s.GetDocument(ctx, id)
+	return content, nil
 }
 
 // GetDocument fetches one document.
 func (s *Store) GetDocument(ctx context.Context, id int64) (*Document, error) {
-	return scanDoc(s.db.QueryRowContext(ctx, "SELECT "+docCols+" FROM documents WHERE id = ?", id))
+	return scanDoc(s.pool.QueryRow(ctx, "SELECT "+docCols+" FROM documents WHERE id = $1", id))
 }
 
 // ListDocuments lists the documents of one store.
 func (s *Store) ListDocuments(ctx context.Context, storeID int64) ([]*Document, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+docCols+" FROM documents WHERE rag_store_id = ? ORDER BY id DESC", storeID)
+	rows, err := s.pool.Query(ctx, "SELECT "+docCols+" FROM documents WHERE rag_store_id = $1 ORDER BY id DESC", storeID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []*Document{}
-	for rows.Next() {
-		d, err := scanDoc(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
+	return collectDocs(rows)
 }
 
 // ListDocumentsByStatus returns documents in any of the given states.
@@ -87,21 +81,19 @@ func (s *Store) ListDocumentsByStatus(ctx context.Context, statuses ...string) (
 	if len(statuses) == 0 {
 		return []*Document{}, nil
 	}
-	q := "SELECT " + docCols + " FROM documents WHERE status IN ("
-	args := make([]any, len(statuses))
-	for i, st := range statuses {
-		if i > 0 {
-			q += ","
-		}
-		q += "?"
-		args[i] = st
-	}
-	q += ") ORDER BY id"
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.pool.Query(ctx, "SELECT "+docCols+" FROM documents WHERE status = ANY($1) ORDER BY id", statuses)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return collectDocs(rows)
+}
+
+func collectDocs(rows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+}) ([]*Document, error) {
 	out := []*Document{}
 	for rows.Next() {
 		d, err := scanDoc(rows)
@@ -115,38 +107,19 @@ func (s *Store) ListDocumentsByStatus(ctx context.Context, statuses ...string) (
 
 // SetDocumentStatus updates processing state.
 func (s *Store) SetDocumentStatus(ctx context.Context, id int64, status, errMsg string) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE documents SET status=?, error=?, updated_at=? WHERE id=?",
-		status, errMsg, now(), id)
+	_, err := s.pool.Exec(ctx, "UPDATE documents SET status=$1, error=$2, updated_at=now() WHERE id=$3",
+		status, errMsg, id)
 	return err
 }
 
-// DeleteDocument removes the document row, its chunks, vectors and file.
+// DeleteDocument removes the document; chunks and embeddings cascade.
 func (s *Store) DeleteDocument(ctx context.Context, id int64) error {
-	d, err := s.GetDocument(ctx, id)
+	res, err := s.pool.Exec(ctx, "DELETE FROM documents WHERE id = $1", id)
 	if err != nil {
 		return err
 	}
-	r, err := s.GetRAGStore(ctx, d.RAGStoreID)
-	if err != nil {
-		return err
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if s.VecAvailable && r.Dimensions > 0 {
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
-			"DELETE FROM %s WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)", vecTable(r.Dimensions)), id); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM documents WHERE id = ?", id); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	os.RemoveAll(filepath.Dir(s.DocumentPath(d)))
 	return nil
 }

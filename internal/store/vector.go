@@ -2,10 +2,10 @@ package store
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
-	"math"
-	"sort"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/pgvector/pgvector-go"
 )
 
 // Chunk is a slice of a document together with its embedding.
@@ -29,42 +29,50 @@ type SearchHit struct {
 	Distance   float64 `json:"distance"`
 }
 
-func vecTable(dims int) string { return fmt.Sprintf("vec_chunks_%d", dims) }
+// vecTable names the embedding table for one vector width. Embeddings of
+// different models have different dimensions and pgvector needs a fixed
+// width per column, hence one table per dimension.
+func vecTable(dims int) string { return fmt.Sprintf("chunk_embeddings_%d", dims) }
 
-// EncodeVector serialises float32s as little-endian bytes (sqlite-vec format).
-func EncodeVector(v []float32) []byte {
-	buf := make([]byte, 4*len(v))
-	for i, f := range v {
-		binary.LittleEndian.PutUint32(buf[4*i:], math.Float32bits(f))
-	}
-	return buf
-}
-
-// DecodeVector reverses EncodeVector.
-func DecodeVector(b []byte) []float32 {
-	out := make([]float32, len(b)/4)
-	for i := range out {
-		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[4*i:]))
-	}
-	return out
-}
-
-// ensureVecTable creates the vec0 virtual table for a dimension if needed.
+// ensureVecTable creates the embedding table and its indexes for a dimension
+// if they do not exist yet. DDL is serialised with an advisory lock so
+// concurrent ingesters on several replicas do not race.
 func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
-	if !s.VecAvailable {
+	if _, ok := s.vecTables.Load(dims); ok {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf(
-		`CREATE VIRTUAL TABLE IF NOT EXISTS %s USING vec0(
-			chunk_id INTEGER PRIMARY KEY,
-			rag_store_id INTEGER,
-			embedding float[%d] distance_metric=cosine
-		)`, vecTable(dims), dims))
-	return err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", lockVecTables, int32(dims)); err != nil {
+		return err
+	}
+	table := vecTable(dims)
+	stmts := []string{
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			chunk_id     BIGINT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+			rag_store_id BIGINT NOT NULL,
+			embedding    vector(%d) NOT NULL
+		)`, table, dims),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_hnsw ON %s USING hnsw (embedding vector_cosine_ops)", table, table),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_store ON %s (rag_store_id)", table, table),
+	}
+	for _, q := range stmts {
+		if _, err := tx.Exec(ctx, q); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.vecTables.Store(dims, true)
+	return nil
 }
 
-// ReplaceDocumentChunks atomically swaps a document's chunks and vectors and
-// marks it ready. All chunks must share the store's embedding width.
+// ReplaceDocumentChunks atomically swaps a document's chunks and embeddings
+// and marks it ready. All chunks must share the store's embedding width.
 func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks []*Chunk) error {
 	if len(chunks) == 0 {
 		return fmt.Errorf("no chunks to store")
@@ -89,54 +97,61 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 		return fmt.Errorf("embedding dimension %d does not match store dimension %d", dims, r.Dimensions)
 	}
 	if err := s.ensureVecTable(ctx, dims); err != nil {
-		return fmt.Errorf("create vec table: %w", err)
+		return fmt.Errorf("create embedding table: %w", err)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
-	if s.VecAvailable {
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
-			"DELETE FROM %s WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)", vecTable(dims)), doc.ID); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM chunks WHERE document_id = ?", doc.ID); err != nil {
+	// Old embeddings go away through ON DELETE CASCADE.
+	if _, err := tx.Exec(ctx, "DELETE FROM chunks WHERE document_id = $1", doc.ID); err != nil {
 		return err
 	}
-	ins, err := tx.PrepareContext(ctx, `INSERT INTO chunks (document_id, rag_store_id, idx, content, token_estimate, embedding)
-		VALUES (?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer ins.Close()
+	batch := &pgx.Batch{}
 	for _, c := range chunks {
-		blob := EncodeVector(c.Embedding)
-		res, err := ins.ExecContext(ctx, doc.ID, doc.RAGStoreID, c.Index, c.Content, c.TokenEstimate, blob)
-		if err != nil {
-			return err
-		}
-		id, _ := res.LastInsertId()
-		c.ID = id
-		if s.VecAvailable {
-			if _, err := tx.ExecContext(ctx, fmt.Sprintf(
-				"INSERT INTO %s (chunk_id, rag_store_id, embedding) VALUES (?, ?, ?)", vecTable(dims)),
-				id, doc.RAGStoreID, blob); err != nil {
-				return fmt.Errorf("insert vector: %w", err)
-			}
-		}
+		batch.Queue(`INSERT INTO chunks (document_id, rag_store_id, idx, content, token_estimate)
+			VALUES ($1, $2, $3, $4, $5) RETURNING id`, doc.ID, doc.RAGStoreID, c.Index, c.Content, c.TokenEstimate)
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE documents SET status=?, error='', chunk_count=?, updated_at=? WHERE id=?",
-		DocReady, len(chunks), now(), doc.ID); err != nil {
+	br := tx.SendBatch(ctx, batch)
+	for _, c := range chunks {
+		if err := br.QueryRow().Scan(&c.ID); err != nil {
+			br.Close()
+			return fmt.Errorf("insert chunk: %w", err)
+		}
+		c.DocumentID, c.RAGStoreID = doc.ID, doc.RAGStoreID
+	}
+	if err := br.Close(); err != nil {
 		return err
 	}
-	return tx.Commit()
+
+	insVec := fmt.Sprintf("INSERT INTO %s (chunk_id, rag_store_id, embedding) VALUES ($1, $2, $3)", vecTable(dims))
+	batch = &pgx.Batch{}
+	for _, c := range chunks {
+		batch.Queue(insVec, c.ID, doc.RAGStoreID, pgvector.NewVector(c.Embedding))
+	}
+	br = tx.SendBatch(ctx, batch)
+	for range chunks {
+		if _, err := br.Exec(); err != nil {
+			br.Close()
+			return fmt.Errorf("insert embedding: %w", err)
+		}
+	}
+	if err := br.Close(); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, "UPDATE documents SET status=$1, error='', chunk_count=$2, updated_at=now() WHERE id=$3",
+		DocReady, len(chunks), doc.ID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-// SearchTopK returns the k nearest chunks in a store for a query vector.
+// SearchTopK returns the k nearest chunks in a store for a query vector,
+// ordered by cosine distance (0 = identical).
 func (s *Store) SearchTopK(ctx context.Context, storeID int64, query []float32, k int) ([]SearchHit, error) {
 	if k <= 0 {
 		k = 5
@@ -151,20 +166,28 @@ func (s *Store) SearchTopK(ctx context.Context, storeID int64, query []float32, 
 	if len(query) != r.Dimensions {
 		return nil, fmt.Errorf("query vector has %d dimensions, store expects %d", len(query), r.Dimensions)
 	}
-	if s.VecAvailable {
-		return s.searchVec(ctx, r, query, k)
-	}
-	return s.searchBruteForce(ctx, r, query, k)
-}
 
-func (s *Store) searchVec(ctx context.Context, r *RAGStore, query []float32, k int) ([]SearchHit, error) {
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT v.chunk_id, v.distance, c.document_id, c.idx, c.content, d.filename
-		FROM %s v
-		JOIN chunks c ON c.id = v.chunk_id
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	// HNSW returns at most ef_search candidates; keep it comfortably above k.
+	efSearch := k * 4
+	if efSearch < 40 {
+		efSearch = 40
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL hnsw.ef_search = %d", efSearch)); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, fmt.Sprintf(`
+		SELECT e.chunk_id, e.embedding <=> $1::vector AS distance, c.document_id, c.idx, c.content, d.filename
+		FROM %s e
+		JOIN chunks c ON c.id = e.chunk_id
 		JOIN documents d ON d.id = c.document_id
-		WHERE v.embedding MATCH ? AND v.rag_store_id = ? AND k = ?
-		ORDER BY v.distance`, vecTable(r.Dimensions)), EncodeVector(query), r.ID, k)
+		WHERE e.rag_store_id = $2
+		ORDER BY e.embedding <=> $1::vector
+		LIMIT $3`, vecTable(r.Dimensions)), pgvector.NewVector(query), r.ID, k)
 	if err != nil {
 		return nil, fmt.Errorf("vector search: %w", err)
 	}
@@ -177,55 +200,8 @@ func (s *Store) searchVec(ctx context.Context, r *RAGStore, query []float32, k i
 		}
 		hits = append(hits, h)
 	}
-	return hits, rows.Err()
-}
-
-func (s *Store) searchBruteForce(ctx context.Context, r *RAGStore, query []float32, k int) ([]SearchHit, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.id, c.document_id, c.idx, c.content, c.embedding, d.filename
-		FROM chunks c JOIN documents d ON d.id = c.document_id
-		WHERE c.rag_store_id = ? AND c.embedding IS NOT NULL`, r.ID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var hits []SearchHit
-	for rows.Next() {
-		var h SearchHit
-		var blob []byte
-		if err := rows.Scan(&h.ChunkID, &h.DocumentID, &h.Index, &h.Content, &blob, &h.Filename); err != nil {
-			return nil, err
-		}
-		emb := DecodeVector(blob)
-		if len(emb) != len(query) {
-			continue
-		}
-		h.Distance = CosineDistance(query, emb)
-		hits = append(hits, h)
-	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	sort.Slice(hits, func(i, j int) bool { return hits[i].Distance < hits[j].Distance })
-	if len(hits) > k {
-		hits = hits[:k]
-	}
-	if hits == nil {
-		hits = []SearchHit{}
-	}
-	return hits, nil
-}
-
-// CosineDistance returns 1 - cosine similarity, matching sqlite-vec's metric.
-func CosineDistance(a, b []float32) float64 {
-	var dot, na, nb float64
-	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		na += float64(a[i]) * float64(a[i])
-		nb += float64(b[i]) * float64(b[i])
-	}
-	if na == 0 || nb == 0 {
-		return 1
-	}
-	return 1 - dot/(math.Sqrt(na)*math.Sqrt(nb))
+	return hits, tx.Commit(ctx)
 }

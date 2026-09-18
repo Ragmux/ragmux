@@ -110,7 +110,11 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	}
 
 	start := time.Now()
-	text, err := ExtractText(ing.store.DocumentPath(doc))
+	data, err := ing.store.DocumentContent(ctx, docID)
+	if err != nil {
+		return fmt.Errorf("load document content: %w", err)
+	}
+	text, err := ExtractText(doc.Filename, data)
 	if err != nil {
 		return err
 	}

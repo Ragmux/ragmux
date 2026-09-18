@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 	"time"
 )
 
@@ -23,19 +24,12 @@ type RequestLog struct {
 
 // InsertRequestLog persists a metric row.
 func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO request_logs
+	_, err := s.pool.Exec(ctx, `INSERT INTO request_logs
 		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed, rag_used, error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, b2i(l.Estimated),
-		l.LatencyMs, b2i(l.Streamed), b2i(l.RAGUsed), l.Error)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
+		l.LatencyMs, l.Streamed, l.RAGUsed, l.Error)
 	return err
-}
-
-func b2i(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // MetricsSummary aggregates request logs over a window.
@@ -53,35 +47,25 @@ type MetricsSummary struct {
 // Summarize computes totals for a project (or all projects when projectID is
 // nil) since the given time.
 func (s *Store) Summarize(ctx context.Context, projectID *int64, since time.Time) (*MetricsSummary, error) {
-	q := `SELECT COUNT(*), COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(AVG(latency_ms),0),
-		COALESCE(SUM(rag_used),0)
-		FROM request_logs WHERE created_at >= ?`
-	args := []any{since.UTC().Format("2006-01-02T15:04:05.000Z")}
+	q := `SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
+		COALESCE(AVG(latency_ms), 0)::float8,
+		COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::float8,
+		COALESCE(SUM(CASE WHEN rag_used THEN 1 ELSE 0 END), 0)
+		FROM request_logs WHERE created_at >= $1`
+	args := []any{since.UTC()}
 	if projectID != nil {
-		q += " AND project_id = ?"
+		q += " AND project_id = $2"
 		args = append(args, *projectID)
 	}
 	m := &MetricsSummary{ProjectID: projectID}
-	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&m.Requests, &m.Errors, &m.PromptTokens,
-		&m.CompletionTokens, &m.AvgLatencyMs, &m.RAGRequests); err != nil {
+	var p95 float64
+	if err := s.pool.QueryRow(ctx, q, args...).Scan(&m.Requests, &m.Errors, &m.PromptTokens,
+		&m.CompletionTokens, &m.AvgLatencyMs, &p95, &m.RAGRequests); err != nil {
 		return nil, err
 	}
-	if m.Requests > 0 {
-		pq := `SELECT latency_ms FROM request_logs WHERE created_at >= ?`
-		if projectID != nil {
-			pq += " AND project_id = ?"
-		}
-		pq += " ORDER BY latency_ms LIMIT 1 OFFSET ?"
-		offset := (m.Requests * 95 / 100)
-		if offset >= m.Requests {
-			offset = m.Requests - 1
-		}
-		pargs := append(append([]any{}, args...), offset)
-		if err := s.db.QueryRowContext(ctx, pq, pargs...).Scan(&m.P95LatencyMs); err != nil {
-			return nil, err
-		}
-	}
+	m.P95LatencyMs = int64(math.Round(p95))
 	return m, nil
 }
 
@@ -94,12 +78,16 @@ func (s *Store) RecentRequests(ctx context.Context, projectID *int64, limit int)
 		latency_ms, streamed, rag_used, error, created_at FROM request_logs`
 	args := []any{}
 	if projectID != nil {
-		q += " WHERE project_id = ?"
+		q += " WHERE project_id = $1"
 		args = append(args, *projectID)
 	}
-	q += " ORDER BY id DESC LIMIT ?"
+	if projectID != nil {
+		q += " ORDER BY id DESC LIMIT $2"
+	} else {
+		q += " ORDER BY id DESC LIMIT $1"
+	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,12 +95,12 @@ func (s *Store) RecentRequests(ctx context.Context, projectID *int64, limit int)
 	out := []*RequestLog{}
 	for rows.Next() {
 		l := &RequestLog{}
-		var est, streamed, rag int
+		var created time.Time
 		if err := rows.Scan(&l.ID, &l.ProjectID, &l.ModelName, &l.StatusCode, &l.PromptTokens, &l.CompletionTokens,
-			&est, &l.LatencyMs, &streamed, &rag, &l.Error, &l.CreatedAt); err != nil {
+			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.Error, &created); err != nil {
 			return nil, err
 		}
-		l.Estimated, l.Streamed, l.RAGUsed = est == 1, streamed == 1, rag == 1
+		l.CreatedAt = ts(created)
 		out = append(out, l)
 	}
 	return out, rows.Err()
@@ -133,17 +121,17 @@ func (s *Store) DailySeries(ctx context.Context, projectID *int64, days int) ([]
 		days = 14
 	}
 	since := time.Now().UTC().AddDate(0, 0, -days+1).Truncate(24 * time.Hour)
-	q := `SELECT substr(created_at,1,10) AS day, COUNT(*),
-		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0)
-		FROM request_logs WHERE created_at >= ?`
-	args := []any{since.Format("2006-01-02T15:04:05.000Z")}
+	q := `SELECT date_trunc('day', created_at AT TIME ZONE 'UTC') AS day, COUNT(*),
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
+		FROM request_logs WHERE created_at >= $1`
+	args := []any{since}
 	if projectID != nil {
-		q += " AND project_id = ?"
+		q += " AND project_id = $2"
 		args = append(args, *projectID)
 	}
 	q += " GROUP BY day ORDER BY day"
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -151,9 +139,11 @@ func (s *Store) DailySeries(ctx context.Context, projectID *int64, days int) ([]
 	out := []DailyBucket{}
 	for rows.Next() {
 		var b DailyBucket
-		if err := rows.Scan(&b.Day, &b.Requests, &b.Errors, &b.PromptTokens, &b.CompletionTokens); err != nil {
+		var day time.Time
+		if err := rows.Scan(&day, &b.Requests, &b.Errors, &b.PromptTokens, &b.CompletionTokens); err != nil {
 			return nil, err
 		}
+		b.Day = day.Format("2006-01-02")
 		out = append(out, b)
 	}
 	return out, rows.Err()

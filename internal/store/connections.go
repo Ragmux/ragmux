@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // ModelConnection describes one upstream LLM (or embedding) endpoint.
@@ -48,9 +49,11 @@ const connCols = "id, name, provider_type, base_url, api_key_enc, model_name, cr
 func (s *Store) scanConn(row interface{ Scan(...any) error }) (*ModelConnection, error) {
 	c := &ModelConnection{}
 	var enc []byte
-	if err := row.Scan(&c.ID, &c.Name, &c.ProviderType, &c.BaseURL, &enc, &c.ModelName, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	var created, updated time.Time
+	if err := row.Scan(&c.ID, &c.Name, &c.ProviderType, &c.BaseURL, &enc, &c.ModelName, &created, &updated); err != nil {
 		return nil, scanErr(err)
 	}
+	c.CreatedAt, c.UpdatedAt = ts(created), ts(updated)
 	key, err := s.cipher.decrypt(enc)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt api key for connection %d: %w", c.ID, err)
@@ -66,22 +69,17 @@ func (s *Store) CreateConnection(ctx context.Context, c *ModelConnection) (*Mode
 	if err != nil {
 		return nil, err
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO model_connections
-		(name, provider_type, base_url, api_key_enc, model_name) VALUES (?, ?, ?, ?, ?)`,
-		c.Name, c.ProviderType, c.BaseURL, enc, c.ModelName)
-	if err != nil {
-		return nil, err
-	}
-	id, _ := res.LastInsertId()
-	return s.GetConnection(ctx, id)
+	return s.scanConn(s.pool.QueryRow(ctx, `INSERT INTO model_connections
+		(name, provider_type, base_url, api_key_enc, model_name) VALUES ($1, $2, $3, $4, $5)
+		RETURNING `+connCols, c.Name, c.ProviderType, c.BaseURL, enc, c.ModelName))
 }
 
 // UpdateConnection replaces mutable fields. An empty APIKey keeps the old one.
 func (s *Store) UpdateConnection(ctx context.Context, c *ModelConnection) (*ModelConnection, error) {
 	if c.APIKey == "" {
-		_, err := s.db.ExecContext(ctx, `UPDATE model_connections SET name=?, provider_type=?, base_url=?,
-			model_name=?, updated_at=? WHERE id=?`,
-			c.Name, c.ProviderType, c.BaseURL, c.ModelName, now(), c.ID)
+		_, err := s.pool.Exec(ctx, `UPDATE model_connections SET name=$1, provider_type=$2, base_url=$3,
+			model_name=$4, updated_at=now() WHERE id=$5`,
+			c.Name, c.ProviderType, c.BaseURL, c.ModelName, c.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -90,9 +88,9 @@ func (s *Store) UpdateConnection(ctx context.Context, c *ModelConnection) (*Mode
 		if err != nil {
 			return nil, err
 		}
-		_, err = s.db.ExecContext(ctx, `UPDATE model_connections SET name=?, provider_type=?, base_url=?,
-			api_key_enc=?, model_name=?, updated_at=? WHERE id=?`,
-			c.Name, c.ProviderType, c.BaseURL, enc, c.ModelName, now(), c.ID)
+		_, err = s.pool.Exec(ctx, `UPDATE model_connections SET name=$1, provider_type=$2, base_url=$3,
+			api_key_enc=$4, model_name=$5, updated_at=now() WHERE id=$6`,
+			c.Name, c.ProviderType, c.BaseURL, enc, c.ModelName, c.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -102,17 +100,17 @@ func (s *Store) UpdateConnection(ctx context.Context, c *ModelConnection) (*Mode
 
 // GetConnection fetches one connection with its decrypted key.
 func (s *Store) GetConnection(ctx context.Context, id int64) (*ModelConnection, error) {
-	return s.scanConn(s.db.QueryRowContext(ctx, "SELECT "+connCols+" FROM model_connections WHERE id = ?", id))
+	return s.scanConn(s.pool.QueryRow(ctx, "SELECT "+connCols+" FROM model_connections WHERE id = $1", id))
 }
 
 // ListConnections returns all connections ordered by name.
 func (s *Store) ListConnections(ctx context.Context) ([]*ModelConnection, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+connCols+" FROM model_connections ORDER BY name")
+	rows, err := s.pool.Query(ctx, "SELECT "+connCols+" FROM model_connections ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []*ModelConnection
+	out := []*ModelConnection{}
 	for rows.Next() {
 		c, err := s.scanConn(rows)
 		if err != nil {
@@ -120,19 +118,16 @@ func (s *Store) ListConnections(ctx context.Context) ([]*ModelConnection, error)
 		}
 		out = append(out, c)
 	}
-	if out == nil {
-		out = []*ModelConnection{}
-	}
 	return out, rows.Err()
 }
 
 // DeleteConnection removes a connection; fails if projects or stores use it.
 func (s *Store) DeleteConnection(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, "DELETE FROM model_connections WHERE id = ?", id)
+	res, err := s.pool.Exec(ctx, "DELETE FROM model_connections WHERE id = $1", id)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if res.RowsAffected() == 0 {
 		return ErrNotFound
 	}
 	return nil
