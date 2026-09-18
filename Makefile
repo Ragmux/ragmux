@@ -1,25 +1,36 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 IMAGE   ?= ragmux/ragmux:latest
 
-.PHONY: build run test vet docker-build docker-run clean
+# Local pgvector Postgres started by `make dev-db` (docker-compose.dev.yml).
+TEST_DATABASE_URL ?= postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable
+export TEST_DATABASE_URL
+
+.PHONY: build run test vet dev-db dev-db-down docker-build docker-run clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o bin/ragmux ./cmd/ragmux
 
+# Runs against the dev database; SECRET_KEY falls back to ./data/secret.key.
 run: build
-	DATA_DIR=./data PORT=8080 ./bin/ragmux
+	DATABASE_URL=$(TEST_DATABASE_URL) DATA_DIR=./data PORT=8080 ./bin/ragmux
 
 test:
-	go test ./...
+	go test -race -count=1 ./...
 
 vet:
 	go vet ./...
+
+dev-db:
+	docker compose -f docker-compose.dev.yml up -d --wait
+
+dev-db-down:
+	docker compose -f docker-compose.dev.yml down
 
 docker-build:
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE) .
 
 docker-run: docker-build
-	docker run -d -p 8080:8080 -v ./gateway_data:/app/data --name ragmux $(IMAGE)
+	docker compose up -d
 
 clean:
 	rm -rf bin

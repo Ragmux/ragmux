@@ -1,0 +1,22 @@
+# Development database only: `make dev-db` (docker compose -f docker-compose.dev.yml up -d).
+# Matches the default TEST_DATABASE_URL in the Makefile:
+#   postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ragmux
+      POSTGRES_PASSWORD: ragmux
+      POSTGRES_DB: ragmux_test
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragmux -d ragmux_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata_dev:

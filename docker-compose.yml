@@ -13,14 +13,37 @@ services:
       - path: .env
         required: false
     environment:
-      DATA_DIR: /app/data
+      DATABASE_URL: postgres://ragmux:${POSTGRES_PASSWORD:-ragmux}@postgres:5432/ragmux?sslmode=disable
+      # Generate once with: openssl rand -hex 32. Keep it: it decrypts the
+      # provider credentials stored in Postgres.
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (openssl rand -hex 32)}
       PORT: "8080"
-    volumes:
-      # Everything persistent (SQLite DB, vectors, uploads, secret key) lives here.
-      - ./gateway_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/ragmux", "-healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ragmux-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ragmux
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragmux}
+      POSTGRES_DB: ragmux
+    volumes:
+      # All persistent state (models, projects, documents, vectors, metrics).
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragmux -d ragmux"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:

@@ -10,15 +10,14 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .
 ARG VERSION=dev
-# CGO is off: SQLite + sqlite-vec run as a wasm module inside the Go binary,
-# so the result is a single static executable.
+# Pure Go (pgx, no cgo): the result is a single static executable.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
     -o /out/ragmux ./cmd/ragmux
 
-# Pre-create the data directory with the runtime user's ownership so a fresh
-# named volume is writable without any chown at start.
+# DATA_DIR only backs the secret.key fallback used when SECRET_KEY is unset;
+# pre-create it writable for the runtime user so that fallback works.
 RUN mkdir -p /out/data && chown 65532:65532 /out/data
 
 # ---- runtime stage ---------------------------------------------------------
@@ -31,7 +30,6 @@ COPY --from=build /out/ragmux /app/ragmux
 COPY --from=build --chown=65532:65532 /out/data /app/data
 
 WORKDIR /app
-VOLUME ["/app/data"]
 EXPOSE 8080
 USER nonroot:nonroot
 

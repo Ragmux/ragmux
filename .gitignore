@@ -1,7 +1,3 @@
-/gateway_data/
 /bin/
 /data/
 .env
-*.db
-*.db-wal
-*.db-shm
