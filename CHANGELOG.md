@@ -26,7 +26,11 @@ All notable changes to Ragmux are documented here. The format follows
   dashboard tab.
 - `GET /admin/api/me` and the login response include `role`, `is_active` and `last_login_at`.
 - Per-project requests-per-minute / tokens-per-minute limits and daily / monthly token budgets
-  with OpenAI-style `x-ratelimit-*` headers.
+  (`rate_limit_rpm`, `rate_limit_tpm`, `budget_daily_tokens`, `budget_monthly_tokens`; UTC
+  windows shared across replicas). Over the limit the gateway answers `429` with
+  `Retry-After`, OpenAI-style `x-ratelimit-*` and `x-ragmux-budget-*-remaining` headers;
+  `GET /admin/api/projects/{id}/usage` shows live counters, metrics summaries gain
+  `rate_limited`, and the dashboard shows limits, usage meters and a 429 tile.
 - RAG: hybrid BM25 + vector search (RRF), section/page aware chunks, optional LLM reranking,
   DOCX and HTML ingestion, similarity threshold.
 - Backup and restore scripts and documentation.

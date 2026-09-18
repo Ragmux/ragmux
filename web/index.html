@@ -65,6 +65,10 @@
   .msg{padding:8px 10px;border-radius:8px;max-width:85%;white-space:pre-wrap}
   .msg.user{align-self:flex-end;background:var(--accent);color:#fff}
   .msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
+  .meter{height:8px;background:var(--code);border-radius:4px;overflow:hidden;margin-top:6px}
+  .meter div{height:100%;background:var(--ok);border-radius:4px}
+  .meter div.warn{background:var(--warn)}
+  .meter div.err{background:var(--danger)}
   .hidden{display:none}
   select[multiple]{min-height:110px}
   td.json{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;max-width:360px;word-break:break-all}
@@ -102,6 +106,10 @@ const ROLE_RANK = { viewer:1, editor:2, admin:3 };
 // can('editor') is true for editors and admins; the API enforces the same matrix.
 const can = role => !!state.user && (ROLE_RANK[state.user.role]||0) >= (ROLE_RANK[role]||99);
 const userName = id => (state.users.find(u=>u.id===id)||{}).username || '#'+id;
+// Compact "2 rpm · 10k tpm · 1M/day" summary of a project's non-zero limits.
+const fmtK = n => n>=1e6 ? (n/1e6).toFixed(n%1e6?1:0)+'M' : n>=1e3 ? (n/1e3).toFixed(n%1e3?1:0)+'k' : String(n);
+const limitSummary = p => [p.rate_limit_rpm?`${fmtK(p.rate_limit_rpm)} rpm`:'', p.rate_limit_tpm?`${fmtK(p.rate_limit_tpm)} tpm`:'', p.budget_daily_tokens?`${fmtK(p.budget_daily_tokens)}/day`:'', p.budget_monthly_tokens?`${fmtK(p.budget_monthly_tokens)}/month`:''].filter(Boolean).join(' · ');
+const meter = pct => `<div class="meter"><div class="${pct>=100?'err':pct>=80?'warn':''}" style="width:${Math.min(100,pct)}%"></div></div>`;
 
 let toastTimer;
 function toast(msg, ms=3500){ const t=$('#toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.add('hidden'), ms); }
@@ -181,6 +189,7 @@ async function renderOverview(){
         <div class="stat"><div class="v">${fmtN(w.completion_tokens)}</div><div class="l">completion tokens</div></div>
         <div class="stat"><div class="v">${Math.round(w.avg_latency_ms)} ms</div><div class="l">avg latency · p95 ${fmtN(w.p95_latency_ms)} ms</div></div>
         <div class="stat"><div class="v">${fmtN(w.rag_requests)}</div><div class="l">RAG-augmented</div></div>
+        <div class="stat"><div class="v">${fmtN(w.rate_limited)}</div><div class="l">rate limited (429)</div></div>
       </div></div>
     <div class="card"><h3>Requests per day (14d) · all time: ${fmtN(t.requests)} req / ${fmtN(t.prompt_tokens+t.completion_tokens)} tokens</h3>
       <div class="bars" style="margin-bottom:22px">${m.daily.length?m.daily.map(d=>`<div style="height:${Math.max(2,100*d.requests/maxReq)}%" title="${d.day}: ${d.requests} req, ${d.errors} err"><span>${d.day.slice(5)}</span></div>`).join(''):'<span class="muted">No requests yet.</span>'}</div></div>
@@ -287,9 +296,9 @@ function renderProjects(){
   const w = can('editor');
   app.innerHTML = `<div class="card"><div class="row between"><h2>Projects</h2>${w?`<button class="primary" id="addProject" ${state.models.length?'':'disabled title="Add a model connection first"'}>+ Add project</button>`:''}</div>
     <p class="muted">Clients call <code>POST /v1/chat/completions</code> with <code>Authorization: Bearer sk-proj-…</code>. Keys are shown once at creation.${can('admin')?'':' You only see projects you are a member of.'}</p>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Model</th><th>RAG store</th><th>Key</th><th>Members</th><th>System prompt</th><th></th></tr></thead><tbody>
-    ${state.projects.map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${esc(modelName(p.model_connection_id))}</td><td>${esc(ragName(p.rag_store_id))}</td><td><code>${esc(p.api_key_prefix)}…</code></td><td class="muted">${esc((p.member_ids||[]).map(userName).join(', ')||'—')}</td><td class="muted">${esc((p.system_prompt||'').slice(0,60))}${(p.system_prompt||'').length>60?'…':''}</td>
-      <td style="white-space:nowrap"><button class="small" data-metrics="${p.id}">Metrics</button>${w?` <button class="small" data-rotate="${p.id}">Rotate key</button> <button class="small" data-edit="${p.id}">Edit</button> <button class="small danger" data-del="${p.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">No projects yet.</td></tr>'}
+    <div class="tbl"><table><thead><tr><th>Name</th><th>Model</th><th>RAG store</th><th>Key</th><th>Limits</th><th>Members</th><th>System prompt</th><th></th></tr></thead><tbody>
+    ${state.projects.map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${esc(modelName(p.model_connection_id))}</td><td>${esc(ragName(p.rag_store_id))}</td><td><code>${esc(p.api_key_prefix)}…</code></td><td class="muted" style="white-space:nowrap">${esc(limitSummary(p)||'—')}</td><td class="muted">${esc((p.member_ids||[]).map(userName).join(', ')||'—')}</td><td class="muted">${esc((p.system_prompt||'').slice(0,60))}${(p.system_prompt||'').length>60?'…':''}</td>
+      <td style="white-space:nowrap"><button class="small" data-metrics="${p.id}">Metrics</button>${w?` <button class="small" data-rotate="${p.id}">Rotate key</button> <button class="small" data-edit="${p.id}">Edit</button> <button class="small danger" data-del="${p.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="muted">No projects yet.</td></tr>'}
     </tbody></table></div></div><div id="projPanel"></div>`;
   if (w) $('#addProject').onclick=()=>projectForm();
   app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>projectForm(state.projects.find(p=>p.id==b.dataset.edit)));
@@ -303,9 +312,15 @@ function projectForm(p){
     ${field('Model connection', select('model_connection_id', state.models.map(m=>({value:m.id,label:`${m.name} (${m.provider_type} · ${m.model_name})`})), p?.model_connection_id))}
     ${field('RAG store (optional)', select('rag_store_id', [{value:0,label:'— none —'}, ...state.rag.map(r=>({value:r.id,label:r.name}))], p?.rag_store_id||0))}
     ${field('Project system prompt (optional, prepended to every request)', `<textarea name="system_prompt">${esc(p?.system_prompt||'')}</textarea>`)}
+    <div class="row"><div style="flex:1">${field('Requests / minute', input('rate_limit_rpm', p?.rate_limit_rpm||0, 'type=number min=0 step=1'))}</div>
+    <div style="flex:1">${field('Tokens / minute', input('rate_limit_tpm', p?.rate_limit_tpm||0, 'type=number min=0 step=1'))}</div></div>
+    <div class="row"><div style="flex:1">${field('Daily token budget', input('budget_daily_tokens', p?.budget_daily_tokens||0, 'type=number min=0 step=1'))}</div>
+    <div style="flex:1">${field('Monthly token budget', input('budget_monthly_tokens', p?.budget_monthly_tokens||0, 'type=number min=0 step=1'))}</div></div>
+    <p class="muted" style="margin-top:-6px">0 = unlimited. Windows are UTC minute / day / month; budgets count prompt + completion tokens and are checked before each call, so one request can overshoot by its own size. Over the limit the API answers <code>429</code> with <code>Retry-After</code>.</p>
     ${field('Members (Ctrl/Cmd-click for several; you stay a member of projects you create)', multiSelect('members', state.users.map(u=>({value:u.id,label:`${u.username} (${u.role})`})), p?.member_ids||[state.user.id]))}`,
     async (d, form) => { const members=[...form.querySelector('[name=members]').selectedOptions].map(o=>Number(o.value));
-      const body={name:d.name, model_connection_id:Number(d.model_connection_id), rag_store_id:Number(d.rag_store_id)||null, system_prompt:d.system_prompt};
+      const body={name:d.name, model_connection_id:Number(d.model_connection_id), rag_store_id:Number(d.rag_store_id)||null, system_prompt:d.system_prompt,
+        rate_limit_rpm:Number(d.rate_limit_rpm)||0, rate_limit_tpm:Number(d.rate_limit_tpm)||0, budget_daily_tokens:Number(d.budget_daily_tokens)||0, budget_monthly_tokens:Number(d.budget_monthly_tokens)||0};
       if (p) { await api('/projects/'+p.id,{method:'PUT',body}); await api(`/projects/${p.id}/members`,{method:'PUT',body:{user_ids:members}}); toast('Saved'); }
       else { const r=await api('/projects',{method:'POST',body:{...body, member_user_ids:members}}); showKey(r.project, r.api_key); }
       await loadAll(); render(); });
@@ -323,9 +338,16 @@ function showKey(p, key){
 }
 async function projectMetrics(id){
   const panel=$('#projPanel'); panel.innerHTML='<div class="card">Loading…</div>';
-  try{ const m=await api(`/projects/${id}/metrics?window=24h`); const p=state.projects.find(x=>x.id===id); const w=m.window, t=m.total;
-    panel.innerHTML=`<div class="card"><h2>${esc(p.name)} · metrics</h2><div class="grid">
-      <div class="stat"><div class="v">${fmtN(w.requests)}</div><div class="l">requests 24h (${fmtN(w.errors)} errors)</div></div>
+  try{ const [m,u]=await Promise.all([api(`/projects/${id}/metrics?window=24h`), api(`/projects/${id}/usage`)]); const p=state.projects.find(x=>x.id===id); const w=m.window, t=m.total;
+    const usageTile = (label, used, limit, pct, resets) => `<div class="stat"><div class="v">${fmtN(used)}${limit?` <span class="muted" style="font-size:13px">/ ${fmtN(limit)}</span>`:''}</div><div class="l">${label}${limit?` · ${pct}% · resets ${fmtDate(resets)}`:' · unlimited'}</div>${limit?meter(pct):''}</div>`;
+    panel.innerHTML=`<div class="card"><h2>${esc(p.name)} · metrics</h2>
+      <h3>Limits &amp; usage</h3><div class="grid" style="margin-bottom:14px">
+      ${usageTile('requests this minute', u.minute.requests, u.minute.request_limit, u.minute.request_percent, u.minute.resets_at)}
+      ${usageTile('tokens this minute', u.minute.tokens, u.minute.token_limit, u.minute.token_percent, u.minute.resets_at)}
+      ${usageTile('tokens today (UTC)', u.day.tokens, u.day.token_limit, u.day.token_percent, u.day.resets_at)}
+      ${usageTile('tokens this month (UTC)', u.month.tokens, u.month.token_limit, u.month.token_percent, u.month.resets_at)}</div>
+      <h3>Last 24 hours</h3><div class="grid">
+      <div class="stat"><div class="v">${fmtN(w.requests)}</div><div class="l">requests 24h (${fmtN(w.errors)} errors · ${fmtN(w.rate_limited)} rate limited)</div></div>
       <div class="stat"><div class="v">${fmtN(w.prompt_tokens)} / ${fmtN(w.completion_tokens)}</div><div class="l">prompt / completion tokens 24h</div></div>
       <div class="stat"><div class="v">${Math.round(w.avg_latency_ms)} ms</div><div class="l">avg latency · p95 ${fmtN(w.p95_latency_ms)} ms</div></div>
       <div class="stat"><div class="v">${fmtN(t.requests)}</div><div class="l">requests all time · ${fmtN(t.prompt_tokens+t.completion_tokens)} tokens</div></div></div>
@@ -393,7 +415,8 @@ function renderPlayground(){
     const chat=$('#chat'); const last=()=>chat.lastElementChild; const t0=performance.now();
     try{ const stream=$('#pgStream').value==='1';
       const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Authorization':'Bearer '+pg.key,'Content-Type':'application/json'},body:JSON.stringify({model:'default',stream,messages:pg.msgs.filter(m=>m.content).map(m=>({role:m.role,content:m.content}))})});
-      if(!r.ok){ const err=await r.json().catch(()=>({})); throw new Error(err.error?.message||r.statusText); }
+      if(!r.ok){ const err=await r.json().catch(()=>({})); const ra=r.headers.get('Retry-After');
+        throw new Error((r.status===429?'429 '+(err.error?.type||'rate limited')+': ':'')+(err.error?.message||r.statusText)+(ra?` (Retry-After: ${ra}s)`:'')); }
       if(stream){ const rd=r.body.getReader(); const dec=new TextDecoder(); let buf=''; let usage=null;
         while(true){ const {done,value}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true}); let i;
           while((i=buf.indexOf('\n\n'))>=0){ const ev=buf.slice(0,i); buf=buf.slice(i+2); for(const line of ev.split('\n')){ if(!line.startsWith('data:')) continue; const d=line.slice(5).trim(); if(d==='[DONE]') continue;

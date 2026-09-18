@@ -24,6 +24,7 @@ import (
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/config"
 	"github.com/ragmux/ragmux/internal/gateway"
+	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -118,11 +119,12 @@ func run(cfg config.Config) error {
 	retriever := rag.NewRetriever(st, embedders)
 
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true"}
-	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20}
+	usage := &limits.Limiter{Store: st}
+	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20, Limiter: usage}
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
 		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
-		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter}
+		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -163,6 +165,9 @@ func run(cfg config.Config) error {
 			case <-t.C:
 				_ = st.PurgeExpiredSessions(ctx)
 				_ = st.DeleteLoginAttemptsBefore(ctx, time.Now().Add(-24*time.Hour))
+				if err := usage.PurgeUsage(ctx); err != nil {
+					log.Warn("purge usage counters", "err", err)
+				}
 			}
 		}
 	}()

@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ragmux/ragmux/internal/auth"
+	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -36,6 +37,8 @@ type Admin struct {
 	WebFS          fs.FS
 	// Limiter throttles login attempts; nil disables limiting.
 	Limiter *auth.LoginLimiter
+	// Usage reads project rate-limit counters; nil builds one on the Store.
+	Usage *limits.Limiter
 }
 
 // Routes mounts /admin handlers.
@@ -82,6 +85,7 @@ func (a *Admin) Routes(r chi.Router) {
 		editor.Delete("/api/projects/{id}", a.deleteProject)
 		editor.Post("/api/projects/{id}/rotate-key", a.rotateKey)
 		r.Get("/api/projects/{id}/metrics", a.projectMetrics)
+		r.Get("/api/projects/{id}/usage", a.projectUsage)
 		r.Get("/api/projects/{id}/members", a.listMembers)
 		editor.Put("/api/projects/{id}/members", a.setMembers)
 
@@ -692,11 +696,29 @@ func (a *Admin) reprocessDocument(w http.ResponseWriter, r *http.Request) {
 // ---- projects ----
 
 type projectInput struct {
-	Name              string  `json:"name"`
-	ModelConnectionID int64   `json:"model_connection_id"`
-	RAGStoreID        *int64  `json:"rag_store_id"`
-	SystemPrompt      string  `json:"system_prompt"`
-	MemberUserIDs     []int64 `json:"member_user_ids"`
+	Name                string  `json:"name"`
+	ModelConnectionID   int64   `json:"model_connection_id"`
+	RAGStoreID          *int64  `json:"rag_store_id"`
+	SystemPrompt        string  `json:"system_prompt"`
+	MemberUserIDs       []int64 `json:"member_user_ids"`
+	RateLimitRPM        int     `json:"rate_limit_rpm"`
+	RateLimitTPM        int     `json:"rate_limit_tpm"`
+	BudgetDailyTokens   int64   `json:"budget_daily_tokens"`
+	BudgetMonthlyTokens int64   `json:"budget_monthly_tokens"`
+}
+
+// project builds the store record from validated input (id and key aside).
+func (in *projectInput) project() *store.Project {
+	return &store.Project{Name: strings.TrimSpace(in.Name), ModelConnectionID: in.ModelConnectionID,
+		RAGStoreID: in.RAGStoreID, SystemPrompt: in.SystemPrompt,
+		RateLimitRPM: in.RateLimitRPM, RateLimitTPM: in.RateLimitTPM,
+		BudgetDailyTokens: in.BudgetDailyTokens, BudgetMonthlyTokens: in.BudgetMonthlyTokens}
+}
+
+// limitFields lists the limit columns with their current values.
+func limitFields(p *store.Project) map[string]int64 {
+	return map[string]int64{"rate_limit_rpm": int64(p.RateLimitRPM), "rate_limit_tpm": int64(p.RateLimitTPM),
+		"budget_daily_tokens": p.BudgetDailyTokens, "budget_monthly_tokens": p.BudgetMonthlyTokens}
 }
 
 // loadProject fetches a project the caller may see; non-members get 404.
@@ -733,6 +755,9 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 			return errors.New("rag_store_id does not reference an existing RAG store")
 		}
 	}
+	if in.RateLimitRPM < 0 || in.RateLimitTPM < 0 || in.BudgetDailyTokens < 0 || in.BudgetMonthlyTokens < 0 {
+		return errors.New("rate limits and budgets must be 0 (unlimited) or positive")
+	}
 	return nil
 }
 
@@ -763,8 +788,7 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := auth.UserFrom(r.Context())
-	p, key, err := a.Store.CreateProject(r.Context(), &store.Project{Name: strings.TrimSpace(in.Name),
-		ModelConnectionID: in.ModelConnectionID, RAGStoreID: in.RAGStoreID, SystemPrompt: in.SystemPrompt})
+	p, key, err := a.Store.CreateProject(r.Context(), in.project())
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -783,7 +807,7 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs})
+	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p)})
 	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
 }
 
@@ -796,7 +820,8 @@ func (a *Admin) getProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.loadProject(w, r); !ok {
+	before, ok := a.loadProject(w, r)
+	if !ok {
 		return
 	}
 	id, _ := idParam(r)
@@ -809,13 +834,25 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p, err := a.Store.UpdateProject(r.Context(), &store.Project{ID: id, Name: strings.TrimSpace(in.Name),
-		ModelConnectionID: in.ModelConnectionID, RAGStoreID: in.RAGStoreID, SystemPrompt: in.SystemPrompt})
+	np := in.project()
+	np.ID = id
+	p, err := a.Store.UpdateProject(r.Context(), np)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "project.update", "project", ptr(p.ID), map[string]any{"name": p.Name})
+	details := map[string]any{"name": p.Name}
+	old, cur := limitFields(before), limitFields(p)
+	changed := map[string]any{}
+	for k, v := range cur {
+		if old[k] != v {
+			changed[k] = map[string]int64{"from": old[k], "to": v}
+		}
+	}
+	if len(changed) > 0 {
+		details["limits_changed"] = changed
+	}
+	a.audit(r, "project.update", "project", ptr(p.ID), details)
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -923,6 +960,24 @@ func (a *Admin) projectMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.metrics(w, r, store.MetricsFilter{ProjectID: &p.ID})
+}
+
+// projectUsage reports the current rate-limit and budget counters.
+func (a *Admin) projectUsage(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.loadProject(w, r)
+	if !ok {
+		return
+	}
+	l := a.Usage
+	if l == nil {
+		l = &limits.Limiter{Store: a.Store}
+	}
+	u, err := l.Usage(r.Context(), p)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, u)
 }
 
 // scopedFilter restricts global metrics to member projects for non-admins.

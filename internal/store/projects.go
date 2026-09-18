@@ -17,19 +17,27 @@ type Project struct {
 	RAGStoreID        *int64 `json:"rag_store_id"`
 	APIKeyPrefix      string `json:"api_key_prefix"`
 	SystemPrompt      string `json:"system_prompt"`
+	// Limits; zero means unlimited. RPM/TPM are per UTC minute, budgets are
+	// prompt+completion tokens per UTC day / month.
+	RateLimitRPM        int   `json:"rate_limit_rpm"`
+	RateLimitTPM        int   `json:"rate_limit_tpm"`
+	BudgetDailyTokens   int64 `json:"budget_daily_tokens"`
+	BudgetMonthlyTokens int64 `json:"budget_monthly_tokens"`
 	// MemberIDs lists the users attached to the project.
 	MemberIDs []int64 `json:"member_ids"`
 	CreatedAt string  `json:"created_at"`
 	UpdatedAt string  `json:"updated_at"`
 }
 
-const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, system_prompt, created_at, updated_at,
+const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, system_prompt,
+	rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens, created_at, updated_at,
 	ARRAY(SELECT user_id FROM project_members pm WHERE pm.project_id = projects.id ORDER BY user_id)`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	p := &Project{}
 	var created, updated time.Time
 	err := row.Scan(&p.ID, &p.Name, &p.ModelConnectionID, &p.RAGStoreID, &p.APIKeyPrefix, &p.SystemPrompt,
+		&p.RateLimitRPM, &p.RateLimitTPM, &p.BudgetDailyTokens, &p.BudgetMonthlyTokens,
 		&created, &updated, &p.MemberIDs)
 	if err != nil {
 		return nil, scanErr(err)
@@ -81,9 +89,11 @@ func (s *Store) CreateProject(ctx context.Context, p *Project) (*Project, string
 		return nil, "", err
 	}
 	out, err := scanProject(s.pool.QueryRow(ctx, `INSERT INTO projects
-		(name, model_connection_id, rag_store_id, api_key_hash, api_key_prefix, system_prompt)
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+projCols,
-		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt))
+		(name, model_connection_id, rag_store_id, api_key_hash, api_key_prefix, system_prompt,
+		rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING `+projCols,
+		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt,
+		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens))
 	if err != nil {
 		return nil, "", err
 	}
@@ -93,8 +103,10 @@ func (s *Store) CreateProject(ctx context.Context, p *Project) (*Project, string
 // UpdateProject changes mutable fields (not the key).
 func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error) {
 	_, err := s.pool.Exec(ctx, `UPDATE projects SET name=$1, model_connection_id=$2, rag_store_id=$3,
-		system_prompt=$4, updated_at=now() WHERE id=$5`,
-		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt, p.ID)
+		system_prompt=$4, rate_limit_rpm=$5, rate_limit_tpm=$6, budget_daily_tokens=$7, budget_monthly_tokens=$8,
+		updated_at=now() WHERE id=$9`,
+		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt,
+		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens, p.ID)
 	if err != nil {
 		return nil, err
 	}
