@@ -241,4 +241,6 @@ ingestion, prompt caching passthrough.
 
 ## License
 
-MIT
+Ragmux is free software licensed under the **GNU Affero General Public License v3.0 or later**
+(AGPL-3.0-or-later). See [LICENSE](LICENSE). If you run a modified version as a network service,
+you must make the modified source available to its users.

@@ -1,0 +1,19 @@
+version: "2"
+run:
+  timeout: 5m
+linters:
+  default: standard
+  enable:
+    - gosec
+    - misspell
+    - unconvert
+    - unparam
+  settings:
+    gosec:
+      excludes:
+        - G104 # handled by errcheck
+        - G404 # math/rand is used only for non-security purposes where allowed
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [gosec, unparam, errcheck]
