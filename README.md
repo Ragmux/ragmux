@@ -41,6 +41,9 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
   as a REST API.
 - **Users and roles:** `admin`, `editor` and `viewer` accounts, per-project membership,
   login rate limiting with lockout, and an audit trail of every management action.
+- **Rate limits and budgets:** per-project requests / tokens per minute and daily / monthly
+  token budgets, enforced across replicas with OpenAI-style `429` responses and
+  `x-ratelimit-*` headers.
 - **Persistence:** everything in PostgreSQL + pgvector; uploaded files are kept as `bytea`
   so no volume is needed on the gateway. Unfinished document ingestion resumes
   automatically after a restart.
@@ -240,6 +243,67 @@ contains credentials. Admins read it with
 `GET /admin/api/audit?limit=100&action=project.&actor_user_id=1&before=2026-09-18T10:00:00Z`
 (`action` is a prefix match, `before` pages backwards).
 
+## Rate limits & budgets
+
+Every project has four optional limits (0 = unlimited), set at creation or with
+`PUT /projects/{id}` and shown in the dashboard's project form:
+
+| Field | Meaning |
+|---|---|
+| `rate_limit_rpm` | Requests per UTC minute |
+| `rate_limit_tpm` | Prompt + completion tokens per UTC minute |
+| `budget_daily_tokens` | Prompt + completion tokens per UTC day |
+| `budget_monthly_tokens` | Prompt + completion tokens per UTC calendar month |
+
+Counters live in the `project_usage` table, so several gateway replicas share them. All
+windows are aligned to UTC boundaries (`date_trunc` of minute, day and month), not sliding.
+When a limit is hit `/v1/chat/completions` answers
+
+```json
+HTTP 429  Retry-After: 42
+{"error":{"message":"Rate limit reached: 2 requests per minute for this project. Retry after 42 seconds.",
+          "type":"rate_limit_exceeded","code":"rate_limit_rpm"}}
+```
+
+`type` is `rate_limit_exceeded` for the per-minute limits and `insufficient_quota` for
+budgets; `code` is one of `rate_limit_rpm`, `rate_limit_tpm`, `budget_daily`,
+`budget_monthly`. `Retry-After` is the number of seconds until the violated window resets
+(next minute, next UTC day or next month). Rejected requests are recorded in the request
+log with status 429 (visible as `rate_limited` in the metrics summaries and the
+dashboard) and do not consume tokens.
+
+Response headers on every chat completion (only for limits that are set):
+
+| Header | Value |
+|---|---|
+| `x-ratelimit-limit-requests` | configured requests per minute |
+| `x-ratelimit-remaining-requests` | requests left in the current minute |
+| `x-ratelimit-reset-requests` | integer seconds until the minute window resets |
+| `x-ragmux-budget-daily-remaining` | tokens left in today's budget |
+| `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
+
+How the checks work: the requests-per-minute slot is reserved atomically **before** the
+upstream call, so concurrent requests cannot exceed the limit; a rejected reservation is
+released again so `remaining` stays accurate. Tokens are only known after the provider
+answers, so the token limit and the budgets are checked against what has been recorded so
+far. For the per-minute token limit the request's own prompt is estimated at four
+characters per token (client messages plus the project system prompt, before RAG context
+is added); budgets use recorded usage only. A single request can therefore overshoot a
+budget by its own size — the *next* request is refused. Providers that do not report
+usage fall back to the same character estimate.
+
+`GET /admin/api/projects/{id}/usage` returns the live counters:
+
+```json
+{"project_id":3,"generated_at":"2026-09-18T12:00:30Z",
+ "minute":{"period_start":"…","resets_at":"…","requests":2,"tokens":24,"request_limit":2,"request_percent":100,"token_limit":0,"token_percent":0, …},
+ "day":{"…":"…","tokens":12,"token_limit":5,"token_percent":100,"resets_at":"2026-09-19T00:00:00Z"},
+ "month":{"…":"…"}}
+```
+
+Minute rows are purged after two hours, day rows after 400 days and month rows after
+three years by the hourly retention job.
+
 ## REST API summary
 
 All management endpoints are under `/admin/api` and need a session (cookie or
@@ -261,10 +325,11 @@ minimum role; `member` means the project membership rule above applies too.
 | GET / DELETE | `/documents/{id}` | viewer / editor | Document status / delete |
 | POST | `/documents/{id}/reprocess` | editor | Re-chunk and re-embed |
 | GET / POST | `/projects` | member / editor | List own projects (admin: all) / create (`member_user_ids` optional, returns key once) |
-| GET / PUT / DELETE | `/projects/{id}` | member (+editor for writes) | Read / update / delete |
+| GET / PUT / DELETE | `/projects/{id}` | member (+editor for writes) | Read / update / delete (`rate_limit_rpm`, `rate_limit_tpm`, `budget_daily_tokens`, `budget_monthly_tokens`) |
 | POST | `/projects/{id}/rotate-key` | member + editor | Issue a new key |
 | GET / PUT | `/projects/{id}/members` | member (+editor for PUT) | List / replace members `{"user_ids":[...]}` |
 | GET | `/projects/{id}/metrics?window=24h` | member | Summary, daily series, recent requests |
+| GET | `/projects/{id}/usage` | member | Current minute / day / month counters against the project's limits |
 | GET | `/metrics/summary`, `/metrics/requests` | viewer | Metrics over the projects the user can see |
 | GET | `/users/lite` | editor | `{id, username, role}` of active users (for member pickers) |
 | GET / POST | `/users` | admin | List / create users `{username, password, role}` |
@@ -306,14 +371,14 @@ internal/testdb/     per-test schemas on TEST_DATABASE_URL
 internal/provider/   OpenAI-compatible, Anthropic, Gemini adapters + embedders
 internal/rag/        parsing (PDF/TXT/MD), chunking, ingestion worker, retrieval
 internal/gateway/    /v1 proxy, RAG injection, metrics
+internal/limits/     per-project rate limits, token budgets, usage counters
 internal/admin/      /admin REST API + dashboard hosting
 web/index.html       dashboard (vanilla JS, embedded in the binary)
 ```
 
 ## Roadmap / not yet
 
-Per-project rate limits, Gemini tool calling, reranking, DOCX/HTML ingestion, prompt
-caching passthrough.
+Gemini tool calling, reranking, DOCX/HTML ingestion, prompt caching passthrough.
 
 ## License
 
