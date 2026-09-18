@@ -19,6 +19,7 @@ import (
 	"github.com/ragmux/ragmux/internal/admin"
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/gateway"
+	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -88,6 +89,7 @@ type env struct {
 	srv     *httptest.Server
 	session string
 	store   *store.Store
+	usage   *limits.Limiter
 }
 
 // newEnv wires the whole application against the schema described by cfg.
@@ -113,15 +115,16 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	ing.Resume(ctx)
 	ret := rag.NewRetriever(st, embedders)
 	authSvc := &auth.Service{Store: st, TTL: time.Hour}
-	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log}
+	usage := &limits.Limiter{Store: st}
+	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log, Limiter: usage}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
-		Limiter: auth.DefaultLoginLimiter(st)}
+		Limiter: auth.DefaultLoginLimiter(st), Usage: usage}
 	r := chi.NewRouter()
 	r.Route("/v1", gw.Routes)
 	r.Route("/admin", adm.Routes)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
-	e := &env{t: t, srv: srv, store: st}
+	e := &env{t: t, srv: srv, store: st, usage: usage}
 	res := e.call("POST", "/admin/api/login", map[string]string{"username": "admin", "password": "password123"}, "")
 	e.session = res["token"].(string)
 	return e
@@ -338,7 +341,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(2) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(3) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
@@ -569,5 +572,129 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 	// Audit rows written by the deleted user keep the username; the actor id is nulled.
 	if l := e.call("GET", "/admin/api/audit?action=user.delete", nil, admin2Tok)["_list"].([]any); len(l) != 1 {
 		t.Errorf("user.delete audit: %v", l)
+	}
+}
+
+func TestProjectLimitsAndBudgets(t *testing.T) {
+	up := mockUpstream(t)
+	defer up.Close()
+	e := newEnv(t, testdb.Config(t))
+	// Pin the limiter clock so the calls below cannot straddle a minute boundary.
+	fixed := time.Date(2026, 9, 18, 12, 0, 30, 0, time.UTC)
+	e.usage.Now = func() time.Time { return fixed }
+	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
+	errField := func(r map[string]any, k string) any { return r["error"].(map[string]any)[k] }
+	msg := map[string]any{"messages": []map[string]string{{"role": "user", "content": "hello there"}}}
+
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	connID := int64(conn["id"].(float64))
+
+	// Validation: negative limits are rejected.
+	if r := e.call("POST", "/admin/api/projects", map[string]any{"name": "neg", "model_connection_id": connID, "rate_limit_rpm": -1}, ""); status(r) != 400 {
+		t.Fatalf("negative limit should be rejected: %v", r)
+	}
+
+	// Project with rpm=2.
+	pr := e.call("POST", "/admin/api/projects", map[string]any{"name": "rpm", "model_connection_id": connID, "rate_limit_rpm": 2}, "")
+	if status(pr) != 201 || pr["project"].(map[string]any)["rate_limit_rpm"] != float64(2) {
+		t.Fatalf("create rpm project: %v", pr)
+	}
+	rpmKey := pr["api_key"].(string)
+	rpmID := int64(pr["project"].(map[string]any)["id"].(float64))
+	for i := 1; i <= 2; i++ {
+		r, h := e.callRaw("POST", "/v1/chat/completions", msg, rpmKey)
+		if status(r) != 200 {
+			t.Fatalf("rpm call %d: %v", i, r)
+		}
+		if h.Get("x-ratelimit-limit-requests") != "2" || h.Get("x-ratelimit-remaining-requests") != fmt.Sprint(2-i) || h.Get("x-ratelimit-reset-requests") == "" {
+			t.Errorf("rpm call %d headers: %v", i, h)
+		}
+	}
+	r3, h3 := e.callRaw("POST", "/v1/chat/completions", msg, rpmKey)
+	if status(r3) != 429 || errField(r3, "type") != "rate_limit_exceeded" || errField(r3, "code") != "rate_limit_rpm" {
+		t.Fatalf("third rpm call: %v", r3)
+	}
+	if h3.Get("Retry-After") != "30" || h3.Get("x-ratelimit-remaining-requests") != "0" || h3.Get("x-ratelimit-reset-requests") != "30" {
+		t.Errorf("429 headers: %v", h3)
+	}
+	// Streaming requests are throttled too, before any SSE header is sent.
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/chat/completions", bytes.NewReader(mustJSON(map[string]any{"stream": true, "messages": msg["messages"]})))
+	req.Header.Set("Authorization", "Bearer "+rpmKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 429 || !strings.Contains(resp.Header.Get("Content-Type"), "json") {
+		t.Errorf("streaming 429: %d %v", resp.StatusCode, resp.Header)
+	}
+
+	// Project with a daily budget of 5 tokens: the first call passes (usage
+	// is only known afterwards), the second is refused.
+	pb := e.call("POST", "/admin/api/projects", map[string]any{"name": "budget", "model_connection_id": connID, "budget_daily_tokens": 5}, "")
+	budgetKey := pb["api_key"].(string)
+	budgetID := int64(pb["project"].(map[string]any)["id"].(float64))
+	r1, h1 := e.callRaw("POST", "/v1/chat/completions", msg, budgetKey)
+	if status(r1) != 200 || h1.Get("x-ragmux-budget-daily-remaining") != "5" || h1.Get("x-ratelimit-limit-requests") != "" {
+		t.Fatalf("first budget call: %v %v", r1, h1)
+	}
+	r2, h2 := e.callRaw("POST", "/v1/chat/completions", msg, budgetKey)
+	if status(r2) != 429 || errField(r2, "type") != "insufficient_quota" || errField(r2, "code") != "budget_daily" {
+		t.Fatalf("second budget call: %v", r2)
+	}
+	if h2.Get("x-ragmux-budget-daily-remaining") != "0" || h2.Get("Retry-After") == "" {
+		t.Errorf("budget 429 headers: %v", h2)
+	}
+	u := e.call("GET", fmt.Sprintf("/admin/api/projects/%d/usage", budgetID), nil, "")
+	day := u["day"].(map[string]any)
+	if day["tokens"] != float64(12) || day["requests"] != float64(1) || day["token_limit"] != float64(5) || day["token_percent"] != float64(100) || day["resets_at"] == nil {
+		t.Errorf("budget usage: %v", u)
+	}
+	u = e.call("GET", fmt.Sprintf("/admin/api/projects/%d/usage", rpmID), nil, "")
+	minute := u["minute"].(map[string]any)
+	if minute["requests"] != float64(2) || minute["request_limit"] != float64(2) || minute["tokens"] != float64(24) {
+		t.Errorf("rpm usage: %v", u)
+	}
+
+	// Editing limits is audited with the changed fields.
+	if r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d", budgetID), map[string]any{"name": "budget", "model_connection_id": connID, "budget_daily_tokens": 1000, "rate_limit_tpm": 50}, ""); status(r) != 200 || r["budget_daily_tokens"] != float64(1000) {
+		t.Fatalf("update limits: %v", r)
+	}
+	upd := e.call("GET", "/admin/api/audit?action=project.update", nil, "")["_list"].([]any)
+	if len(upd) != 1 {
+		t.Fatalf("project.update audit entries: %v", upd)
+	}
+	changed := upd[0].(map[string]any)["details"].(map[string]any)["limits_changed"].(map[string]any)
+	if changed["budget_daily_tokens"].(map[string]any)["to"] != float64(1000) || changed["rate_limit_tpm"] == nil || changed["rate_limit_rpm"] != nil {
+		t.Errorf("limits_changed: %v", changed)
+	}
+	// With the budget raised the project is usable again.
+	if r := e.call("POST", "/v1/chat/completions", msg, budgetKey); status(r) != 200 {
+		t.Errorf("after raising budget: %v", r)
+	}
+
+	// A project without limits is unaffected and carries no limit headers.
+	pz := e.call("POST", "/admin/api/projects", map[string]any{"name": "free", "model_connection_id": connID}, "")
+	freeKey := pz["api_key"].(string)
+	for i := 0; i < 4; i++ {
+		r, h := e.callRaw("POST", "/v1/chat/completions", msg, freeKey)
+		if status(r) != 200 || h.Get("x-ratelimit-limit-requests") != "" || h.Get("x-ragmux-budget-daily-remaining") != "" {
+			t.Fatalf("unlimited call %d: %v %v", i, r, h)
+		}
+	}
+
+	// 429s are visible in the metrics.
+	m := e.call("GET", "/admin/api/metrics/summary", nil, "")
+	if w := m["window"].(map[string]any); w["rate_limited"] != float64(3) || m["total"].(map[string]any)["rate_limited"] != float64(3) {
+		t.Errorf("rate_limited in summary: %v", m["window"])
+	}
+	pm := e.call("GET", fmt.Sprintf("/admin/api/projects/%d/metrics", rpmID), nil, "")
+	if w := pm["window"].(map[string]any); w["rate_limited"] != float64(2) || w["requests"] != float64(4) {
+		t.Errorf("rpm project metrics: %v", w)
+	}
+	recent := pm["recent"].([]any)
+	if r0 := recent[0].(map[string]any); r0["status_code"] != float64(429) || r0["error"] != "rate_limit_rpm" {
+		t.Errorf("recent 429 row: %v", r0)
 	}
 }

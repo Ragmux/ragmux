@@ -10,11 +10,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -31,6 +33,8 @@ type Gateway struct {
 	Log       *slog.Logger
 	// MaxBodyBytes caps chat request bodies.
 	MaxBodyBytes int64
+	// Limiter enforces per-project rate limits and budgets; nil disables them.
+	Limiter *limits.Limiter
 }
 
 type ctxKey struct{}
@@ -154,6 +158,30 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Model = clientModel
 
+	// Limits are checked before RAG retrieval so throttled clients do not
+	// cost an embedding call. The token estimate covers the client's
+	// messages and the project prompt; retrieved context is not included.
+	var decision limits.Decision
+	if g.Limiter != nil {
+		est := (len(p.SystemPrompt) + messageChars(req.Messages) + 3) / 4
+		decision, err = g.Limiter.Check(ctx, p, est)
+		if err != nil {
+			log.Error("limit check", "err", err)
+			writeError(w, http.StatusInternalServerError, "server_error", "limit check failed")
+			return
+		}
+		setLimitHeaders(w.Header(), p, decision)
+		if !decision.Allowed {
+			rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, Streamed: req.Stream,
+				StatusCode: http.StatusTooManyRequests, Error: decision.Reason, LatencyMs: time.Since(start).Milliseconds()}
+			if err := g.Store.InsertRequestLog(ctx, rec); err != nil {
+				log.Error("write request log", "err", err)
+			}
+			writeLimitError(w, decision)
+			return
+		}
+	}
+
 	// Project-level system prompt, if configured, goes first.
 	if p.SystemPrompt != "" {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
@@ -178,14 +206,18 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, RAGUsed: ragUsed, Streamed: req.Stream}
-	promptChars := 0
-	for _, m := range req.Messages {
-		promptChars += len(m.Text())
-	}
+	promptChars := messageChars(req.Messages)
 	defer func() {
 		rec.LatencyMs = time.Since(start).Milliseconds()
 		if err := g.Store.InsertRequestLog(context.Background(), rec); err != nil {
 			log.Error("write request log", "err", err)
+		}
+		if g.Limiter != nil {
+			// The minute request slot was already reserved by Check when an
+			// RPM limit is set; otherwise count the request here.
+			if err := g.Limiter.Record(context.Background(), p.ID, rec.PromptTokens, rec.CompletionTokens, !decision.Reserved); err != nil {
+				log.Error("record usage", "err", err)
+			}
 		}
 	}()
 
@@ -281,6 +313,60 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	fillUsage(rec, usage, promptChars, compChars)
+}
+
+func messageChars(msgs []provider.Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += len(m.Text())
+	}
+	return n
+}
+
+// setLimitHeaders exposes the request budget the way OpenAI does (reset as
+// integer seconds) plus Ragmux-specific remaining token budgets. Only limits
+// that are configured produce headers.
+func setLimitHeaders(h http.Header, p *store.Project, d limits.Decision) {
+	if p.RateLimitRPM > 0 {
+		h.Set("x-ratelimit-limit-requests", strconv.Itoa(d.LimitRequests))
+		h.Set("x-ratelimit-remaining-requests", strconv.Itoa(d.RemainingRequests))
+		h.Set("x-ratelimit-reset-requests", strconv.Itoa(ceilSeconds(d.ResetRequests)))
+	}
+	if p.BudgetDailyTokens > 0 {
+		h.Set("x-ragmux-budget-daily-remaining", strconv.FormatInt(max(d.DailyLimit-d.DailyUsed, 0), 10))
+	}
+	if p.BudgetMonthlyTokens > 0 {
+		h.Set("x-ragmux-budget-monthly-remaining", strconv.FormatInt(max(d.MonthlyLimit-d.MonthlyUsed, 0), 10))
+	}
+}
+
+func ceilSeconds(d time.Duration) int {
+	return int((d + time.Second - 1) / time.Second)
+}
+
+// writeLimitError answers a denied request with an OpenAI-style 429.
+func writeLimitError(w http.ResponseWriter, d limits.Decision) {
+	typ, msg := "rate_limit_exceeded", ""
+	switch d.Reason {
+	case limits.ReasonRPM:
+		msg = fmt.Sprintf("Rate limit reached: %d requests per minute for this project.", d.LimitRequests)
+	case limits.ReasonTPM:
+		msg = "Rate limit reached: tokens per minute for this project."
+	case limits.ReasonBudgetDaily:
+		typ = "insufficient_quota"
+		msg = fmt.Sprintf("Daily token budget exhausted (%d of %d tokens used).", d.DailyUsed, d.DailyLimit)
+	case limits.ReasonBudgetMonthly:
+		typ = "insufficient_quota"
+		msg = fmt.Sprintf("Monthly token budget exhausted (%d of %d tokens used).", d.MonthlyUsed, d.MonthlyLimit)
+	default:
+		msg = "Rate limit reached for this project."
+	}
+	retry := ceilSeconds(d.RetryAfter)
+	msg += fmt.Sprintf(" Retry after %d seconds.", retry)
+	w.Header().Set("Retry-After", strconv.Itoa(retry))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": d.Reason}})
 }
 
 func providerError(err error) (int, *provider.Error) {
