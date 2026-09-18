@@ -27,6 +27,11 @@ services:
       LOGIN_USER_LIMIT_PER_MIN: ${LOGIN_USER_LIMIT_PER_MIN:-}
       LOGIN_LOCKOUT_FAILURES: ${LOGIN_LOCKOUT_FAILURES:-}
       LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-}
+      # Outbound SSRF guard: provider base URLs may not point at private or
+      # local addresses unless listed here (e.g. "host.docker.internal,ollama")
+      # or allowed wholesale.
+      PRIVATE_UPSTREAM_ALLOWLIST: ${PRIVATE_UPSTREAM_ALLOWLIST:-}
+      ALLOW_PRIVATE_UPSTREAMS: ${ALLOW_PRIVATE_UPSTREAMS:-false}
     depends_on:
       postgres:
         condition: service_healthy

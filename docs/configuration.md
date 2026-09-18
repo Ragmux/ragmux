@@ -21,6 +21,11 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `UPSTREAM_TIMEOUT` | `5m` | Timeout for a non-streaming provider call. Streaming calls use it for the connect and response-header phase only. |
 | `INGEST_WORKERS` | `2` | Parallel document ingestion jobs (`>= 1`). |
 | `MAX_UPLOAD_MB` | `50` | Maximum size of one document upload request in MiB (`>= 1`). |
+| `MAX_CHUNKS_PER_DOCUMENT` | `20000` | A document that splits into more chunks than this is marked `failed` before anything is embedded (`>= 1`). Bounds the memory and embedding cost of one document. |
+| `ALLOW_PRIVATE_UPSTREAMS` | `false` | `true` lets provider `base_url`s point at loopback, link-local and private networks and re-enables `HTTP_PROXY`/`HTTPS_PROXY` for provider calls. See [Private upstreams](#private-upstreams). |
+| `PRIVATE_UPSTREAM_ALLOWLIST` | *(empty)* | Comma-separated hostnames (case-insensitive) that may resolve to private addresses while `ALLOW_PRIVATE_UPSTREAMS` stays `false`, e.g. `host.docker.internal,ollama`. |
+| `STREAM_MAX_DURATION` | `30m` | Wall-time limit for one streaming provider response (Go duration). The stream ends with a `504 timeout` error when it is reached. |
+| `STREAM_MAX_BYTES_MB` | `256` | Maximum bytes read from one streaming provider response in MiB (`>= 1`). |
 | `SECURE_COOKIES` | `false` | `true` marks the `ragmux_session` cookie `Secure`. Set it when the dashboard is served over HTTPS. |
 | `TRUST_PROXY_HEADERS` | `false` | `true` takes the client address from `X-Real-IP` or the first `X-Forwarded-For` entry (used by login limits and the audit log). Enable only behind a reverse proxy that overwrites those headers. |
 | `LOGIN_RATE_LIMIT_PER_MIN` | `10` | Failed logins allowed per minute from one IP address (`0` disables). |
@@ -34,7 +39,34 @@ The integer variables from `LOGIN_RATE_LIMIT_PER_MIN` down accept `0` or any pos
 number; a negative or non-numeric value is a configuration error.
 
 Standard `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` variables are honoured for outbound
-provider calls (`http.ProxyFromEnvironment`).
+provider calls (`http.ProxyFromEnvironment`) only when `ALLOW_PRIVATE_UPSTREAMS=true`:
+a proxy connects on the gateway's behalf and would bypass the private-address filter
+described next.
+
+## Private upstreams
+
+Provider `base_url`s are entered by dashboard editors, so the gateway treats them as
+untrusted destinations. By default an outbound provider connection is refused when the
+host resolves to a loopback, link-local, multicast, unspecified or private address
+(`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`, `192.0.0/24`,
+`198.18/15`, `fc00::/7`, `fe80::/10`, `64:ff9b::/96`, IPv4-mapped IPv6 included). The
+gateway resolves the name itself and dials the checked address, so a DNS answer that
+changes between the check and the connect does not help an attacker. Redirects are
+followed at most three hops, only to `http`/`https` and only to the same host. A rejected
+connection is reported as
+`upstream host "…" resolves to a private or local address; set ALLOW_PRIVATE_UPSTREAMS=true or add it to PRIVATE_UPSTREAM_ALLOWLIST`,
+and the dashboard refuses to save a `base_url` whose host currently resolves only to such
+addresses.
+
+Local model servers therefore need to be allowed explicitly:
+
+- `PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama` lists the hostnames that may
+  resolve to private addresses (an Ollama on the Docker host, a `vllm` service in the same
+  Compose network, …). Hostnames only; IP literals such as `127.0.0.1` are not matched.
+- `ALLOW_PRIVATE_UPSTREAMS=true` disables the filter for every connection. Use it only
+  when everyone who can edit model connections may also reach every host the gateway can.
+
+The same policy applies to the `POST /admin/api/models/{id}/test` ping.
 
 ## Command-line flags
 
@@ -55,7 +87,11 @@ These are not configurable:
 - `/v1/chat/completions` request bodies are limited to 4 MiB; admin JSON bodies to 1 MiB.
 - HTTP `ReadHeaderTimeout` is 20 s and `IdleTimeout` 120 s.
 - Upstream connections: dial timeout 15 s, TLS handshake 15 s, up to 100 idle connections
-  (20 per host), idle timeout 90 s.
+  (20 per host), idle timeout 90 s, at most 3 same-host redirects.
+- Document parsing: PDFs are read for at most 60 s and 2000 pages; a DOCX
+  `word/document.xml` may be at most 32 MiB (and at most 100× its compressed size); the
+  extracted text of any document is capped at 20 MiB; one ingestion job may run 15 min.
+- The ingestion queue holds 1024 documents; uploads beyond that get `503`.
 - Graceful shutdown on `SIGINT`/`SIGTERM`: in-flight HTTP requests get 15 s, running
   ingestion jobs 30 s, then the retention job and the pool stop. Documents whose
   ingestion was cut short resume on the next start.
@@ -71,6 +107,7 @@ These are not configurable:
 | `POSTGRES_PASSWORD` | `ragmux` | the bundled `postgres` service and the `DATABASE_URL` Compose builds for the gateway (`postgres://ragmux:<password>@postgres:5432/ragmux?sslmode=disable`) |
 | `VERSION` | `dev` | build argument stamped into `ragmux -version` when the image is built locally |
 | `ADMIN_USER`, `ADMIN_PASSWORD`, `LOG_LEVEL`, `CORS_ORIGINS`, `LOGIN_*` | as above | gateway |
+| `PRIVATE_UPSTREAM_ALLOWLIST`, `ALLOW_PRIVATE_UPSTREAMS` | *(empty)*, `false` | gateway; needed for Ollama and other local model servers (see [Private upstreams](#private-upstreams)) |
 | `BACKUP_SCHEDULE` | `@daily` | `backup` profile (see [Backup and restore](backup-restore.md)) |
 | `BACKUP_KEEP_DAYS`, `BACKUP_KEEP_WEEKS`, `BACKUP_KEEP_MONTHS` | `7`, `4`, `6` | `backup` profile |
 

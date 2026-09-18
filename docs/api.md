@@ -59,7 +59,7 @@ requests without a valid session answer
 Management endpoints answer errors as
 
 ```json
-{"error": {"message": "chunk_size must be between 100 and 20000", "type": "Bad Request"}}
+{"error": {"message": "chunk_size must be between 200 and 20000", "type": "Bad Request"}}
 ```
 
 where `type` is the HTTP status text: `Bad Request` (validation), `Not Found`,
@@ -106,8 +106,13 @@ Request body for create and update:
 ```
 
 `provider_type` is one of `openai`, `anthropic`, `gemini`, `deepseek`, `ollama`,
-`custom_openai`; `base_url` must start with `http://` or `https://` and is required
-for `custom_openai`. The response never contains the key:
+`custom_openai`; `base_url` must be an `http://` or `https://` URL with a host and
+without credentials, query string or fragment, and is required for `custom_openai`; a
+host that resolves only to private or local addresses is rejected with `400` unless
+allowed by `PRIVATE_UPSTREAM_ALLOWLIST` / `ALLOW_PRIVATE_UPSTREAMS` (see
+[Configuration](configuration.md#private-upstreams)). `model_name` may contain letters,
+digits and `. _ : / @ -` (up to 128 characters, no leading `/`, no `..`). The response
+never contains the key:
 
 ```json
 {"id": 1, "name": "claude", "provider_type": "anthropic", "base_url": "",
@@ -147,7 +152,7 @@ retrieval semantics are explained in [Retrieval (RAG)](rag.md)):
  "rerank": false, "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true}
 ```
 
-Validation: `chunk_size` 100-20000, `chunk_overlap` ≥ 0 and smaller than `chunk_size`,
+Validation: `chunk_size` 200-20000, `chunk_overlap` ≥ 0 and smaller than `chunk_size`,
 `top_k` ≤ 50, `search_mode` `vector` or `hybrid`, `fts_config` must exist in
 `pg_ts_config`, `rerank_candidates` 1-100, `max_distance` 0-2. The embedding connection
 must be of a type that supports embeddings and cannot be changed while the store has
@@ -163,7 +168,9 @@ Documents look like
 
 with `status` moving `pending` → `processing` → `ready` (or `failed` with `error` set).
 Accepted extensions: `.pdf`, `.docx`, `.html`, `.htm`, `.md`, `.markdown`, `.txt`; the
-request body is limited to `MAX_UPLOAD_MB`.
+request body is limited to `MAX_UPLOAD_MB`. Upload and reprocess answer
+`503 ingestion queue is full, retry later` when the background queue (1024 documents) is
+full; the documents concerned are marked `failed` with that message.
 
 Search request and response:
 
@@ -177,7 +184,8 @@ POST /admin/api/rag-stores/1/search
            "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2}]}
 ```
 
-Everything but `query` is optional and overrides the store setting for this call only.
+Everything but `query` is optional and overrides the store setting for this call only;
+`top_k` is clamped to 1-50 (`0` or absent uses the store's `top_k`).
 A `502` is returned when the embedding call fails.
 
 ### Projects

@@ -24,6 +24,14 @@ exactly as given (so include `/v1` yourself, e.g. `http://vllm:8000/v1`). For `o
 trailing `/v1` is removed because the native endpoints live at the root. When the gateway
 runs in Docker, local servers on the host are reachable as `http://host.docker.internal:<port>`.
 
+A `base_url` must be a plain `http://` or `https://` URL with a host and without
+credentials, query string or fragment. Hosts on private or local networks (the Docker
+host, a Compose service, `localhost`) are refused unless they are listed in
+`PRIVATE_UPSTREAM_ALLOWLIST` or `ALLOW_PRIVATE_UPSTREAMS=true` is set — see
+[Private upstreams](configuration.md#private-upstreams). `model_name` may contain letters,
+digits and `. _ : / @ -` (up to 128 characters, no leading `/`, no `..`); for `gemini` it
+is sent as a single escaped path segment.
+
 `POST /admin/api/models/{id}/test` with `{"mode":"chat"}` or `{"mode":"embedding"}`
 sends a ping through the connection and reports the reply, or the dimensions for
 embeddings, together with latency.
@@ -116,6 +124,18 @@ gives access to Ollama-only options:
 Ollama itself is unauthenticated; if you set an `api_key` it is sent as
 `Authorization: Bearer …`, which is useful behind an authenticating reverse proxy.
 
+Ollama usually runs on a private address, which the gateway refuses by default. Add its
+hostname to the allowlist in `.env` before creating the connection:
+
+```bash
+PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama   # Docker host, or a Compose service named "ollama"
+```
+
+Then use `base_url` `http://host.docker.internal:11434` (Ollama on the host) or
+`http://ollama:11434` (Ollama as a Compose service). `ALLOW_PRIVATE_UPSTREAMS=true`
+allows every private host instead; see
+[Private upstreams](configuration.md#private-upstreams).
+
 To use Ollama's OpenAI-compatible endpoint instead, create a `custom_openai` connection
 with `base_url` ending in `/v1` (for example `http://host.docker.internal:11434/v1`).
 The native type is preferable for `keep_alive`, `num_ctx` and batch embeddings.
@@ -131,7 +151,18 @@ model name with `owned_by` set to the provider type.
 
 ## Error relay and redaction
 
-Provider errors are relayed with the upstream status and message in the OpenAI error
-envelope; transport failures become `502 upstream_error`. Before an upstream message
-reaches a client, the request log or the gateway's own log, anything matching
-`Bearer …`, `sk-…`, `sk-ant-…` or `AIza…` is replaced by `[redacted]`.
+Provider errors are relayed with the upstream status and message (cut to 512
+characters) in the OpenAI error envelope. Transport failures are never relayed verbatim:
+they become `502 upstream_error` with one of `upstream unreachable`, `upstream TLS
+handshake failed`, `upstream returned a non-HTTP response`, `upstream redirect
+rejected: …`, the private-address message from
+[Private upstreams](configuration.md#private-upstreams), or `upstream request failed`;
+timeouts become `504 timeout` / `upstream request timed out`. The raw cause is logged at
+warn level with the upstream host. Streaming responses end with an error after
+`STREAM_MAX_DURATION` or `STREAM_MAX_BYTES_MB`.
+
+Before an upstream message reaches a client, the request log or the gateway's own log,
+the connection's own API key and anything matching `Bearer …`, `Basic …`, a JWT
+(`eyJ…`), `sk-…`, `sk-ant-…`, `AIza…`, `ya29.…`, `gsk_…`, `hf_…`, `xai-…` or credentials
+embedded in a URL (`https://user:pass@host`) is replaced by `[redacted]`. This covers
+Anthropic stream `error` events and Ollama error bodies as well.
