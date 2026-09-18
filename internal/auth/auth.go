@@ -59,14 +59,24 @@ func (s *Service) Login(ctx context.Context, username, password string) (*store.
 	if !CheckPassword(u.PasswordHash, password) || !u.IsActive {
 		return nil, "", ErrInvalidCredentials
 	}
-	tok, err := store.GenerateSessionToken()
+	tok, err := s.NewSession(ctx, u.ID)
 	if err != nil {
 		return nil, "", err
 	}
-	if err := s.Store.CreateSession(ctx, u.ID, tok, s.TTL); err != nil {
-		return nil, "", err
-	}
 	return u, tok, nil
+}
+
+// NewSession issues a session token for a user whose identity the caller
+// has already established (a login, or the first-run setup).
+func (s *Service) NewSession(ctx context.Context, userID int64) (string, error) {
+	tok, err := store.GenerateSessionToken()
+	if err != nil {
+		return "", err
+	}
+	if err := s.Store.CreateSession(ctx, userID, tok, s.TTL); err != nil {
+		return "", err
+	}
+	return tok, nil
 }
 
 // Logout revokes the session in the request.

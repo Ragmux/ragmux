@@ -121,10 +121,18 @@ type env struct {
 // Calling it twice with the same cfg is the test's equivalent of restarting
 // the container against the same database.
 func newEnv(t *testing.T, cfg store.OpenConfig) *env {
+	return newEnvWith(t, cfg, true)
+}
+
+// newEnvWith is newEnv with control over the bootstrap admin: with
+// bootstrap false the users table is left as it is (empty for a fresh
+// schema) and no session is opened, which is how the first-run setup flow
+// is exercised.
+func newEnvWith(t *testing.T, cfg store.OpenConfig, bootstrap bool) *env {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	st := testdb.OpenWith(t, cfg)
-	if n, _ := st.CountUsers(ctx); n == 0 {
+	if n, _ := st.CountUsers(ctx); n == 0 && bootstrap {
 		h, _ := auth.HashPassword("password123")
 		if _, err := st.CreateUser(ctx, "admin", h, "admin"); err != nil {
 			t.Fatal(err)
@@ -153,6 +161,9 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, srv: srv, store: st, usage: usage}
+	if !bootstrap {
+		return e
+	}
 	res := e.call("POST", "/admin/api/login", map[string]any{"username": "admin", "password": "password123", "bearer": true}, "")
 	e.session = res["token"].(string)
 	return e
@@ -369,7 +380,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(4) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(6) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 

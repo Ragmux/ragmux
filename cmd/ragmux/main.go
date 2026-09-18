@@ -252,7 +252,9 @@ func run(cfg config.Config) error {
 	return shutErr
 }
 
-// bootstrapAdmin creates the first user when the users table is empty.
+// bootstrapAdmin pre-creates the first user from ADMIN_USER/ADMIN_PASSWORD
+// when the users table is empty (unattended installs). Without a password
+// nothing is created: the dashboard offers the first-run setup instead.
 func bootstrapAdmin(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) error {
 	n, err := st.CountUsers(ctx)
 	if err != nil {
@@ -261,31 +263,22 @@ func bootstrapAdmin(ctx context.Context, st *store.Store, cfg config.Config, log
 	if n > 0 {
 		return nil
 	}
-	pw := cfg.AdminPassword
-	generated := false
-	if pw == "" {
-		pw, err = store.GenerateSessionToken()
-		if err != nil {
-			return err
-		}
-		pw = pw[:20]
-		generated = true
+	if cfg.AdminPassword == "" {
+		log.Info("no users yet: open /admin/ to create the first administrator")
+		return nil
 	}
-	hash, err := auth.HashPassword(pw)
+	hash, err := auth.HashPassword(cfg.AdminPassword)
 	if err != nil {
 		return err
 	}
-	if _, err := st.CreateUser(ctx, cfg.AdminUser, hash, string(auth.RoleAdmin)); err != nil {
+	u, err := st.CreateFirstUser(ctx, cfg.AdminUser, hash, string(auth.RoleAdmin))
+	if errors.Is(err, store.ErrSetupDone) {
+		return nil // another replica or a setup request got there first
+	}
+	if err != nil {
 		return err
 	}
-	if generated {
-		// Printed once; set ADMIN_PASSWORD to avoid this.
-		fmt.Fprintf(os.Stderr, "\n==========================================================\n"+
-			"  Initial admin account created\n  username: %s\n  password: %s\n"+
-			"  (change it in the dashboard; set ADMIN_PASSWORD to preset it)\n"+
-			"==========================================================\n\n", cfg.AdminUser, pw)
-	}
-	log.Info("admin user created", "username", cfg.AdminUser, "generated_password", generated)
+	log.Info("admin user created from ADMIN_PASSWORD", "username", u.Username)
 	return nil
 }
 
