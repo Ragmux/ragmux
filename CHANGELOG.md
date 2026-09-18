@@ -6,6 +6,13 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **Provider keys are bound to their connection.** `api_key_enc` is now sealed with the
+  connection id as AES-GCM associated data (`key_version = 1`), so a ciphertext copied
+  onto another row by someone with database write access no longer decrypts there.
+  Rows written by earlier releases (`key_version = 0`) are re-sealed once on the next
+  start with the same `SECRET_KEY`; `ragmux rotate-key` also writes the bound form.
+
 ## [0.2.2] — 2026-09-18
 
 ### Security

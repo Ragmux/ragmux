@@ -288,6 +288,13 @@ Rows are only rewritten when every one of them decrypts with the current key and
 re-decrypts with the new one; otherwise the command exits `1` and the database is
 unchanged. Dumps taken before the rotation still need the old key.
 
+Since 0.2.3 each stored key is also bound to its connection id (`key_version = 1` in
+`model_connections`), so a ciphertext moved to another row does not decrypt. Dumps taken
+with an earlier version restore fine: the gateway re-seals every `key_version = 0` row
+with the same `SECRET_KEY` on its first start and logs how many it changed. That start
+fails with `upgrade stored provider keys` when the key does not match the dump; put the
+right key back and start again.
+
 ## Security notes
 
 Dumps contain the encrypted provider API keys, every uploaded document, password
