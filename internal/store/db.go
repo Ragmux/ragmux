@@ -134,6 +134,15 @@ type DatabaseInfo struct {
 	SizeBytes         int64  `json:"size_bytes"`
 }
 
+// BackupInfo sizes the parts of the state an operator backs up: the
+// per-dimension vector tables that pg_dump picks up dynamically, the raw
+// document bytes kept in the database, and when the schema last changed.
+type BackupInfo struct {
+	Tables          int        `json:"tables"`
+	DocumentsBytes  int64      `json:"documents_bytes"`
+	LastMigrationAt *time.Time `json:"last_migration_at"`
+}
+
 // DatabaseInfo reports server, extension and migration versions plus size.
 func (s *Store) DatabaseInfo(ctx context.Context) (*DatabaseInfo, error) {
 	info := &DatabaseInfo{PostgresVersion: s.ServerVersion}
@@ -142,6 +151,23 @@ func (s *Store) DatabaseInfo(ctx context.Context) (*DatabaseInfo, error) {
 		COALESCE((SELECT MAX(version) FROM schema_migrations), 0),
 		pg_database_size(current_database())`).
 		Scan(&info.PgvectorVersion, &info.MigrationsVersion, &info.SizeBytes)
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// BackupInfo counts the chunk_embeddings_<dims> tables in the current
+// schema, sums the stored document contents and returns the timestamp of
+// the newest applied migration (nil before the first one).
+func (s *Store) BackupInfo(ctx context.Context) (*BackupInfo, error) {
+	info := &BackupInfo{}
+	err := s.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM pg_tables
+		   WHERE schemaname = current_schema() AND tablename ~ '^chunk_embeddings_[0-9]+$'),
+		COALESCE((SELECT SUM(octet_length(content)) FROM documents), 0),
+		(SELECT MAX(applied_at) FROM schema_migrations)`).
+		Scan(&info.Tables, &info.DocumentsBytes, &info.LastMigrationAt)
 	if err != nil {
 		return nil, err
 	}
