@@ -6,6 +6,28 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **RAG sources on chat responses.** Responses whose prompt received retrieved context
+  carry `x-ragmux-rag-sources`, a JSON array of `{document_id, filename, section, page,
+  score}` for the injected passages, trimmed to whole entries under 2 KB. A request may
+  add `"ragmux": {"include_context": true}` to receive the same list plus the exact
+  injected context block as a top-level `ragmux` object on non-streaming responses; the
+  field is stripped before the upstream call and streaming responses only get the header.
+- **`rag_hits` in request logs** (migration 0007): the number of passages injected per
+  request, next to `rag_used`, in `/admin/api/metrics/requests` and the summary's `recent`.
+- **Metrics summary options.** `GET /admin/api/metrics/summary` (and
+  `/projects/{id}/metrics`) accept `compare=1` for a `previous` block covering the window
+  before the current one, `days=N` (1–90) to size the `daily` series and `by_project=1`
+  for a per-project `projects` breakdown under the caller's membership scope.
+- **CSV export.** `GET /admin/api/metrics/requests.csv?window=&project_id=` and
+  `GET /admin/api/projects/{id}/metrics.csv?window=` download up to 50 000 request logs
+  of the window as `text/csv` with a dated attachment filename; cells starting with
+  `=`, `+`, `-` or `@` are prefixed with a quote so spreadsheets do not evaluate them.
+- **Budget forecast.** `GET /admin/api/projects/{id}/usage` gains
+  `forecast.daily_exhausted_at` / `monthly_exhausted_at`: a linear projection from the
+  tokens consumed in the last 60 minutes, `null` without a budget, without recent usage,
+  or when the budget outlasts its window.
+
 ## [0.2.3] — 2026-09-18
 
 ### Changed

@@ -231,8 +231,9 @@ A `502` is returned when the embedding call fails.
 | POST | `/projects/{id}/rotate-key` | member + editor | New key → `{"project": …, "api_key": "sk-proj-…"}`; the old key stops working immediately |
 | GET | `/projects/{id}/members` | member | `[{id, username, role, added_at}]` |
 | PUT | `/projects/{id}/members` | member + editor | `{"user_ids": [1, 4]}` replaces the member set; an editor cannot remove themselves |
-| GET | `/projects/{id}/metrics?window=24h` | member | Metrics for one project (see below) |
-| GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters |
+| GET | `/projects/{id}/metrics?window=24h` | member | Metrics for one project (see below; takes the same `compare`, `days` and `by_project` options as the summary) |
+| GET | `/projects/{id}/metrics.csv?window=24h` | member | The project's request logs in the window as a CSV download (see below) |
+| GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
 
 Project body:
 
@@ -257,18 +258,32 @@ again.
             "requests": 2, "prompt_tokens": 20, "completion_tokens": 4, "tokens": 24,
             "request_limit": 2, "request_percent": 100, "token_limit": 0, "token_percent": 0},
  "day":   {"…": "…", "tokens": 12, "token_limit": 5, "token_percent": 100, "resets_at": "2026-09-19T00:00:00Z"},
- "month": {"…": "…"}}
+ "month": {"…": "…"},
+ "forecast": {"daily_exhausted_at": "2026-09-18T15:40:00Z", "monthly_exhausted_at": null}}
 ```
+
+`forecast` extends the tokens consumed in the last 60 minutes linearly and reports when
+each budget would run out at that pace. A value is `null` when the budget is not set,
+nothing was consumed in the last hour, or the projection lands after the window resets
+(`resets_at`); an already exhausted budget projects to `generated_at`.
 
 ### Metrics
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/metrics/summary?window=24h` | viewer | Summary over the projects the caller can see |
+| GET | `/metrics/summary?window=24h&compare=1&days=14&by_project=1` | viewer | Summary over the projects the caller can see |
 | GET | `/metrics/requests?limit=50&project_id=3` | viewer | Recent request logs, newest first (`limit` defaults to 100, max 1000; `project_id` must be visible to the caller) |
+| GET | `/metrics/requests.csv?window=24h&project_id=3` | viewer | Request logs in the window as a CSV download (`project_id` optional, same visibility rule) |
 
-`window` is a Go duration (default `24h`). The summary response (also used by
-`/projects/{id}/metrics`):
+`window` is a Go duration (default `24h`). Optional summary parameters:
+
+| Parameter | Effect |
+|---|---|
+| `compare=1` | adds `previous`: the same summary fields for the window of equal length that ends where the current one starts |
+| `days=N` | sizes the `daily` series (1–90, default 14; out-of-range values are clamped) |
+| `by_project=1` | adds `projects`: one row per project with requests in the window, busiest first, limited to the projects the caller can see |
+
+The summary response (also used by `/projects/{id}/metrics`):
 
 ```json
 {"window": {"requests": 120, "errors": 3, "prompt_tokens": 51000, "completion_tokens": 9800,
@@ -277,12 +292,32 @@ again.
  "daily":  [{"day": "2026-09-05", "requests": 10, "errors": 0, "prompt_tokens": 4000, "completion_tokens": 900}],
  "recent": [{"id": 991, "project_id": 3, "model_name": "claude-sonnet-4-5", "status_code": 200,
              "prompt_tokens": 420, "completion_tokens": 80, "estimated": false, "latency_ms": 910,
-             "streamed": true, "rag_used": true, "error": "", "created_at": "…"}]}
+             "streamed": true, "rag_used": true, "rag_hits": 3, "error": "", "created_at": "…"}],
+ "previous": {"…": "only with compare=1"},
+ "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
+               "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70}]}
 ```
 
-`daily` covers the last 14 days, `recent` the last 50 requests. Status semantics
-(`429`, `499`, `502`/`504`) are described in
+`daily` covers the last `days` days (14 by default), `recent` the last 50 requests.
+`rag_hits` is the number of retrieved passages injected into that request (`0` when
+`rag_used` is false). Status semantics (`429`, `499`, `502`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
+
+#### CSV export
+
+`GET /metrics/requests.csv` and `GET /projects/{id}/metrics.csv` return the window's
+request logs, oldest first and at most 50 000 rows, as `text/csv` with a
+`Content-Disposition: attachment; filename="ragmux-requests-<date>.csv"` (or
+`ragmux-project-<id>-requests-<date>.csv`) header. Columns:
+
+```
+created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
+estimated, latency_ms, streamed, rag_used, rag_hits, error
+```
+
+Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
+are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
+model names and error messages can be shaped by an upstream.
 
 ### Users and audit log
 
@@ -339,8 +374,17 @@ Accepts the OpenAI Chat Completions payload: `model`, `messages` (text or
 `text` / `image_url` content parts), `stream`, `temperature`, `top_p`, `max_tokens` /
 `max_completion_tokens`, `stop`, `n`, `tools`, `tool_choice`, `response_format`,
 `stream_options`, `user`. Unknown fields are forwarded to OpenAI-compatible upstreams
-unchanged (see [Providers](providers.md)). `messages` is required; the body may not
-exceed 4 MiB.
+unchanged (see [Providers](providers.md)), with one exception: an optional `ragmux`
+object is consumed by the gateway and never sent upstream. `messages` is required; the
+body may not exceed 4 MiB.
+
+```json
+{"model": "…", "messages": […], "ragmux": {"include_context": true}}
+```
+
+`include_context` asks for the retrieved sources and the exact context block that was
+injected, added as a top-level `ragmux` object to a non-streaming response (see
+[RAG](rag.md#sources-on-the-response)); streaming responses only carry the headers.
 
 What happens to a request, in order:
 
@@ -349,8 +393,9 @@ What happens to a request, in order:
    message (or inserted as one).
 3. If the project has a RAG store, the last `user` message is used as the query and the
    retrieved passages are injected the same way; the response carries
-   `x-ragmux-rag-hits: <n>`. Retrieval failures are logged and the request continues
-   without context.
+   `x-ragmux-rag-hits: <n>` and, when passages were injected, `x-ragmux-rag-sources`
+   listing them. Retrieval failures are logged and the request continues without
+   context.
 4. The request is translated for the provider and sent. The `model` field is **not**
    used for routing; the project's connection decides. The value you send is echoed
    back in the response (`model` of the completion and every stream chunk); an empty
@@ -371,6 +416,7 @@ Response headers, only for limits the project has set:
 | `x-ragmux-budget-daily-remaining` | tokens left in today's budget |
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
+| `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
 
 Status codes:
 

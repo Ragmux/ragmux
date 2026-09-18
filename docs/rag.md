@@ -166,6 +166,36 @@ document could trigger.
 (`0` when nothing matched; absent when the project has no store). If the embedding call
 fails the request continues without context and a warning is logged.
 
+### Sources on the response
+
+When passages were injected the response also carries `x-ragmux-rag-sources`, a compact
+JSON array with one entry per injected passage in prompt order (the `[n]` labels):
+
+```
+x-ragmux-rag-sources: [{"document_id":2,"filename":"handbook.pdf","section":"Leave > Vacation","page":12,"score":0.0325}]
+```
+
+`score` is the fused search score, `section` and `page` are empty / `0` when the format
+has none. Non-ASCII characters are `\u`-escaped and the array is capped at 2048 bytes:
+trailing entries are dropped until it fits, so the header is always a complete array
+even when it lists fewer passages than `x-ragmux-rag-hits`. Passage text is never put in
+a header.
+
+A client that wants the passages themselves adds `"ragmux": {"include_context": true}` to
+the chat request. The field is removed before the request goes upstream; a non-streaming
+response then gains a top-level `ragmux` object next to the OpenAI fields:
+
+```json
+{"id": "…", "object": "chat.completion", "choices": […], "usage": {…},
+ "ragmux": {"sources": [{"document_id": 2, "filename": "handbook.pdf", "section": "Leave > Vacation", "page": 12, "score": 0.0325}],
+            "context": "Use the following retrieved context …\n\n<context>\n[1] (handbook.pdf · Leave > Vacation · p.12)\n…</context>"}}
+```
+
+`context` is the exact block that was prepended to the system prompt (empty, with
+`sources: []`, when nothing was injected). Streaming responses are not modified; they
+only get the header. Every request also records the number of injected passages as
+`rag_hits` in the request log.
+
 ## Search endpoint
 
 `POST /admin/api/rag-stores/{id}/search` takes `{query, top_k, mode, rerank, max_distance}`
