@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -33,8 +34,12 @@ func CheckPassword(hash, pw string) bool {
 type Service struct {
 	Store *store.Store
 	TTL   time.Duration
-	// Secure marks the cookie Secure; enable behind TLS.
+	// Secure marks the cookie Secure unconditionally (SECURE_COOKIES). The
+	// flag is also set when the request itself arrived over TLS, or, with
+	// TrustProxy, when the proxy reports X-Forwarded-Proto: https.
 	Secure bool
+	// TrustProxy mirrors TRUST_PROXY_HEADERS for the X-Forwarded-Proto check.
+	TrustProxy bool
 }
 
 // ErrInvalidCredentials is returned by Login on a bad username/password.
@@ -66,28 +71,38 @@ func (s *Service) Login(ctx context.Context, username, password string) (*store.
 
 // Logout revokes the session in the request.
 func (s *Service) Logout(ctx context.Context, r *http.Request) error {
-	if tok := tokenFromRequest(r); tok != "" {
+	if tok := TokenFromRequest(r); tok != "" {
 		return s.Store.DeleteSession(ctx, tok)
 	}
 	return nil
 }
 
-// SetCookie writes the session cookie.
-func (s *Service) SetCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure follows SECURE_COOKIES so plain-HTTP deployments keep working
-		Name: CookieName, Value: token, Path: "/", HttpOnly: true, Secure: s.Secure,
+// SetCookie writes the session cookie for the request's connection.
+func (s *Service) SetCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure is derived from the connection so plain-HTTP deployments keep working
+		Name: CookieName, Value: token, Path: "/", HttpOnly: true, Secure: s.secure(r),
 		SameSite: http.SameSiteLaxMode, MaxAge: int(s.TTL.Seconds()),
 	})
 }
 
 // ClearCookie expires the session cookie.
-func (s *Service) ClearCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure follows SECURE_COOKIES so plain-HTTP deployments keep working
-		Name: CookieName, Value: "", Path: "/", HttpOnly: true, Secure: s.Secure, SameSite: http.SameSiteLaxMode, MaxAge: -1,
+func (s *Service) ClearCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // G124: Secure is derived from the connection so plain-HTTP deployments keep working
+		Name: CookieName, Value: "", Path: "/", HttpOnly: true, Secure: s.secure(r), SameSite: http.SameSiteLaxMode, MaxAge: -1,
 	})
 }
 
-func tokenFromRequest(r *http.Request) string {
+// secure reports whether the cookie for this request should carry Secure.
+func (s *Service) secure(r *http.Request) bool {
+	if s.Secure || r.TLS != nil {
+		return true
+	}
+	return s.TrustProxy && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+// TokenFromRequest returns the session token the request carries: the bearer
+// header wins over the cookie.
+func TokenFromRequest(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimSpace(h[7:])
 	}
@@ -97,12 +112,24 @@ func tokenFromRequest(r *http.Request) string {
 	return ""
 }
 
-// Middleware rejects requests without a valid session.
+// IsBearer reports whether the request authenticates with an Authorization
+// header rather than the session cookie. Bearer requests cannot be forged by
+// a foreign page, so the cross-site checks do not apply to them.
+func IsBearer(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ")
+}
+
+// Middleware rejects requests without a valid session, and cookie-
+// authenticated state changes that a foreign origin initiated.
 func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tok := tokenFromRequest(r)
+		tok := TokenFromRequest(r)
 		if tok == "" {
 			unauthorized(w)
+			return
+		}
+		if !IsBearer(r) && !SameOriginOK(r) {
+			forbiddenCrossSite(w)
 			return
 		}
 		u, err := s.Store.UserBySession(r.Context(), tok)
@@ -112,6 +139,32 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(ContextWithUser(r.Context(), u)))
 	})
+}
+
+// SameOriginOK is the CSRF check for cookie-authenticated requests. Reads
+// always pass. For state-changing methods the browser's Sec-Fetch-Site must
+// say same-origin (or none: typed URL, bookmark); "same-site" (a sibling
+// subdomain) and "cross-site" are refused. Older browsers do not send
+// Sec-Fetch-Site but always send Origin on cross-origin POSTs, so its host
+// must then match the request host. Requests with neither header come from
+// non-browser clients using a cookie jar and are allowed.
+func SameOriginOK(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site == "same-origin" || site == "none"
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" || origin == "null" {
+		return origin == ""
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // ContextWithUser attaches a user the way Middleware does (for tests and
@@ -124,6 +177,12 @@ func ContextWithUser(ctx context.Context, u *store.User) context.Context {
 func UserFrom(ctx context.Context) *store.User {
 	u, _ := ctx.Value(ctxKey{}).(*store.User)
 	return u
+}
+
+func forbiddenCrossSite(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`{"error":{"message":"cross-site request rejected","type":"forbidden"}}`))
 }
 
 func unauthorized(w http.ResponseWriter) {
