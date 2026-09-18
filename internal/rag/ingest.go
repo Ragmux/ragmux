@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -27,7 +28,19 @@ type Ingester struct {
 	stopping  chan struct{}
 	stopOnce  sync.Once
 	batchSize int
+	// MaxChunksPerDocument fails a document that splits into more chunks
+	// than this before anything is embedded; 0 means DefaultMaxChunks.
+	MaxChunksPerDocument int
 }
+
+// DefaultMaxChunks is the chunk cap used when MaxChunksPerDocument is 0.
+const DefaultMaxChunks = 20000
+
+// processTimeout bounds one document's parse, embed and store cycle.
+const processTimeout = 15 * time.Minute
+
+// ErrQueueFull is returned by Enqueue when the ingestion queue is full.
+var ErrQueueFull = errors.New("ingestion queue is full, retry later")
 
 // NewIngester starts n worker goroutines.
 func NewIngester(ctx context.Context, st *store.Store, factory EmbedderFactory, workers int, log *slog.Logger) *Ingester {
@@ -47,12 +60,14 @@ func NewIngester(ctx context.Context, st *store.Store, factory EmbedderFactory, 
 	return ing
 }
 
-// Enqueue schedules a document for processing.
-func (ing *Ingester) Enqueue(docID int64) {
+// Enqueue schedules a document for processing. It returns ErrQueueFull
+// instead of blocking when the queue has no room.
+func (ing *Ingester) Enqueue(docID int64) error {
 	select {
 	case ing.queue <- docID:
+		return nil
 	default:
-		ing.log.Warn("ingest queue full; document will be picked up on next restart", "doc", docID)
+		return ErrQueueFull
 	}
 }
 
@@ -63,7 +78,10 @@ func (ing *Ingester) Resume(ctx context.Context) error {
 		return err
 	}
 	for _, d := range docs {
-		ing.Enqueue(d.ID)
+		if err := ing.Enqueue(d.ID); err != nil {
+			// Still pending in the database, so a later Resume finds it.
+			ing.log.Warn("resume: ingest queue full; document waits for the next restart", "doc", d.ID)
+		}
 	}
 	if len(docs) > 0 {
 		ing.log.Info("resumed unfinished document ingestion", "count", len(docs))
@@ -122,8 +140,11 @@ func (ing *Ingester) worker(ctx context.Context) {
 	}
 }
 
-// Process runs the full pipeline for a single document synchronously.
+// Process runs the full pipeline for a single document synchronously,
+// bounded by processTimeout.
 func (ing *Ingester) Process(ctx context.Context, docID int64) error {
+	ctx, cancel := context.WithTimeout(ctx, processTimeout)
+	defer cancel()
 	doc, err := ing.store.GetDocument(ctx, docID)
 	if err != nil {
 		return err
@@ -149,13 +170,22 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	if err != nil {
 		return fmt.Errorf("load document content: %w", err)
 	}
-	parsed, err := Extract(doc.Filename, data)
+	parsed, err := Extract(ctx, doc.Filename, data)
 	if err != nil {
 		return err
 	}
 	pieces := SplitBlocks(parsed.Blocks, rs.ChunkSize, rs.ChunkOverlap)
 	if len(pieces) == 0 {
 		return fmt.Errorf("document produced no text chunks")
+	}
+	// The cap bounds the memory held by the chunk slice and the single
+	// ReplaceDocumentChunks write below, and the embedding calls it takes.
+	maxChunks := ing.MaxChunksPerDocument
+	if maxChunks <= 0 {
+		maxChunks = DefaultMaxChunks
+	}
+	if len(pieces) > maxChunks {
+		return fmt.Errorf("document splits into %d chunks, more than the limit of %d (MAX_CHUNKS_PER_DOCUMENT); raise the store's chunk_size or the limit", len(pieces), maxChunks)
 	}
 	title := parsed.Title
 	if title == "" {
