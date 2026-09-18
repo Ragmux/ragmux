@@ -428,7 +428,8 @@ func (a *Admin) testConnection(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	maxTok := 16
+	// Reasoning models spend part of the budget thinking before answering.
+	maxTok := 256
 	req := provider.ChatRequest{Model: c.ModelName, MaxTokens: &maxTok,
 		Messages: []provider.Message{{Role: "user", Content: provider.TextContent("Reply with the single word: pong")}}}
 	resp, err := prov.Chat(r.Context(), req)

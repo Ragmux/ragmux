@@ -6,6 +6,21 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-18
+
+### Fixed
+- OpenAI-compatible requests carried a stray `"Extra": null` field, which OpenAI rejects with
+  `Unrecognized request argument supplied: Extra`. Unknown client fields are still merged into
+  the request; the container field itself is no longer serialised.
+- Connection tests use a 256-token budget so reasoning models (Claude, Gemini, gemma) return
+  a visible reply instead of an empty string.
+- Gemini `completion_tokens` now includes reasoning ("thoughts") tokens, so
+  `prompt_tokens + completion_tokens == total_tokens` as with the other providers.
+
+Verified live against OpenAI (`gpt-4o-mini`, `text-embedding-3-small`), Anthropic
+(`claude-opus-5`), Gemini (`gemini-3.6-flash`) and a local Ollama `gemma4:12b`: JSON and
+streaming chat, tool calls (OpenAI, Anthropic), hybrid RAG with reranking over MD/DOCX/HTML.
+
 ## [0.2.0] — 2026-09-18
 
 ### Breaking
@@ -94,5 +109,6 @@ for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over P
 projects with `sk-proj-` keys, metrics and an embedded dashboard.
 
 [Unreleased]: https://github.com/ragmux/ragmux/compare/v0.2.0...HEAD
+[0.2.1]: https://github.com/ragmux/ragmux/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ragmux/ragmux/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ragmux/ragmux/releases/tag/v0.1.0

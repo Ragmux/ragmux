@@ -25,6 +25,13 @@ func TestChatRequestExtraRoundTrip(t *testing.T) {
 	if m["seed"] != float64(42) || m["logprobs"] != true || m["temperature"] != 0.5 {
 		t.Errorf("round trip lost fields: %s", out)
 	}
+	if _, ok := m["Extra"]; ok {
+		t.Errorf("Extra must not be serialised as a field: %s", out)
+	}
+	plain, _ := json.Marshal(ChatRequest{Model: "m"})
+	if strings.Contains(string(plain), "Extra") {
+		t.Errorf("empty Extra leaked into wire format: %s", plain)
+	}
 	if r.Messages[0].Text() != "hi" {
 		t.Errorf("text = %q", r.Messages[0].Text())
 	}
