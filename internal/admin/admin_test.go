@@ -75,3 +75,24 @@ func TestEffectiveLimitAndStoreQuota(t *testing.T) {
 		t.Errorf("unlimited: %v", err)
 	}
 }
+
+func TestUpstreamPrivateLiterals(t *testing.T) {
+	ctx := context.Background()
+	for baseURL, want := range map[string]bool{
+		"":                          false, // provider default URL
+		"http://localhost:11434":    true,
+		"http://127.0.0.1:8000/v1":  true,
+		"http://[::1]:8000/v1":      true,
+		"http://172.16.5.5/v1":      true,
+		"http://169.254.169.254/v1": true,
+		"https://8.8.8.8/v1":        false,
+	} {
+		got := upstreamPrivate(ctx, baseURL)
+		if got == nil || *got != want {
+			t.Errorf("upstreamPrivate(%q) = %v, want %v", baseURL, got, want)
+		}
+	}
+	if got := upstreamPrivate(ctx, "://bad"); got != nil {
+		t.Errorf("unparseable url should be unknown, got %v", *got)
+	}
+}

@@ -287,13 +287,22 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 		t.Fatalf("upload: %v", doc)
 	}
 	docID := int64(doc["id"].(float64))
+	if doc["progress_percent"] != float64(0) || doc["page_count"] != nil {
+		t.Errorf("fresh document: %v", doc)
+	}
 	e.waitReady(docID)
+	if d := e.call("GET", fmt.Sprintf("/admin/api/documents/%d", docID), nil, ""); d["progress_percent"] != float64(100) || d["page_count"] != nil {
+		t.Errorf("ready document: %v", d)
+	}
 
 	// Vector search returns the banana chunk for a banana query.
 	sr := e.call("POST", fmt.Sprintf("/admin/api/rag-stores/%d/search", storeID), map[string]any{"query": "tell me about banana"}, "")
 	hits := sr["hits"].([]any)
 	if len(hits) == 0 || !strings.Contains(hits[0].(map[string]any)["content"].(string), "Banana") {
 		t.Fatalf("search hits: %v", hits)
+	}
+	if _, ok := sr["retrieval_latency_ms"].(float64); !ok || sr["rerank_latency_ms"] != nil {
+		t.Errorf("search latencies without rerank: %v", sr)
 	}
 
 	proj := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID, "rag_store_id": storeID}, "")
@@ -920,6 +929,12 @@ func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
 	rr := search(map[string]any{"query": "apple zyxquux", "rerank": true})
 	if rr["reranked"] != true || hitContents(rr)[0] == hitContents(hy)[0] {
 		t.Errorf("rerank should reorder: %v vs %v", hitContents(rr), hitContents(hy))
+	}
+	if _, ok := rr["rerank_latency_ms"].(float64); !ok {
+		t.Errorf("rerank_latency_ms should be set: %v", rr)
+	}
+	if _, ok := rr["retrieval_latency_ms"].(float64); !ok || hy["rerank_latency_ms"] != nil {
+		t.Errorf("latency fields: reranked %v, plain %v", rr, hy)
 	}
 
 	// Updating retrieval settings; chunking changes recommend reprocessing.

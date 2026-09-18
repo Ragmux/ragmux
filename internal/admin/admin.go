@@ -122,6 +122,7 @@ func (a *Admin) authenticated(r chi.Router) {
 	editor.Put("/api/models/{id}", a.updateConnection)
 	editor.Delete("/api/models/{id}", a.deleteConnection)
 	editor.Post("/api/models/{id}/test", a.testConnection)
+	editor.Post("/api/models/test", a.testUnsavedConnection)
 
 	// RAG stores and documents: same split; search is a read.
 	r.Get("/api/rag-stores", a.listRAGStores)
@@ -424,14 +425,18 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 		DefaultURL string `json:"default_base_url"`
 		Embeddings bool   `json:"supports_embeddings"`
 		NeedsKey   bool   `json:"requires_api_key"`
+		// Tools and Streaming mirror the adapter capabilities: every adapter
+		// streams; Gemini refuses requests with tools.
+		Tools     bool `json:"supports_tools"`
+		Streaming bool `json:"supports_streaming"`
 	}
 	out := []pt{
-		{"openai", "OpenAI", "https://api.openai.com/v1", true, true},
-		{"anthropic", "Anthropic", "https://api.anthropic.com", false, true},
-		{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", true, true},
-		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", false, true},
-		{"ollama", "Ollama", "http://localhost:11434", true, false},
-		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", true, false},
+		{"openai", "OpenAI", "https://api.openai.com/v1", true, true, true, true},
+		{"anthropic", "Anthropic", "https://api.anthropic.com", false, true, true, true},
+		{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", true, true, false, true},
+		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", false, true, true, true},
+		{"ollama", "Ollama", "http://localhost:11434", true, false, true, true},
+		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", true, false, true, true},
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -454,6 +459,12 @@ func (in connInput) validate(ctx context.Context, a *Admin) error {
 	if strings.TrimSpace(in.Name) == "" {
 		return errors.New("name is required")
 	}
+	return in.validateEndpoint(ctx, a)
+}
+
+// validateEndpoint is validate without the name check: a connection can be
+// tested before it has a name.
+func (in connInput) validateEndpoint(ctx context.Context, a *Admin) error {
 	if !store.IsValidProviderType(in.ProviderType) {
 		return fmt.Errorf("provider_type must be one of %s", strings.Join(store.ValidProviderTypes, ", "))
 	}
@@ -490,6 +501,34 @@ func (in connInput) validate(ctx context.Context, a *Admin) error {
 	return nil
 }
 
+// connection builds the row to save from validated input. private_upstream
+// is classified here, at save time, so reads never touch DNS.
+func (in connInput) connection(ctx context.Context, id int64) *store.ModelConnection {
+	c := &store.ModelConnection{ID: id, Name: strings.TrimSpace(in.Name), ProviderType: in.ProviderType,
+		BaseURL: strings.TrimSpace(in.BaseURL), APIKey: strings.TrimSpace(in.APIKey), ModelName: strings.TrimSpace(in.ModelName)}
+	c.UpstreamPrivate = upstreamPrivate(ctx, c.BaseURL)
+	return c
+}
+
+// upstreamPrivate classifies the host of a base URL; nil when the lookup
+// failed (stored as NULL, reported as false). The provider default URL
+// (empty base_url) counts as public.
+func upstreamPrivate(ctx context.Context, baseURL string) *bool {
+	f := false
+	if baseURL == "" {
+		return &f
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Hostname() == "" {
+		return nil
+	}
+	private, err := netguard.HostIsPrivate(ctx, u.Hostname())
+	if err != nil {
+		return nil
+	}
+	return &private
+}
+
 func (a *Admin) listConnections(w http.ResponseWriter, r *http.Request) {
 	list, err := a.Store.ListConnections(r.Context())
 	if err != nil {
@@ -509,9 +548,7 @@ func (a *Admin) createConnection(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	c, err := a.Store.CreateConnection(r.Context(), &store.ModelConnection{
-		Name: strings.TrimSpace(in.Name), ProviderType: in.ProviderType, BaseURL: strings.TrimSpace(in.BaseURL),
-		APIKey: strings.TrimSpace(in.APIKey), ModelName: strings.TrimSpace(in.ModelName)})
+	c, err := a.Store.CreateConnection(r.Context(), in.connection(r.Context(), 0))
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -541,9 +578,7 @@ func (a *Admin) updateConnection(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	c, err := a.Store.UpdateConnection(r.Context(), &store.ModelConnection{ID: id,
-		Name: strings.TrimSpace(in.Name), ProviderType: in.ProviderType, BaseURL: strings.TrimSpace(in.BaseURL),
-		APIKey: strings.TrimSpace(in.APIKey), ModelName: strings.TrimSpace(in.ModelName)})
+	c, err := a.Store.UpdateConnection(r.Context(), in.connection(r.Context(), id))
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -563,7 +598,8 @@ func (a *Admin) deleteConnection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// testConnection sends a tiny prompt (or embedding) through the connection.
+// testConnection sends a tiny prompt (or embedding) through a saved
+// connection and records the outcome on the row.
 func (a *Admin) testConnection(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
 	c, err := a.Store.GetConnection(r.Context(), id)
@@ -576,42 +612,109 @@ func (a *Admin) testConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = decode(r, &in)
 	a.audit(r, "model.test", "model", ptr(c.ID), map[string]any{"mode": in.Mode})
+	res, err := a.runConnectionTest(r.Context(), c, in.Mode)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := a.Store.RecordConnectionTest(r.Context(), c.ID, res.ok, res.latencyMS, res.errMsg); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res.body)
+}
+
+// testUnsavedConnection tests the connection described in the body without
+// saving it, under the same validation as create. With connection_id set
+// and api_key empty the stored key of that connection is used, so an edit
+// form can try a changed URL or model without re-entering the key.
+func (a *Admin) testUnsavedConnection(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		connInput
+		Mode         string `json:"mode"`
+		ConnectionID int64  `json:"connection_id"`
+	}
+	if err := decode(r, &in); err != nil {
+		badBody(w, err)
+		return
+	}
+	if err := in.validateEndpoint(r.Context(), a); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	c := &store.ModelConnection{ProviderType: in.ProviderType, BaseURL: strings.TrimSpace(in.BaseURL),
+		APIKey: strings.TrimSpace(in.APIKey), ModelName: strings.TrimSpace(in.ModelName)}
+	var target *int64
+	if c.APIKey == "" && in.ConnectionID > 0 {
+		saved, err := a.Store.GetConnection(r.Context(), in.ConnectionID)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		c.APIKey = saved.APIKey
+		target = ptr(saved.ID)
+	}
+	a.audit(r, "model.test", "model", target, map[string]any{"mode": in.Mode, "unsaved": true,
+		"provider_type": c.ProviderType, "model_name": c.ModelName})
+	res, err := a.runConnectionTest(r.Context(), c, in.Mode)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res.body)
+}
+
+// testResult is the outcome of one connection test: the response body plus
+// the fields persisted for saved connections. errMsg is redacted.
+type testResult struct {
+	body      map[string]any
+	ok        bool
+	latencyMS int64
+	errMsg    string
+}
+
+// runConnectionTest pings the connection in chat or embedding mode. The
+// returned error means the connection cannot be tested at all (no
+// embedder for the type); an upstream failure is reported in the result.
+func (a *Admin) runConnectionTest(ctx context.Context, c *store.ModelConnection, mode string) (*testResult, error) {
 	start := time.Now()
-	if in.Mode == "embedding" {
+	failed := func(err error) *testResult {
+		msg := provider.RedactWith(err.Error(), c.APIKey)
+		ms := time.Since(start).Milliseconds()
+		return &testResult{body: map[string]any{"ok": false, "error": msg, "latency_ms": ms}, latencyMS: ms, errMsg: msg}
+	}
+	if mode == "embedding" {
 		pc := a.providerConfig(c)
 		pc.Timeout = 60 * time.Second
 		emb, err := provider.NewEmbedder(pc)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
-			return
+			return nil, err
 		}
-		vecs, err := emb.Embed(r.Context(), []string{"ping"})
+		vecs, err := emb.Embed(ctx, []string{"ping"})
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "latency_ms": time.Since(start).Milliseconds()})
-			return
+			return failed(err), nil
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dimensions": len(vecs[0]), "latency_ms": time.Since(start).Milliseconds()})
-		return
+		ms := time.Since(start).Milliseconds()
+		return &testResult{body: map[string]any{"ok": true, "dimensions": len(vecs[0]), "latency_ms": ms}, ok: true, latencyMS: ms}, nil
 	}
 	prov, err := a.Providers(c)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+		return nil, err
 	}
 	// Reasoning models spend part of the budget thinking before answering.
 	maxTok := 256
 	req := provider.ChatRequest{Model: c.ModelName, MaxTokens: &maxTok,
 		Messages: []provider.Message{{Role: "user", Content: provider.TextContent("Reply with the single word: pong")}}}
-	resp, err := prov.Chat(r.Context(), req)
+	resp, err := prov.Chat(ctx, req)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "latency_ms": time.Since(start).Milliseconds()})
-		return
+		return failed(err), nil
 	}
 	reply := ""
 	if len(resp.Choices) > 0 && resp.Choices[0].Message.Content != nil {
 		reply = *resp.Choices[0].Message.Content
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reply": reply, "usage": resp.Usage, "latency_ms": time.Since(start).Milliseconds()})
+	ms := time.Since(start).Milliseconds()
+	return &testResult{body: map[string]any{"ok": true, "reply": reply, "usage": resp.Usage, "latency_ms": ms}, ok: true, latencyMS: ms}, nil
 }
 
 // providerConfig builds the provider configuration through the gateway's
@@ -948,7 +1051,8 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "reranked": res.Reranked,
-		"latency_ms": time.Since(start).Milliseconds()})
+		"latency_ms": time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
+		"rerank_latency_ms": res.RerankLatencyMS})
 }
 
 // rerankConnection finds a chat connection for reranking searches from the
