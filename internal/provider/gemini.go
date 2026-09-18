@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -17,6 +18,13 @@ type gemini struct {
 
 func newGemini(cfg Config) *gemini {
 	return &gemini{cfg: cfg, base: cfg.baseURL(geminiBase)}
+}
+
+// geminiModelPath returns the model name as a single, escaped URL path
+// segment (a leading "models/" is dropped) so a crafted model_name cannot
+// change the endpoint the request is sent to.
+func geminiModelPath(model string) string {
+	return url.PathEscape(strings.TrimPrefix(model, "models/"))
 }
 
 func (p *gemini) headers() map[string]string {
@@ -196,7 +204,7 @@ func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, err
 	}
 	var gr geminiResponse
-	url := p.base + "/models/" + p.cfg.Model + ":generateContent"
+	url := p.base + "/models/" + geminiModelPath(p.cfg.Model) + ":generateContent"
 	if err := doJSON(ctx, p.cfg, url, p.headers(), body, &gr); err != nil {
 		return nil, err
 	}
@@ -219,7 +227,7 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 	if err != nil {
 		return err
 	}
-	url := p.base + "/models/" + p.cfg.Model + ":streamGenerateContent?alt=sse"
+	url := p.base + "/models/" + geminiModelPath(p.cfg.Model) + ":streamGenerateContent?alt=sse"
 	resp, err := doStream(ctx, p.cfg, url, p.headers(), body)
 	if err != nil {
 		return err
