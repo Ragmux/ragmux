@@ -72,6 +72,7 @@ func (a *Admin) Routes(r chi.Router) {
 		r.Get("/api/rag-stores/{id}/documents", a.listDocuments)
 		editor.Post("/api/rag-stores/{id}/documents", a.uploadDocument)
 		r.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
+		editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
 		r.Get("/api/documents/{id}", a.getDocument)
 		editor.Delete("/api/documents/{id}", a.deleteDocument)
 		editor.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
@@ -444,11 +445,18 @@ func (a *Admin) testConnection(w http.ResponseWriter, r *http.Request) {
 // ---- RAG stores ----
 
 type ragInput struct {
-	Name                  string `json:"name"`
-	EmbeddingConnectionID int64  `json:"embedding_connection_id"`
-	ChunkSize             int    `json:"chunk_size"`
-	ChunkOverlap          int    `json:"chunk_overlap"`
-	TopK                  int    `json:"top_k"`
+	Name                  string   `json:"name"`
+	EmbeddingConnectionID int64    `json:"embedding_connection_id"`
+	ChunkSize             int      `json:"chunk_size"`
+	ChunkOverlap          int      `json:"chunk_overlap"`
+	TopK                  int      `json:"top_k"`
+	SearchMode            string   `json:"search_mode"`
+	FTSConfig             string   `json:"fts_config"`
+	Rerank                bool     `json:"rerank"`
+	RerankCandidates      int      `json:"rerank_candidates"`
+	MaxDistance           *float64 `json:"max_distance"`
+	// ContextualChunks defaults to true when omitted.
+	ContextualChunks *bool `json:"contextual_chunks"`
 }
 
 func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
@@ -470,6 +478,37 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	if in.TopK > 50 {
 		return errors.New("top_k must be <= 50")
 	}
+	if in.SearchMode == "" {
+		in.SearchMode = store.SearchHybrid
+	}
+	if in.SearchMode != store.SearchVector && in.SearchMode != store.SearchHybrid {
+		return errors.New("search_mode must be \"vector\" or \"hybrid\"")
+	}
+	in.FTSConfig = strings.ToLower(strings.TrimSpace(in.FTSConfig))
+	if in.FTSConfig == "" {
+		in.FTSConfig = "simple"
+	}
+	if ok, err := a.Store.TextSearchConfigExists(r.Context(), in.FTSConfig); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("fts_config %q is not a text search configuration on this server", in.FTSConfig)
+	}
+	if in.RerankCandidates <= 0 {
+		in.RerankCandidates = 15
+	}
+	if in.RerankCandidates > 100 {
+		return errors.New("rerank_candidates must be between 1 and 100")
+	}
+	if in.MaxDistance == nil {
+		in.MaxDistance = new(float64)
+	}
+	if *in.MaxDistance < 0 || *in.MaxDistance > 2 {
+		return errors.New("max_distance must be between 0 (off) and 2")
+	}
+	if in.ContextualChunks == nil {
+		t := true
+		in.ContextualChunks = &t
+	}
 	conn, err := a.Store.GetConnection(r.Context(), in.EmbeddingConnectionID)
 	if err != nil {
 		return errors.New("embedding_connection_id does not reference an existing model connection")
@@ -478,6 +517,13 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 		return fmt.Errorf("provider %q cannot be used for embeddings", conn.ProviderType)
 	}
 	return nil
+}
+
+func (in *ragInput) toStore(id int64) *store.RAGStore {
+	return &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
+		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK,
+		SearchMode: in.SearchMode, FTSConfig: in.FTSConfig, Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
+		MaxDistance: *in.MaxDistance, ContextualChunks: *in.ContextualChunks}
 }
 
 func (a *Admin) listRAGStores(w http.ResponseWriter, r *http.Request) {
@@ -499,8 +545,7 @@ func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rs, err := a.Store.CreateRAGStore(r.Context(), &store.RAGStore{Name: strings.TrimSpace(in.Name),
-		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK})
+	rs, err := a.Store.CreateRAGStore(r.Context(), in.toStore(0))
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -530,8 +575,12 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rs, err := a.Store.UpdateRAGStore(r.Context(), &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
-		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK})
+	before, err := a.Store.GetRAGStore(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	rs, err := a.Store.UpdateRAGStore(r.Context(), in.toStore(id))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			a.fail(w, err)
@@ -540,8 +589,36 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name})
-	writeJSON(w, http.StatusOK, rs)
+	// Chunking and embedding-text settings only take effect when documents
+	// are processed again; tell the caller when that is worth doing.
+	reprocess := rs.ChunkCount > 0 && (before.ChunkSize != rs.ChunkSize || before.ChunkOverlap != rs.ChunkOverlap ||
+		before.ContextualChunks != rs.ContextualChunks)
+	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess})
+	writeJSON(w, http.StatusOK, ragStoreResponse{RAGStore: rs, ReprocessRecommended: reprocess})
+}
+
+// ragStoreResponse is a store plus the reprocess hint returned by updates.
+type ragStoreResponse struct {
+	*store.RAGStore
+	ReprocessRecommended bool `json:"reprocess_recommended"`
+}
+
+func (a *Admin) reprocessStore(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	if _, err := a.Store.GetRAGStore(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
+	ids, err := a.Store.ResetStoreDocuments(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	for _, docID := range ids {
+		a.Ingester.Enqueue(docID)
+	}
+	a.audit(r, "rag_store.reprocess_all", "rag_store", ptr(id), map[string]any{"documents": len(ids)})
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "documents": len(ids)})
 }
 
 func (a *Admin) deleteRAGStore(w http.ResponseWriter, r *http.Request) {
@@ -561,24 +638,69 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	// Overrides let the dashboard try settings before saving them.
 	var in struct {
-		Query string `json:"query"`
-		TopK  int    `json:"top_k"`
+		Query       string   `json:"query"`
+		TopK        int      `json:"top_k"`
+		Mode        string   `json:"mode"`
+		Rerank      *bool    `json:"rerank"`
+		MaxDistance *float64 `json:"max_distance"`
 	}
 	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Query) == "" {
 		writeErr(w, http.StatusBadRequest, "query is required")
 		return
 	}
+	if in.Mode != "" {
+		if in.Mode != store.SearchVector && in.Mode != store.SearchHybrid {
+			writeErr(w, http.StatusBadRequest, "mode must be \"vector\" or \"hybrid\"")
+			return
+		}
+		rs.SearchMode = in.Mode
+	}
+	if in.Rerank != nil {
+		rs.Rerank = *in.Rerank
+	}
+	if in.MaxDistance != nil {
+		if *in.MaxDistance < 0 || *in.MaxDistance > 2 {
+			writeErr(w, http.StatusBadRequest, "max_distance must be between 0 (off) and 2")
+			return
+		}
+		rs.MaxDistance = *in.MaxDistance
+	}
+	// Reranking uses the chat model of a project linked to this store; the
+	// embedding connection cannot chat.
+	var prov provider.Provider
+	model := ""
+	if rs.Rerank {
+		if conn, err := a.rerankConnection(r, rs.ID); err == nil {
+			if p, err := a.Providers(conn); err == nil {
+				prov, model = p, conn.ModelName
+			}
+		}
+	}
 	start := time.Now()
-	hits, err := a.Retriever.Search(r.Context(), rs, in.Query, in.TopK)
+	res, err := a.Retriever.SearchWith(r.Context(), rs, in.Query, in.TopK, prov, model)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	if hits == nil {
-		hits = []store.SearchHit{}
+	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "reranked": res.Reranked,
+		"latency_ms": time.Since(start).Milliseconds()})
+}
+
+// rerankConnection finds a chat connection for reranking searches from the
+// admin API: the model connection of the first project using the store.
+func (a *Admin) rerankConnection(r *http.Request, storeID int64) (*store.ModelConnection, error) {
+	projects, err := a.Store.ListProjects(r.Context())
+	if err != nil {
+		return nil, err
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"hits": hits, "latency_ms": time.Since(start).Milliseconds()})
+	for _, p := range projects {
+		if p.RAGStoreID != nil && *p.RAGStoreID == storeID {
+			return a.Store.GetConnection(r.Context(), p.ModelConnectionID)
+		}
+	}
+	return nil, store.ErrNotFound
 }
 
 // ---- documents ----
@@ -624,7 +746,7 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	for _, fh := range files {
 		name := filepath.Base(fh.Filename)
 		if !rag.IsSupported(name) {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported file type for %q (pdf, txt, md)", name))
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported file type for %q (pdf, docx, html, txt, md)", name))
 			return
 		}
 		src, err := fh.Open()
@@ -638,6 +760,10 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		src.Close()
 		if err != nil {
 			a.fail(w, err)
+			return
+		}
+		if !rag.SniffOK(name, data) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%q does not look like a %s file", name, strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")))
 			return
 		}
 		doc, err := a.Store.CreateDocument(r.Context(), &store.Document{RAGStoreID: id, Filename: name,
