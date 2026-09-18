@@ -31,8 +31,12 @@ All notable changes to Ragmux are documented here. The format follows
   `Retry-After`, OpenAI-style `x-ratelimit-*` and `x-ragmux-budget-*-remaining` headers;
   `GET /admin/api/projects/{id}/usage` shows live counters, metrics summaries gain
   `rate_limited`, and the dashboard shows limits, usage meters and a 429 tile.
-- RAG: hybrid BM25 + vector search (RRF), section/page aware chunks, optional LLM reranking,
-  DOCX and HTML ingestion, similarity threshold.
+- RAG: hybrid vector + PostgreSQL full-text search fused with reciprocal rank fusion
+  (`search_mode`, `fts_config`), section/page aware chunks with contextual embeddings
+  (`contextual_chunks`), optional LLM reranking through the project's chat model (`rerank`,
+  `rerank_candidates`), a cosine distance threshold (`max_distance`), DOCX and HTML ingestion,
+  `x-ragmux-rag-hits` response header, `POST /admin/api/rag-stores/{id}/reprocess` and search
+  overrides (`mode`, `rerank`, `max_distance`) with rank/score details in the dashboard.
 - Backup and restore scripts and documentation.
 - Data retention jobs, gateway test suite, native Ollama adapter, CI (lint, vet, tests, vuln scan)
   and release workflow publishing `ghcr.io/ragmux/ragmux`.
