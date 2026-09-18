@@ -50,9 +50,17 @@ Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-
 unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
 and log the detail under that id.
 
-Login failures answer `401 {"error":{"message":"invalid username or password","type":"Unauthorized"}}`;
-too many failures answer `429 {"error":{"message":"too many login attempts, try again later","type":"rate_limited"}}`
-with a `Retry-After` header (see [Users, roles and limits](users-and-limits.md#login-protection)).
+Login failures answer
+`401 {"error":{"message":"invalid username or password","type":"Unauthorized","attempts_remaining":4}}`,
+where `attempts_remaining` is how many more failures the username may record this
+minute before the per-user limit triggers (absent when that limit is disabled). It is
+derived from the recorded attempts alone, so an unknown username and a wrong password
+get identical answers. Too many failures answer
+`429 {"error":{"message":"too many login attempts, try again later","type":"rate_limited","locked":false}}`
+with a `Retry-After` header; `locked` is `true` when the username/address lockout
+triggered rather than a per-minute budget (see
+[Users, roles and limits](users-and-limits.md#login-protection)). Usernames are matched
+case-insensitively.
 
 ### Client API
 
@@ -99,7 +107,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | `{"needs_setup": true}` while the `users` table is empty, `false` afterwards |
+| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": 8, "secret_key_source": "env", "database_role": "ragmux"}`: `needs_setup` is `true` while the `users` table is empty; the other three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role) |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
@@ -109,9 +117,9 @@ case setup is already complete (see [Configuration](configuration.md#environment
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long |
+| POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
-| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` |
+| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339) and `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie) |
 | POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key` |
 
@@ -289,40 +297,69 @@ again.
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | GET | `/users/lite` | editor | Active users as `[{id, username, role}]` (for member pickers) |
-| GET | `/users` | admin | All users |
-| POST | `/users` | admin | `{username, password, role}` → `201` user (`role` defaults to `viewer`, password 8+ characters and ≤ 72 bytes, username ≤ 64) |
+| GET | `/users` | admin | All users, each with `project_count` (memberships) and `active_sessions` (unexpired sessions) |
+| POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password 8+ characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
 | DELETE | `/users/{id}` | admin | Delete → `{"ok": true}` |
 | POST | `/users/{id}/reset-password` | admin | `{new_password}`; revokes the user's sessions |
 | POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
-| GET | `/audit` | admin | Audit entries, newest first |
+| GET | `/audit` | admin | Audit entries, newest first, with the total for the filter |
+| GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
+| GET | `/security/logins` | admin | Failed-login counters and active lockouts |
 
 `PUT`/`DELETE` on users refuse to demote, deactivate or delete the last active admin
 (`409`) and to deactivate or delete the caller's own account (`400`).
 
-`GET /audit?limit=100&action=project.&actor_user_id=1&before=2026-09-18T10:00:00Z`:
-`action` is a prefix match, `before` (RFC 3339) pages backwards. Entries:
+`GET /audit?limit=100&action=project.&actor_user_id=1&since=2026-09-01T00:00:00Z&until=2026-09-18T00:00:00Z&before=2026-09-17T10:00:00Z`:
+`action` is a prefix match, `since` (inclusive) and `until` (exclusive) bound
+`created_at`, `before` pages backwards (all three RFC 3339; a malformed value is a
+`400`), `limit` defaults to 100 (max 1000). The response is
 
 ```json
-{"id": 512, "actor_user_id": 1, "actor_username": "admin", "action": "project.rotate_key",
- "target_type": "project", "target_id": 3, "details": {"name": "support-bot"},
- "ip": "203.0.113.7", "created_at": "…"}
+{"entries": [{"id": 512, "actor_user_id": 1, "actor_username": "admin", "action": "project.rotate_key",
+              "target_type": "project", "target_id": 3, "details": {"name": "support-bot"},
+              "ip": "203.0.113.7", "created_at": "…"}],
+ "total": 1834, "has_more": true}
 ```
+
+where `total` counts every entry matching `action`, `actor_user_id`, `since` and
+`until` (ignoring `before` and `limit`) and `has_more` tells whether another page
+exists beyond this one.
+
+`GET /audit/export?action=login.&since=…` streams the same entries as
+`application/x-ndjson` (`Content-Disposition: attachment; filename="ragmux-audit-<timestamp>.ndjson"`),
+one JSON object per line in the shape above, newest first, capped at 100 000 rows;
+`before` is honoured so a larger range can be exported in slices. Every export writes
+an `audit.exported` entry whose `details` carry the filters that were used.
+
+`GET /security/logins`:
+
+```json
+{"failed_last_hour": 12, "failed_last_24h": 40,
+ "active_lockouts": [{"username": "admin", "ip": "203.0.113.7", "until": "2026-09-18T10:14:00Z"}]}
+```
+
+The counters are failed attempts in the `login_attempts` table; `active_lockouts` lists
+the username/address pairs the login limiter currently refuses, computed with the same
+`LOGIN_LOCKOUT_FAILURES` / `LOGIN_LOCKOUT_MINUTES` rule, with `until` the time the
+lockout ends (empty when the lockout is disabled).
 
 ### System
 
 `GET /system` (viewer):
 
 ```json
-{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": 4, "size_bytes": 8787635},
+{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": 8, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
- "version": "0.2.0"}
+ "version": "0.3.0"}
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
 bytes of uploaded files stored in the database, `secret_key_source` is `env` or `file`.
+`database.postgres_version` and `database.pgvector_version` are only returned to admins;
+editors and viewers receive the `database` object without those two keys.
 
 ## Health
 
