@@ -34,6 +34,16 @@ func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 	return err
 }
 
+// DeleteRequestLogsBefore removes request logs older than t and reports how
+// many rows were removed.
+func (s *Store) DeleteRequestLogsBefore(ctx context.Context, t time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM request_logs WHERE created_at < $1", t.UTC())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // MetricsSummary aggregates request logs over a window.
 type MetricsSummary struct {
 	ProjectID        *int64  `json:"project_id,omitempty"`

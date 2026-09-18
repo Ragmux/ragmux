@@ -149,8 +149,12 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) error {
 	return err
 }
 
-// PurgeExpiredSessions removes stale sessions.
-func (s *Store) PurgeExpiredSessions(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE expires_at <= now()")
-	return err
+// PurgeExpiredSessions removes sessions that expired before t and reports
+// how many rows were removed.
+func (s *Store) PurgeExpiredSessions(ctx context.Context, t time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE expires_at <= $1", t.UTC())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

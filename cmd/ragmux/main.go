@@ -25,6 +25,7 @@ import (
 	"github.com/ragmux/ragmux/internal/config"
 	"github.com/ragmux/ragmux/internal/gateway"
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/maintenance"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -80,8 +81,12 @@ func run(cfg config.Config) error {
 	slog.SetDefault(log)
 	admin.Version = version
 
+	// ctx ends on SIGINT/SIGTERM and drives startup; background workers get
+	// their own context so they can be drained in order during shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	bgCtx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
 
 	st, err := store.Open(ctx, store.OpenConfig{
 		DatabaseURL:  cfg.DatabaseURL,
@@ -116,7 +121,7 @@ func run(cfg config.Config) error {
 	providers := func(c *store.ModelConnection) (provider.Provider, error) { return provider.New(provCfg(c)) }
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) { return provider.NewEmbedder(provCfg(c)) }
 
-	ingester := rag.NewIngester(ctx, st, embedders, cfg.IngestWorkers, log)
+	ingester := rag.NewIngester(bgCtx, st, embedders, cfg.IngestWorkers, log)
 	defer ingester.Stop()
 	if err := ingester.Resume(ctx); err != nil {
 		log.Warn("resume ingestion", "err", err)
@@ -160,22 +165,15 @@ func run(cfg config.Config) error {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	janitor := &maintenance.Janitor{Store: st, Limiter: usage, Log: log,
+		RequestLogDays: cfg.LogRetentionDays, AuditDays: cfg.AuditRetentionDays}
+	janitorDone := make(chan struct{})
 	go func() {
-		t := time.NewTicker(time.Hour)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				_ = st.PurgeExpiredSessions(ctx)
-				_ = st.DeleteLoginAttemptsBefore(ctx, time.Now().Add(-24*time.Hour))
-				if err := usage.PurgeUsage(ctx); err != nil {
-					log.Warn("purge usage counters", "err", err)
-				}
-			}
-		}
+		defer close(janitorDone)
+		janitor.Run(bgCtx, maintenance.DefaultInterval)
 	}()
+	log.Info("retention job scheduled", "log_retention_days", cfg.LogRetentionDays,
+		"audit_retention_days", cfg.AuditRetentionDays, "interval", maintenance.DefaultInterval)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -190,10 +188,25 @@ func run(cfg config.Config) error {
 		return err
 	case <-ctx.Done():
 	}
-	log.Info("shutting down")
+
+	// Shutdown order: stop accepting HTTP and drain in-flight requests, let
+	// running ingestion jobs finish, stop the retention job, then the
+	// deferred st.Close releases the pool.
+	log.Info("shutting down: draining http")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutCtx)
+	shutErr := srv.Shutdown(shutCtx)
+	if shutErr != nil {
+		log.Warn("http shutdown", "err", shutErr)
+	}
+	log.Info("shutting down: waiting for ingestion jobs")
+	if !ingester.StopWithTimeout(30 * time.Second) {
+		log.Warn("ingestion jobs cancelled; unfinished documents resume on next start")
+	}
+	stopBackground()
+	<-janitorDone
+	log.Info("shutdown complete")
+	return shutErr
 }
 
 // bootstrapAdmin creates the first user when the users table is empty.
