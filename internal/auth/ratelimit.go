@@ -93,6 +93,47 @@ func (l *LoginLimiter) lockoutRemaining(ctx context.Context, username, ip string
 	return rem
 }
 
+// Remaining reports how many more failures the username may record this
+// minute before the per-user limit triggers (never below zero). It counts
+// recorded failures only, so the answer is the same for an unknown username
+// and a wrong password. ok is false when there is no per-user limit.
+func (l *LoginLimiter) Remaining(ctx context.Context, username string) (remaining int, ok bool, err error) {
+	if l.PerUser <= 0 {
+		return 0, false, nil
+	}
+	byUser, _, err := l.Store.CountFailedLoginAttempts(ctx, username, "", l.now().Add(-time.Minute))
+	if err != nil {
+		return 0, false, err
+	}
+	return max(l.PerUser-byUser, 0), true, nil
+}
+
+// Lockout is a username/address pair Check currently refuses.
+type Lockout struct {
+	Username string    `json:"username"`
+	IP       string    `json:"ip"`
+	Until    time.Time `json:"until"`
+}
+
+// ActiveLockouts lists the pairs whose failures inside LockoutWindow reach
+// LockoutFailures, with the time the lockout ends: the same rule Check
+// applies and the same estimate lockoutRemaining reports.
+func (l *LoginLimiter) ActiveLockouts(ctx context.Context) ([]Lockout, error) {
+	out := []Lockout{}
+	if l.LockoutFailures <= 0 || l.LockoutWindow <= 0 {
+		return out, nil
+	}
+	now := l.now()
+	pairs, err := l.Store.FailedLoginPairsSince(ctx, now.Add(-l.LockoutWindow), l.LockoutFailures)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range pairs {
+		out = append(out, Lockout{Username: p.Username, IP: p.IP, Until: p.Oldest.Add(l.LockoutWindow).UTC()})
+	}
+	return out, nil
+}
+
 // Record stores the outcome of an attempt.
 func (l *LoginLimiter) Record(ctx context.Context, username, ip string, success bool) error {
 	return l.Store.RecordLoginAttempt(ctx, username, ip, success)

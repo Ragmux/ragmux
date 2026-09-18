@@ -18,6 +18,16 @@ import (
 const CookieName = "ragmux_session"
 
 type ctxKey struct{}
+type sessionKey struct{}
+
+// Session describes the session a request authenticated with.
+type Session struct {
+	// ExpiresAt is when the session stops resolving.
+	ExpiresAt time.Time
+	// Bearer is true when the token came in the Authorization header
+	// rather than the cookie.
+	Bearer bool
+}
 
 // HashPassword bcrypt-hashes a password.
 func HashPassword(pw string) (string, error) {
@@ -142,12 +152,14 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 			forbiddenCrossSite(w)
 			return
 		}
-		u, err := s.Store.UserBySession(r.Context(), tok)
+		u, expires, err := s.Store.UserAndExpiryBySession(r.Context(), tok)
 		if err != nil {
 			unauthorized(w)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(ContextWithUser(r.Context(), u)))
+		ctx := ContextWithUser(r.Context(), u)
+		ctx = ContextWithSession(ctx, &Session{ExpiresAt: expires, Bearer: IsBearer(r)})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -187,6 +199,18 @@ func ContextWithUser(ctx context.Context, u *store.User) context.Context {
 func UserFrom(ctx context.Context) *store.User {
 	u, _ := ctx.Value(ctxKey{}).(*store.User)
 	return u
+}
+
+// ContextWithSession attaches the session description the way Middleware
+// does.
+func ContextWithSession(ctx context.Context, se *Session) context.Context {
+	return context.WithValue(ctx, sessionKey{}, se)
+}
+
+// SessionFrom returns the session the request authenticated with, if any.
+func SessionFrom(ctx context.Context) *Session {
+	se, _ := ctx.Value(sessionKey{}).(*Session)
+	return se
 }
 
 func forbiddenCrossSite(w http.ResponseWriter) {
