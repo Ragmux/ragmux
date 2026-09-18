@@ -4,7 +4,7 @@ services:
       context: .
       args:
         VERSION: ${VERSION:-dev}
-    image: ragmux/ragmux:latest
+    image: ragmux/ragmux:latest-app
     container_name: ragmux
     restart: unless-stopped
     ports:

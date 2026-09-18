@@ -30,7 +30,8 @@ All notable changes to Ragmux are documented here. The format follows
   (`ragmux` service built from `Dockerfile.aio`, volume `ragmux-data`, nothing required in
   `.env`; `SECRET_KEY` recommended). The previous two-service file (gateway image + separate
   `pgvector/pgvector:pg17`, requiring `SECRET_KEY`, `POSTGRES_PASSWORD` and
-  `RAGMUX_DB_PASSWORD`) is unchanged in behaviour but renamed to **`docker-compose.split.yml`**:
+  `RAGMUX_DB_PASSWORD`) is unchanged in behaviour but renamed to **`docker-compose.split.yml`**
+  (its local image tag becomes `ragmux/ragmux:latest-app`, matching the published `-app` tag):
   existing deployments add `-f docker-compose.split.yml` (or `COMPOSE_FILE` in `.env`) to keep
   their `pgdata` volume, or move to the default layout with a dump/restore cycle
   ([Moving between layouts](docs/backup-restore.md#moving-between-layouts)). No automatic
