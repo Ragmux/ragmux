@@ -66,6 +66,8 @@
   .msg.user{align-self:flex-end;background:var(--accent);color:#fff}
   .msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
   .hidden{display:none}
+  select[multiple]{min-height:110px}
+  td.json{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;max-width:360px;word-break:break-all}
 </style>
 </head>
 <body>
@@ -77,6 +79,8 @@
     <button data-tab="rag">RAG Stores</button>
     <button data-tab="projects">Projects</button>
     <button data-tab="playground">Playground</button>
+    <button data-tab="users" data-role="admin">Users</button>
+    <button data-tab="audit" data-role="admin">Audit</button>
   </nav>
   <div class="spacer"></div>
   <span id="whoami" class="muted"></span>
@@ -93,7 +97,11 @@ const $ = (s, el=document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtN = n => (n ?? 0).toLocaleString();
 const fmtDate = s => s ? new Date(s).toLocaleString() : '';
-const state = { user:null, tab:'overview', models:[], rag:[], projects:[], providerTypes:[], playground:{key:'', msgs:[]} };
+const state = { user:null, tab:'overview', models:[], rag:[], projects:[], providerTypes:[], users:[], playground:{key:'', msgs:[]} };
+const ROLE_RANK = { viewer:1, editor:2, admin:3 };
+// can('editor') is true for editors and admins; the API enforces the same matrix.
+const can = role => !!state.user && (ROLE_RANK[state.user.role]||0) >= (ROLE_RANK[role]||99);
+const userName = id => (state.users.find(u=>u.id===id)||{}).username || '#'+id;
 
 let toastTimer;
 function toast(msg, ms=3500){ const t=$('#toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.add('hidden'), ms); }
@@ -105,6 +113,7 @@ async function api(path, opts={}){
   if (r.status === 401 && !path.startsWith('/login')) { state.user=null; render(); throw new Error('session expired'); }
   const ct = r.headers.get('content-type')||'';
   const data = ct.includes('json') ? await r.json() : await r.text();
+  if (r.status === 403) { const msg=(data && data.error && data.error.message) || 'forbidden'; toast('Not allowed: '+msg); throw new Error(msg); }
   if (!r.ok) throw new Error((data && data.error && data.error.message) || r.statusText);
   return data;
 }
@@ -125,6 +134,8 @@ function closeModal(){ $('#modal').innerHTML=''; }
 const field = (label, inner) => `<div class="field"><label>${esc(label)}</label>${inner}</div>`;
 const input = (name, val='', attrs='') => `<input name="${name}" value="${esc(val)}" ${attrs}>`;
 const select = (name, opts, val) => `<select name="${name}">${opts.map(o=>`<option value="${esc(o.value)}" ${String(o.value)===String(val)?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`;
+const multiSelect = (name, opts, vals=[]) => `<select name="${name}" multiple>${opts.map(o=>`<option value="${esc(o.value)}" ${vals.map(String).includes(String(o.value))?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`;
+const ROLES = [{value:'viewer',label:'viewer — read only'},{value:'editor',label:'editor — manage models, RAG and own projects'},{value:'admin',label:'admin — everything incl. users'}];
 async function confirmDialog(msg){ return new Promise(res => { modal('Confirm', `<p>${esc(msg)}</p>`, async()=>res(true), 'Confirm'); $('#mCancel').addEventListener('click', ()=>res(false)); }); }
 
 // ---------- render ----------
@@ -140,13 +151,17 @@ function render(){
     return;
   }
   nav.classList.remove('hidden'); $('#btnLogout').classList.remove('hidden'); $('#btnPassword').classList.remove('hidden');
-  $('#whoami').textContent = state.user.username;
-  nav.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.tab===state.tab));
-  ({overview:renderOverview, models:renderModels, rag:renderRAG, projects:renderProjects, playground:renderPlayground})[state.tab]();
+  $('#whoami').textContent = `${state.user.username} · ${state.user.role}`;
+  nav.querySelectorAll('button').forEach(b => { b.classList.toggle('active', b.dataset.tab===state.tab); b.classList.toggle('hidden', !!b.dataset.role && !can(b.dataset.role)); });
+  const tabs = {overview:renderOverview, models:renderModels, rag:renderRAG, projects:renderProjects, playground:renderPlayground, users:renderUsers, audit:renderAudit};
+  if (!tabs[state.tab]) state.tab='overview';
+  tabs[state.tab]();
 }
 
 async function loadAll(){
   [state.models, state.rag, state.projects, state.providerTypes] = await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types')]);
+  // Editors and admins can list users (for project members); viewers cannot.
+  state.users = can('editor') ? await api('/users/lite').catch(()=>[]) : [];
 }
 const modelName = id => (state.models.find(m=>m.id===id)||{}).name || '#'+id;
 const ragName = id => id ? ((state.rag.find(r=>r.id===id)||{}).name || '#'+id) : '—';
@@ -178,13 +193,14 @@ async function renderOverview(){
 // ---------- models ----------
 function renderModels(){
   const app=$('#app');
-  app.innerHTML = `<div class="card"><div class="row between"><h2>Model connections</h2><button class="primary" id="addModel">+ Add connection</button></div>
+  const w = can('editor');
+  app.innerHTML = `<div class="card"><div class="row between"><h2>Model connections</h2>${w?'<button class="primary" id="addModel">+ Add connection</button>':''}</div>
     <p class="muted">Provider credentials are encrypted at rest and never exposed to API clients; projects use their own <code>sk-proj-…</code> keys.</p>
     <div class="tbl"><table><thead><tr><th>Name</th><th>Provider</th><th>Model</th><th>Base URL</th><th>Key</th><th></th></tr></thead><tbody>
     ${state.models.map(m=>`<tr><td><b>${esc(m.name)}</b></td><td><span class="pill">${esc(m.provider_type)}</span></td><td><code>${esc(m.model_name)}</code></td><td class="muted">${esc(m.base_url||'(default)')}</td><td class="muted">${esc(m.api_key_masked||'—')}</td>
-      <td style="white-space:nowrap"><button class="small" data-test="${m.id}">Test chat</button> <button class="small" data-testemb="${m.id}">Test embed</button> <button class="small" data-edit="${m.id}">Edit</button> <button class="small danger" data-del="${m.id}">Delete</button></td></tr>`).join('')||'<tr><td colspan="6" class="muted">No connections yet.</td></tr>'}
+      <td style="white-space:nowrap"><button class="small" data-test="${m.id}">Test chat</button> <button class="small" data-testemb="${m.id}">Test embed</button>${w?` <button class="small" data-edit="${m.id}">Edit</button> <button class="small danger" data-del="${m.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No connections yet.</td></tr>'}
     </tbody></table></div></div>`;
-  $('#addModel').onclick = () => modelForm();
+  if (w) $('#addModel').onclick = () => modelForm();
   app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>modelForm(state.models.find(m=>m.id==b.dataset.edit)));
   app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this connection? Projects and RAG stores using it must be reassigned first.')) return;
     try{ await api('/models/'+b.dataset.del,{method:'DELETE'}); toast('Deleted'); await loadAll(); render(); }catch(e){ toast(e.message); } });
@@ -214,12 +230,13 @@ let openStore = null;
 function renderRAG(){
   const app=$('#app');
   const embModels = state.models.filter(m => (state.providerTypes.find(t=>t.type===m.provider_type)||{}).supports_embeddings);
-  app.innerHTML = `<div class="card"><div class="row between"><h2>RAG stores</h2><button class="primary" id="addStore" ${embModels.length?'':'disabled title="Add an embedding-capable model connection first"'}>+ Add store</button></div>
+  const w = can('editor');
+  app.innerHTML = `<div class="card"><div class="row between"><h2>RAG stores</h2>${w?`<button class="primary" id="addStore" ${embModels.length?'':'disabled title="Add an embedding-capable model connection first"'}>+ Add store</button>`:''}</div>
     <div class="tbl"><table><thead><tr><th>Name</th><th>Embedding model</th><th>Chunking</th><th>Top-k</th><th>Dims</th><th>Docs / chunks</th><th></th></tr></thead><tbody>
     ${state.rag.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(modelName(r.embedding_connection_id))}</td><td>${r.chunk_size} / ${r.chunk_overlap}</td><td>${r.top_k}</td><td>${r.dimensions||'—'}</td><td>${r.document_count} / ${r.chunk_count}</td>
-      <td style="white-space:nowrap"><button class="small primary" data-open="${r.id}">Documents</button> <button class="small" data-edit="${r.id}">Edit</button> <button class="small danger" data-del="${r.id}">Delete</button></td></tr>`).join('')||'<tr><td colspan="7" class="muted">No RAG stores yet.</td></tr>'}
+      <td style="white-space:nowrap"><button class="small primary" data-open="${r.id}">Documents</button>${w?` <button class="small" data-edit="${r.id}">Edit</button> <button class="small danger" data-del="${r.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">No RAG stores yet.</td></tr>'}
     </tbody></table></div></div><div id="storePanel"></div>`;
-  $('#addStore').onclick=()=>storeForm(null, embModels);
+  if (w) $('#addStore').onclick=()=>storeForm(null, embModels);
   app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>storeForm(state.rag.find(r=>r.id==b.dataset.edit), embModels));
   app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this store with all its documents and vectors?')) return;
     try{ await api('/rag-stores/'+b.dataset.del,{method:'DELETE'}); if(openStore==b.dataset.del) openStore=null; await loadAll(); render(); }catch(e){ toast(e.message); } });
@@ -242,16 +259,17 @@ async function renderStorePanel(){
   const r = state.rag.find(x=>x.id===openStore); if(!r) return;
   const panel=$('#storePanel');
   let docs=[]; try{ docs=await api(`/rag-stores/${r.id}/documents`); }catch(e){ toast(e.message); }
+  const w = can('editor');
   panel.innerHTML = `<div class="card"><div class="row between"><h2>${esc(r.name)} · documents</h2>
-      <form id="upl" class="row"><input type="file" name="file" accept=".pdf,.txt,.md,.markdown" multiple required style="width:auto"><button class="primary">Upload</button></form></div>
+      ${w?'<form id="upl" class="row"><input type="file" name="file" accept=".pdf,.txt,.md,.markdown" multiple required style="width:auto"><button class="primary">Upload</button></form>':''}</div>
     <div class="tbl"><table><thead><tr><th>File</th><th>Size</th><th>Status</th><th>Chunks</th><th>Uploaded</th><th></th></tr></thead><tbody>
     ${docs.map(d=>`<tr><td>${esc(d.filename)}</td><td>${(d.size_bytes/1024).toFixed(1)} KB</td><td><span class="pill ${d.status}">${d.status}</span>${d.error?`<div class="muted" style="font-size:11px">${esc(d.error)}</div>`:''}</td><td>${d.chunk_count}</td><td>${fmtDate(d.created_at)}</td>
-      <td style="white-space:nowrap"><button class="small" data-re="${d.id}">Reprocess</button> <button class="small danger" data-del="${d.id}">Delete</button></td></tr>`).join('')||'<tr><td colspan="6" class="muted">No documents. Upload PDF, TXT or Markdown files.</td></tr>'}
+      <td style="white-space:nowrap">${w?`<button class="small" data-re="${d.id}">Reprocess</button> <button class="small danger" data-del="${d.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No documents. Upload PDF, TXT or Markdown files.</td></tr>'}
     </tbody></table></div>
     <h3 style="margin-top:16px">Test retrieval</h3>
     <form id="srch" class="row"><input name="q" placeholder="Ask something that should be in the documents…" style="flex:1"><button>Search</button></form>
     <div id="hits"></div></div>`;
-  $('#upl').onsubmit = async e => { e.preventDefault(); const fd=new FormData(e.target); const btn=$('button',e.target); btn.disabled=true;
+  if (w) $('#upl').onsubmit = async e => { e.preventDefault(); const fd=new FormData(e.target); const btn=$('button',e.target); btn.disabled=true;
     try{ await api(`/rag-stores/${r.id}/documents`,{method:'POST',body:fd}); toast('Uploaded; processing in background'); await loadAll(); renderStorePanel(); }catch(err){ toast(err.message); } finally{ btn.disabled=false; } };
   panel.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this document and its vectors?')) return; try{ await api('/documents/'+b.dataset.del,{method:'DELETE'}); await loadAll(); renderStorePanel(); }catch(e){ toast(e.message); } });
   panel.querySelectorAll('[data-re]').forEach(b=>b.onclick=async()=>{ try{ await api('/documents/'+b.dataset.re+'/reprocess',{method:'POST'}); toast('Queued'); setTimeout(renderStorePanel,800); }catch(e){ toast(e.message); } });
@@ -266,13 +284,14 @@ async function renderStorePanel(){
 // ---------- projects ----------
 function renderProjects(){
   const app=$('#app');
-  app.innerHTML = `<div class="card"><div class="row between"><h2>Projects</h2><button class="primary" id="addProject" ${state.models.length?'':'disabled title="Add a model connection first"'}>+ Add project</button></div>
-    <p class="muted">Clients call <code>POST /v1/chat/completions</code> with <code>Authorization: Bearer sk-proj-…</code>. Keys are shown once at creation.</p>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Model</th><th>RAG store</th><th>Key</th><th>System prompt</th><th></th></tr></thead><tbody>
-    ${state.projects.map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${esc(modelName(p.model_connection_id))}</td><td>${esc(ragName(p.rag_store_id))}</td><td><code>${esc(p.api_key_prefix)}…</code></td><td class="muted">${esc((p.system_prompt||'').slice(0,60))}${(p.system_prompt||'').length>60?'…':''}</td>
-      <td style="white-space:nowrap"><button class="small" data-metrics="${p.id}">Metrics</button> <button class="small" data-rotate="${p.id}">Rotate key</button> <button class="small" data-edit="${p.id}">Edit</button> <button class="small danger" data-del="${p.id}">Delete</button></td></tr>`).join('')||'<tr><td colspan="6" class="muted">No projects yet.</td></tr>'}
+  const w = can('editor');
+  app.innerHTML = `<div class="card"><div class="row between"><h2>Projects</h2>${w?`<button class="primary" id="addProject" ${state.models.length?'':'disabled title="Add a model connection first"'}>+ Add project</button>`:''}</div>
+    <p class="muted">Clients call <code>POST /v1/chat/completions</code> with <code>Authorization: Bearer sk-proj-…</code>. Keys are shown once at creation.${can('admin')?'':' You only see projects you are a member of.'}</p>
+    <div class="tbl"><table><thead><tr><th>Name</th><th>Model</th><th>RAG store</th><th>Key</th><th>Members</th><th>System prompt</th><th></th></tr></thead><tbody>
+    ${state.projects.map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${esc(modelName(p.model_connection_id))}</td><td>${esc(ragName(p.rag_store_id))}</td><td><code>${esc(p.api_key_prefix)}…</code></td><td class="muted">${esc((p.member_ids||[]).map(userName).join(', ')||'—')}</td><td class="muted">${esc((p.system_prompt||'').slice(0,60))}${(p.system_prompt||'').length>60?'…':''}</td>
+      <td style="white-space:nowrap"><button class="small" data-metrics="${p.id}">Metrics</button>${w?` <button class="small" data-rotate="${p.id}">Rotate key</button> <button class="small" data-edit="${p.id}">Edit</button> <button class="small danger" data-del="${p.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">No projects yet.</td></tr>'}
     </tbody></table></div></div><div id="projPanel"></div>`;
-  $('#addProject').onclick=()=>projectForm();
+  if (w) $('#addProject').onclick=()=>projectForm();
   app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>projectForm(state.projects.find(p=>p.id==b.dataset.edit)));
   app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this project and its metrics?')) return; try{ await api('/projects/'+b.dataset.del,{method:'DELETE'}); await loadAll(); render(); }catch(e){ toast(e.message); } });
   app.querySelectorAll('[data-rotate]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Rotate the key? The current key stops working immediately.')) return; try{ const r=await api('/projects/'+b.dataset.rotate+'/rotate-key',{method:'POST'}); showKey(r.project, r.api_key); await loadAll(); }catch(e){ toast(e.message); } });
@@ -283,9 +302,12 @@ function projectForm(p){
     ${field('Name', input('name', p?.name||'', 'required'))}
     ${field('Model connection', select('model_connection_id', state.models.map(m=>({value:m.id,label:`${m.name} (${m.provider_type} · ${m.model_name})`})), p?.model_connection_id))}
     ${field('RAG store (optional)', select('rag_store_id', [{value:0,label:'— none —'}, ...state.rag.map(r=>({value:r.id,label:r.name}))], p?.rag_store_id||0))}
-    ${field('Project system prompt (optional, prepended to every request)', `<textarea name="system_prompt">${esc(p?.system_prompt||'')}</textarea>`)}`,
-    async d => { const body={name:d.name, model_connection_id:Number(d.model_connection_id), rag_store_id:Number(d.rag_store_id)||null, system_prompt:d.system_prompt};
-      if (p) { await api('/projects/'+p.id,{method:'PUT',body}); toast('Saved'); } else { const r=await api('/projects',{method:'POST',body}); showKey(r.project, r.api_key); }
+    ${field('Project system prompt (optional, prepended to every request)', `<textarea name="system_prompt">${esc(p?.system_prompt||'')}</textarea>`)}
+    ${field('Members (Ctrl/Cmd-click for several; you stay a member of projects you create)', multiSelect('members', state.users.map(u=>({value:u.id,label:`${u.username} (${u.role})`})), p?.member_ids||[state.user.id]))}`,
+    async (d, form) => { const members=[...form.querySelector('[name=members]').selectedOptions].map(o=>Number(o.value));
+      const body={name:d.name, model_connection_id:Number(d.model_connection_id), rag_store_id:Number(d.rag_store_id)||null, system_prompt:d.system_prompt};
+      if (p) { await api('/projects/'+p.id,{method:'PUT',body}); await api(`/projects/${p.id}/members`,{method:'PUT',body:{user_ids:members}}); toast('Saved'); }
+      else { const r=await api('/projects',{method:'POST',body:{...body, member_user_ids:members}}); showKey(r.project, r.api_key); }
       await loadAll(); render(); });
 }
 function showKey(p, key){
@@ -310,6 +332,47 @@ async function projectMetrics(id){
       <h3 style="margin-top:14px">Recent</h3><div class="tbl"><table><thead><tr><th>Time</th><th>Status</th><th>Tokens (p/c)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
       ${m.recent.map(r=>`<tr><td>${fmtDate(r.created_at)}</td><td><span class="pill ${r.status_code<400?'ok':'err'}">${r.status_code}</span></td><td>${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated?' ~':''}</td><td>${fmtN(r.latency_ms)} ms</td><td>${r.streamed?'stream ':''}${r.rag_used?'rag':''}</td><td class="muted">${esc(r.error)}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
   }catch(e){ panel.innerHTML=`<div class="card">Error: ${esc(e.message)}</div>`; }
+}
+
+// ---------- users (admin) ----------
+async function renderUsers(){
+  const app=$('#app'); app.innerHTML='<div class="card">Loading…</div>';
+  let users; try{ users=await api('/users'); }catch(e){ app.innerHTML=`<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  app.innerHTML = `<div class="card"><div class="row between"><h2>Users</h2><button class="primary" id="addUser">+ Add user</button></div>
+    <p class="muted"><b>admin</b> manages everything including users; <b>editor</b> manages models, RAG stores and the projects it belongs to; <b>viewer</b> is read-only. Deactivated users cannot sign in and lose their sessions.</p>
+    <div class="tbl"><table><thead><tr><th>Username</th><th>Role</th><th>Active</th><th>Last login</th><th>Created</th><th></th></tr></thead><tbody>
+    ${users.map(u=>`<tr><td><b>${esc(u.username)}</b>${u.id===state.user.id?' <span class="muted">(you)</span>':''}</td><td><span class="pill">${esc(u.role)}</span></td><td>${u.is_active?'<span class="pill ok">active</span>':'<span class="pill err">inactive</span>'}</td><td>${fmtDate(u.last_login_at)||'<span class="muted">never</span>'}</td><td>${fmtDate(u.created_at)}</td>
+      <td style="white-space:nowrap"><button class="small" data-edit="${u.id}">Edit</button> <button class="small" data-reset="${u.id}">Reset password</button> <button class="small" data-revoke="${u.id}">Revoke sessions</button> <button class="small danger" data-del="${u.id}" ${u.id===state.user.id?'disabled':''}>Delete</button></td></tr>`).join('')}
+    </tbody></table></div></div>`;
+  const reload = async()=>{ await loadAll(); render(); };
+  $('#addUser').onclick=()=>modal('New user', `${field('Username', input('username','','required autocomplete=off'))}${field('Password (min 8)', input('password','','type=password required minlength=8 autocomplete=new-password'))}${field('Role', select('role', ROLES, 'viewer'))}`,
+    async d=>{ await api('/users',{method:'POST',body:d}); toast('User created'); await reload(); }, 'Create');
+  app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{ const u=users.find(x=>x.id==b.dataset.edit);
+    modal(`Edit ${u.username}`, `${field('Role', select('role', ROLES, u.role))}${field('Status', select('is_active', [{value:'true',label:'active'},{value:'false',label:'inactive — cannot sign in'}], String(u.is_active)))}`,
+      async d=>{ await api('/users/'+u.id,{method:'PUT',body:{role:d.role, is_active:d.is_active==='true'}}); toast('Saved'); if(u.id===state.user.id){ state.user=await api('/me'); } await reload(); }); });
+  app.querySelectorAll('[data-reset]').forEach(b=>b.onclick=()=>{ const u=users.find(x=>x.id==b.dataset.reset);
+    modal(`Reset password for ${u.username}`, `${field('New password (min 8)', input('new_password','','type=password required minlength=8 autocomplete=new-password'))}<p class="muted">All sessions of this user are revoked.</p>`,
+      async d=>{ await api(`/users/${u.id}/reset-password`,{method:'POST',body:d}); toast('Password reset'); }, 'Reset'); });
+  app.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Sign this user out everywhere?')) return; try{ await api(`/users/${b.dataset.revoke}/sessions/revoke`,{method:'POST'}); toast('Sessions revoked'); }catch(e){ toast(e.message); } });
+  app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this user? Their sessions and project memberships are removed; audit entries keep the username.')) return; try{ await api('/users/'+b.dataset.del,{method:'DELETE'}); toast('Deleted'); await reload(); }catch(e){ toast(e.message); } });
+}
+
+// ---------- audit (admin) ----------
+const auditState = { rows:[], action:'', done:false };
+async function renderAudit(){
+  const app=$('#app');
+  app.innerHTML = `<div class="card"><div class="row between"><h2>Audit log</h2>
+      <form id="auditFilter" class="row"><input name="action" placeholder="filter by action prefix, e.g. login. or project.create" value="${esc(auditState.action)}" style="width:320px"><button>Filter</button></form></div>
+    <div class="tbl"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th><th>Details</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+    <div class="row" style="margin-top:10px"><button id="auditMore">Load more</button><span class="muted" id="auditInfo"></span></div></div>`;
+  const draw = () => { $('#auditRows').innerHTML = auditState.rows.map(a=>`<tr><td style="white-space:nowrap">${fmtDate(a.created_at)}</td><td>${esc(a.actor_username||'—')}${a.actor_user_id?` <span class="muted">#${a.actor_user_id}</span>`:''}</td><td><code>${esc(a.action)}</code></td><td class="muted">${esc(a.target_type)}${a.target_id!=null?' #'+a.target_id:''}</td><td class="muted">${esc(a.ip)}</td><td class="json">${esc(JSON.stringify(a.details))}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No entries.</td></tr>';
+    $('#auditMore').disabled=auditState.done; $('#auditInfo').textContent=`${auditState.rows.length} entries${auditState.done?' · end':''}`; };
+  const load = async (more) => { try{ const q=new URLSearchParams({limit:'100'}); if(auditState.action) q.set('action',auditState.action);
+      if(more && auditState.rows.length) q.set('before', auditState.rows[auditState.rows.length-1].created_at);
+      const rows=await api('/audit?'+q); auditState.rows = more ? auditState.rows.concat(rows) : rows; auditState.done = rows.length<100; draw(); }catch(e){ toast(e.message); } };
+  $('#auditFilter').onsubmit=e=>{ e.preventDefault(); auditState.action=$('[name=action]',e.target).value.trim(); load(false); };
+  $('#auditMore').onclick=()=>load(true);
+  await load(false);
 }
 
 // ---------- playground ----------
@@ -348,7 +411,8 @@ $('#btnPassword').onclick = ()=> modal('Change password', `${field('Current pass
   async d=>{ await api('/me/password',{method:'POST',body:d}); toast('Password changed'); });
 
 (async function init(){
-  try { state.user = await api('/me'); await loadAll(); } catch(e) { state.user=null; }
+  try { state.user = await api('/me'); } catch(e) { state.user=null; if (e.message!=='session expired') toast('Could not load session: '+e.message); }
+  if (state.user) { try { await loadAll(); } catch(e) { toast(e.message); } }
   render();
 })();
 </script>
