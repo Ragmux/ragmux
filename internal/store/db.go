@@ -307,3 +307,22 @@ func pgCode(err error) string {
 	}
 	return ""
 }
+
+// SetupInfo is the cheap, unauthenticated slice of DatabaseInfo shown on
+// the first-run page: the newest applied migration and the database role.
+type SetupInfo struct {
+	MigrationsVersion int
+	DatabaseRole      string
+}
+
+// SetupInfo reads the migration version and the connected role in one
+// round trip.
+func (s *Store) SetupInfo(ctx context.Context) (*SetupInfo, error) {
+	info := &SetupInfo{}
+	err := s.pool.QueryRow(ctx, "SELECT COALESCE((SELECT MAX(version) FROM schema_migrations), 0), current_user").
+		Scan(&info.MigrationsVersion, &info.DatabaseRole)
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}

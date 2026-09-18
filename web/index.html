@@ -441,7 +441,7 @@ async function renderAudit(){
     $('#auditMore').disabled=auditState.done; $('#auditInfo').textContent=`${auditState.rows.length} entries${auditState.done?' · end':''}`; };
   const load = async (more) => { try{ const q=new URLSearchParams({limit:'100'}); if(auditState.action) q.set('action',auditState.action);
       if(more && auditState.rows.length) q.set('before', auditState.rows[auditState.rows.length-1].created_at);
-      const rows=await api('/audit?'+q); auditState.rows = more ? auditState.rows.concat(rows) : rows; auditState.done = rows.length<100; draw(); }catch(e){ toast(e.message); } };
+      const res=await api('/audit?'+q); const rows=res.entries||[]; auditState.rows = more ? auditState.rows.concat(rows) : rows; auditState.done = !res.has_more; draw(); }catch(e){ toast(e.message); } };
   $('#auditFilter').onsubmit=e=>{ e.preventDefault(); auditState.action=$('[name=action]',e.target).value.trim(); load(false); };
   $('#auditMore').onclick=()=>load(true);
   await load(false);

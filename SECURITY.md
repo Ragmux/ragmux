@@ -74,5 +74,10 @@ of [Configuration](docs/configuration.md):
   [Docker Compose variables](docs/configuration.md#docker-compose-variables): keeping
   `SECRET_KEY` and `DATABASE_URL` in secrets files (`*_FILE`) instead of `.env`
 
+- [Login protection](docs/users-and-limits.md#login-protection) and the
+  [audit log](docs/users-and-limits.md#audit-log): the limiter's counters
+  (`GET /admin/api/security/logins`) and the NDJSON export for keeping the trail beyond
+  `AUDIT_RETENTION_DAYS`
+
 Also keep `SECRET_KEY` with your backups and rotate it with `ragmux rotate-key` when it
 may have leaked ([Backup and restore](docs/backup-restore.md#rotating-secret_key)).

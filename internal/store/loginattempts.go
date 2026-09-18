@@ -54,3 +54,42 @@ func (s *Store) OldestFailedLoginAttempt(ctx context.Context, username, ip strin
 	}
 	return *t, nil
 }
+
+// CountFailedLoginAttemptsSince counts every failure recorded since t.
+func (s *Store) CountFailedLoginAttemptsSince(ctx context.Context, since time.Time) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM login_attempts WHERE NOT success AND created_at >= $1",
+		since.UTC()).Scan(&n)
+	return n, err
+}
+
+// FailedLoginPair is a username/address pair with its failures since a
+// point in time and the time of the oldest counted failure.
+type FailedLoginPair struct {
+	Username string
+	IP       string
+	Failures int
+	Oldest   time.Time
+}
+
+// FailedLoginPairsSince returns the username/address pairs with at least
+// min failures since t, most failures first.
+func (s *Store) FailedLoginPairsSince(ctx context.Context, since time.Time, minFailures int) ([]FailedLoginPair, error) {
+	rows, err := s.pool.Query(ctx, `SELECT username, ip, COUNT(*), MIN(created_at) FROM login_attempts
+		WHERE NOT success AND created_at >= $1 GROUP BY username, ip HAVING COUNT(*) >= $2
+		ORDER BY COUNT(*) DESC, username, ip`, since.UTC(), minFailures)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []FailedLoginPair{}
+	for rows.Next() {
+		var p FailedLoginPair
+		if err := rows.Scan(&p.Username, &p.IP, &p.Failures, &p.Oldest); err != nil {
+			return nil, err
+		}
+		p.Oldest = p.Oldest.UTC()
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}

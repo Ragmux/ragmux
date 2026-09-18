@@ -43,6 +43,37 @@ All notable changes to Ragmux are documented here. The format follows
   100 when ready; a failed document keeps its last value).
 - `POST /admin/api/rag-stores/{id}/search` returns `retrieval_latency_ms` and
   `rerank_latency_ms` (`null` when reranking did not run) next to `latency_ms`.
+- `GET /admin/api/audit` takes `since` and `until` (RFC 3339) next to `action`,
+  `actor_user_id`, `before` and `limit`, and answers `{"entries": […], "total": N,
+  "has_more": bool}` where `total` counts every entry matching the filters. The
+  dashboard's Audit tab reads the new shape.
+- `GET /admin/api/audit/export` (admin) streams the same entries as NDJSON, newest
+  first, capped at 100 000 rows, as an attachment; every export is audited as
+  `audit.exported` with the filters in `details`.
+- `GET /admin/api/security/logins` (admin): failed logins in the last hour and 24 hours
+  plus the username/address pairs the login limiter currently locks out, computed with
+  the limiter's own rule.
+- Failed logins (`401`) carry `attempts_remaining` (per-user budget minus recorded
+  failures, identical for unknown usernames and wrong passwords); `429` answers gain
+  `"locked": true|false` next to `Retry-After`.
+- `GET /admin/api/me` reports `session_expires_at` and `session_bearer`.
+- `GET /admin/api/users` entries carry `project_count` and `active_sessions`;
+  `POST /admin/api/users` accepts `project_ids` and writes the memberships in the same
+  transaction (`422` for an unknown project).
+- `GET /admin/api/setup` reports `migrations_version`, `secret_key_source` and
+  `database_role` so the setup page can confirm which database the gateway runs on.
+
+### Changed
+- **Usernames are case-insensitive.** Login matches `lower(username)`, and creating a
+  user or the first administrator with a name that differs from an existing one only by
+  case answers `409`; the stored casing is preserved. Migration `0008` adds a unique
+  index on `lower(username)` and refuses to run (with the colliding names) over data
+  that already collides; see
+  [Case-insensitive usernames](docs/users-and-limits.md#case-insensitive-usernames)
+  for the manual fix.
+- `GET /admin/api/system` returns `database.postgres_version` and
+  `database.pgvector_version` to admins only; editors and viewers receive the
+  `database` object without those two keys.
 
 ## [0.2.3] — 2026-09-18
 

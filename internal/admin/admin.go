@@ -169,6 +169,8 @@ func (a *Admin) authenticated(r chi.Router) {
 	adminOnly.Post("/api/users/{id}/reset-password", a.resetPassword)
 	adminOnly.Post("/api/users/{id}/sessions/revoke", a.revokeSessions)
 	adminOnly.Get("/api/audit", a.listAudit)
+	adminOnly.Get("/api/audit/export", a.exportAudit)
+	adminOnly.Get("/api/security/logins", a.loginSecurity)
 }
 
 // ---- helpers ----
@@ -286,7 +288,7 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) {
 			a.auditAs(r, nil, "login.failure", "user", nil, map[string]any{"username": in.Username})
-			writeErr(w, http.StatusUnauthorized, "invalid username or password")
+			a.invalidCredentials(w, r, in.Username)
 			return
 		}
 		a.fail(w, err)
@@ -302,6 +304,25 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 		out["token"] = tok
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// invalidCredentials answers a failed login. The body carries the number of
+// failures left before the per-user limit triggers; it is derived from the
+// recorded attempts alone, so an unknown username and a wrong password get
+// identical answers and the response does not reveal which accounts exist.
+func (a *Admin) invalidCredentials(w http.ResponseWriter, r *http.Request, username string) {
+	body := map[string]any{"message": "invalid username or password", "type": http.StatusText(http.StatusUnauthorized)}
+	if a.Limiter != nil {
+		remaining, ok, err := a.Limiter.Remaining(r.Context(), username)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		if ok {
+			body["attempts_remaining"] = remaining
+		}
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]any{"error": body})
 }
 
 // allowAttempt consults the login limiter for a username/address pair and
@@ -332,7 +353,7 @@ func (a *Admin) throttled(w http.ResponseWriter, r *http.Request, username strin
 	a.auditAs(r, nil, action, "user", nil, map[string]any{"username": username})
 	w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
 	writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{
-		"message": "too many login attempts, try again later", "type": "rate_limited"}})
+		"message": "too many login attempts, try again later", "type": "rate_limited", "locked": locked}})
 }
 
 // decodeLogin is decode for the one endpoint that has no session yet: the
@@ -380,8 +401,19 @@ func (a *Admin) auditAs(r *http.Request, actor *store.User, action, targetType s
 
 func ptr(id int64) *int64 { return &id }
 
+// me returns the caller's account plus the session it is using: when it
+// expires and whether it arrived as a bearer token.
 func (a *Admin) me(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, auth.UserFrom(r.Context()))
+	out := struct {
+		*store.User
+		SessionExpiresAt string `json:"session_expires_at"`
+		SessionBearer    bool   `json:"session_bearer"`
+	}{User: auth.UserFrom(r.Context())}
+	if se := auth.SessionFrom(r.Context()); se != nil {
+		out.SessionExpiresAt = se.ExpiresAt.UTC().Format(time.RFC3339)
+		out.SessionBearer = se.Bearer
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
@@ -1669,6 +1701,9 @@ func csvCell(s string) string {
 	return s
 }
 
+// systemInfo describes the installation. The PostgreSQL and pgvector
+// versions are only shown to admins: editors and viewers get the database
+// object without those two keys.
 func (a *Admin) systemInfo(w http.ResponseWriter, r *http.Request) {
 	info, err := a.Store.DatabaseInfo(r.Context())
 	if err != nil {
@@ -1680,8 +1715,12 @@ func (a *Admin) systemInfo(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	var database any = info
+	if u := auth.UserFrom(r.Context()); !auth.Role(u.Role).AtLeast(auth.RoleAdmin) {
+		database = map[string]any{"migrations_version": info.MigrationsVersion, "size_bytes": info.SizeBytes}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"database":          info,
+		"database":          database,
 		"backup":            backup,
 		"secret_key_source": a.Store.SecretKeySource,
 		"version":           Version,

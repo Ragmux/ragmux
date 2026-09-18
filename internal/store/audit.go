@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // AuditLog is one recorded management action.
@@ -20,12 +22,49 @@ type AuditLog struct {
 	CreatedAt     string         `json:"created_at"`
 }
 
-// AuditFilter narrows ListAuditLogs.
+// AuditFilter narrows ListAuditLogs, CountAuditLogs and StreamAuditLogs.
+// Since and Until bound created_at (inclusive / exclusive); Before is the
+// paging cursor and, like Limit, is ignored by CountAuditLogs.
 type AuditFilter struct {
 	Limit       int
 	ActorUserID *int64
 	Action      string
 	Before      *time.Time
+	Since       *time.Time
+	Until       *time.Time
+}
+
+// MaxAuditExport caps the rows StreamAuditLogs hands out.
+const MaxAuditExport = 100000
+
+const auditCols = "id, actor_user_id, actor_username, action, target_type, target_id, details, ip, created_at"
+
+// where renders the filter as a WHERE clause; paging tells whether the
+// Before cursor takes part (it never does for a count).
+func (f AuditFilter) where(paging bool) (string, []any) {
+	q := " WHERE true"
+	args := []any{}
+	if f.ActorUserID != nil {
+		args = append(args, *f.ActorUserID)
+		q += fmt.Sprintf(" AND actor_user_id = $%d", len(args))
+	}
+	if f.Action != "" {
+		args = append(args, f.Action+"%")
+		q += fmt.Sprintf(" AND action LIKE $%d", len(args))
+	}
+	if f.Since != nil {
+		args = append(args, f.Since.UTC())
+		q += fmt.Sprintf(" AND created_at >= $%d", len(args))
+	}
+	if f.Until != nil {
+		args = append(args, f.Until.UTC())
+		q += fmt.Sprintf(" AND created_at < $%d", len(args))
+	}
+	if paging && f.Before != nil {
+		args = append(args, f.Before.UTC())
+		q += fmt.Sprintf(" AND created_at < $%d", len(args))
+	}
+	return q, args
 }
 
 // InsertAuditLog persists an audit entry. Details must not contain secrets.
@@ -45,52 +84,86 @@ func (s *Store) InsertAuditLog(ctx context.Context, l *AuditLog) error {
 	return err
 }
 
-// ListAuditLogs returns the newest entries matching the filter.
-func (s *Store) ListAuditLogs(ctx context.Context, f AuditFilter) ([]*AuditLog, error) {
+// ListAuditLogs returns the newest entries matching the filter and whether
+// more entries exist beyond the limit (default 100, at most 1000).
+func (s *Store) ListAuditLogs(ctx context.Context, f AuditFilter) (entries []*AuditLog, hasMore bool, err error) {
 	if f.Limit <= 0 || f.Limit > 1000 {
 		f.Limit = 100
 	}
-	q := `SELECT id, actor_user_id, actor_username, action, target_type, target_id, details, ip, created_at
-		FROM audit_logs WHERE true`
-	args := []any{}
-	if f.ActorUserID != nil {
-		args = append(args, *f.ActorUserID)
-		q += fmt.Sprintf(" AND actor_user_id = $%d", len(args))
-	}
-	if f.Action != "" {
-		args = append(args, f.Action+"%")
-		q += fmt.Sprintf(" AND action LIKE $%d", len(args))
-	}
-	if f.Before != nil {
-		args = append(args, f.Before.UTC())
-		q += fmt.Sprintf(" AND created_at < $%d", len(args))
-	}
-	args = append(args, f.Limit)
-	q += fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
-	rows, err := s.pool.Query(ctx, q, args...)
+	where, args := f.where(true)
+	args = append(args, f.Limit+1)
+	rows, err := s.pool.Query(ctx, "SELECT "+auditCols+" FROM audit_logs"+where+
+		fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args)), args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	out := []*AuditLog{}
+	entries = []*AuditLog{}
 	for rows.Next() {
-		l := &AuditLog{}
-		var raw []byte
-		var created time.Time
-		if err := rows.Scan(&l.ID, &l.ActorUserID, &l.ActorUsername, &l.Action, &l.TargetType, &l.TargetID,
-			&raw, &l.IP, &created); err != nil {
+		l, err := scanAuditLog(rows)
+		if err != nil {
+			return nil, false, err
+		}
+		entries = append(entries, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(entries) > f.Limit {
+		return entries[:f.Limit], true, nil
+	}
+	return entries, false, nil
+}
+
+// CountAuditLogs counts every entry matching the filter, ignoring the
+// Before cursor and the limit.
+func (s *Store) CountAuditLogs(ctx context.Context, f AuditFilter) (int64, error) {
+	where, args := f.where(false)
+	var n int64
+	err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM audit_logs"+where, args...).Scan(&n)
+	return n, err
+}
+
+// StreamAuditLogs calls fn for every entry matching the filter, newest
+// first, up to MaxAuditExport rows. A non-nil error from fn stops the scan
+// and is returned.
+func (s *Store) StreamAuditLogs(ctx context.Context, f AuditFilter, fn func(*AuditLog) error) error {
+	where, args := f.where(true)
+	args = append(args, MaxAuditExport)
+	rows, err := s.pool.Query(ctx, "SELECT "+auditCols+" FROM audit_logs"+where+
+		fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args)), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		l, err := scanAuditLog(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(l); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func scanAuditLog(rows pgx.Rows) (*AuditLog, error) {
+	l := &AuditLog{}
+	var raw []byte
+	var created time.Time
+	if err := rows.Scan(&l.ID, &l.ActorUserID, &l.ActorUsername, &l.Action, &l.TargetType, &l.TargetID,
+		&raw, &l.IP, &created); err != nil {
+		return nil, err
+	}
+	l.Details = map[string]any{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &l.Details); err != nil {
 			return nil, err
 		}
-		l.Details = map[string]any{}
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &l.Details); err != nil {
-				return nil, err
-			}
-		}
-		l.CreatedAt = ts(created)
-		out = append(out, l)
 	}
-	return out, rows.Err()
+	l.CreatedAt = ts(created)
+	return l, nil
 }
 
 // DeleteAuditLogsBefore removes audit entries older than t and reports how

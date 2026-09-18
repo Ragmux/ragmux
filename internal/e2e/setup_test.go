@@ -124,7 +124,7 @@ func TestFirstRunSetup(t *testing.T) {
 	}
 	session := e2.login("owner", "correct-horse-battery")
 	audit := e2.call("GET", "/admin/api/audit?action=setup.complete", nil, session)
-	if list, _ := audit["_list"].([]any); len(list) != 1 {
+	if list, _ := audit["entries"].([]any); len(list) != 1 {
 		t.Errorf("setup.complete audit rows: %v", audit)
 	}
 

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -47,8 +48,12 @@ func (a *Admin) listUsersLite(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// errUsernameTaken answers a create that collides with an existing name;
+// the comparison is case-insensitive.
+const errUsernameTaken = "a user with that name already exists (usernames are case-insensitive)"
+
 func (a *Admin) listUsers(w http.ResponseWriter, r *http.Request) {
-	list, err := a.Store.ListUsers(r.Context())
+	list, err := a.Store.ListUsersWithStats(r.Context())
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -56,11 +61,14 @@ func (a *Admin) listUsers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// createUser adds an account and, when project_ids is given, its project
+// memberships in the same transaction.
 func (a *Admin) createUser(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		Role     string `json:"role"`
+		Username   string  `json:"username"`
+		Password   string  `json:"password"`
+		Role       string  `json:"role"`
+		ProjectIDs []int64 `json:"project_ids"`
 	}
 	if err := decode(r, &in); err != nil {
 		badBody(w, err)
@@ -87,12 +95,29 @@ func (a *Admin) createUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	u, err := a.Store.CreateUser(r.Context(), in.Username, hash, in.Role)
+	for _, id := range in.ProjectIDs {
+		if id <= 0 {
+			writeErr(w, http.StatusUnprocessableEntity, "project_ids contains an unknown project")
+			return
+		}
+	}
+	u, err := a.Store.CreateUserWithProjects(r.Context(), in.Username, hash, in.Role, in.ProjectIDs)
 	if err != nil {
-		a.fail(w, err)
+		switch {
+		case store.IsUniqueViolation(err):
+			writeErr(w, http.StatusConflict, errUsernameTaken)
+		case store.IsForeignKeyViolation(err):
+			writeErr(w, http.StatusUnprocessableEntity, "project_ids contains an unknown project")
+		default:
+			a.fail(w, err)
+		}
 		return
 	}
-	a.audit(r, "user.create", "user", ptr(u.ID), map[string]any{"username": u.Username, "role": u.Role})
+	details := map[string]any{"username": u.Username, "role": u.Role}
+	if len(in.ProjectIDs) > 0 {
+		details["project_ids"] = in.ProjectIDs
+	}
+	a.audit(r, "user.create", "user", ptr(u.ID), details)
 	writeJSON(w, http.StatusCreated, u)
 }
 
@@ -251,7 +276,9 @@ func (a *Admin) revokeSessions(w http.ResponseWriter, r *http.Request) {
 
 // ---- audit log ----
 
-func (a *Admin) listAudit(w http.ResponseWriter, r *http.Request) {
+// auditFilter parses the shared audit query parameters; it writes the 400
+// and returns false when one of them is malformed.
+func auditFilter(w http.ResponseWriter, r *http.Request) (store.AuditFilter, bool) {
 	q := r.URL.Query()
 	f := store.AuditFilter{Action: strings.TrimSpace(q.Get("action"))}
 	f.Limit, _ = strconv.Atoi(q.Get("limit"))
@@ -259,22 +286,82 @@ func (a *Admin) listAudit(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "bad actor_user_id")
-			return
+			return f, false
 		}
 		f.ActorUserID = &id
 	}
-	if v := q.Get("before"); v != "" {
+	for _, p := range []struct {
+		name string
+		dst  **time.Time
+	}{{"before", &f.Before}, {"since", &f.Since}, {"until", &f.Until}} {
+		v := q.Get(p.name)
+		if v == "" {
+			continue
+		}
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "before must be an RFC 3339 timestamp")
-			return
+			writeErr(w, http.StatusBadRequest, p.name+" must be an RFC 3339 timestamp")
+			return f, false
 		}
-		f.Before = &t
+		*p.dst = &t
 	}
-	list, err := a.Store.ListAuditLogs(r.Context(), f)
+	return f, true
+}
+
+// auditQuery is the filter as recorded in the audit.exported entry.
+func auditQuery(f store.AuditFilter) map[string]any {
+	d := map[string]any{}
+	if f.Action != "" {
+		d["action"] = f.Action
+	}
+	if f.ActorUserID != nil {
+		d["actor_user_id"] = *f.ActorUserID
+	}
+	for _, p := range []struct {
+		name string
+		t    *time.Time
+	}{{"before", f.Before}, {"since", f.Since}, {"until", f.Until}} {
+		if p.t != nil {
+			d[p.name] = p.t.UTC().Format(time.RFC3339)
+		}
+	}
+	return d
+}
+
+func (a *Admin) listAudit(w http.ResponseWriter, r *http.Request) {
+	f, ok := auditFilter(w, r)
+	if !ok {
+		return
+	}
+	entries, hasMore, err := a.Store.ListAuditLogs(r.Context(), f)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	total, err := a.Store.CountAuditLogs(r.Context(), f)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "total": total, "has_more": hasMore})
+}
+
+// exportAudit streams the matching entries as NDJSON, newest first, at most
+// store.MaxAuditExport rows. The export itself is audited before the first
+// row is written so the entry exists even when the client disconnects.
+func (a *Admin) exportAudit(w http.ResponseWriter, r *http.Request) {
+	f, ok := auditFilter(w, r)
+	if !ok {
+		return
+	}
+	a.audit(r, "audit.exported", "audit", nil, auditQuery(f))
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Disposition", `attachment; filename="ragmux-audit-`+time.Now().UTC().Format("20060102T150405Z")+`.ndjson"`)
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	err := a.Store.StreamAuditLogs(r.Context(), f, func(l *store.AuditLog) error { return enc.Encode(l) })
+	if err != nil {
+		// Headers are out; the client sees a truncated body, the log the cause.
+		a.Log.Error("audit export interrupted", "err", err, "req_id", w.Header().Get("X-Request-Id"))
+	}
 }
