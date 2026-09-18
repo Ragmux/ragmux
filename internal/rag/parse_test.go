@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -210,5 +211,57 @@ func TestExtractPDFPages(t *testing.T) {
 	}
 	if _, err := ExtractBlocks(context.Background(), "x.pdf", []byte("%PDF-1.4 garbage")); err == nil {
 		t.Error("expected error for a broken pdf")
+	}
+}
+
+func TestExtractDOCXRejectsBombs(t *testing.T) {
+	ctx := context.Background()
+	// A header that declares a huge document.xml is rejected before reading.
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.CreateRaw(&zip.FileHeader{Name: "word/document.xml", Method: zip.Store,
+		UncompressedSize64: 40 << 20, CompressedSize64: 5, CRC32: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write([]byte("<w:p>"))
+	zw.Close()
+	if _, err := ExtractBlocks(ctx, "big.docx", buf.Bytes()); err == nil || !strings.Contains(err.Error(), "limit is 32 MiB") {
+		t.Errorf("declared size: err = %v", err)
+	}
+	// Highly compressible content (ratio > 100) is rejected too.
+	body := docxP("", strings.Repeat("a", 2<<20))
+	if _, err := ExtractBlocks(ctx, "ratio.docx", buildDOCX(t, body)); err == nil || !strings.Contains(err.Error(), "compression ratio") {
+		t.Errorf("ratio: err = %v", err)
+	}
+	// A normal document still parses.
+	if _, err := ExtractBlocks(ctx, "ok.docx", buildDOCX(t, docxP("", "hello world"))); err != nil {
+		t.Errorf("normal: %v", err)
+	}
+}
+
+func TestExtractTextCap(t *testing.T) {
+	ctx := context.Background()
+	big := make([]byte, maxExtractedText+1)
+	for i := range big {
+		big[i] = 'a'
+	}
+	if _, err := ExtractBlocks(ctx, "big.txt", big); !errors.Is(err, ErrTooMuchText) {
+		t.Errorf("txt: %v", err)
+	}
+	if _, err := ExtractBlocks(ctx, "big.md", big); !errors.Is(err, ErrTooMuchText) {
+		t.Errorf("md: %v", err)
+	}
+	html := append([]byte("<p>"), big...)
+	if _, err := ExtractBlocks(ctx, "big.html", html); !errors.Is(err, ErrTooMuchText) {
+		t.Errorf("html: %v", err)
+	}
+}
+
+func TestExtractPDFHonoursContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ExtractBlocks(ctx, "doc.pdf", buildPDF(t, "Hello")); err == nil {
+		t.Error("cancelled context must abort pdf parsing")
 	}
 }
