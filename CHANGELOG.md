@@ -64,6 +64,17 @@ All notable changes to Ragmux are documented here. The format follows
   `database_role` so the setup page can confirm which database the gateway runs on.
 
 ### Changed
+- **Dashboard.** `/admin/` is rebuilt as a sidebar console (dark ground, amber accent,
+  self-hosted Bricolage Grotesque / IBM Plex Sans / JetBrains Mono under `web/fonts/`,
+  SIL OFL) with forms in side drawers, and wires every endpoint above: window tabs with
+  previous-period deltas, traffic by project, budget watch and forecasts, CSV / NDJSON
+  exports, connection tests before saving, capability and private-upstream pills, quota
+  meters and ingestion progress, per-stage retrieval latencies, usage rings with reset
+  countdowns, playground citations and response headers, user filters and password
+  strength, audit filters with totals, login attempt and lockout feedback, and the
+  setup page's database and key status. Role-based visibility is unchanged; the page
+  still consists of one inline script pinned by the CSP hash and loads nothing from
+  third parties.
 - **Usernames are case-insensitive.** Login matches `lower(username)`, and creating a
   user or the first administrator with a name that differs from an existing one only by
   case answers `409`; the stored casing is preserved. Migration `0008` adds a unique
