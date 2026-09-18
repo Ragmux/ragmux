@@ -3,6 +3,7 @@ package admin
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -146,12 +147,14 @@ func (a *Admin) authenticated(r chi.Router) {
 	editor.Delete("/api/projects/{id}", a.deleteProject)
 	editor.Post("/api/projects/{id}/rotate-key", a.rotateKey)
 	r.Get("/api/projects/{id}/metrics", a.projectMetrics)
+	r.Get("/api/projects/{id}/metrics.csv", a.projectMetricsCSV)
 	r.Get("/api/projects/{id}/usage", a.projectUsage)
 	r.Get("/api/projects/{id}/members", a.listMembers)
 	editor.Put("/api/projects/{id}/members", a.setMembers)
 
 	r.Get("/api/metrics/summary", a.metricsSummary)
 	r.Get("/api/metrics/requests", a.recentRequests)
+	r.Get("/api/metrics/requests.csv", a.requestsCSV)
 	r.Get("/api/system", a.systemInfo)
 
 	// User management and the audit trail are admin-only; the lite user
@@ -1348,14 +1351,25 @@ func containsID(ids []int64, id int64) bool {
 
 // ---- metrics ----
 
-func sinceParam(r *http.Request) time.Time {
+// windowParam reads ?window= as a Go duration (default 24h).
+func windowParam(r *http.Request) time.Duration {
 	d := 24 * time.Hour
 	if v := r.URL.Query().Get("window"); v != "" {
 		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
 			d = parsed
 		}
 	}
-	return time.Now().Add(-d)
+	return d
+}
+
+func sinceParam(r *http.Request) time.Time {
+	return time.Now().Add(-windowParam(r))
+}
+
+// flagParam is true for ?name=1 or ?name=true.
+func flagParam(r *http.Request, name string) bool {
+	v := r.URL.Query().Get(name)
+	return v == "1" || v == "true"
 }
 
 func (a *Admin) projectMetrics(w http.ResponseWriter, r *http.Request) {
@@ -1364,6 +1378,15 @@ func (a *Admin) projectMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.metrics(w, r, store.MetricsFilter{ProjectID: &p.ID})
+}
+
+// projectMetricsCSV exports one project's request logs.
+func (a *Admin) projectMetricsCSV(w http.ResponseWriter, r *http.Request) {
+	p, ok := a.loadProject(w, r)
+	if !ok {
+		return
+	}
+	a.exportCSV(w, r, store.MetricsFilter{ProjectID: &p.ID}, fmt.Sprintf("ragmux-project-%d-requests", p.ID))
 }
 
 // projectUsage reports the current rate-limit and budget counters.
@@ -1393,13 +1416,44 @@ func scopedFilter(r *http.Request) store.MetricsFilter {
 	return store.MetricsFilter{UserID: &u.ID}
 }
 
+// requestFilter is scopedFilter narrowed by ?project_id=, which must name a
+// project the caller can see. ok is false once an error has been written.
+func (a *Admin) requestFilter(w http.ResponseWriter, r *http.Request) (f store.MetricsFilter, ok bool) {
+	f = scopedFilter(r)
+	v := r.URL.Query().Get("project_id")
+	if v == "" {
+		return f, true
+	}
+	id, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad project_id")
+		return f, false
+	}
+	allowed, err := auth.CanAccessProject(r.Context(), a.Store, auth.UserFrom(r.Context()), id)
+	if err != nil {
+		a.fail(w, err)
+		return f, false
+	}
+	if !allowed {
+		writeErr(w, http.StatusNotFound, "not found")
+		return f, false
+	}
+	return store.MetricsFilter{ProjectID: &id}, true
+}
+
 func (a *Admin) metricsSummary(w http.ResponseWriter, r *http.Request) {
 	a.metrics(w, r, scopedFilter(r))
 }
 
+// metrics answers the summary shape. ?compare=1 adds the preceding window
+// of the same length, ?days= sizes the daily series and ?by_project=1 adds
+// a per-project breakdown of the window.
 func (a *Admin) metrics(w http.ResponseWriter, r *http.Request, f store.MetricsFilter) {
 	ctx := r.Context()
-	window, err := a.Store.Summarize(ctx, f, sinceParam(r))
+	now := time.Now()
+	span := windowParam(r)
+	since := now.Add(-span)
+	window, err := a.Store.Summarize(ctx, f, since)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1409,7 +1463,8 @@ func (a *Admin) metrics(w http.ResponseWriter, r *http.Request, f store.MetricsF
 		a.fail(w, err)
 		return
 	}
-	daily, err := a.Store.DailySeries(ctx, f, 14)
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	daily, err := a.Store.DailySeries(ctx, f, days)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1419,27 +1474,30 @@ func (a *Admin) metrics(w http.ResponseWriter, r *http.Request, f store.MetricsF
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"window": window, "total": total, "daily": daily, "recent": recent})
-}
-
-func (a *Admin) recentRequests(w http.ResponseWriter, r *http.Request) {
-	f := scopedFilter(r)
-	if v := r.URL.Query().Get("project_id"); v != "" {
-		id, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, "bad project_id")
-			return
-		}
-		ok, err := auth.CanAccessProject(r.Context(), a.Store, auth.UserFrom(r.Context()), id)
+	out := map[string]any{"window": window, "total": total, "daily": daily, "recent": recent}
+	if flagParam(r, "compare") {
+		previous, err := a.Store.SummarizeBetween(ctx, f, since.Add(-span), since)
 		if err != nil {
 			a.fail(w, err)
 			return
 		}
-		if !ok {
-			writeErr(w, http.StatusNotFound, "not found")
+		out["previous"] = previous
+	}
+	if flagParam(r, "by_project") {
+		projects, err := a.Store.SummarizeByProject(ctx, f, since)
+		if err != nil {
+			a.fail(w, err)
 			return
 		}
-		f = store.MetricsFilter{ProjectID: &id}
+		out["projects"] = projects
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *Admin) recentRequests(w http.ResponseWriter, r *http.Request) {
+	f, ok := a.requestFilter(w, r)
+	if !ok {
+		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	list, err := a.Store.RecentRequests(r.Context(), f, limit)
@@ -1448,6 +1506,63 @@ func (a *Admin) recentRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// requestsCSV exports the request logs the caller can see.
+func (a *Admin) requestsCSV(w http.ResponseWriter, r *http.Request) {
+	f, ok := a.requestFilter(w, r)
+	if !ok {
+		return
+	}
+	a.exportCSV(w, r, f, "ragmux-requests")
+}
+
+var csvHeader = []string{"created_at", "project_id", "project_name", "model_name", "status_code", "prompt_tokens",
+	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error"}
+
+// exportCSV streams the window's request logs (oldest first, at most
+// store.MaxExportRows) as a CSV download. Errors after the first row can
+// only truncate the file, so they are logged rather than answered.
+func (a *Admin) exportCSV(w http.ResponseWriter, r *http.Request, f store.MetricsFilter, name string) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s-%s.csv"`, name, time.Now().UTC().Format("2006-01-02")))
+	w.Header().Set("Cache-Control", "no-store")
+	cw := csv.NewWriter(w)
+	if err := cw.Write(csvHeader); err != nil {
+		return
+	}
+	err := a.Store.ExportRequests(r.Context(), f, sinceParam(r), func(row *store.RequestExportRow) error {
+		return cw.Write(csvRecord(row))
+	})
+	cw.Flush()
+	if err != nil && r.Context().Err() == nil {
+		a.Log.Error("csv export", "err", err, "request_id", middleware.GetReqID(r.Context()))
+	}
+}
+
+func csvRecord(row *store.RequestExportRow) []string {
+	rec := []string{row.CreatedAt, strconv.FormatInt(row.ProjectID, 10), row.ProjectName, row.ModelName,
+		strconv.Itoa(row.StatusCode), strconv.Itoa(row.PromptTokens), strconv.Itoa(row.CompletionTokens),
+		strconv.FormatBool(row.Estimated), strconv.FormatInt(row.LatencyMs, 10), strconv.FormatBool(row.Streamed),
+		strconv.FormatBool(row.RAGUsed), strconv.Itoa(row.RAGHits), row.Error}
+	for i, c := range rec {
+		rec[i] = csvCell(c)
+	}
+	return rec
+}
+
+// csvCell defuses formula injection: spreadsheets evaluate cells starting
+// with = + - @ (and tab / CR variants), so those get a leading apostrophe.
+// Model names and error messages are the fields an upstream could shape.
+func csvCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
 }
 
 func (a *Admin) systemInfo(w http.ResponseWriter, r *http.Request) {

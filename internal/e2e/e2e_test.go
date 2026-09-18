@@ -1185,3 +1185,115 @@ func TestStoreQuotas(t *testing.T) {
 		t.Fatalf("instance ceiling should still apply: %v", r)
 	}
 }
+
+// fetch performs a request and returns the raw body and headers, for
+// endpoints that do not answer JSON.
+func (e *env) fetch(path, bearer string) (int, []byte, http.Header) {
+	e.t.Helper()
+	req, _ := http.NewRequest("GET", e.srv.URL+path, nil)
+	if bearer == "" {
+		bearer = e.session
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw, resp.Header
+}
+
+func TestMetricsExportAndSummaryOptions(t *testing.T) {
+	e := newEnv(t, testdb.Config(t))
+	ctx := context.Background()
+	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "m", "provider_type": "ollama", "model_name": "x"}, "")
+	connID := int64(conn["id"].(float64))
+	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewerpass", "role": "viewer"}, "")
+	viewerID := int64(vw["id"].(float64))
+	viewerTok := e.login("vw", "viewerpass")
+	pa := e.call("POST", "/admin/api/projects", map[string]any{"name": "alpha", "model_connection_id": connID, "member_user_ids": []int64{viewerID}}, "")
+	idA := int64(pa["project"].(map[string]any)["id"].(float64))
+	pb := e.call("POST", "/admin/api/projects", map[string]any{"name": "beta", "model_connection_id": connID}, "")
+	idB := int64(pb["project"].(map[string]any)["id"].(float64))
+
+	// Rows are inserted directly: the export must render exactly what was
+	// logged, including a hostile model name and error text.
+	for _, l := range []store.RequestLog{
+		{ProjectID: idA, ModelName: "x", StatusCode: 200, PromptTokens: 10, CompletionTokens: 3, LatencyMs: 40, RAGUsed: true, RAGHits: 2, Streamed: true},
+		{ProjectID: idA, ModelName: "=cmd|' /C calc'!A0", StatusCode: 502, LatencyMs: 5, Error: "-2+3+cmd|' /C calc'!A0"},
+		{ProjectID: idB, ModelName: "x", StatusCode: 429, Error: "rate_limit_rpm"},
+	} {
+		if err := e.store.InsertRequestLog(ctx, &l); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, raw, h := e.fetch("/admin/api/metrics/requests.csv?window=1h", "")
+	if code != 200 || !strings.HasPrefix(h.Get("Content-Type"), "text/csv") ||
+		!strings.HasPrefix(h.Get("Content-Disposition"), `attachment; filename="ragmux-requests-`) {
+		t.Fatalf("csv: %d %v", code, h)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error" {
+		t.Fatalf("csv lines: %q", lines)
+	}
+	if !strings.Contains(lines[1], fmt.Sprintf(",%d,alpha,x,200,10,3,false,40,true,true,2,", idA)) {
+		t.Errorf("first row: %q", lines[1])
+	}
+	if !strings.Contains(lines[2], `,alpha,'=cmd|' /C calc'!A0,502,0,0,false,5,false,false,0,'-2+3+cmd|' /C calc'!A0`) {
+		t.Errorf("escaped row: %q", lines[2])
+	}
+	if !strings.Contains(lines[3], ",beta,x,429,") {
+		t.Errorf("third row: %q", lines[3])
+	}
+
+	// project_id narrows; the per-project route is equivalent; a viewer
+	// sees only member projects and gets 404 on the others.
+	if _, raw, _ := e.fetch(fmt.Sprintf("/admin/api/metrics/requests.csv?project_id=%d", idB), ""); strings.Count(string(raw), "\n") != 2 || !strings.Contains(string(raw), "beta") {
+		t.Errorf("project_id filter: %q", raw)
+	}
+	code, raw, h = e.fetch(fmt.Sprintf("/admin/api/projects/%d/metrics.csv", idA), viewerTok)
+	if code != 200 || strings.Count(string(raw), "\n") != 3 || strings.Contains(string(raw), "beta") ||
+		!strings.HasPrefix(h.Get("Content-Disposition"), fmt.Sprintf(`attachment; filename="ragmux-project-%d-requests-`, idA)) {
+		t.Errorf("viewer project csv: %d %v %q", code, h, raw)
+	}
+	if code, _, _ := e.fetch(fmt.Sprintf("/admin/api/projects/%d/metrics.csv", idB), viewerTok); code != 404 {
+		t.Errorf("viewer foreign project csv: %d", code)
+	}
+	if code, _, _ := e.fetch(fmt.Sprintf("/admin/api/metrics/requests.csv?project_id=%d", idB), viewerTok); code != 404 {
+		t.Errorf("viewer foreign project_id csv: %d", code)
+	}
+	if _, raw, _ := e.fetch("/admin/api/metrics/requests.csv", viewerTok); strings.Contains(string(raw), "beta") {
+		t.Errorf("viewer global csv leaks beta: %q", raw)
+	}
+	if code, _, _ := e.fetch("/admin/api/metrics/requests.csv", "nope"); code != 401 {
+		t.Errorf("unauthenticated csv: %d", code)
+	}
+
+	// Summary options: comparison window, per-project breakdown, series size.
+	m := e.call("GET", "/admin/api/metrics/summary?window=1h&compare=1&by_project=1&days=3", nil, "")
+	if status(m) != 200 || m["previous"] == nil || m["previous"].(map[string]any)["requests"] != float64(0) {
+		t.Fatalf("summary with compare: %v", m)
+	}
+	projects := m["projects"].([]any)
+	if len(projects) != 2 || projects[0].(map[string]any)["name"] != "alpha" || projects[0].(map[string]any)["requests"] != float64(2) ||
+		projects[0].(map[string]any)["rag_requests"] != float64(1) || projects[1].(map[string]any)["rate_limited"] != float64(1) {
+		t.Errorf("projects breakdown: %v", projects)
+	}
+	if rec := m["recent"].([]any)[2].(map[string]any); rec["rag_hits"] != float64(2) || rec["rag_used"] != true {
+		t.Errorf("recent rag_hits: %v", rec)
+	}
+	plain := e.call("GET", "/admin/api/metrics/summary", nil, "")
+	if _, ok := plain["previous"]; ok {
+		t.Errorf("previous without compare: %v", plain)
+	}
+	if _, ok := plain["projects"]; ok {
+		t.Errorf("projects without by_project: %v", plain)
+	}
+	vm := e.call("GET", "/admin/api/metrics/summary?by_project=1", nil, viewerTok)
+	if list := vm["projects"].([]any); len(list) != 1 || list[0].(map[string]any)["project_id"] != float64(idA) {
+		t.Errorf("viewer projects breakdown: %v", list)
+	}
+}
