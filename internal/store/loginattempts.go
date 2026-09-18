@@ -23,6 +23,16 @@ func (s *Store) CountFailedLoginAttempts(ctx context.Context, username, ip strin
 	return byUser, byIP, err
 }
 
+// CountFailedLoginAttemptsForPair counts failures since the given time for
+// the username coming from the IP address (the lockout key).
+func (s *Store) CountFailedLoginAttemptsForPair(ctx context.Context, username, ip string, since time.Time) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM login_attempts
+		WHERE NOT success AND created_at >= $3 AND username = $1 AND ip = $2`,
+		username, ip, since.UTC()).Scan(&n)
+	return n, err
+}
+
 // DeleteLoginAttemptsBefore purges attempts older than t and reports how
 // many rows were removed.
 func (s *Store) DeleteLoginAttemptsBefore(ctx context.Context, t time.Time) (int64, error) {
@@ -34,11 +44,11 @@ func (s *Store) DeleteLoginAttemptsBefore(ctx context.Context, t time.Time) (int
 }
 
 // OldestFailedLoginAttempt returns the time of the oldest failure for the
-// username since t, or the zero time when there is none.
-func (s *Store) OldestFailedLoginAttempt(ctx context.Context, username string, since time.Time) (time.Time, error) {
+// username from the IP address since t, or the zero time when there is none.
+func (s *Store) OldestFailedLoginAttempt(ctx context.Context, username, ip string, since time.Time) (time.Time, error) {
 	var t *time.Time
 	err := s.pool.QueryRow(ctx, `SELECT MIN(created_at) FROM login_attempts
-		WHERE username = $1 AND NOT success AND created_at >= $2`, username, since.UTC()).Scan(&t)
+		WHERE username = $1 AND ip = $2 AND NOT success AND created_at >= $3`, username, ip, since.UTC()).Scan(&t)
 	if err != nil || t == nil {
 		return time.Time{}, err
 	}

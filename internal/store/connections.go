@@ -132,3 +132,61 @@ func (s *Store) DeleteConnection(ctx context.Context, id int64) error {
 	}
 	return nil
 }
+
+// ReencryptConnections re-encrypts every stored provider key with the key
+// given as 64 hex characters, in one transaction, and verifies each row
+// decrypts with the new key before committing. It returns the number of
+// rows rewritten. The store keeps using its current key; restart the
+// gateway with the new SECRET_KEY afterwards.
+func (s *Store) ReencryptConnections(ctx context.Context, newKeyHex string) (int, error) {
+	newCipher, _, err := loadCipher(newKeyHex, "", s.log)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	rows, err := tx.Query(ctx, "SELECT id, api_key_enc FROM model_connections ORDER BY id FOR UPDATE")
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id  int64
+		enc []byte
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.enc); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		todo = append(todo, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, r := range todo {
+		plain, err := s.cipher.decrypt(r.enc)
+		if err != nil {
+			return 0, fmt.Errorf("decrypt api key for connection %d with the current key: %w", r.id, err)
+		}
+		enc, err := newCipher.encrypt(plain)
+		if err != nil {
+			return 0, err
+		}
+		if back, err := newCipher.decrypt(enc); err != nil || back != plain {
+			return 0, fmt.Errorf("verify re-encrypted key for connection %d: %w", r.id, err)
+		}
+		if _, err := tx.Exec(ctx, "UPDATE model_connections SET api_key_enc = $1 WHERE id = $2", enc, r.id); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return len(todo), nil
+}
