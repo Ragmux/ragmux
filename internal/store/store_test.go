@@ -344,3 +344,38 @@ func TestSessions(t *testing.T) {
 		t.Errorf("password hash not updated: %+v", got)
 	}
 }
+
+func TestBackupInfoCountsVectorTablesAndDocumentBytes(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	empty, err := s.BackupInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.Tables != 0 || empty.DocumentsBytes != 0 || empty.LastMigrationAt == nil {
+		t.Errorf("backup info on fresh schema: %+v", empty)
+	}
+
+	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "emb", ProviderType: "openai", ModelName: "e"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.CreateRAGStore(ctx, &store.RAGStore{Name: "docs", EmbeddingConnectionID: conn.ID, ChunkSize: 100, ChunkOverlap: 10, TopK: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := s.CreateDocument(ctx, &store.Document{RAGStoreID: r.ID, Filename: "a.txt"}, []byte("hello world"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceDocumentChunks(ctx, doc, []*store.Chunk{{Index: 0, Content: "hello", Embedding: []float32{1, 0, 0}}}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := s.BackupInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Tables != 1 || info.DocumentsBytes != int64(len("hello world")) {
+		t.Errorf("backup info after ingest: %+v", info)
+	}
+}

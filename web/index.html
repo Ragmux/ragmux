@@ -182,7 +182,7 @@ async function renderOverview(){
   const w=m.window, t=m.total;
   const maxReq = Math.max(1, ...m.daily.map(d=>d.requests));
   app.innerHTML = `
-    <div class="card"><div class="row between"><h2>Last 24 hours</h2><span class="muted">PostgreSQL ${esc(sys.database.postgres_version)} · pgvector ${esc(sys.database.pgvector_version)} · DB ${(sys.database.size_bytes/1048576).toFixed(2)} MB · key: ${esc(sys.secret_key_source)} · v${esc(sys.version)}</span></div>
+    <div class="card"><div class="row between"><h2>Last 24 hours</h2><span class="muted">PostgreSQL ${esc(sys.database.postgres_version)} · pgvector ${esc(sys.database.pgvector_version)} · DB ${(sys.database.size_bytes/1048576).toFixed(2)} MB (${fmtN(sys.backup.tables)} vector table${sys.backup.tables===1?'':'s'}, docs ${(sys.backup.documents_bytes/1048576).toFixed(2)} MB) · key: ${esc(sys.secret_key_source)} · v${esc(sys.version)}</span></div>
       <div class="grid">
         <div class="stat"><div class="v">${fmtN(w.requests)}</div><div class="l">requests (${fmtN(w.errors)} errors)</div></div>
         <div class="stat"><div class="v">${fmtN(w.prompt_tokens)}</div><div class="l">prompt tokens</div></div>

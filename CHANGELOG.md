@@ -37,7 +37,11 @@ All notable changes to Ragmux are documented here. The format follows
   `rerank_candidates`), a cosine distance threshold (`max_distance`), DOCX and HTML ingestion,
   `x-ragmux-rag-hits` response header, `POST /admin/api/rag-stores/{id}/reprocess` and search
   overrides (`mode`, `rerank`, `max_distance`) with rank/score details in the dashboard.
-- Backup and restore scripts and documentation.
+- Backup and restore: `scripts/backup.sh` (`pg_dump -Fc`, verification, rotation, optional
+  `SECRET_KEY` export), `scripts/restore.sh` (`--yes` guard, stops/starts the gateway, waits for
+  `/healthz`), `make backup` / `make restore`, a scheduled `backup` Compose profile
+  (`prodrigestivill/postgres-backup-local`), `docs/backup-restore.md`, a `backup` block in
+  `GET /admin/api/system` and `ragmux -version`.
 - Data retention jobs, gateway test suite, native Ollama adapter, CI (lint, vet, tests, vuln scan)
   and release workflow publishing `ghcr.io/ragmux/ragmux`.
 

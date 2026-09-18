@@ -1178,8 +1178,14 @@ func (a *Admin) systemInfo(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	backup, err := a.Store.BackupInfo(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"database":          info,
+		"backup":            backup,
 		"secret_key_source": a.Store.SecretKeySource,
 		"version":           Version,
 	})

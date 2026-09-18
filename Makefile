@@ -5,7 +5,7 @@ IMAGE   ?= ragmux/ragmux:latest
 TEST_DATABASE_URL ?= postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable
 export TEST_DATABASE_URL
 
-.PHONY: build run test vet dev-db dev-db-down docker-build docker-run clean
+.PHONY: build run test vet dev-db dev-db-down docker-build docker-run backup restore clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o bin/ragmux ./cmd/ragmux
@@ -31,6 +31,16 @@ docker-build:
 
 docker-run: docker-build
 	docker compose up -d
+
+# Logical backup of the compose database into ./backups (scripts/backup.sh).
+backup:
+	scripts/backup.sh
+
+# Restore a dump: make restore FILE=backups/ragmux-....dump YES=1
+# Without YES=1 the script only prints its plan.
+restore:
+	@test -n "$(FILE)" || { echo "usage: make restore FILE=<dump> [YES=1]"; exit 2; }
+	scripts/restore.sh $(if $(YES),--yes) "$(FILE)"
 
 clean:
 	rm -rf bin

@@ -35,8 +35,13 @@ var version = "dev"
 
 func main() {
 	healthcheck := flag.Bool("healthcheck", false, "probe the running server and exit (for container HEALTHCHECK)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println("ragmux " + version)
+		return
+	}
 	if *healthcheck {
 		port, err := config.PortFromEnv()
 		if err != nil {

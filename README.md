@@ -84,7 +84,8 @@ The gateway itself is stateless. Two things make up your state:
 
 1. **The PostgreSQL database** (`pgdata` volume in Compose): users, model connections,
    projects, uploaded documents (stored as `bytea`), chunks, vectors and request logs.
-   Back it up with `pg_dump` like any other Postgres database.
+   Back it up with `pg_dump` like any other Postgres database (see
+   [Backup & restore](#backup--restore)).
 2. **`SECRET_KEY`**: the 32-byte AES-256-GCM key (64 hex characters) that encrypts
    provider API keys inside the database. Generate it once with `openssl rand -hex 32`
    and keep it next to your backups — without it the stored credentials cannot be read.
@@ -93,6 +94,25 @@ Stop, remove and recreate the gateway container as often as you like; as long as
 database and `SECRET_KEY` are the same, every model, project, document and metric is
 still there. If `SECRET_KEY` is unset the gateway falls back to generating and reading
 `DATA_DIR/secret.key` and logs a warning; that is meant for local development only.
+
+### Backup & restore
+
+Everything to back up is the database plus `SECRET_KEY`. The repository ships two
+scripts and a scheduled-backup Compose profile; the full operator guide (formats,
+PITR, managed Postgres, restore runbook, DR drill) is in
+[docs/backup-restore.md](docs/backup-restore.md).
+
+```bash
+scripts/backup.sh                                  # pg_dump -Fc via the postgres service -> ./backups/ragmux-<stamp>.dump
+scripts/restore.sh --yes backups/ragmux-<stamp>.dump   # stop ragmux, pg_restore --clean, start, wait for /healthz
+docker compose --profile backup up -d              # daily dumps into ./backups with 7d/4w/6m retention
+```
+
+`GET /admin/api/system` includes a `backup` block (vector table count, document bytes,
+last migration time) and `ragmux -version` prints the build version. Restoring an older
+dump into a newer Ragmux is fine (missing migrations are applied on start); the reverse is
+not. Without the original `SECRET_KEY` the stored provider keys cannot be decrypted and
+must be re-entered.
 
 ## Configuration
 
@@ -437,7 +457,7 @@ minimum role; `member` means the project membership rule above applies too.
 | POST | `/users/{id}/reset-password` | admin | `{new_password}`; revokes the user's sessions |
 | POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
 | GET | `/audit` | admin | Audit log (`limit`, `action`, `actor_user_id`, `before`) |
-| GET | `/system` | viewer | Postgres / pgvector / migration versions, DB size, key source, version |
+| GET | `/system` | viewer | Postgres / pgvector / migration versions, DB size, `backup` sizing, key source, version |
 
 Public: `GET /healthz`. Client API: `POST /v1/chat/completions`, `GET /v1/models`.
 
@@ -448,6 +468,8 @@ make dev-db               # pgvector Postgres on localhost:5433 (docker-compose.
 make test                 # unit + end-to-end tests (mock upstream, real Postgres)
 make run                  # runs on :8080 against the dev database
 make docker-build
+make backup               # scripts/backup.sh against the compose stack
+make restore FILE=backups/ragmux-<stamp>.dump YES=1   # scripts/restore.sh (without YES=1: plan only)
 ```
 
 Requires Go 1.27+ and Docker for the database. Tests read `TEST_DATABASE_URL` (the
