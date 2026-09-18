@@ -235,3 +235,41 @@ func (s *Store) SummarizeByProject(ctx context.Context, f MetricsFilter, since t
 	}
 	return out, rows.Err()
 }
+
+// RequestExportRow is one request log with its project's name, for CSV export.
+type RequestExportRow struct {
+	RequestLog
+	ProjectName string
+}
+
+// MaxExportRows bounds one CSV export.
+const MaxExportRows = 50000
+
+// ExportRequests streams request logs since the given time, oldest first,
+// to fn until MaxExportRows have been delivered or fn returns an error.
+func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.Time, fn func(*RequestExportRow) error) error {
+	q := `SELECT l.id, l.project_id, COALESCE(p.name, ''), l.model_name, l.status_code, l.prompt_tokens, l.completion_tokens,
+		l.estimated, l.latency_ms, l.streamed, l.rag_used, l.rag_hits, l.error, l.created_at
+		FROM request_logs l LEFT JOIN projects p ON p.id = l.project_id WHERE l.created_at >= $1`
+	cond, args := f.whereCol("l.project_id", []any{since.UTC()})
+	args = append(args, MaxExportRows)
+	q += cond + fmt.Sprintf(" ORDER BY l.id LIMIT $%d", len(args))
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r RequestExportRow
+		var created time.Time
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.ModelName, &r.StatusCode, &r.PromptTokens, &r.CompletionTokens,
+			&r.Estimated, &r.LatencyMs, &r.Streamed, &r.RAGUsed, &r.RAGHits, &r.Error, &created); err != nil {
+			return err
+		}
+		r.CreatedAt = ts(created)
+		if err := fn(&r); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}

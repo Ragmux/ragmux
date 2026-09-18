@@ -174,3 +174,61 @@ func TestUnlimitedStillCounts(t *testing.T) {
 		t.Fatalf("after purge: %+v", u)
 	}
 }
+
+func TestBudgetForecast(t *testing.T) {
+	l, p, c := setup(t, store.Project{BudgetDailyTokens: 1000, BudgetMonthlyTokens: 5000})
+	ctx := context.Background()
+	u, err := l.Usage(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Forecast.DailyExhaustedAt != nil || u.Forecast.MonthlyExhaustedAt != nil {
+		t.Fatalf("forecast without usage: %+v", u.Forecast)
+	}
+	// 500 tokens 70 minutes ago fall outside the lookback; 100 + 200 inside.
+	base := c.t
+	c.t = base.Add(-70 * time.Minute)
+	if err := l.Record(ctx, p.ID, 400, 100, true); err != nil {
+		t.Fatal(err)
+	}
+	c.t = base.Add(-30 * time.Minute)
+	if err := l.Record(ctx, p.ID, 80, 20, true); err != nil {
+		t.Fatal(err)
+	}
+	c.t = base.Add(-time.Minute)
+	if err := l.Record(ctx, p.ID, 150, 50, true); err != nil {
+		t.Fatal(err)
+	}
+	c.t = base
+	u, err = l.Usage(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Day used 800 of 1000 at 300 tokens/hour: 200 left is 40 minutes.
+	if got := u.Forecast.DailyExhaustedAt; got == nil || !got.Equal(base.Add(40*time.Minute)) {
+		t.Errorf("daily forecast: %v", got)
+	}
+	// Month used 800 of 5000: 4200 left is 14 hours, still inside September.
+	if got := u.Forecast.MonthlyExhaustedAt; got == nil || !got.Equal(base.Add(14*time.Hour)) {
+		t.Errorf("monthly forecast: %v", got)
+	}
+
+	// A budget that outlasts its window has no projection.
+	p.BudgetDailyTokens = 1_000_000
+	u, _ = l.Usage(ctx, p)
+	if u.Forecast.DailyExhaustedAt != nil || u.Forecast.MonthlyExhaustedAt == nil {
+		t.Errorf("large daily budget: %+v", u.Forecast)
+	}
+	// No budget at all: nothing is projected.
+	p.BudgetDailyTokens, p.BudgetMonthlyTokens = 0, 0
+	u, _ = l.Usage(ctx, p)
+	if u.Forecast.DailyExhaustedAt != nil || u.Forecast.MonthlyExhaustedAt != nil {
+		t.Errorf("no budget: %+v", u.Forecast)
+	}
+	// An exhausted budget projects to now.
+	p.BudgetDailyTokens = 700
+	u, _ = l.Usage(ctx, p)
+	if got := u.Forecast.DailyExhaustedAt; got == nil || !got.Equal(base) {
+		t.Errorf("exhausted: %v", got)
+	}
+}

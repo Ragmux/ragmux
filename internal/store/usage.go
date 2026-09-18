@@ -105,3 +105,12 @@ func (s *Store) DeleteUsageBefore(ctx context.Context, period string, cutoff tim
 	}
 	return res.RowsAffected(), nil
 }
+
+// MinuteTokensSince sums the tokens of a project's minute rows starting at or
+// after since; the budget forecast projects from it.
+func (s *Store) MinuteTokensSince(ctx context.Context, projectID int64, since time.Time) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) FROM project_usage
+		WHERE project_id = $1 AND period = 'minute' AND period_start >= $2`, projectID, since.UTC()).Scan(&n)
+	return n, err
+}
