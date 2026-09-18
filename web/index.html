@@ -3,490 +3,1073 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>Ragmux Gateway</title>
 <style>
-  :root{
-    --bg:#f6f7f9;--panel:#fff;--border:#e3e6ea;--text:#1c2027;--muted:#6b7280;
-    --accent:#2563eb;--accent-2:#1d4ed8;--danger:#dc2626;--ok:#16a34a;--warn:#d97706;--code:#f1f3f6;
-  }
-  @media (prefers-color-scheme: dark){
-    :root{--bg:#0f1115;--panel:#171a21;--border:#262b35;--text:#e6e8ec;--muted:#9aa3b2;--accent:#3b82f6;--accent-2:#60a5fa;--code:#0b0d11}
-  }
-  *{box-sizing:border-box}
-  body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
-  a{color:var(--accent)}
-  header{display:flex;align-items:center;gap:16px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
-  header h1{font-size:16px;margin:0 12px 0 0;letter-spacing:.3px}
-  header nav{display:flex;gap:4px;flex-wrap:wrap}
-  header nav button{background:none;border:0;padding:8px 12px;border-radius:6px;color:var(--muted);cursor:pointer;font:inherit}
-  header nav button.active{background:var(--bg);color:var(--text);font-weight:600}
-  header .spacer{flex:1}
-  main{max-width:1180px;margin:0 auto;padding:20px}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
-  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-  .row.between{justify-content:space-between}
-  h2{font-size:18px;margin:0 0 12px}
-  h3{font-size:14px;margin:0 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
-  th{color:var(--muted);font-weight:600;font-size:12px}
-  tr:last-child td{border-bottom:0}
-  .tbl{overflow-x:auto}
-  button,.btn{font:inherit;padding:7px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-  button.primary:hover{background:var(--accent-2)}
-  button.danger{color:var(--danger)}
-  button.small{padding:4px 8px;font-size:12px}
-  button:disabled{opacity:.5;cursor:default}
-  input,select,textarea{font:inherit;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);width:100%}
-  textarea{min-height:90px;resize:vertical}
-  label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-  .field{margin-bottom:12px}
-  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
-  .stat{padding:14px;border:1px solid var(--border);border-radius:8px;background:var(--bg)}
-  .stat .v{font-size:22px;font-weight:700}
-  .stat .l{font-size:12px;color:var(--muted)}
-  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-  pre{background:var(--code);padding:10px;border-radius:6px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-  code{background:var(--code);padding:1px 5px;border-radius:4px}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;background:var(--code);color:var(--muted)}
-  .pill.ready,.pill.ok{background:#dcfce7;color:#166534}
-  .pill.failed,.pill.err{background:#fee2e2;color:#991b1b}
-  .pill.processing,.pill.pending{background:#fef3c7;color:#92400e}
-  .muted{color:var(--muted)}
-  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;z-index:10;overflow:auto}
-  .modal{background:var(--panel);border-radius:10px;width:100%;max-width:560px;padding:20px;border:1px solid var(--border)}
-  .toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:var(--bg);padding:10px 14px;border-radius:8px;z-index:20;max-width:420px;white-space:pre-wrap}
-  .login{max-width:360px;margin:80px auto}
-  .bars{display:flex;align-items:flex-end;gap:4px;height:80px}
-  .bars div{flex:1;background:var(--accent);border-radius:3px 3px 0 0;min-height:2px;position:relative}
-  .bars div span{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font-size:10px;color:var(--muted)}
-  .chat{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow:auto;padding:8px;background:var(--bg);border-radius:8px;border:1px solid var(--border)}
-  .msg{padding:8px 10px;border-radius:8px;max-width:85%;white-space:pre-wrap}
-  .msg.user{align-self:flex-end;background:var(--accent);color:#fff}
-  .msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
-  .meter{height:8px;background:var(--code);border-radius:4px;overflow:hidden;margin-top:6px}
-  .meter div{height:100%;background:var(--ok);border-radius:4px}
-  .meter div.warn{background:var(--warn)}
-  .meter div.err{background:var(--danger)}
-  .hidden{display:none}
-  select[multiple]{min-height:110px}
-  td.json{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;max-width:360px;word-break:break-all}
+/* Self-hosted fonts (SIL OFL, see fonts/OFL-*.txt). Latin + latin-ext subsets. */
+@font-face{font-family:"Bricolage Grotesque";font-style:normal;font-weight:600 700;font-display:swap;src:url(fonts/bricolage-grotesque-latin.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"Bricolage Grotesque";font-style:normal;font-weight:600 700;font-display:swap;src:url(fonts/bricolage-grotesque-latin-ext.woff2) format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:400 600;font-display:swap;src:url(fonts/ibm-plex-sans-latin.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:400 600;font-display:swap;src:url(fonts/ibm-plex-sans-latin-ext.woff2) format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:400 500;font-display:swap;src:url(fonts/jetbrains-mono-latin.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:400 500;font-display:swap;src:url(fonts/jetbrains-mono-latin-ext.woff2) format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+
+:root{--bg:#0e1117;--bg2:#12161e;--panel:#161b25;--panel2:#1c2230;--line:#252d3c;--line2:#324056;--tx:#eceef4;--tx2:#aab3c5;--tx3:#8a95ab;--amber:#f2b632;--amber-ink:#2a1d02;--mint:#3fd0a4;--rose:#f47186;--blue:#6fb0ff;--violet:#a68cff;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--disp:"Bricolage Grotesque","Avenir Next",Futura,system-ui,sans-serif;--body:"IBM Plex Sans","Helvetica Neue",Helvetica,Arial,system-ui,sans-serif}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:var(--body);font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(circle at 1px 1px,#1b2130 1px,transparent 0);background-size:24px 24px}
+a{color:var(--amber);text-decoration:none}a:hover{color:#ffd36b}
+h1,h2,h3{margin:0;font-family:var(--disp);font-weight:600;letter-spacing:-.01em}
+h1{font-size:30px;line-height:1.1}h2{font-size:20px}
+h3{font-family:var(--body);font-size:11.5px;font-weight:600;color:var(--tx2);text-transform:uppercase;letter-spacing:.08em}
+p{margin:0}
+code,.mono{font-family:var(--mono);font-size:12.5px}
+code{color:var(--tx2)}
+pre{font-family:var(--mono);font-size:12px;background:#0f131b;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.hidden{display:none!important}
+.sr{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+.muted{color:var(--tx3)}.dim{color:var(--tx2)}.hint{font-size:12px;color:var(--tx3)}
+.row{display:flex;gap:12px;align-items:center}.wrap{flex-wrap:wrap}.between{justify-content:space-between}.grow{flex:1;min-width:0}
+.right{text-align:right}.nowrap{white-space:nowrap}
+.ellip{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stack{display:flex;flex-direction:column;gap:12px}
+
+/* shell */
+.shell{display:flex;min-height:100vh}
+.side{width:236px;flex:none;display:flex;flex-direction:column;background:#0a0d13;border-right:1px solid var(--line);position:sticky;top:0;height:100vh;z-index:3}
+.side::before{content:"";position:absolute;inset:0;background:radial-gradient(420px 260px at 20% -10%,rgba(242,182,50,.16),transparent 70%);pointer-events:none}
+.brand{display:flex;align-items:center;gap:12px;padding:24px 20px 18px;position:relative}
+.mark{width:38px;height:38px;flex:none;border-radius:11px;background:var(--amber);color:var(--amber-ink);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 24px rgba(242,182,50,.28)}
+.brand-name{font-family:var(--disp);font-size:20px;font-weight:700;letter-spacing:-.02em;line-height:1}
+.brand-sub{font-size:11px;color:var(--tx3);margin-top:4px;font-family:var(--mono)}
+.nav{display:flex;flex-direction:column;gap:4px;padding:8px 12px;position:relative}
+.nav-label{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--tx3);padding:14px 10px 6px}
+.nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:10px;color:var(--tx2);font-weight:500;min-height:44px;border:0;background:transparent;width:100%;text-align:left}
+.nav-item:hover{background:#131823;color:var(--tx)}
+.nav-item.active{background:#1a2130;color:var(--tx);box-shadow:inset 0 0 0 1px var(--line2)}
+.nav-item.active svg{color:var(--amber)}
+.nav-item svg{width:18px;height:18px;flex:none}
+.nav-badge{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--tx3);background:#111621;border:1px solid var(--line);border-radius:6px;padding:1px 6px}
+.nav-badge:empty{display:none}
+.side-foot{margin-top:auto;padding:14px 16px 18px;display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--line);position:relative}
+.health{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx2);font-family:var(--mono);min-height:18px}
+.dot{width:8px;height:8px;flex:none;border-radius:50%;background:var(--mint);box-shadow:0 0 0 4px rgba(63,208,164,.18)}
+.dot.err{background:var(--rose);box-shadow:0 0 0 4px rgba(244,113,134,.18)}
+.me{display:flex;align-items:center;gap:10px}
+.avatar{width:32px;height:32px;flex:none;border-radius:9px;background:linear-gradient(135deg,#f2b632,#ff7a59);display:flex;align-items:center;justify-content:center;font-family:var(--disp);font-weight:700;color:#1b1204;font-size:13px;text-transform:uppercase}
+.avatar.sm{width:30px;height:30px;font-size:12px}.avatar.xs{width:24px;height:24px;font-size:10px;border-radius:7px}
+.me-name{font-weight:600;font-size:13px}.me-role{font-size:11.5px;color:var(--tx3)}
+.side-actions{display:flex;gap:8px}
+.side-actions .btn{flex:1;justify-content:center}
+.main{flex:1;min-width:0;display:flex;flex-direction:column;gap:22px;padding:26px 32px 32px}
+.topbar{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.eyebrow{font-family:var(--mono);font-size:11.5px;color:var(--tx3);letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase}
+.lede{color:var(--tx2);margin:6px 0 0;max-width:640px}
+.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+
+/* buttons, pills, inputs */
+.btn{display:inline-flex;align-items:center;gap:8px;min-height:40px;padding:0 16px;border-radius:10px;border:1px solid var(--line2);background:var(--panel2);color:var(--tx);font-weight:500;cursor:pointer;text-decoration:none;white-space:nowrap}
+.btn:hover{border-color:#44536f;color:var(--tx)}
+.btn.primary{background:var(--amber);color:var(--amber-ink);border-color:transparent;font-weight:600;box-shadow:0 6px 18px rgba(242,182,50,.22)}
+.btn.primary:hover{background:#ffc74a;color:var(--amber-ink)}
+.btn.ghost{background:transparent}
+.btn.sm{min-height:34px;padding:0 12px;font-size:13px;border-radius:8px}
+.btn.danger{color:var(--rose)}
+.btn:disabled{opacity:.5;cursor:default}
+.btn svg{width:16px;height:16px;flex:none}
+.icon-btn{width:36px;height:36px;flex:none;border-radius:9px;border:1px solid var(--line2);background:var(--panel2);display:inline-flex;align-items:center;justify-content:center;color:var(--tx2);cursor:pointer}
+.icon-btn:hover{color:var(--tx);border-color:#44536f}
+.icon-btn svg{width:16px;height:16px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;font-size:11.5px;font-family:var(--mono);border:1px solid var(--line2);color:var(--tx2);background:#121722;white-space:nowrap;vertical-align:middle}
+.pill.ok{color:#8fe9c9;border-color:rgba(63,208,164,.35);background:rgba(63,208,164,.08)}
+.pill.err{color:#ffa3b0;border-color:rgba(244,113,134,.4);background:rgba(244,113,134,.1)}
+.pill.warn{color:#ffd36b;border-color:rgba(242,182,50,.4);background:rgba(242,182,50,.1)}
+.pill.info{color:#a9ceff;border-color:rgba(111,176,255,.4);background:rgba(111,176,255,.1)}
+.pill.violet{color:#cbbdff;border-color:rgba(166,140,255,.4);background:rgba(166,140,255,.1)}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label,.field legend{font-size:12.5px;color:var(--tx2);font-weight:500;padding:0}
+.input{min-height:42px;padding:0 12px;border-radius:10px;border:1px solid var(--line2);background:#0f131b;color:var(--tx);width:100%}
+.input:focus{outline:2px solid rgba(242,182,50,.45);outline-offset:0;border-color:var(--amber)}
+.input::placeholder{color:#6b7689}
+select.input{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--tx3) 50%),linear-gradient(135deg,var(--tx3) 50%,transparent 50%);background-position:calc(100% - 18px) 18px,calc(100% - 13px) 18px;background-size:5px 5px;background-repeat:no-repeat;padding-right:34px}
+select.input option{background:#12161f}
+textarea.input{min-height:96px;padding:10px 12px;resize:vertical}
+.search{position:relative}
+.search .input{padding-left:38px}
+.search svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);width:16px;height:16px;color:var(--tx3);pointer-events:none}
+.tabs{display:inline-flex;gap:4px;background:#0f131b;border:1px solid var(--line);border-radius:10px;padding:4px}
+.tab{padding:7px 12px;border-radius:7px;font-size:13px;color:var(--tx2);border:0;background:transparent;cursor:pointer;min-height:34px}
+.tab:hover{color:var(--tx)}
+.tab.on,.tab[aria-pressed="true"],.tab[aria-selected="true"]{background:var(--panel2);color:var(--tx);box-shadow:inset 0 0 0 1px var(--line2)}
+.chip{padding:5px 11px;border-radius:999px;font-size:12px;font-family:var(--mono);color:var(--tx2);border:1px solid var(--line2);background:transparent;cursor:pointer}
+.chip:hover{color:var(--tx)}.chip.on{background:var(--panel2);color:var(--tx);border-color:#44536f}
+.kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-bottom-width:2px;border-radius:5px;padding:1px 6px;color:var(--tx2);background:#0f131b}
+.toggle{display:flex;align-items:center;gap:10px;min-height:40px;cursor:pointer;justify-content:space-between}
+.toggle input{position:absolute;opacity:0;width:1px;height:1px}
+.switch{width:40px;height:22px;flex:none;border-radius:999px;background:#2a3242;position:relative;transition:background .15s}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#8a95ab;transition:left .15s,background .15s}
+.toggle input:checked+.switch{background:var(--amber)}
+.toggle input:checked+.switch::after{left:21px;background:#1b1204}
+.toggle input:focus-visible+.switch{outline:2px solid var(--amber);outline-offset:2px}
+.check{display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--tx2)}
+.check:hover{background:#131823;color:var(--tx)}
+.check input{accent-color:var(--amber);width:16px;height:16px;margin:0}
+.checklist{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line2);border-radius:10px;background:#0f131b;padding:6px;max-height:190px;overflow:auto}
+.radio-card{display:flex;gap:12px;align-items:center;padding:12px 14px;border:1px solid var(--line2);border-radius:10px;cursor:pointer}
+.radio-card input{accent-color:var(--amber);margin:0;width:16px;height:16px}
+.radio-card:has(input:checked){border-color:var(--amber);background:rgba(242,182,50,.06)}
+.radio-card:has(input:focus-visible){outline:2px solid var(--amber);outline-offset:2px}
+.strength{display:flex;gap:4px;margin-top:2px}
+.strength i{flex:1;height:4px;border-radius:2px;background:#2a3242}
+.strength[data-score="1"] i:nth-child(-n+1){background:var(--rose)}
+.strength[data-score="2"] i:nth-child(-n+2){background:var(--amber)}
+.strength[data-score="3"] i:nth-child(-n+3){background:var(--mint)}
+.strength[data-score="4"] i{background:var(--mint)}
+
+/* cards, stats, tables */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:0 1px 0 rgba(255,255,255,.02) inset,0 12px 32px rgba(0,0,0,.28)}
+.card.flat{box-shadow:none}
+.card.sel{border-color:var(--amber);box-shadow:0 0 0 3px rgba(242,182,50,.12)}
+.card.tight{padding:16px 18px}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.card-head.m0{margin:0}
+.note{padding:12px 16px;border-radius:12px;display:flex;align-items:center;gap:12px;border:1px solid var(--line2);background:var(--panel2)}
+.note.warn{background:rgba(242,182,50,.06);border-color:rgba(242,182,50,.35)}
+.note.err{background:rgba(244,113,134,.06);border-color:rgba(244,113,134,.35)}
+.note.ok{background:rgba(63,208,164,.06);border-color:rgba(63,208,164,.35)}
+.stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px}
+.stats.four{grid-template-columns:repeat(4,minmax(0,1fr))}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;display:flex;flex-direction:column;gap:6px;position:relative;overflow:hidden;min-width:0}
+.stat .l{font-size:12px;color:var(--tx3);display:flex;align-items:center;gap:8px}
+.stat .v{font-family:var(--disp);font-size:28px;font-weight:600;letter-spacing:-.02em;line-height:1;white-space:nowrap}
+.stat .v small{font-size:14px;color:var(--tx3);margin-left:4px;font-family:var(--body);font-weight:500}
+.stat .d{font-size:12px;color:var(--tx3);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat .d.up{color:var(--mint)}.stat .d.down{color:var(--rose)}
+.stat .spark{position:absolute;right:12px;bottom:10px;opacity:.9}
+.tbl{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:500;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--tx3);padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:11px 12px;border-bottom:1px solid #1d2431;vertical-align:middle}
+tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:#191f2b}
+td.json{font-family:var(--mono);font-size:11.5px;color:var(--tx2);max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.meter{height:6px;border-radius:999px;background:#0f131b;overflow:hidden;border:1px solid var(--line)}
+.meter>i{display:block;height:100%;border-radius:999px;background:var(--amber)}
+.meter.mint>i{background:var(--mint)}.meter.rose>i{background:var(--rose)}.meter.blue>i{background:var(--blue)}
+.empty{border:1px dashed var(--line2);border-radius:14px;padding:26px;text-align:center;color:var(--tx3)}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--tx2)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
+.chart{position:relative}
+.chart svg{display:block;width:100%;height:230px}
+.chart-x{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--tx3);padding:6px 2px 0}
+.chart-tip{position:absolute;top:8px;pointer-events:none;background:var(--panel2);border:1px solid var(--line2);border-radius:8px;padding:6px 10px;font-family:var(--mono);font-size:11px;color:var(--tx);white-space:nowrap;transform:translateX(-50%)}
+.chart-tip .hint{font-size:10px}
+.provider{width:34px;height:34px;flex:none;border-radius:9px;display:flex;align-items:center;justify-content:center;font-family:var(--disp);font-weight:700;font-size:13px;background:rgba(138,149,171,.14);color:var(--tx2);border:1px solid var(--line2)}
+.provider.sm{width:30px;height:30px;font-size:12px}
+.p-openai{background:rgba(63,208,164,.14);color:#8fe9c9;border-color:rgba(63,208,164,.35)}
+.p-anthropic{background:rgba(242,182,50,.14);color:#ffd36b;border-color:rgba(242,182,50,.35)}
+.p-gemini{background:rgba(111,176,255,.14);color:#a9ceff;border-color:rgba(111,176,255,.35)}
+.p-ollama{background:rgba(166,140,255,.14);color:#cbbdff;border-color:rgba(166,140,255,.35)}
+.p-deepseek{background:rgba(244,113,134,.14);color:#ffa3b0;border-color:rgba(244,113,134,.35)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px;align-items:center}
+.kv .k{color:var(--tx3)}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.split{display:grid;grid-template-columns:320px minmax(0,1fr);gap:18px 20px;align-items:start}
+.split.wide{grid-template-columns:400px minmax(0,1fr)}
+.split.pg{grid-template-columns:minmax(0,1fr) 340px}
+.ov-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:18px}
+.bar-row{display:flex;flex-direction:column;gap:6px}
+.rings{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.ring-tile{display:flex;align-items:center;gap:12px;min-width:0}
+.ring-tile svg{width:76px;height:76px;flex:none}
+.ring-tile .big{font-family:var(--disp);font-size:19px;font-weight:600;line-height:1.1;margin:2px 0;overflow-wrap:anywhere}
+.hit{display:grid;grid-template-columns:34px 1fr 150px;gap:12px;align-items:start;padding:12px 0;border-top:1px solid var(--line)}
+.hit .n{font-family:var(--mono);color:var(--amber);font-size:13px}
+.hit .score{display:flex;flex-direction:column;gap:5px;font-family:var(--mono);font-size:11px;color:var(--tx3)}
+.hit pre{background:transparent;border:0;padding:0;font-family:var(--body);font-size:13px;color:var(--tx2);max-height:140px}
+.drop{border:1px dashed rgba(242,182,50,.45);background:rgba(242,182,50,.04);border-radius:14px;padding:18px;display:flex;align-items:center;justify-content:center;gap:12px;color:var(--tx2);cursor:pointer;width:100%;font:inherit}
+.drop.over{background:rgba(242,182,50,.12);border-style:solid}
+.drop svg{width:20px;height:20px;color:var(--amber)}
+.store-card{cursor:pointer;text-align:left;width:100%;font:inherit;color:inherit}
+.store-card:hover{border-color:var(--line2)}
+
+/* chat */
+.chat-card{display:flex;flex-direction:column;padding:0;min-height:560px}
+.chat{flex:1;display:flex;flex-direction:column;gap:18px;padding:24px;overflow:auto;max-height:70vh}
+.bubble.user{align-self:flex-end;max-width:66%;background:var(--amber);color:var(--amber-ink);padding:12px 16px;border-radius:16px 16px 4px 16px;white-space:pre-wrap;word-break:break-word}
+.bubble.asst{display:flex;gap:12px;align-items:flex-start}
+.bubble.asst .body{max-width:72%;background:var(--panel2);border:1px solid var(--line2);padding:12px 16px;border-radius:4px 16px 16px 16px;line-height:1.55;white-space:pre-wrap;word-break:break-word;min-width:60px}
+.bubble.asst .body.err{border-color:rgba(244,113,134,.4);color:#ffa3b0}
+.caret{display:inline-block;width:8px;height:15px;background:var(--amber);vertical-align:-2px;margin-left:3px;border-radius:2px;animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.meta{display:flex;gap:8px;margin-left:42px;flex-wrap:wrap}
+.composer{border-top:1px solid var(--line);padding:14px 16px;display:flex;gap:10px;align-items:flex-end;background:#12161f;border-radius:0 0 16px 16px}
+.composer textarea{min-height:56px;flex:1}
+.resp{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;font-family:var(--mono);font-size:12px}
+
+/* drawer & modal & toast */
+.drawer-bg,.modal-bg{position:fixed;inset:0;background:rgba(5,7,11,.55);z-index:20;opacity:0;transition:opacity .15s}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:440px;max-width:100vw;background:#12161f;border-left:1px solid var(--line2);display:flex;flex-direction:column;box-shadow:-24px 0 60px rgba(0,0,0,.45);z-index:21;transform:translateX(100%);transition:transform .18s ease-out;margin:0}
+.open .drawer{transform:none}.open .drawer-bg,.open .modal-bg{opacity:1}
+.drawer-head{padding:22px 24px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}
+.drawer-body{padding:20px 24px;display:flex;flex-direction:column;gap:16px;overflow:auto;flex:1}
+.drawer-foot{padding:16px 24px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}
+.modal{position:fixed;left:50%;top:14vh;transform:translateX(-50%);width:560px;max-width:calc(100vw - 32px);background:#12161f;border:1px solid var(--line2);border-radius:16px;padding:24px;z-index:21;display:flex;flex-direction:column;gap:14px;box-shadow:0 24px 60px rgba(0,0,0,.5);margin:0;max-height:80vh;overflow:auto}
+.toast{position:fixed;bottom:20px;right:20px;background:var(--panel2);border:1px solid var(--line2);color:var(--tx);padding:12px 16px;border-radius:12px;z-index:30;max-width:440px;white-space:pre-wrap;box-shadow:0 12px 32px rgba(0,0,0,.4);font-size:13px}
+.toast.err{border-color:rgba(244,113,134,.5)}
+.toast.ok{border-color:rgba(63,208,164,.5)}
+
+/* auth screens */
+.auth{display:flex;min-height:100vh}
+.auth-hero{width:640px;flex:none;position:relative;overflow:hidden;background:#0a0d13;display:flex;flex-direction:column;justify-content:space-between;padding:44px 48px;border-right:1px solid var(--line)}
+.auth-hero .glow{position:absolute;inset:0;background:radial-gradient(520px 420px at 30% 20%,rgba(242,182,50,.22),transparent 70%),radial-gradient(420px 380px at 90% 90%,rgba(63,208,164,.14),transparent 70%)}
+.auth-hero .deco{position:absolute;inset:0;width:100%;height:100%}
+.auth-hero>*{position:relative}
+.auth-hero h1{font-size:44px;line-height:1.05}
+.auth-form{flex:1;display:flex;align-items:center;justify-content:center;padding:40px 24px}
+.auth-form form{width:420px;max-width:100%;padding:32px;display:flex;flex-direction:column;gap:18px}
+.auth-form h2{font-size:26px}
+.status-lines{display:flex;flex-direction:column;gap:8px;font-size:13px}
+
+/* responsive */
+@media (max-width:1100px){
+  .side{width:64px}
+  .side .brand{padding:20px 13px 14px;justify-content:center}
+  .side .brand>div:last-child,.side .nav-label,.side .nav-text,.side .nav-badge,.side .health span:not(.dot),.side .me>div,.side .side-actions .lbl{display:none}
+  .side .nav{padding:8px}
+  .side .nav-item{justify-content:center;padding:10px}
+  .side .side-foot{padding:12px 10px 14px;align-items:center}
+  .side .side-actions{flex-direction:column}
+  .main{padding:22px 20px 28px}
+  .stats{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .split,.split.wide,.split.pg,.ov-grid,.grid2{grid-template-columns:minmax(0,1fr)}
+  .auth-hero{display:none}
+}
+@media (max-width:760px){
+  .stats,.stats.four,.grid4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .drawer{width:100vw}
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>⛩ Ragmux</h1>
-  <nav id="nav" class="hidden">
-    <button data-tab="overview">Overview</button>
-    <button data-tab="models">Models</button>
-    <button data-tab="rag">RAG Stores</button>
-    <button data-tab="projects">Projects</button>
-    <button data-tab="playground">Playground</button>
-    <button data-tab="users" data-role="admin">Users</button>
-    <button data-tab="audit" data-role="admin">Audit</button>
-  </nav>
-  <div class="spacer"></div>
-  <span id="whoami" class="muted"></span>
-  <button id="btnPassword" class="small hidden">Password</button>
-  <button id="btnLogout" class="small hidden">Logout</button>
-</header>
-<main id="app"></main>
-<div id="modal"></div>
-<div id="toast" class="toast hidden"></div>
+<div id="auth" class="auth hidden"></div>
+<div id="shell" class="shell hidden">
+  <aside class="side">
+    <div class="brand"><div class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18V7l4 5 4-5v11"/><path d="M15 18V6l5 4-5 4"/></svg></div><div><div class="brand-name">Ragmux</div><div class="brand-sub" id="brandSub">gateway</div></div></div>
+    <nav class="nav" id="nav" aria-label="Main">
+      <div class="nav-label">Operate</div>
+      <button class="nav-item" data-tab="overview" title="Overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span class="nav-text">Overview</span></button>
+      <button class="nav-item" data-tab="models" title="Models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg><span class="nav-text">Models</span><span class="nav-badge" data-badge="models"></span></button>
+      <button class="nav-item" data-tab="rag" title="RAG stores"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nav-text">RAG stores</span><span class="nav-badge" data-badge="rag"></span></button>
+      <button class="nav-item" data-tab="projects" title="Projects"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.9 12.1 20 3M15 8l2 2M18 5l2 2"/></svg><span class="nav-text">Projects</span><span class="nav-badge" data-badge="projects"></span></button>
+      <button class="nav-item" data-tab="playground" title="Playground"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12 15h5"/></svg><span class="nav-text">Playground</span></button>
+      <div class="nav-label" data-role="admin">Administer</div>
+      <button class="nav-item" data-tab="users" data-role="admin" title="Users"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><circle cx="17" cy="9" r="2.5"/><path d="M16 14.5c3 0 5.5 2 5.5 5.5"/></svg><span class="nav-text">Users</span><span class="nav-badge" data-badge="users"></span></button>
+      <button class="nav-item" data-tab="audit" data-role="admin" title="Audit log"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg><span class="nav-text">Audit log</span></button>
+    </nav>
+    <div class="side-foot">
+      <div class="health" id="health"><span class="dot"></span><span>…</span></div>
+      <div class="me"><div class="avatar" id="meAvatar"></div><div><div class="me-name" id="meName"></div><div class="me-role" id="meRole"></div></div></div>
+      <div class="side-actions">
+        <button class="btn sm ghost" id="btnPassword" title="Change password" aria-label="Change password"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><span class="lbl">Password</span></button>
+        <button class="btn sm ghost" id="btnLogout" title="Sign out" aria-label="Sign out"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h5M15 8l4 4-4 4M9 12h10"/></svg><span class="lbl">Sign out</span></button>
+      </div>
+    </div>
+  </aside>
+  <main class="main" id="app"></main>
+</div>
+<div id="drawerRoot"></div>
+<div id="modalRoot"></div>
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
 <script>
 'use strict';
-const $ = (s, el=document) => el.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmtN = n => (n ?? 0).toLocaleString();
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtN = n => Number(n || 0).toLocaleString('en-US');
+const fmtK = n => { n = Number(n || 0); return n >= 1e6 ? (n / 1e6).toFixed(n % 1e6 ? 1 : 0) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(n % 1e3 && n < 1e5 ? 1 : 0) + 'k' : String(n); };
+const fmtBytes = b => { b = Number(b || 0); return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1024).toFixed(b < 10240 ? 1 : 0) + ' KB'; };
+const mb = b => (Number(b || 0) / 1048576).toFixed(b && b < 1048576 ? 2 : 1);
 const fmtDate = s => s ? new Date(s).toLocaleString() : '';
-const state = { user:null, needsSetup:false, tab:'overview', models:[], rag:[], projects:[], providerTypes:[], users:[], playground:{key:'', msgs:[]} };
-const ROLE_RANK = { viewer:1, editor:2, admin:3 };
+const fmtTime = s => s ? new Date(s).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+const fmtDay = s => s ? new Date(s).toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+const fmtMonthDay = s => new Date(s).toLocaleDateString([], { month: 'short', day: '2-digit' });
+const fmtMs = ms => `${fmtN(Math.round(ms || 0))} ms`;
+// "34 s", "6h 12m", "3d 4h" for a duration in milliseconds.
+function fmtDur(ms) {
+  if (ms <= 0) return 'now';
+  const s = Math.round(ms / 1000);
+  if (s < 90) return `${s} s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ${m % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+const pct = (a, b) => b ? Math.round(100 * a / b) : 0;
+const initials = name => String(name || '?').replace(/[^a-z0-9]/gi, '').slice(0, 2).toUpperCase() || '?';
+const GRADIENTS = ['#f2b632,#ff7a59', '#6fb0ff,#a68cff', '#3fd0a4,#6fb0ff', '#a68cff,#f47186', '#8a95ab,#324056', '#3fd0a4,#f2b632'];
+const avatar = (name, cls = '') => { let h = 0; for (const c of String(name || '')) h = (h * 31 + c.charCodeAt(0)) >>> 0; return `<div class="avatar ${cls}" style="background:linear-gradient(135deg,${GRADIENTS[h % GRADIENTS.length]})" aria-hidden="true">${esc(initials(name))}</div>`; };
+const meter = (p, cls = '') => `<div class="meter ${cls || (p >= 90 ? 'rose' : p >= 70 ? '' : 'mint')}"><i style="width:${Math.min(100, Math.max(0, p))}%"></i></div>`;
+const pctPill = p => `<span class="pill ${p >= 90 ? 'err' : p >= 70 ? 'warn' : 'ok'}">${p}%</span>`;
+const statusPill = c => `<span class="pill ${c < 400 ? 'ok' : c === 429 ? 'warn' : c === 499 ? '' : 'err'}">${c}</span>`;
+const flagPills = r => [r.streamed ? '<span class="pill info">stream</span>' : '', r.rag_used ? `<span class="pill violet">rag ${fmtN(r.rag_hits || 0)}</span>` : ''].filter(Boolean).join(' ');
+const ICON = {
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4-4"/></svg>',
+  upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>',
+  send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12 20 4l-4 16-4-7z"/></svg>',
+  download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12m0 0 4-4m-4 4-4-4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>',
+};
+
+const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], users: [], system: null, sessionExp: null,
+  overview: { window: '24h' }, openStore: null, openProject: null, users_filter: { q: '', role: 'all' },
+  playground: { key: '', system: '', stream: true, sources: true, msgs: [], last: null } };
+const ROLE_RANK = { viewer: 1, editor: 2, admin: 3 };
 // can('editor') is true for editors and admins; the API enforces the same matrix.
-const can = role => !!state.user && (ROLE_RANK[state.user.role]||0) >= (ROLE_RANK[role]||99);
-const userName = id => (state.users.find(u=>u.id===id)||{}).username || '#'+id;
+const can = role => !!state.user && (ROLE_RANK[state.user.role] || 0) >= (ROLE_RANK[role] || 99);
+const modelById = id => state.models.find(m => m.id === id);
+const modelName = id => (modelById(id) || {}).name || '#' + id;
+const ragName = id => id ? ((state.rag.find(r => r.id === id) || {}).name || '#' + id) : '—';
+const userName = id => (state.users.find(u => u.id === id) || {}).username || '#' + id;
+const projectName = id => (state.projects.find(p => p.id === id) || {}).name || '#' + id;
+const ptype = t => state.providerTypes.find(x => x.type === t) || {};
+const PROVIDER_LETTER = { openai: 'O', anthropic: 'A', gemini: 'G', ollama: 'L', deepseek: 'D', custom_openai: 'C' };
+const providerBadge = (type, cls = '') => `<div class="provider p-${esc(type)} ${cls}" aria-hidden="true">${PROVIDER_LETTER[type] || (type || '?')[0].toUpperCase()}</div>`;
 // Compact "2 rpm · 10k tpm · 1M/day" summary of a project's non-zero limits.
-const fmtK = n => n>=1e6 ? (n/1e6).toFixed(n%1e6?1:0)+'M' : n>=1e3 ? (n/1e3).toFixed(n%1e3?1:0)+'k' : String(n);
-const limitSummary = p => [p.rate_limit_rpm?`${fmtK(p.rate_limit_rpm)} rpm`:'', p.rate_limit_tpm?`${fmtK(p.rate_limit_tpm)} tpm`:'', p.budget_daily_tokens?`${fmtK(p.budget_daily_tokens)}/day`:'', p.budget_monthly_tokens?`${fmtK(p.budget_monthly_tokens)}/month`:''].filter(Boolean).join(' · ');
-const meter = pct => `<div class="meter"><div class="${pct>=100?'err':pct>=80?'warn':''}" style="width:${Math.min(100,pct)}%"></div></div>`;
+const limitSummary = p => [p.rate_limit_rpm ? `${fmtK(p.rate_limit_rpm)} rpm` : '', p.rate_limit_tpm ? `${fmtK(p.rate_limit_tpm)} tpm` : '', p.budget_daily_tokens ? `${fmtK(p.budget_daily_tokens)}/day` : '', p.budget_monthly_tokens ? `${fmtK(p.budget_monthly_tokens)}/month` : ''].filter(Boolean).join(' · ') || 'unlimited';
+// "hybrid (english) · rerank 15 · dist ≤ 0.6" summary of a store's retrieval settings.
+const retrievalSummary = r => [r.search_mode === 'vector' ? 'vector' : `hybrid (${r.fts_config || 'simple'})`, r.rerank ? `rerank ${r.rerank_candidates}` : '', r.max_distance ? `dist ≤ ${r.max_distance}` : ''].filter(Boolean).join(' · ');
 
 let toastTimer;
-function toast(msg, ms=3500){ const t=$('#toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.add('hidden'), ms); }
-
-async function api(path, opts={}){
-  const o = { headers:{}, ...opts };
-  if (o.body && !(o.body instanceof FormData)) { o.headers['Content-Type']='application/json'; o.body = JSON.stringify(o.body); }
-  const r = await fetch('/admin/api'+path, o);
-  if (r.status === 401 && !path.startsWith('/login')) { state.user=null; render(); throw new Error('session expired'); }
-  const ct = r.headers.get('content-type')||'';
-  const data = ct.includes('json') ? await r.json() : await r.text();
-  if (r.status === 403) { const msg=(data && data.error && data.error.message) || 'forbidden'; toast('Not allowed: '+msg); throw new Error(msg); }
-  if (!r.ok) throw new Error((data && data.error && data.error.message) || r.statusText);
-  return data;
+function toast(msg, ms = 3500, cls = '') {
+  const t = $('#toast'); t.textContent = msg; t.className = 'toast ' + cls; clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add('hidden'), ms);
 }
+const errMsg = (data, fallback) => (data && data.error && data.error.message) || fallback || 'request failed';
 
-// ---------- modal / forms ----------
-function modal(title, bodyHtml, onSubmit, submitLabel='Save'){
-  const root = $('#modal');
-  root.innerHTML = `<div class="modal-bg"><form class="modal"><h2>${esc(title)}</h2>${bodyHtml}
-    <div class="row" style="justify-content:flex-end;margin-top:8px"><button type="button" id="mCancel">Cancel</button><button class="primary" type="submit">${esc(submitLabel)}</button></div></form></div>`;
+// request returns the raw outcome so the sign-in screen can read the status
+// and headers; api() is the throwing wrapper every other screen uses.
+async function request(path, opts = {}) {
+  const o = { headers: {}, ...opts };
+  if (o.body && !(o.body instanceof FormData)) { o.headers['Content-Type'] = 'application/json'; o.body = JSON.stringify(o.body); }
+  const r = await fetch('/admin/api' + path, o);
+  const ct = r.headers.get('content-type') || '';
+  const data = ct.includes('json') ? await r.json() : await r.text();
+  return { status: r.status, ok: r.ok, data, headers: r.headers };
+}
+async function api(path, opts) {
+  const r = await request(path, opts);
+  if (r.status === 401 && !path.startsWith('/login') && !path.startsWith('/setup')) { signedOut(); throw new Error('session expired'); }
+  if (r.status === 403) { const m = errMsg(r.data, 'forbidden'); toast('Not allowed: ' + m, 4000, 'err'); throw new Error(m); }
+  if (!r.ok) throw new Error(errMsg(r.data, r.statusText));
+  return r.data;
+}
+const on = (root, sel, ev, fn) => $$(sel, root).forEach(el => el.addEventListener(ev, e => fn(el, e)));
+
+// ---------------------------------------------------------------------------
+// form building blocks
+// ---------------------------------------------------------------------------
+let fieldSeq = 0;
+const fid = name => `f-${name}-${++fieldSeq}`;
+function field(name, label, inner, hint = '') {
+  const id = fid(name);
+  return `<div class="field"><label for="${id}">${esc(label)}</label>${inner.replace('<INPUT', `<input id="${id}"`).replace('<SELECT', `<select id="${id}"`).replace('<TEXTAREA', `<textarea id="${id}"`)}${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
+}
+const input = (name, val = '', attrs = '') => `<INPUT class="input" name="${name}" value="${esc(val)}" ${attrs}>`;
+const textarea = (name, val = '', attrs = '') => `<TEXTAREA class="input" name="${name}" ${attrs}>${esc(val)}</TEXTAREA>`;
+const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${name}" ${attrs}>${opts.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(val) ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</SELECT>`;
+const toggle = (name, checked, label, hint = '') => `<label class="toggle"><span><span class="dim">${esc(label)}</span>${hint ? `<div class="hint">${hint}</div>` : ''}</span><input type="checkbox" name="${name}" ${checked ? 'checked' : ''}><span class="switch" aria-hidden="true"></span></label>`;
+const checklist = (name, opts, vals = [], empty = 'Nothing to choose from.') => `<div class="checklist">${opts.map(o => `<label class="check"><input type="checkbox" name="${name}" value="${esc(o.value)}" ${vals.map(String).includes(String(o.value)) ? 'checked' : ''}>${esc(o.label)}</label>`).join('') || `<div class="hint" style="padding:6px 10px">${esc(empty)}</div>`}</div>`;
+const twoCol = (a, b) => `<div class="row" style="align-items:flex-start"><div class="grow">${a}</div><div class="grow">${b}</div></div>`;
+const ROLES = [{ value: 'admin', label: 'admin', hint: 'Everything, including users and the audit log' }, { value: 'editor', label: 'editor', hint: 'Models, RAG stores and own projects' }, { value: 'viewer', label: 'viewer', hint: 'Read-only across member projects' }];
+const roleCards = val => `<fieldset class="field" style="border:0;padding:0;margin:0;gap:8px"><legend>Role</legend>${ROLES.map(r => `<label class="radio-card"><input type="radio" name="role" value="${r.value}" ${r.value === val ? 'checked' : ''}><div><div style="font-weight:500">${r.label}</div><div class="hint">${r.hint}</div></div></label>`).join('')}</fieldset>`;
+// Client-side strength heuristic: length and character variety; the server only enforces length.
+function strengthScore(pw) {
+  if (!pw) return 0;
+  let s = 0;
+  if (pw.length >= 8) s++;
+  if (pw.length >= 12) s++;
+  const kinds = [/[a-z]/, /[A-Z]/, /\d/, /[^\w]/].filter(re => re.test(pw)).length;
+  if (kinds >= 3) s++;
+  if (pw.length >= 16 && kinds >= 2) s++;
+  return Math.min(4, s);
+}
+const STRENGTH = ['', 'Weak', 'Fair', 'Strong', 'Very strong'];
+const strengthMeter = id => `<div class="strength" data-score="0" id="${id}"><i></i><i></i><i></i><i></i></div><div class="hint" id="${id}-t">Minimum length applies; longer and mixed is better.</div>`;
+function bindStrength(inputEl, id, min) {
+  const upd = () => { const v = inputEl.value; const s = strengthScore(v); $('#' + id).dataset.score = s; $(`#${id}-t`).textContent = v ? `${STRENGTH[s] || 'Weak'} · ${v.length} characters${v.length < min ? ` (minimum ${min})` : ''}` : `Minimum ${min} characters; longer and mixed is better.`; };
+  inputEl.addEventListener('input', upd); upd();
+}
+const formData = form => { const d = Object.fromEntries(new FormData(form).entries()); for (const cb of $$('input[type=checkbox]', form)) d[cb.name] = cb.checked; return d; };
+const checkedValues = (form, name) => $$(`input[name="${name}"]:checked`, form).map(i => Number(i.value));
+
+// ---------------------------------------------------------------------------
+// drawer (forms) and modal (confirm / key reveal)
+// ---------------------------------------------------------------------------
+let lastFocus = null;
+function drawer({ eyebrow = '', title, body, submitLabel = 'Save', onSubmit, extra = '', hideSubmit = false }) {
+  closeDrawer();
+  lastFocus = document.activeElement;
+  const root = $('#drawerRoot');
+  root.innerHTML = `<div class="drawer-bg"></div><form class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+    <div class="drawer-head"><div>${eyebrow ? `<div class="eyebrow">${esc(eyebrow)}</div>` : ''}<h2 id="drawerTitle">${esc(title)}</h2></div><button type="button" class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
+    <div class="drawer-body">${body}</div>
+    <div class="drawer-foot"><button type="button" class="btn ghost" data-close>Cancel</button>${extra}${hideSubmit ? '' : `<button class="btn primary" type="submit">${esc(submitLabel)}</button>`}</div></form>`;
+  requestAnimationFrame(() => root.classList.add('open'));
   const form = $('form', root);
-  $('#mCancel').onclick = closeModal;
-  $('.modal-bg', root).addEventListener('click', e => { if (e.target.classList.contains('modal-bg')) closeModal(); });
-  form.onsubmit = async e => { e.preventDefault(); const btn=$('button[type=submit]', form); btn.disabled=true;
-    try { await onSubmit(Object.fromEntries(new FormData(form).entries()), form); closeModal(); } catch(err){ toast('Error: '+err.message); } finally { btn.disabled=false; } };
+  on(root, '[data-close]', 'click', closeDrawer);
+  $('.drawer-bg', root).addEventListener('click', closeDrawer);
+  form.onsubmit = async e => { e.preventDefault(); const btn = $('button[type=submit]', form); if (btn) btn.disabled = true;
+    try { await onSubmit(formData(form), form); closeDrawer(); } catch (err) { toast('Error: ' + err.message, 5000, 'err'); } finally { if (btn) btn.disabled = false; } };
+  const first = $('input:not([type=hidden]):not([type=checkbox]):not([type=radio]),select,textarea', form); if (first) setTimeout(() => first.focus(), 60);
   return form;
 }
-function closeModal(){ $('#modal').innerHTML=''; }
-const field = (label, inner) => `<div class="field"><label>${esc(label)}</label>${inner}</div>`;
-const input = (name, val='', attrs='') => `<input name="${name}" value="${esc(val)}" ${attrs}>`;
-const select = (name, opts, val) => `<select name="${name}">${opts.map(o=>`<option value="${esc(o.value)}" ${String(o.value)===String(val)?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`;
-const multiSelect = (name, opts, vals=[]) => `<select name="${name}" multiple>${opts.map(o=>`<option value="${esc(o.value)}" ${vals.map(String).includes(String(o.value))?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`;
-const ROLES = [{value:'viewer',label:'viewer — read only'},{value:'editor',label:'editor — manage models, RAG and own projects'},{value:'admin',label:'admin — everything incl. users'}];
-async function confirmDialog(msg){ return new Promise(res => { modal('Confirm', `<p>${esc(msg)}</p>`, async()=>res(true), 'Confirm'); $('#mCancel').addEventListener('click', ()=>res(false)); }); }
-
-// ---------- first-run setup ----------
-// Shown instead of the login form while the users table is empty (GET
-// /setup says needs_setup). The server refuses the request once any user
-// exists, so a stale page cannot create a second administrator.
-function renderSetup(app){
-  app.innerHTML = `<div class="card login"><h2>Create the first administrator</h2>
-    <p class="muted">No accounts exist yet. This account gets the admin role; you can add more users afterwards.</p>
-    <form id="setupForm">
-      ${field('Username', input('username','','required autocomplete=username pattern="[a-z0-9._-]{3,64}" title="3-64 characters: a-z, 0-9, . _ -"'))}
-      ${field('Password (min 12)', input('password','','type=password required minlength=12 maxlength=72 autocomplete=new-password'))}
-      ${field('Confirm password', input('confirm','','type=password required minlength=12 maxlength=72 autocomplete=new-password'))}
-      <button class="primary" style="width:100%">Create administrator</button></form></div>`;
-  $('#setupForm').onsubmit = async e => { e.preventDefault(); const d=Object.fromEntries(new FormData(e.target).entries());
-    if (d.password !== d.confirm) { toast('Passwords do not match'); return; }
-    const btn=$('button', e.target); btn.disabled=true;
-    try { const r = await api('/setup',{method:'POST',body:{username:d.username, password:d.password}}); state.needsSetup=false; state.user=r.user; await loadAll(); render(); }
-    catch(err){ toast(err.message); if (/already completed/.test(err.message)) { state.needsSetup=false; render(); } }
-    finally { btn.disabled=false; } };
+function closeDrawer() { const root = $('#drawerRoot'); if (!root.innerHTML) return; root.classList.remove('open'); root.innerHTML = ''; if (lastFocus && lastFocus.focus) lastFocus.focus(); }
+function modal(title, bodyHtml, { submitLabel = 'Confirm', cancelLabel = 'Cancel', onSubmit = async () => {}, danger = false, onClose = () => {} } = {}) {
+  const root = $('#modalRoot');
+  root.innerHTML = `<div class="modal-bg"></div><form class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><h2 id="modalTitle">${esc(title)}</h2>${bodyHtml}
+    <div class="row" style="justify-content:flex-end;margin-top:4px">${cancelLabel ? `<button type="button" class="btn ghost" data-close>${esc(cancelLabel)}</button>` : ''}<button class="btn ${danger ? 'danger' : 'primary'}" type="submit">${esc(submitLabel)}</button></div></form>`;
+  requestAnimationFrame(() => root.classList.add('open'));
+  const form = $('form', root);
+  const close = () => { root.classList.remove('open'); root.innerHTML = ''; root.onEscape = null; onClose(); };
+  root.onEscape = close;
+  on(root, '[data-close]', 'click', close);
+  $('.modal-bg', root).addEventListener('click', close);
+  form.onsubmit = async e => { e.preventDefault(); const btn = $('button[type=submit]', form); btn.disabled = true;
+    try { await onSubmit(formData(form), form); root.classList.remove('open'); root.innerHTML = ''; root.onEscape = null; } catch (err) { toast('Error: ' + err.message, 5000, 'err'); } finally { btn.disabled = false; } };
+  setTimeout(() => $('button[type=submit]', form).focus(), 60);
+  return form;
 }
+function confirmDialog(msg, { label = 'Confirm', danger = true } = {}) {
+  return new Promise(res => { let done = false; modal('Please confirm', `<p class="dim">${esc(msg)}</p>`, { submitLabel: label, danger, onSubmit: async () => { done = true; res(true); }, onClose: () => { if (!done) res(false); } }); });
+}
+document.addEventListener('keydown', e => { if (e.key !== 'Escape') return; const mr = $('#modalRoot'); if (mr.innerHTML) { if (mr.onEscape) mr.onEscape(); else mr.innerHTML = ''; return; } closeDrawer(); });
 
-// ---------- render ----------
-function render(){
-  const nav=$('#nav'); const app=$('#app');
-  if (!state.user){ nav.classList.add('hidden'); $('#btnLogout').classList.add('hidden'); $('#btnPassword').classList.add('hidden'); $('#whoami').textContent='';
-    if (state.needsSetup){ renderSetup(app); return; }
-    app.innerHTML = `<div class="card login"><h2>Sign in</h2><form id="loginForm">
-      ${field('Username', input('username','admin','autocomplete=username'))}
-      ${field('Password', input('password','','type=password autocomplete=current-password'))}
-      <button class="primary" style="width:100%">Sign in</button></form></div>`;
-    $('#loginForm').onsubmit = async e => { e.preventDefault(); const d=Object.fromEntries(new FormData(e.target).entries());
-      try { const r = await api('/login',{method:'POST',body:d}); state.user=r.user; await loadAll(); render(); } catch(err){ toast(err.message); } };
-    return;
-  }
-  nav.classList.remove('hidden'); $('#btnLogout').classList.remove('hidden'); $('#btnPassword').classList.remove('hidden');
-  $('#whoami').textContent = `${state.user.username} · ${state.user.role}`;
-  nav.querySelectorAll('button').forEach(b => { b.classList.toggle('active', b.dataset.tab===state.tab); b.classList.toggle('hidden', !!b.dataset.role && !can(b.dataset.role)); });
-  const tabs = {overview:renderOverview, models:renderModels, rag:renderRAG, projects:renderProjects, playground:renderPlayground, users:renderUsers, audit:renderAudit};
-  if (!tabs[state.tab]) state.tab='overview';
+// ---------------------------------------------------------------------------
+// shell: sidebar, session, health line
+// ---------------------------------------------------------------------------
+function signedOut() { state.user = null; state.sessionExp = null; closeDrawer(); render(); }
+function render() {
+  const shell = $('#shell'), auth = $('#auth');
+  if (!state.user) { shell.classList.add('hidden'); auth.classList.remove('hidden'); if (state.needsSetup) renderSetup(); else renderLogin(); return; }
+  auth.classList.add('hidden'); shell.classList.remove('hidden');
+  $('#meName').textContent = state.user.username;
+  $('#meAvatar').outerHTML = avatar(state.user.username).replace('class="avatar "', 'class="avatar" id="meAvatar"');
+  updateSession();
+  $$('[data-role]', $('#nav')).forEach(el => el.classList.toggle('hidden', !can(el.dataset.role)));
+  $$('.nav-item').forEach(b => { const active = b.dataset.tab === state.tab; b.classList.toggle('active', active); if (active) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
+  updateBadges();
+  const tabs = { overview: renderOverview, models: renderModels, rag: renderRAG, projects: renderProjects, playground: renderPlayground, users: renderUsers, audit: renderAudit };
+  if (!tabs[state.tab] || ($('.nav-item[data-tab=' + state.tab + ']').dataset.role && !can('admin'))) state.tab = 'overview';
+  clearTimeout(pollTimer); clearInterval(ringTimer);
   tabs[state.tab]();
 }
-
-async function loadAll(){
+function updateBadges() {
+  const b = { models: state.models.length, rag: state.rag.length, projects: state.projects.length, users: state.users.length && can('admin') ? state.users.length : '' };
+  for (const [k, v] of Object.entries(b)) { const el = $(`[data-badge=${k}]`); if (el) el.textContent = v ? String(v) : ''; }
+}
+function updateSession() {
+  const exp = state.sessionExp ? new Date(state.sessionExp) - Date.now() : null;
+  $('#meRole').textContent = `${state.user.role}${exp !== null ? ` · session ${exp > 0 ? fmtDur(exp) + ' left' : 'expired'}` : ''}`;
+}
+setInterval(() => { if (state.user) updateSession(); }, 30000);
+async function loadAll() {
   [state.models, state.rag, state.projects, state.providerTypes] = await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types')]);
-  // Editors and admins can list users (for project members); viewers cannot.
-  state.users = can('editor') ? await api('/users/lite').catch(()=>[]) : [];
+  // Admins get the full list (badge, actor filter); editors the active users for member pickers; viewers nothing.
+  state.users = can('admin') ? await api('/users').catch(() => []) : can('editor') ? await api('/users/lite').catch(() => []) : [];
+  loadSystem();
 }
-const modelName = id => (state.models.find(m=>m.id===id)||{}).name || '#'+id;
-const ragName = id => id ? ((state.rag.find(r=>r.id===id)||{}).name || '#'+id) : '—';
+async function loadSystem() {
+  const h = $('#health');
+  try {
+    const s = state.system = await api('/system');
+    const db = s.database || {};
+    // pg / pgvector versions are only returned to admins; others get size + migrations.
+    const parts = ['healthy', db.postgres_version ? `pg ${String(db.postgres_version).split(' ')[0]}` : '', db.pgvector_version ? `pgvector ${db.pgvector_version}` : '', !db.postgres_version && db.size_bytes ? `db ${mb(db.size_bytes)} MB` : ''].filter(Boolean);
+    h.innerHTML = `<span class="dot"></span><span title="migrations ${esc(db.migrations_version)} · key from ${esc(s.secret_key_source)} · db ${mb(db.size_bytes)} MB">${esc(parts.join(' · '))}</span>`;
+    $('#brandSub').textContent = s.version ? `gateway · v${s.version}` : 'gateway';
+  } catch (e) { h.innerHTML = `<span class="dot err"></span><span>${esc(e.message)}</span>`; }
+}
+$('#nav').addEventListener('click', e => { const b = e.target.closest('.nav-item'); if (!b) return; state.tab = b.dataset.tab; render(); });
+$('#btnLogout').onclick = async () => { try { await api('/logout', { method: 'POST' }); } catch (e) { /* session is gone either way */ } signedOut(); };
+$('#btnPassword').onclick = () => {
+  const form = drawer({ eyebrow: 'Account', title: 'Change password', submitLabel: 'Change password', body: `
+    ${field('current_password', 'Current password', input('current_password', '', 'type=password required autocomplete=current-password'))}
+    ${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=8 maxlength=72 autocomplete=new-password'), strengthMeter('pwm'))}
+    <p class="hint">Every other session of your account is signed out.</p>`,
+    onSubmit: async d => { await api('/me/password', { method: 'POST', body: { current_password: d.current_password, new_password: d.new_password } }); toast('Password changed', 3500, 'ok'); } });
+  bindStrength($('[name=new_password]', form), 'pwm', 8);
+};
 
-// ---------- overview ----------
-async function renderOverview(){
-  const app=$('#app'); app.innerHTML='<div class="card">Loading…</div>';
-  let m, sys;
-  try { [m, sys] = await Promise.all([api('/metrics/summary?window=24h'), api('/system')]); } catch(e){ app.innerHTML=`<div class="card">Error: ${esc(e.message)}</div>`; return; }
-  const w=m.window, t=m.total;
-  const maxReq = Math.max(1, ...m.daily.map(d=>d.requests));
+// ---------------------------------------------------------------------------
+// sign in and first-run setup
+// ---------------------------------------------------------------------------
+const heroHtml = () => `<section class="auth-hero"><div class="glow"></div>
+  <svg class="deco" viewBox="0 0 640 900" preserveAspectRatio="xMidYMid slice" fill="none" aria-hidden="true"><g stroke="#232b39" stroke-width="1"><path d="M0 150H640M0 300H640M0 450H640M0 600H640M0 750H640"/><path d="M160 0V900M320 0V900M480 0V900"/></g><g stroke="#f2b632" stroke-width="1.5" opacity=".9"><path d="M80 640 C 200 560, 260 700, 380 520 S 560 400, 600 300"/></g><g fill="#f2b632"><circle cx="80" cy="640" r="4"/><circle cx="380" cy="520" r="4"/><circle cx="600" cy="300" r="5"/></g><g fill="#3fd0a4" opacity=".8"><circle cx="220" cy="240" r="3"/><circle cx="470" cy="180" r="3"/><circle cx="300" cy="820" r="3"/></g></svg>
+  <div class="brand" style="padding:0"><div class="mark" style="width:44px;height:44px" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18V7l4 5 4-5v11"/><path d="M15 18V6l5 4-5 4"/></svg></div><div><div class="brand-name" style="font-size:24px">Ragmux</div><div class="brand-sub">self-hosted AI gateway</div></div></div>
+  <div class="stack" style="gap:18px;max-width:460px"><h1>One endpoint.<br>Every model.<br>Your documents.</h1>
+    <p class="lede" style="font-size:15px">OpenAI-compatible proxy over OpenAI, Anthropic, Gemini, DeepSeek and Ollama, with hybrid RAG, per-project keys and budgets, on your own PostgreSQL.</p>
+    <div class="row wrap" style="gap:8px"><span class="pill">AGPL-3.0</span><span class="pill" id="heroVersion">${state.system && state.system.version ? 'v' + esc(state.system.version) : 'gateway'}</span><span class="pill">pgvector</span><span class="pill">AES-GCM sealed keys</span></div></div>
+  <div class="hint mono">ragmux.com · github.com/Ragmux/ragmux</div></section>`;
+async function heroVersion() {
+  try { const r = await fetch('/healthz'); const j = await r.json(); const el = $('#heroVersion'); if (el && j.version) el.textContent = 'v' + j.version; } catch (e) { /* the pill keeps its placeholder */ }
+}
+function renderLogin() {
+  $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="loginForm">
+    <div><div class="eyebrow">Sign in</div><h2>Welcome back</h2><p class="lede" style="font-size:13.5px">Sessions are bound to this browser and expire after the configured TTL.</p></div>
+    ${field('username', 'Username', input('username', '', 'required autocomplete=username autocapitalize=none spellcheck=false'))}
+    ${field('password', 'Password', input('password', '', 'type=password required autocomplete=current-password'))}
+    <div id="loginNote"></div>
+    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Sign in</button>
+    <div class="hint" style="text-align:center">Forgot your password? Ask an administrator to reset it.</div></form></section>`;
+  heroVersion();
+  $('#loginForm').onsubmit = async e => { e.preventDefault(); const form = e.target; const d = formData(form); const btn = $('button', form); btn.disabled = true; const note = $('#loginNote');
+    try {
+      const r = await request('/login', { method: 'POST', body: { username: d.username, password: d.password } });
+      if (r.ok) { state.user = r.data.user; state.needsSetup = false; await afterSignIn(); return; }
+      const err = (r.data && r.data.error) || {};
+      if (r.status === 401) { const left = err.attempts_remaining; note.innerHTML = `<div class="note warn">${left != null ? `<span class="pill warn">${fmtN(left)} left</span>` : '<span class="pill err">401</span>'}<span class="hint">${esc(err.message || 'invalid username or password')}${left != null ? '. Further failures this minute trigger the per-user limit.' : ''}</span></div>`; }
+      else if (r.status === 429) { const ra = r.headers.get('Retry-After'); note.innerHTML = `<div class="note err"><span class="pill err">${err.locked ? 'locked' : '429'}</span><span class="hint">${esc(err.message || 'too many login attempts')}${ra ? ` · retry in ${esc(ra)} s` : ''}${err.locked ? ' · this username/address pair is locked out' : ''}</span></div>`; }
+      else note.innerHTML = `<div class="note err"><span class="hint">${esc(errMsg(r.data, r.statusText))}</span></div>`;
+    } catch (err) { toast(err.message, 4000, 'err'); } finally { btn.disabled = false; } };
+}
+// Shown instead of the login form while the users table is empty (GET /setup
+// says needs_setup). The server refuses once any user exists, so a stale page
+// cannot create a second administrator.
+function renderSetup() {
+  const s = state.setup || {};
+  $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="setupForm">
+    <div><div class="eyebrow">First run · step 1 of 1</div><h2>Create the first administrator</h2><p class="lede" style="font-size:13.5px">No users exist yet. This form works only once and is rate limited per address; afterwards sign in normally.</p></div>
+    ${field('username', 'Username', input('username', '', 'required autocomplete=username autocapitalize=none spellcheck=false pattern="[a-z0-9._-]{3,64}" title="3-64 characters: a-z, 0-9, . _ -"'), '3–64 characters: lowercase letters, digits, dot, dash, underscore.')}
+    ${field('password', 'Password', input('password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('spw'))}
+    ${field('confirm', 'Confirm password', input('confirm', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'))}
+    <div class="status-lines">
+      ${s.migrations_version != null ? `<div class="row" style="gap:8px"><span class="dot"></span><span class="dim">PostgreSQL connected · migrations ${esc(s.migrations_version)}${s.database_role ? ` · role ${esc(s.database_role)}` : ''}</span></div>` : ''}
+      ${s.secret_key_source ? `<div class="row" style="gap:8px"><span class="dot"></span><span class="dim">SECRET_KEY from ${s.secret_key_source === 'env' ? 'environment' : esc(s.secret_key_source)}</span></div>` : ''}
+    </div>
+    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Create administrator &amp; sign in</button>
+    <div class="hint" style="text-align:center">Prefer automation? Set <code>ADMIN_USER</code> and <code>ADMIN_PASSWORD</code> before first start instead.</div></form></section>`;
+  heroVersion();
+  bindStrength($('[name=password]', $('#setupForm')), 'spw', 12);
+  $('#setupForm').onsubmit = async e => { e.preventDefault(); const d = formData(e.target);
+    if (d.password !== d.confirm) { toast('Passwords do not match', 3500, 'err'); return; }
+    const btn = $('button', e.target); btn.disabled = true;
+    try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } }); state.needsSetup = false; state.user = r.user; await afterSignIn(); }
+    catch (err) { toast(err.message, 5000, 'err'); if (/already completed/.test(err.message)) { state.needsSetup = false; render(); } }
+    finally { btn.disabled = false; } };
+}
+async function afterSignIn() {
+  try { const me = await api('/me'); state.user = me; state.sessionExp = me.session_expires_at || null; } catch (e) { /* login response already carries the user */ }
+  try { await loadAll(); } catch (e) { toast(e.message, 4000, 'err'); }
+  state.tab = 'overview'; render();
+}
+
+// ---------------------------------------------------------------------------
+// shared drawing: sparkline, area chart, usage ring
+// ---------------------------------------------------------------------------
+function sparkline(values, color) {
+  if (values.length < 2) return '';
+  const max = Math.max(1, ...values); const w = 72, h = 26;
+  const pts = values.map((v, i) => `${(i * w / (values.length - 1)).toFixed(1)} ${(h - 3 - (h - 6) * v / max).toFixed(1)}`);
+  return `<svg class="spark" width="72" height="26" viewBox="0 0 72 26" fill="none" aria-hidden="true"><path d="M${pts.join(' L')}" stroke="${color}" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+}
+// Requests-per-day area chart with an errors line; hover shows the day's numbers.
+function areaChart(series) {
+  let daily = series;
+  const W = 860, H = 230, top = 12, bottom = 200;
+  if (!daily.length) return '<div class="empty">No requests in this range yet.</div>';
+  if (daily.length === 1) daily = [daily[0], daily[0]];
+  const max = Math.max(1, ...daily.map(d => d.requests));
+  const x = i => daily.length > 1 ? i * W / (daily.length - 1) : W / 2;
+  const y = v => bottom - (bottom - top) * v / max;
+  const line = key => daily.map((d, i) => `${x(i).toFixed(1)} ${y(d[key]).toFixed(1)}`).join(' L');
+  const grid = [0.25, 0.5, 0.75, 1].map(f => `<line x1="0" y1="${(bottom - (bottom - top) * f).toFixed(1)}" x2="${W}" y2="${(bottom - (bottom - top) * f).toFixed(1)}"/>`).join('');
+  const labels = series.filter((_, i) => series.length <= 8 || i % Math.ceil(series.length / 8) === 0 || i === series.length - 1).map(d => `<span>${esc(fmtMonthDay(d.day))}</span>`).join('');
+  return `<div class="chart" id="areaChart"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Requests per day">
+    <defs><linearGradient id="ga" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f2b632" stop-opacity=".35"/><stop offset="1" stop-color="#f2b632" stop-opacity="0"/></linearGradient></defs>
+    <g stroke="#232b39" stroke-width="1">${grid}</g>
+    <path d="M${line('requests')} V${bottom} H0Z" fill="url(#ga)"/>
+    <path d="M${line('requests')}" fill="none" stroke="#f2b632" stroke-width="2.2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+    <path d="M${line('errors')}" fill="none" stroke="#f47186" stroke-width="1.6" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+    <g id="chartDots" fill="#f2b632">${daily.map((d, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(d.requests).toFixed(1)}" r="0" data-i="${i}"/>`).join('')}</g></svg>
+    <div class="chart-tip hidden" id="chartTip"></div><div class="chart-x">${labels}</div></div>`;
+}
+function bindChart(daily) {
+  const el = $('#areaChart'); if (!el || !daily.length) return; const svg = $('svg', el), tip = $('#chartTip');
+  svg.addEventListener('mousemove', e => { const r = svg.getBoundingClientRect(); const i = Math.max(0, Math.min(daily.length - 1, Math.round((e.clientX - r.left) / r.width * (daily.length - 1)))); const d = daily[i];
+    tip.innerHTML = `${esc(fmtMonthDay(d.day))} · ${fmtN(d.requests)} req<div class="hint">${fmtN(d.errors)} err · ${fmtK(d.prompt_tokens + d.completion_tokens)} tokens</div>`; tip.classList.remove('hidden');
+    tip.style.left = `${Math.max(60, Math.min(r.width - 60, (daily.length > 1 ? i / (daily.length - 1) : .5) * r.width))}px`;
+    $$('circle', svg).forEach(c => c.setAttribute('r', c.dataset.i == i ? '4' : '0')); });
+  svg.addEventListener('mouseleave', () => { tip.classList.add('hidden'); $$('circle', svg).forEach(c => c.setAttribute('r', '0')); });
+}
+const RING_C = 2 * Math.PI * 42;
+function ring(p, color, label) {
+  return `<svg width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="${esc(label)} ${p}%"><circle cx="48" cy="48" r="42" fill="none" stroke="#1d2431" stroke-width="8"/><circle cx="48" cy="48" r="42" fill="none" stroke="${color}" stroke-width="8" stroke-linecap="round" stroke-dasharray="${(Math.min(100, p) / 100 * RING_C).toFixed(1)} 999" transform="rotate(-90 48 48)"/><text x="48" y="53" text-anchor="middle" fill="#eceef4" font-size="18" font-weight="600" font-family="Bricolage Grotesque, system-ui, sans-serif">${p}%</text></svg>`;
+}
+const usageColor = p => p >= 90 ? '#f47186' : p >= 70 ? '#f2b632' : '#3fd0a4';
+
+// ---------------------------------------------------------------------------
+// overview
+// ---------------------------------------------------------------------------
+const WINDOWS = { '24h': { label: '24h', prev: 'prev 24h', days: 14, eyebrow: 'last 24 hours' }, '168h': { label: '7d', prev: 'prev 7d', days: 14, eyebrow: 'last 7 days' }, '720h': { label: '30d', prev: 'prev 30d', days: 30, eyebrow: 'last 30 days' } };
+const greeting = () => { const h = new Date().getHours(); return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'; };
+function delta(cur, prev, { invert = false, suffix = '' } = {}) {
+  if (prev == null) return '';
+  if (!prev) return cur ? `<div class="d ${invert ? 'down' : 'up'}">new${suffix}</div>` : `<div class="d">no change${suffix}</div>`;
+  const ch = (cur - prev) / prev * 100; const good = invert ? ch <= 0 : ch >= 0;
+  return `<div class="d ${Math.abs(ch) < 0.5 ? '' : good ? 'up' : 'down'}">${ch >= 0 ? '+' : ''}${ch.toFixed(1)}%${suffix}</div>`;
+}
+async function renderOverview() {
+  const app = $('#app'); const win = state.overview.window; const W = WINDOWS[win];
+  app.innerHTML = '<div class="card">Loading…</div>';
+  let m, usages = [];
+  try {
+    m = await api(`/metrics/summary?window=${win}&compare=1&days=${W.days}&by_project=1`);
+    const budgeted = state.projects.filter(p => p.budget_daily_tokens || p.budget_monthly_tokens);
+    usages = (await Promise.all(budgeted.map(p => api(`/projects/${p.id}/usage`).then(u => ({ p, u })).catch(() => null)))).filter(Boolean);
+  } catch (e) { app.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  const w = m.window, t = m.total, prev = m.previous || {}, daily = m.daily || [], byProject = m.projects || [];
+  const vs = ` vs ${W.prev}`;
+  const budgets = [];
+  for (const { p, u } of usages) {
+    if (u.day && u.day.token_limit) budgets.push({ name: p.name, kind: 'daily tokens', pct: u.day.token_percent, at: u.forecast && u.forecast.daily_exhausted_at, resets: u.day.resets_at });
+    if (u.month && u.month.token_limit) budgets.push({ name: p.name, kind: 'monthly tokens', pct: u.month.token_percent, at: u.forecast && u.forecast.monthly_exhausted_at, resets: u.month.resets_at });
+  }
+  budgets.sort((a, b) => b.pct - a.pct);
+  const hot = budgets.filter(b => b.pct >= 80).length;
+  const lede = state.projects.length ? `Traffic across ${state.projects.length} project${state.projects.length === 1 ? '' : 's'}${hot ? `. ${hot} budget${hot === 1 ? ' is' : 's are'} above 80%.` : w.requests ? ' is being served.' : '; no requests in this window yet.'}` : 'No projects yet — add a model connection and a project to start routing traffic.';
+  const maxP = Math.max(1, ...byProject.map(p => p.requests)); const COLORS = ['', 'blue', 'mint', 'rose', 'blue', 'mint'];
   app.innerHTML = `
-    <div class="card"><div class="row between"><h2>Last 24 hours</h2><span class="muted">PostgreSQL ${esc(sys.database.postgres_version)} · pgvector ${esc(sys.database.pgvector_version)} · DB ${(sys.database.size_bytes/1048576).toFixed(2)} MB (${fmtN(sys.backup.tables)} vector table${sys.backup.tables===1?'':'s'}, docs ${(sys.backup.documents_bytes/1048576).toFixed(2)} MB) · key: ${esc(sys.secret_key_source)} · v${esc(sys.version)}</span></div>
-      <div class="grid">
-        <div class="stat"><div class="v">${fmtN(w.requests)}</div><div class="l">requests (${fmtN(w.errors)} errors)</div></div>
-        <div class="stat"><div class="v">${fmtN(w.prompt_tokens)}</div><div class="l">prompt tokens</div></div>
-        <div class="stat"><div class="v">${fmtN(w.completion_tokens)}</div><div class="l">completion tokens</div></div>
-        <div class="stat"><div class="v">${Math.round(w.avg_latency_ms)} ms</div><div class="l">avg latency · p95 ${fmtN(w.p95_latency_ms)} ms</div></div>
-        <div class="stat"><div class="v">${fmtN(w.rag_requests)}</div><div class="l">RAG-augmented</div></div>
-        <div class="stat"><div class="v">${fmtN(w.rate_limited)}</div><div class="l">rate limited (429)</div></div>
-      </div></div>
-    <div class="card"><h3>Requests per day (14d) · all time: ${fmtN(t.requests)} req / ${fmtN(t.prompt_tokens+t.completion_tokens)} tokens</h3>
-      <div class="bars" style="margin-bottom:22px">${m.daily.length?m.daily.map(d=>`<div style="height:${Math.max(2,100*d.requests/maxReq)}%" title="${d.day}: ${d.requests} req, ${d.errors} err"><span>${d.day.slice(5)}</span></div>`).join(''):'<span class="muted">No requests yet.</span>'}</div></div>
-    <div class="card"><h3>Recent requests</h3><div class="tbl"><table><thead><tr><th>Time</th><th>Project</th><th>Model</th><th>Status</th><th>Tokens (p/c)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead>
-      <tbody>${m.recent.map(r=>`<tr><td>${fmtDate(r.created_at)}</td><td>${esc((state.projects.find(p=>p.id===r.project_id)||{}).name||'#'+r.project_id)}</td><td>${esc(r.model_name)}</td>
-        <td><span class="pill ${r.status_code<400?'ok':'err'}">${r.status_code}</span></td><td>${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated?' <span class="muted">~</span>':''}</td><td>${fmtN(r.latency_ms)} ms</td>
-        <td>${r.streamed?'<span class="pill">stream</span> ':''}${r.rag_used?'<span class="pill">rag</span>':''}</td><td class="muted">${esc(r.error)}</td></tr>`).join('')||'<tr><td colspan="8" class="muted">No requests yet.</td></tr>'}</tbody></table></div></div>`;
+    <div class="topbar"><div><div class="eyebrow">Overview · ${W.eyebrow} · UTC</div><h1>${greeting()}, ${esc(state.user.username)}</h1><p class="lede">${lede}</p></div>
+      <div class="actions"><div class="tabs" role="tablist" aria-label="Window">${Object.entries(WINDOWS).map(([k, v]) => `<button class="tab" role="tab" aria-selected="${k === win}" data-win="${k}">${v.label}</button>`).join('')}</div>
+        <a class="btn" href="/admin/api/metrics/requests.csv?window=${win}">${ICON.download} Export CSV</a></div></div>
+    <div class="stats">
+      <div class="stat"><div class="l">Requests</div><div class="v">${fmtN(w.requests)}</div>${delta(w.requests, prev.requests, { suffix: vs }) || `<div class="d">${fmtN(w.errors)} errors</div>`}${sparkline(daily.map(d => d.requests), '#3fd0a4')}</div>
+      <div class="stat"><div class="l">Errors</div><div class="v">${fmtN(w.errors)}</div><div class="d">${w.requests ? (100 * w.errors / w.requests).toFixed(1) : '0.0'}% error rate</div>${sparkline(daily.map(d => d.errors), '#f47186')}</div>
+      <div class="stat"><div class="l">Prompt tokens</div><div class="v">${fmtK(w.prompt_tokens)}</div>${delta(w.prompt_tokens, prev.prompt_tokens, { suffix: vs }) || `<div class="d">≈ ${fmtN(Math.round(w.prompt_tokens / (w.requests || 1)))} / request</div>`}</div>
+      <div class="stat"><div class="l">Completion tokens</div><div class="v">${fmtK(w.completion_tokens)}</div>${delta(w.completion_tokens, prev.completion_tokens, { suffix: vs }) || `<div class="d">≈ ${fmtN(Math.round(w.completion_tokens / (w.requests || 1)))} / request</div>`}</div>
+      <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(w.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(w.p95_latency_ms)} ms${prev.avg_latency_ms ? ` · ${delta(w.avg_latency_ms, prev.avg_latency_ms, { invert: true }).replace(/<[^>]+>/g, '')}${vs}` : ''}</div></div>
+      <div class="stat"><div class="l">Rate limited</div><div class="v">${fmtN(w.rate_limited)}</div><div class="d ${w.rate_limited ? 'down' : ''}">429 · ${w.requests ? (100 * w.rate_limited / w.requests).toFixed(1) : '0.0'}% of calls</div></div>
+    </div>
+    <div class="ov-grid">
+      <section class="card"><div class="card-head"><div><h2>Requests per day</h2><div class="hint">${W.days} days · ${fmtN(w.rag_requests)} RAG-augmented in ${W.label} · all time ${fmtN(t.requests)} requests · ${fmtK(t.prompt_tokens + t.completion_tokens)} tokens</div></div>
+        <div class="legend"><span><i style="background:var(--amber)"></i>requests</span><span><i style="background:var(--rose)"></i>errors</span></div></div>${areaChart(daily)}</section>
+      <section class="card stack" style="gap:14px"><div class="card-head m0"><h2>Traffic by project</h2><span class="hint">${W.label}</span></div>
+        <div class="stack">${byProject.map((p, i) => `<div class="bar-row"><div class="row between"><span class="dim ellip">${esc(p.name)}</span><span class="mono muted nowrap">${fmtN(p.requests)} · ${pct(p.requests, w.requests)}%${p.errors ? ` · ${fmtN(p.errors)} err` : ''}</span></div><div class="meter ${COLORS[i % COLORS.length]}"><i style="width:${pct(p.requests, maxP)}%"></i></div></div>`).join('') || '<div class="hint">No traffic in this window.</div>'}</div>
+        <div class="stack" style="border-top:1px solid var(--line);padding-top:14px;gap:10px"><h3>Budget watch</h3>
+          ${budgets.map(b => `<div class="row between"><span class="dim ellip">${esc(b.name)} · ${b.kind}</span>${pctPill(b.pct)}</div>${meter(b.pct)}${b.at ? `<div class="hint">at the current rate exhausted ${new Date(b.at) <= Date.now() ? 'now' : 'in ' + fmtDur(new Date(b.at) - Date.now())} · resets ${esc(fmtDay(b.resets))}</div>` : ''}`).join('') || '<div class="hint">No project has a token budget.</div>'}</div></section>
+    </div>
+    <section class="card"><div class="card-head"><h2>Recent requests</h2><div class="row"><span class="pill">last 50</span><button class="btn sm ghost" data-goto="projects">All projects →</button></div></div>
+      <div class="tbl"><table><thead><tr><th>Time</th><th>Project</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
+      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td>${esc(projectName(r.project_id))}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:280px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No requests yet.</td></tr>'}</tbody></table></div></section>`;
+  bindChart(daily);
+  on(app, '[data-win]', 'click', b => { state.overview.window = b.dataset.win; renderOverview(); });
+  on(app, '[data-goto]', 'click', b => { state.tab = b.dataset.goto; render(); });
 }
 
-// ---------- models ----------
-function renderModels(){
-  const app=$('#app');
-  const w = can('editor');
-  app.innerHTML = `<div class="card"><div class="row between"><h2>Model connections</h2>${w?'<button class="primary" id="addModel">+ Add connection</button>':''}</div>
-    <p class="muted">Provider credentials are encrypted at rest and never exposed to API clients; projects use their own <code>sk-proj-…</code> keys.</p>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Provider</th><th>Model</th><th>Base URL</th><th>Key</th><th></th></tr></thead><tbody>
-    ${state.models.map(m=>`<tr><td><b>${esc(m.name)}</b></td><td><span class="pill">${esc(m.provider_type)}</span></td><td><code>${esc(m.model_name)}</code></td><td class="muted">${esc(m.base_url||'(default)')}</td><td class="muted">${esc(m.api_key_masked||'—')}</td>
-      <td style="white-space:nowrap"><button class="small" data-test="${m.id}">Test chat</button> <button class="small" data-testemb="${m.id}">Test embed</button>${w?` <button class="small" data-edit="${m.id}">Edit</button> <button class="small danger" data-del="${m.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No connections yet.</td></tr>'}
-    </tbody></table></div></div>`;
-  if (w) $('#addModel').onclick = () => modelForm();
-  app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>modelForm(state.models.find(m=>m.id==b.dataset.edit)));
-  app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this connection? Projects and RAG stores using it must be reassigned first.')) return;
-    try{ await api('/models/'+b.dataset.del,{method:'DELETE'}); toast('Deleted'); await loadAll(); render(); }catch(e){ toast(e.message); } });
-  const test = async (id, mode) => { toast('Testing…', 60000); try{ const r=await api('/models/'+id+'/test',{method:'POST',body:{mode}});
-    toast(r.ok ? `OK in ${r.latency_ms} ms` + (r.reply?`\nreply: ${r.reply}`:'') + (r.dimensions?`\ndimensions: ${r.dimensions}`:'') : `Failed: ${r.error}`, 8000); }catch(e){ toast(e.message); } };
-  app.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>test(b.dataset.test,'chat'));
-  app.querySelectorAll('[data-testemb]').forEach(b=>b.onclick=()=>test(b.dataset.testemb,'embedding'));
+// ---------------------------------------------------------------------------
+// models
+// ---------------------------------------------------------------------------
+const capsLine = t => [t.supports_embeddings ? 'chat + embeddings' : 'chat', t.supports_tools ? 'tools' : ''].filter(Boolean).join(', ');
+const testPill = m => m.last_test_ok === true ? `<span class="pill ok" title="tested ${esc(fmtDate(m.last_test_at))}">ok · ${fmtN(m.last_test_latency_ms)} ms</span>` : m.last_test_ok === false ? `<span class="pill err" title="${esc(m.last_test_error)}">failed</span>` : '<span class="pill">untested</span>';
+const hostOf = (url, t) => { if (!url) return `${(t.default_base_url || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '') || 'provider default'} (default)`; return url; };
+function renderModels() {
+  const app = $('#app'); const w = can('editor');
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Models · ${state.models.length} connection${state.models.length === 1 ? '' : 's'}</div><h1>Model connections</h1><p class="lede">Provider credentials are sealed with AES-GCM at rest and never reach API clients. Projects authenticate with their own <code>sk-proj-…</code> keys.</p></div>
+    <div class="actions">${w ? `<button class="btn primary" id="addModel">${ICON.plus} Add connection</button>` : ''}</div></div>
+    <div class="grid2">${state.models.map(m => { const t = ptype(m.provider_type); return `<div class="card tight stack" style="gap:14px">
+      <div class="row" style="align-items:flex-start">${providerBadge(m.provider_type)}<div class="grow"><div style="font-weight:600;font-size:15px" class="ellip">${esc(m.name)}</div><div class="hint">${esc(t.label || m.provider_type)} · ${capsLine(t)}</div></div><div class="row wrap" style="gap:6px;justify-content:flex-end">${m.private_upstream ? '<span class="pill warn">private upstream</span>' : ''}${testPill(m)}</div></div>
+      <div class="kv"><span class="k">model</span><span class="mono ellip">${esc(m.model_name)}</span><span class="k">base URL</span><span class="mono dim ellip" title="${esc(m.base_url || t.default_base_url)}">${esc(hostOf(m.base_url, t))}</span><span class="k">key</span><span class="mono dim">${esc(m.api_key_masked || '— none')}</span></div>
+      ${m.last_test_ok === false && m.last_test_error ? `<div class="hint ellip" title="${esc(m.last_test_error)}">last test: ${esc(m.last_test_error)}</div>` : ''}
+      ${w ? `<div class="row wrap" style="gap:8px;margin-top:2px"><button class="btn sm" data-test="${m.id}">Test chat</button>${t.supports_embeddings ? `<button class="btn sm" data-testemb="${m.id}">Test embed</button>` : ''}<span class="grow"></span><button class="btn sm ghost" data-edit="${m.id}">Edit</button><button class="btn sm ghost danger" data-del="${m.id}">Delete</button></div>` : ''}</div>`; }).join('')}
+      ${w ? `<div class="empty stack" style="align-items:center;justify-content:center;gap:10px"><div class="dim" style="font-weight:500">Add DeepSeek, Mistral or any OpenAI-compatible endpoint</div><div class="hint">custom_openai connections run through the same SSRF guard and redaction layer</div><button class="btn sm" data-add>${ICON.plus} New connection</button></div>` : (state.models.length ? '' : '<div class="empty">No connections yet.</div>')}</div>`;
+  if (w) { $('#addModel').onclick = () => modelForm(); on(app, '[data-add]', 'click', () => modelForm()); }
+  on(app, '[data-edit]', 'click', b => modelForm(modelById(Number(b.dataset.edit))));
+  on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this connection? Projects and RAG stores using it must be reassigned first.', { label: 'Delete' })) return;
+    try { await api('/models/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); await loadAll(); render(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  const test = async (id, mode, btn) => { btn.disabled = true; toast('Testing…', 60000); try { const r = await api('/models/' + id + '/test', { method: 'POST', body: { mode } }); toast(testSummary(r), 8000, r.ok ? 'ok' : 'err'); await loadAll(); render(); } catch (e) { toast(e.message, 5000, 'err'); btn.disabled = false; } };
+  on(app, '[data-test]', 'click', b => test(b.dataset.test, 'chat', b));
+  on(app, '[data-testemb]', 'click', b => test(b.dataset.testemb, 'embedding', b));
 }
-function modelForm(m){
-  const types = state.providerTypes.map(t=>({value:t.type,label:t.label}));
-  const form = modal(m?'Edit connection':'New connection', `
-    ${field('Name', input('name', m?.name||'', 'required placeholder="e.g. openai-gpt4o"'))}
-    ${field('Provider type', select('provider_type', types, m?.provider_type||'openai'))}
-    ${field('Base URL (blank = provider default)', input('base_url', m?.base_url||'', 'placeholder="https://…"'))}
-    ${field(m?'API key (blank = keep current)':'API key / token', input('api_key','', 'type=password autocomplete=off'))}
-    ${field('Target model name', input('model_name', m?.model_name||'', 'required placeholder="gpt-4o, claude-sonnet-4-5, qwen2.5:7b …"'))}
-    <p class="muted" id="ptHint"></p>`,
-    async d => { if (m) await api('/models/'+m.id,{method:'PUT',body:d}); else await api('/models',{method:'POST',body:d}); toast('Saved'); await loadAll(); render(); });
-  const hint = () => { const t=state.providerTypes.find(x=>x.type===$('[name=provider_type]',form).value); if(!t) return;
-    $('#ptHint').textContent = `Default URL: ${t.default_base_url}. ${t.supports_embeddings?'Can serve embeddings for RAG stores.':'No embeddings API.'} ${t.requires_api_key?'API key required.':'API key optional.'}`;
-    if(!m && !$('[name=base_url]',form).value && (t.type==='custom_openai'||t.type==='ollama')) $('[name=base_url]',form).placeholder=t.default_base_url; };
-  $('[name=provider_type]',form).onchange=hint; hint();
+const testSummary = r => r.ok ? `OK in ${fmtN(r.latency_ms)} ms` + (r.reply ? `\nreply: ${r.reply}` : '') + (r.dimensions ? `\ndimensions: ${r.dimensions}` : '') : `Failed: ${r.error}`;
+function modelForm(m) {
+  const types = state.providerTypes.map(t => ({ value: t.type, label: t.label }));
+  const form = drawer({ eyebrow: m ? 'Edit' : 'New', title: 'Connection', submitLabel: 'Save connection', extra: '<button type="button" class="btn" id="testFirst">Test first</button>', body: `
+    ${field('name', 'Name', input('name', m ? m.name : '', 'required placeholder="e.g. openai-gpt4o"'))}
+    ${field('provider_type', 'Provider type', select('provider_type', types, m ? m.provider_type : 'openai'))}
+    ${field('base_url', 'Base URL', input('base_url', m ? m.base_url : '', 'placeholder="https://…"'), '<span id="urlHint">Blank uses the provider default. Loopback and private ranges are refused unless allowed by PRIVATE_UPSTREAM_ALLOWLIST / ALLOW_PRIVATE_UPSTREAMS.</span>')}
+    ${field('api_key', m ? 'API key (blank = keep current)' : 'API key / token', input('api_key', '', 'type=password autocomplete=off'), 'Stored encrypted, bound to this connection id. Shown masked afterwards.')}
+    ${field('model_name', 'Target model name', input('model_name', m ? m.model_name : '', 'required placeholder="gpt-4o, claude-sonnet-4-5, qwen2.5:7b …"'))}
+    <div class="card flat tight stack" style="background:var(--panel2);gap:6px" id="capCard"></div>
+    <div id="testOut"></div>`,
+    onSubmit: async d => { const body = { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name };
+      if (m) await api('/models/' + m.id, { method: 'PUT', body }); else await api('/models', { method: 'POST', body }); toast('Saved', 3000, 'ok'); await loadAll(); render(); } });
+  const caps = () => { const t = ptype($('[name=provider_type]', form).value);
+    $('#capCard').innerHTML = `<div class="row between"><span class="dim">Embeddings</span><span class="pill ${t.supports_embeddings ? 'ok' : ''}">${t.supports_embeddings ? 'yes' : 'not supported'}</span></div><div class="row between"><span class="dim">Tool calling</span><span class="pill ${t.supports_tools ? 'ok' : ''}">${t.supports_tools ? 'yes' : 'no'}</span></div><div class="row between"><span class="dim">Streaming</span><span class="pill ${t.supports_streaming ? 'ok' : ''}">${t.supports_streaming ? 'SSE' : 'no'}</span></div><div class="row between"><span class="dim">API key</span><span class="pill">${t.requires_api_key ? 'required' : 'optional'}</span></div>`;
+    $('#urlHint').textContent = `Default: ${t.default_base_url || 'none'}${t.type === 'custom_openai' ? ' — a base URL is required for custom_openai.' : '.'} Loopback and private ranges are refused unless allowed by PRIVATE_UPSTREAM_ALLOWLIST / ALLOW_PRIVATE_UPSTREAMS.`;
+    $('[name=base_url]', form).placeholder = t.default_base_url || 'https://…'; };
+  $('[name=provider_type]', form).onchange = caps; caps();
+  // "Test first" tries the form as typed; when editing with an empty key the
+  // stored key of the connection is reused via connection_id.
+  $('#testFirst').onclick = async () => { const d = formData(form); const btn = $('#testFirst'); btn.disabled = true; const out = $('#testOut'); out.innerHTML = '<div class="note"><span class="hint">Testing…</span></div>';
+    try { const body = { provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name, mode: 'chat' }; if (m && !d.api_key) body.connection_id = m.id;
+      const r = await api('/models/test', { method: 'POST', body }); out.innerHTML = `<div class="note ${r.ok ? 'ok' : 'err'}"><span class="pill ${r.ok ? 'ok' : 'err'}">${r.ok ? 'ok' : 'failed'} · ${fmtN(r.latency_ms)} ms</span><span class="hint" style="white-space:pre-wrap">${esc(r.ok ? (r.reply ? 'reply: ' + r.reply : 'reachable') : r.error)}</span></div>`; }
+    catch (e) { out.innerHTML = `<div class="note err"><span class="hint">${esc(e.message)}</span></div>`; } finally { btn.disabled = false; } };
 }
 
-// ---------- RAG ----------
-let openStore = null;
-function renderRAG(){
-  const app=$('#app');
-  const embModels = state.models.filter(m => (state.providerTypes.find(t=>t.type===m.provider_type)||{}).supports_embeddings);
-  const w = can('editor');
-  app.innerHTML = `<div class="card"><div class="row between"><h2>RAG stores</h2>${w?`<button class="primary" id="addStore" ${embModels.length?'':'disabled title="Add an embedding-capable model connection first"'}>+ Add store</button>`:''}</div>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Embedding model</th><th>Chunking</th><th>Top-k</th><th>Retrieval</th><th>Dims</th><th>Docs / chunks</th><th>Quota</th><th></th></tr></thead><tbody>
-    ${state.rag.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(modelName(r.embedding_connection_id))}</td><td>${r.chunk_size} / ${r.chunk_overlap}${r.contextual_chunks?' <span class="pill" title="Contextual chunks: filename and section are embedded with the text">ctx</span>':''}</td><td>${r.top_k}</td><td class="muted" style="white-space:nowrap">${esc(retrievalSummary(r))}</td><td>${r.dimensions||'—'}</td><td>${r.document_count} / ${r.chunk_count}</td><td class="muted" style="white-space:nowrap" title="documents / max · MB used / max (∞ = unlimited)">${esc(quotaSummary(r))}</td>
-      <td style="white-space:nowrap"><button class="small primary" data-open="${r.id}">Documents</button>${w?` <button class="small" data-edit="${r.id}">Edit</button> <button class="small danger" data-del="${r.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="9" class="muted">No RAG stores yet.</td></tr>'}
-    </tbody></table></div></div><div id="storePanel"></div>`;
-  if (w) $('#addStore').onclick=()=>storeForm(null, embModels);
-  app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>storeForm(state.rag.find(r=>r.id==b.dataset.edit), embModels));
-  app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this store with all its documents and vectors?')) return;
-    try{ await api('/rag-stores/'+b.dataset.del,{method:'DELETE'}); if(openStore==b.dataset.del) openStore=null; await loadAll(); render(); }catch(e){ toast(e.message); } });
-  app.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{ openStore=Number(b.dataset.open); renderStorePanel(); });
-  if (openStore && state.rag.some(r=>r.id===openStore)) renderStorePanel();
-}
-// "hybrid (english) · rerank 15 · dist ≤ 0.6" summary of a store's retrieval settings.
-const retrievalSummary = r => [r.search_mode==='vector'?'vector':`hybrid (${r.fts_config||'simple'})`, r.rerank?`rerank ${r.rerank_candidates}`:'', r.max_distance?`dist ≤ ${r.max_distance}`:''].filter(Boolean).join(' · ');
-// "3/10 docs · 1.2/50 MB" usage against the store's own quotas (∞ = unlimited).
-const mb = b => (b/1048576).toFixed(b && b < 1048576 ? 2 : 1);
-const quotaSummary = r => `${r.document_count}/${r.max_documents||'∞'} docs · ${mb(r.bytes_used||0)}/${r.max_bytes?mb(r.max_bytes):'∞'} MB`;
-const checkbox = (name, checked, label) => `<label class="row" style="gap:6px;align-items:center;font-weight:normal"><input type="checkbox" name="${name}" ${checked?'checked':''} style="width:auto">${esc(label)}</label>`;
-function storeForm(r, embModels){
-  modal(r?'Edit RAG store':'New RAG store', `
-    ${field('Name', input('name', r?.name||'', 'required'))}
-    ${field('Embedding model connection', select('embedding_connection_id', embModels.map(m=>({value:m.id,label:`${m.name} (${m.provider_type} · ${m.model_name})`})), r?.embedding_connection_id))}
-    <div class="row"><div style="flex:1">${field('Chunk size (chars)', input('chunk_size', r?.chunk_size||1000, 'type=number min=200 max=20000'))}</div>
-    <div style="flex:1">${field('Chunk overlap', input('chunk_overlap', r?.chunk_overlap??200, 'type=number min=0'))}</div>
-    <div style="flex:1">${field('Top-k', input('top_k', r?.top_k||5, 'type=number min=1 max=50'))}</div></div>
-    ${field('', checkbox('contextual_chunks', r?r.contextual_chunks:true, 'Contextual chunks — embed the filename and section together with each chunk (changing this needs a reprocess)'))}
-    <div class="row"><div style="flex:1">${field('Search mode', select('search_mode', [{value:'hybrid',label:'hybrid — vector + full-text (RRF)'},{value:'vector',label:'vector only'}], r?.search_mode||'hybrid'))}</div>
-    <div style="flex:1">${field('Full-text query config', input('fts_config', r?.fts_config||'simple', 'placeholder=simple'))}</div></div>
-    <p class="muted" style="margin-top:-6px">Postgres text search configuration used to parse queries in hybrid mode: <code>simple</code> (default, no stemming), <code>english</code>, <code>turkish</code>, <code>german</code>… Chunks are always indexed with <code>simple</code>.</p>
-    <div class="row"><div style="flex:1">${field('', checkbox('rerank', !!r?.rerank, 'Rerank with the project chat model'))}</div>
-    <div style="flex:1">${field('Rerank candidates', input('rerank_candidates', r?.rerank_candidates||15, 'type=number min=1 max=100'))}</div>
-    <div style="flex:1">${field('Max distance (0 = off)', input('max_distance', r?.max_distance||0, 'type=number min=0 max=2 step=0.01'))}</div></div>
-    <p class="muted" style="margin-top:-6px">Reranking sends the candidate passages to the chat model on every request (extra latency and tokens). Max distance drops passages whose cosine distance to the query exceeds it.</p>
-    <div class="row"><div style="flex:1">${field('Max documents (0 = unlimited)', input('max_documents', r?.max_documents||0, 'type=number min=0 step=1'))}</div>
-    <div style="flex:1">${field('Max size (MB, 0 = unlimited)', input('max_mb', r&&r.max_bytes?Math.ceil(r.max_bytes/1048576):0, 'type=number min=0 step=1'))}</div></div>
-    <p class="muted" style="margin-top:-6px">Upload quotas for this store; uploads that would exceed them are rejected. An instance-wide ceiling (MAX_DOCUMENTS_PER_STORE / MAX_BYTES_PER_STORE_MB) may apply on top.</p>
-    ${r&&r.chunk_count?'<p class="muted">Embedding connection is locked while the store has chunks.</p>':''}`,
-    async d => { const body={...d, embedding_connection_id:Number(d.embedding_connection_id), chunk_size:Number(d.chunk_size), chunk_overlap:Number(d.chunk_overlap), top_k:Number(d.top_k),
-        contextual_chunks:d.contextual_chunks==='on', rerank:d.rerank==='on', rerank_candidates:Number(d.rerank_candidates)||15, max_distance:Number(d.max_distance)||0,
-        max_documents:Number(d.max_documents)||0, max_bytes:(Number(d.max_mb)||0)*1048576}; delete body.max_mb;
-      let res; if (r) res=await api('/rag-stores/'+r.id,{method:'PUT',body}); else res=await api('/rag-stores',{method:'POST',body});
-      toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3500);
-      await loadAll(); render(); });
-}
+// ---------------------------------------------------------------------------
+// RAG stores and documents
+// ---------------------------------------------------------------------------
 let pollTimer;
-async function renderStorePanel(){
-  const r = state.rag.find(x=>x.id===openStore); if(!r) return;
-  const panel=$('#storePanel');
-  let docs=[]; try{ docs=await api(`/rag-stores/${r.id}/documents`); }catch(e){ toast(e.message); }
+const quotaPct = r => Math.max(r.max_documents ? pct(r.document_count, r.max_documents) : 0, r.max_bytes ? pct(r.bytes_used || 0, r.max_bytes) : 0);
+const quotaLine = r => `${fmtN(r.document_count)} / ${r.max_documents ? fmtN(r.max_documents) : '∞'} docs · ${mb(r.bytes_used || 0)} / ${r.max_bytes ? mb(r.max_bytes) : '∞'} MB`;
+const embModels = () => state.models.filter(m => ptype(m.provider_type).supports_embeddings);
+function renderRAG() {
+  const app = $('#app'); const w = can('editor'); const emb = embModels();
+  if (state.openStore && !state.rag.some(r => r.id === state.openStore)) state.openStore = null;
+  if (!state.openStore && state.rag.length) state.openStore = state.rag[0].id;
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">RAG · ${state.rag.length} store${state.rag.length === 1 ? '' : 's'} · ${emb.length} embedding model${emb.length === 1 ? '' : 's'}</div><h1>RAG stores</h1><p class="lede">Hybrid retrieval: full-text and vectors fused with reciprocal rank fusion, optional rerank with the project's chat model.</p></div>
+    <div class="actions">${w ? `<button class="btn primary" id="addStore" ${emb.length ? '' : 'disabled title="Add an embedding-capable model connection first"'}>${ICON.plus} Add store</button>` : ''}</div></div>
+    <div class="split"><section class="stack" style="gap:10px" id="storeList">
+      ${state.rag.map(r => { const m = modelById(r.embedding_connection_id) || {}; const qp = quotaPct(r); return `<button class="card tight store-card ${r.id === state.openStore ? 'sel' : ''}" data-open="${r.id}" aria-pressed="${r.id === state.openStore}">
+        <div class="row between"><div style="font-weight:600" class="ellip">${esc(r.name)}</div><span class="pill ${r.search_mode === 'vector' ? '' : 'ok'}">${r.search_mode === 'vector' ? 'vector' : 'hybrid'}</span></div>
+        <div class="hint" style="margin-top:4px">${esc(m.name || '#' + r.embedding_connection_id)}${r.dimensions ? ` · ${r.dimensions}d` : ''}${r.search_mode !== 'vector' ? ` · ${esc(r.fts_config || 'simple')}` : ''}</div>
+        <div class="row mono" style="margin-top:12px;gap:14px;font-size:12px"><span><span style="color:var(--tx)">${fmtN(r.document_count)}</span> <span class="muted">docs</span></span><span><span style="color:var(--tx)">${fmtN(r.chunk_count)}</span> <span class="muted">chunks</span></span>${r.rerank ? `<span class="muted">rerank ${r.rerank_candidates}</span>` : ''}${r.max_distance ? `<span class="muted">dist ≤ ${r.max_distance}</span>` : ''}</div>
+        <div style="margin-top:10px">${meter(qp, r.max_documents || r.max_bytes ? '' : 'mint')}</div><div class="hint" style="margin-top:4px">${quotaLine(r)}</div></button>`; }).join('') || `<div class="empty">No RAG stores yet.${emb.length ? '' : ' Add an embedding-capable model connection first.'}</div>`}</section>
+    <section class="stack" style="gap:16px" id="storePanel"></section></div>`;
+  if (w) $('#addStore').onclick = () => storeForm(null);
+  on(app, '[data-open]', 'click', b => { state.openStore = Number(b.dataset.open); $$('[data-open]', app).forEach(x => { const sel = Number(x.dataset.open) === state.openStore; x.classList.toggle('sel', sel); x.setAttribute('aria-pressed', sel); }); renderStorePanel(); });
+  if (state.openStore) renderStorePanel();
+}
+function storeForm(r) {
+  const emb = embModels();
+  drawer({ eyebrow: r ? 'Edit' : 'New', title: 'RAG store', submitLabel: r ? 'Save store' : 'Create store', body: `
+    ${field('name', 'Name', input('name', r ? r.name : '', 'required'))}
+    ${field('embedding_connection_id', 'Embedding model connection', select('embedding_connection_id', emb.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), r ? r.embedding_connection_id : undefined, r && r.chunk_count ? 'disabled' : ''), r && r.chunk_count ? 'Locked while the store has chunks.' : '')}
+    ${twoCol(field('chunk_size', 'Chunk size (chars)', input('chunk_size', r ? r.chunk_size : 1000, 'type=number min=200 max=20000')), field('chunk_overlap', 'Chunk overlap', input('chunk_overlap', r ? r.chunk_overlap : 200, 'type=number min=0')))}
+    ${twoCol(field('top_k', 'Top-k', input('top_k', r ? r.top_k : 5, 'type=number min=1 max=50')), field('search_mode', 'Search mode', select('search_mode', [{ value: 'hybrid', label: 'hybrid — vector + full-text (RRF)' }, { value: 'vector', label: 'vector only' }], r ? r.search_mode : 'hybrid')))}
+    ${toggle('contextual_chunks', r ? r.contextual_chunks : true, 'Contextual chunks', 'Embed filename and section with each chunk (changing this needs a reprocess).')}
+    ${field('fts_config', 'Full-text query config', input('fts_config', r ? r.fts_config || 'simple' : 'simple', 'placeholder=simple'), 'Postgres text search configuration for hybrid queries: <code>simple</code> (no stemming), <code>english</code>, <code>turkish</code>, <code>german</code>… Chunks are always indexed with <code>simple</code>.')}
+    ${toggle('rerank', !!(r && r.rerank), 'Rerank with the project chat model', 'Sends the candidates to the chat model on every request (extra latency and tokens).')}
+    ${twoCol(field('rerank_candidates', 'Rerank candidates', input('rerank_candidates', r ? r.rerank_candidates : 15, 'type=number min=1 max=100')), field('max_distance', 'Max distance (0 = off)', input('max_distance', r ? r.max_distance : 0, 'type=number min=0 max=2 step=0.01')))}
+    ${twoCol(field('max_documents', 'Max documents (0 = ∞)', input('max_documents', r ? r.max_documents : 0, 'type=number min=0 step=1')), field('max_mb', 'Max size MB (0 = ∞)', input('max_mb', r && r.max_bytes ? Math.ceil(r.max_bytes / 1048576) : 0, 'type=number min=0 step=1')))}
+    <p class="hint">Upload quotas for this store; an instance-wide ceiling (MAX_DOCUMENTS_PER_STORE / MAX_BYTES_PER_STORE_MB) may apply on top. Max distance drops passages whose cosine distance to the query exceeds it.</p>`,
+    onSubmit: async d => { const body = { name: d.name, embedding_connection_id: Number(d.embedding_connection_id || (r && r.embedding_connection_id)), chunk_size: Number(d.chunk_size), chunk_overlap: Number(d.chunk_overlap), top_k: Number(d.top_k), search_mode: d.search_mode, fts_config: d.fts_config,
+        contextual_chunks: d.contextual_chunks, rerank: d.rerank, rerank_candidates: Number(d.rerank_candidates) || 15, max_distance: Number(d.max_distance) || 0, max_documents: Number(d.max_documents) || 0, max_bytes: (Number(d.max_mb) || 0) * 1048576 };
+      const res = r ? await api('/rag-stores/' + r.id, { method: 'PUT', body }) : await api('/rag-stores', { method: 'POST', body });
+      toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3000, 'ok');
+      if (!r && res && res.id) state.openStore = res.id; await loadAll(); render(); } });
+}
+const docStatus = d => d.status === 'processing' || d.status === 'pending' ? `<span class="pill warn">${d.status}${d.progress_percent != null ? ` · ${d.progress_percent}%` : ''}</span>` : d.status === 'failed' ? `<span class="pill err" title="${esc(d.error)}">failed</span>` : '<span class="pill ok">ready</span>';
+async function renderStorePanel() {
+  const r = state.rag.find(x => x.id === state.openStore); const panel = $('#storePanel'); if (!r || !panel) return;
   const w = can('editor');
-  panel.innerHTML = `<div class="card"><div class="row between"><h2>${esc(r.name)} · documents</h2>
-      ${w?`<div class="row"><form id="upl" class="row"><input type="file" name="file" accept=".pdf,.docx,.html,.htm,.txt,.md,.markdown" multiple required style="width:auto"><button class="primary">Upload</button></form><button class="small" id="reAll" ${docs.length?'':'disabled'}>Reprocess all</button></div>`:''}</div>
-    <p class="muted">Accepted: PDF, DOCX, HTML, TXT, Markdown. Retrieval: ${esc(retrievalSummary(r))}.</p>
-    <div class="tbl"><table><thead><tr><th>File</th><th>Size</th><th>Status</th><th>Chunks</th><th>Uploaded</th><th></th></tr></thead><tbody>
-    ${docs.map(d=>`<tr><td>${esc(d.filename)}</td><td>${(d.size_bytes/1024).toFixed(1)} KB</td><td><span class="pill ${d.status}">${d.status}</span>${d.error?`<div class="muted" style="font-size:11px">${esc(d.error)}</div>`:''}</td><td>${d.chunk_count}</td><td>${fmtDate(d.created_at)}</td>
-      <td style="white-space:nowrap">${w?`<button class="small" data-re="${d.id}">Reprocess</button> <button class="small danger" data-del="${d.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No documents. Upload PDF, DOCX, HTML, TXT or Markdown files.</td></tr>'}
-    </tbody></table></div>
-    <h3 style="margin-top:16px">Test retrieval</h3>
-    <form id="srch" class="row"><input name="q" placeholder="Ask something that should be in the documents…" style="flex:1">
-      ${select('mode', [{value:'hybrid',label:'hybrid'},{value:'vector',label:'vector'}], r.search_mode||'hybrid').replace('<select','<select style="width:auto"')}
-      ${checkbox('rerank', !!r.rerank, 'rerank')}
-      <button>Search</button></form>
-    <div id="hits"></div></div>`;
-  if (w) $('#upl').onsubmit = async e => { e.preventDefault(); const fd=new FormData(e.target); const btn=$('button',e.target); btn.disabled=true;
-    try{ await api(`/rag-stores/${r.id}/documents`,{method:'POST',body:fd}); toast('Uploaded; processing in background'); await loadAll(); renderStorePanel(); }catch(err){ toast(err.message); } finally{ btn.disabled=false; } };
-  panel.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this document and its vectors?')) return; try{ await api('/documents/'+b.dataset.del,{method:'DELETE'}); await loadAll(); renderStorePanel(); }catch(e){ toast(e.message); } });
-  panel.querySelectorAll('[data-re]').forEach(b=>b.onclick=async()=>{ try{ await api('/documents/'+b.dataset.re+'/reprocess',{method:'POST'}); toast('Queued'); setTimeout(renderStorePanel,800); }catch(e){ toast(e.message); } });
-  if (w) $('#reAll').onclick = async () => { if(!await confirmDialog('Re-parse, re-chunk and re-embed every document in this store? This calls the embedding model for all chunks again.')) return;
-    try{ const res=await api(`/rag-stores/${r.id}/reprocess`,{method:'POST'}); toast(`Queued ${res.documents} document(s)`); setTimeout(renderStorePanel,800); }catch(e){ toast(e.message); } };
-  $('#srch').onsubmit = async e => { e.preventDefault(); const f=e.target; const q=$('[name=q]',f).value; if(!q) return; $('#hits').innerHTML='<p class="muted">Searching…</p>';
-    try{ const res=await api(`/rag-stores/${r.id}/search`,{method:'POST',body:{query:q, mode:$('[name=mode]',f).value, rerank:$('[name=rerank]',f).checked}});
-      const where = h => [h.section, h.page?`p.${h.page}`:''].filter(Boolean).join(' · ');
-      $('#hits').innerHTML = `<p class="muted">${res.hits.length} hits in ${res.latency_ms} ms · ${esc(res.mode)}${res.reranked?' · reranked':''}</p>` + res.hits.map((h,i)=>`<div class="card" style="padding:10px"><div class="row between"><b>[${i+1}] ${esc(h.filename)}${where(h)?` · ${esc(where(h))}`:''} <span class="muted">(chunk ${h.index})</span></b>
-        <span class="muted">score ${h.score.toFixed(4)} · vector #${h.vector_rank||'—'} · fts #${h.fts_rank||'—'} · distance ${h.distance.toFixed(4)}</span></div><pre>${esc(h.content)}</pre></div>`).join(''); }
-    catch(err){ $('#hits').innerHTML=`<p class="muted">Error: ${esc(err.message)}</p>`; } };
+  let docs = []; try { docs = await api(`/rag-stores/${r.id}/documents`); } catch (e) { toast(e.message, 5000, 'err'); }
+  if (state.openStore !== r.id) return;
+  const rt = panel.dataset.mode || r.search_mode || 'hybrid'; const rr = panel.dataset.rerank ? panel.dataset.rerank === '1' : !!r.rerank;
+  const hitsHtml = panel.dataset.hits || '';
+  panel.innerHTML = `<div class="card stack" style="gap:14px">
+      <div class="card-head m0"><div><h2>${esc(r.name)} · documents</h2><div class="hint">chunk ${r.chunk_size} / overlap ${r.chunk_overlap} · contextual chunks ${r.contextual_chunks ? 'on' : 'off'} · top-k ${r.top_k} · ${esc(retrievalSummary(r))}</div></div>
+        <div class="row wrap">${w ? `<button class="btn sm" id="reAll" ${docs.length ? '' : 'disabled'}>Reprocess all</button><button class="btn sm" id="editStore">Edit store</button><button class="btn sm ghost danger" id="delStore">Delete</button><button class="btn sm primary" id="uploadBtn">${ICON.upload} Upload</button><input type="file" id="fileInput" class="hidden" multiple accept=".pdf,.docx,.html,.htm,.txt,.md,.markdown">` : ''}</div></div>
+      ${w ? `<button type="button" class="drop" id="dropzone">${ICON.upload}<span class="dim">Drop PDF, DOCX, HTML, Markdown or text here, or click to choose</span></button>` : ''}
+      <div class="tbl"><table><thead><tr><th>Document</th><th>Size</th><th>Chunks</th><th>Status</th><th>Added</th>${w ? '<th></th>' : ''}</tr></thead><tbody>
+      ${docs.map(d => `<tr><td><div class="ellip" style="font-weight:500;max-width:340px">${esc(d.filename)}</div><div class="hint mono">${esc(d.mime || '')}${d.page_count ? ` · ${fmtN(d.page_count)} page${d.page_count === 1 ? '' : 's'}` : ''}</div>${d.error ? `<div class="hint ellip" style="max-width:340px" title="${esc(d.error)}">${esc(d.error)}</div>` : ''}</td><td class="mono nowrap">${fmtBytes(d.size_bytes)}</td><td class="mono">${d.chunk_count ? fmtN(d.chunk_count) : '—'}</td><td>${docStatus(d)}</td><td class="mono muted nowrap" title="${esc(fmtDate(d.created_at))}">${fmtDay(d.created_at)}</td>${w ? `<td class="right nowrap"><button class="btn sm ghost" data-re="${d.id}">Reprocess</button> <button class="btn sm ghost danger" data-del="${d.id}">Delete</button></td>` : ''}</tr>`).join('') || `<tr><td colspan="6" class="muted">No documents yet.${w ? ' Upload PDF, DOCX, HTML, TXT or Markdown files.' : ''}</td></tr>`}</tbody></table></div></div>
+    <div class="card stack" style="gap:12px"><div class="card-head m0"><h2>Test retrieval</h2><div class="row"><div class="tabs" role="tablist" aria-label="Search mode"><button class="tab" role="tab" data-mode="hybrid" aria-selected="${rt === 'hybrid'}">hybrid</button><button class="tab" role="tab" data-mode="vector" aria-selected="${rt === 'vector'}">vector</button></div><button class="tab" id="rerankToggle" aria-pressed="${rr}" style="border:1px solid var(--line)">rerank</button></div></div>
+      <form class="row" id="srch"><div class="search grow">${ICON.search}<label for="q" class="sr">Query</label><input id="q" class="input" name="q" placeholder="Ask something that should be in the documents…" autocomplete="off"></div><button class="btn primary">Search</button></form>
+      <div id="hits">${hitsHtml}</div></div>`;
+  const refresh = async () => { await loadAll(); if (state.tab === 'rag') { render(); } };
+  if (w) {
+    const upload = async files => { if (!files.length) return; const fd = new FormData(); for (const f of files) fd.append('file', f); toast(`Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`, 60000);
+      try { await api(`/rag-stores/${r.id}/documents`, { method: 'POST', body: fd }); toast('Uploaded; processing in background', 3500, 'ok'); await refresh(); } catch (e) { toast(e.message, 6000, 'err'); } };
+    const fi = $('#fileInput'); fi.onchange = () => { upload([...fi.files]); fi.value = ''; };
+    $('#uploadBtn').onclick = () => fi.click(); const dz = $('#dropzone'); dz.onclick = () => fi.click();
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); }); dz.addEventListener('dragleave', () => dz.classList.remove('over'));
+    dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('over'); upload([...e.dataTransfer.files]); });
+    $('#editStore').onclick = () => storeForm(r);
+    $('#delStore').onclick = async () => { if (!await confirmDialog('Delete this store with all its documents and vectors? Projects linked to it lose the link.', { label: 'Delete store' })) return; try { await api('/rag-stores/' + r.id, { method: 'DELETE' }); state.openStore = null; await refresh(); } catch (e) { toast(e.message, 5000, 'err'); } };
+    $('#reAll').onclick = async () => { if (!await confirmDialog('Re-parse, re-chunk and re-embed every document in this store? This calls the embedding model for all chunks again.', { label: 'Reprocess all', danger: false })) return; try { const res = await api(`/rag-stores/${r.id}/reprocess`, { method: 'POST' }); toast(`Queued ${res.documents} document(s)`, 3000, 'ok'); setTimeout(renderStorePanel, 800); } catch (e) { toast(e.message, 5000, 'err'); } };
+    on(panel, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this document and its vectors?', { label: 'Delete' })) return; try { await api('/documents/' + b.dataset.del, { method: 'DELETE' }); await refresh(); } catch (e) { toast(e.message, 5000, 'err'); } });
+    on(panel, '[data-re]', 'click', async b => { try { await api('/documents/' + b.dataset.re + '/reprocess', { method: 'POST' }); toast('Queued', 2500, 'ok'); setTimeout(renderStorePanel, 800); } catch (e) { toast(e.message, 5000, 'err'); } });
+  }
+  on(panel, '[data-mode]', 'click', b => { panel.dataset.mode = b.dataset.mode; $$('[data-mode]', panel).forEach(x => x.setAttribute('aria-selected', x === b)); });
+  $('#rerankToggle').onclick = b => { const el = b.currentTarget; const v = el.getAttribute('aria-pressed') !== 'true'; el.setAttribute('aria-pressed', v); panel.dataset.rerank = v ? '1' : '0'; };
+  $('#srch').onsubmit = async e => { e.preventDefault(); const q = $('#q').value.trim(); if (!q) return; const hits = $('#hits'); hits.innerHTML = '<p class="hint">Searching…</p>';
+    try { const res = await api(`/rag-stores/${r.id}/search`, { method: 'POST', body: { query: q, mode: panel.dataset.mode || rt, rerank: panel.dataset.rerank ? panel.dataset.rerank === '1' : rr } });
+      const maxS = Math.max(1e-9, ...res.hits.map(h => h.score)); const where = h => [h.section, h.page ? `p.${h.page}` : ''].filter(Boolean).join(' · ');
+      hits.innerHTML = `<div class="hint">${res.hits.length} hit${res.hits.length === 1 ? '' : 's'} in ${fmtN(res.latency_ms)} ms · ${esc(res.mode)}${res.retrieval_latency_ms != null ? ` · retrieval ${fmtN(res.retrieval_latency_ms)} ms` : ''}${res.reranked ? ` · rerank ${res.rerank_latency_ms != null ? fmtN(res.rerank_latency_ms) + ' ms' : 'on'}` : ''}</div>` +
+        res.hits.map((h, i) => `<div class="hit"><div class="n">[${i + 1}]</div><div><div class="row wrap" style="gap:8px;margin-bottom:4px"><span style="font-weight:500">${esc(h.filename)}</span>${where(h) ? `<span class="pill">${esc(where(h))}</span>` : ''}<span class="hint">chunk ${h.index}</span></div><pre>${esc(h.content)}</pre></div>
+          <div class="score"><div class="row between"><span>${res.mode === 'vector' ? 'score' : 'rrf'}</span><span style="color:var(--tx)">${Number(h.score).toFixed(4)}</span></div><div class="meter mint"><i style="width:${pct(h.score, maxS)}%"></i></div><div class="row between"><span>vec #${h.vector_rank || '—'} · fts #${h.fts_rank || '—'}</span><span>d ${Number(h.distance).toFixed(2)}</span></div></div></div>`).join('');
+      panel.dataset.hits = hits.innerHTML; }
+    catch (err) { hits.innerHTML = `<p class="hint">Error: ${esc(err.message)}</p>`; } };
   clearTimeout(pollTimer);
-  if (docs.some(d=>d.status==='pending'||d.status==='processing')) pollTimer=setTimeout(async()=>{ if(state.tab==='rag'&&openStore===r.id){ await loadAll(); renderStorePanel(); } }, 2500);
+  if (docs.some(d => d.status === 'pending' || d.status === 'processing')) pollTimer = setTimeout(async () => { if (state.tab === 'rag' && state.openStore === r.id) { try { state.rag = await api('/rag-stores'); } catch (e) { /* keep the previous counts */ } renderStorePanel(); } }, 2500);
 }
 
-// ---------- projects ----------
-function renderProjects(){
-  const app=$('#app');
-  const w = can('editor');
-  app.innerHTML = `<div class="card"><div class="row between"><h2>Projects</h2>${w?`<button class="primary" id="addProject" ${state.models.length?'':'disabled title="Add a model connection first"'}>+ Add project</button>`:''}</div>
-    <p class="muted">Clients call <code>POST /v1/chat/completions</code> with <code>Authorization: Bearer sk-proj-…</code>. Keys are shown once at creation.${can('admin')?'':' You only see projects you are a member of.'}</p>
-    <div class="tbl"><table><thead><tr><th>Name</th><th>Model</th><th>RAG store</th><th>Key</th><th>Limits</th><th>Members</th><th>System prompt</th><th></th></tr></thead><tbody>
-    ${state.projects.map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${esc(modelName(p.model_connection_id))}</td><td>${esc(ragName(p.rag_store_id))}</td><td><code>${esc(p.api_key_prefix)}…</code></td><td class="muted" style="white-space:nowrap">${esc(limitSummary(p)||'—')}</td><td class="muted">${esc((p.member_ids||[]).map(userName).join(', ')||'—')}</td><td class="muted">${esc((p.system_prompt||'').slice(0,60))}${(p.system_prompt||'').length>60?'…':''}</td>
-      <td style="white-space:nowrap"><button class="small" data-metrics="${p.id}">Metrics</button>${w?` <button class="small" data-rotate="${p.id}">Rotate key</button> <button class="small" data-edit="${p.id}">Edit</button> <button class="small danger" data-del="${p.id}">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="muted">No projects yet.</td></tr>'}
-    </tbody></table></div></div><div id="projPanel"></div>`;
-  if (w) $('#addProject').onclick=()=>projectForm();
-  app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>projectForm(state.projects.find(p=>p.id==b.dataset.edit)));
-  app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this project and its metrics?')) return; try{ await api('/projects/'+b.dataset.del,{method:'DELETE'}); await loadAll(); render(); }catch(e){ toast(e.message); } });
-  app.querySelectorAll('[data-rotate]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Rotate the key? The current key stops working immediately.')) return; try{ const r=await api('/projects/'+b.dataset.rotate+'/rotate-key',{method:'POST'}); showKey(r.project, r.api_key); await loadAll(); }catch(e){ toast(e.message); } });
-  app.querySelectorAll('[data-metrics]').forEach(b=>b.onclick=()=>projectMetrics(Number(b.dataset.metrics)));
+// ---------------------------------------------------------------------------
+// projects
+// ---------------------------------------------------------------------------
+let ringTimer;
+function renderProjects() {
+  const app = $('#app'); const w = can('editor');
+  if (state.openProject && !state.projects.some(p => p.id === state.openProject)) state.openProject = null;
+  if (!state.openProject && state.projects.length) state.openProject = state.projects[0].id;
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Projects · ${state.projects.length}${can('admin') ? ' · all projects' : ' · projects you are a member of'}</div><h1>Projects</h1><p class="lede">Clients call <code>POST /v1/chat/completions</code> with <code>Authorization: Bearer sk-proj-…</code>. Keys are shown once and can be rotated any time.</p></div>
+    <div class="actions">${w ? `<button class="btn primary" id="addProject" ${state.models.length ? '' : 'disabled title="Add a model connection first"'}>${ICON.plus} Add project</button>` : ''}</div></div>
+    <div class="split wide"><section class="stack" style="gap:10px">
+      ${state.projects.map(p => `<div class="card tight stack ${p.id === state.openProject ? 'sel' : ''}" style="gap:10px" data-card="${p.id}">
+        <div class="row between"><div style="font-weight:600;font-size:15px" class="ellip">${esc(p.name)}</div><code class="pill">${esc(p.api_key_prefix)}…</code></div>
+        <div class="kv" style="font-size:12.5px;gap:4px 12px"><span class="k">model</span><span class="mono ellip">${esc(modelName(p.model_connection_id))}</span><span class="k">rag</span><span class="ellip">${esc(ragName(p.rag_store_id))}</span><span class="k">limits</span><span class="mono dim ellip">${esc(limitSummary(p))}</span></div>
+        <div class="row between" style="margin-top:2px"><span class="hint ellip">${(p.member_ids || []).length} member${(p.member_ids || []).length === 1 ? '' : 's'}${state.users.length ? ' · ' + esc((p.member_ids || []).map(userName).join(', ')) : ''}</span><span class="row" style="gap:6px"><button class="btn sm ghost" data-metrics="${p.id}" aria-pressed="${p.id === state.openProject}">Metrics</button>${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button>` : ''}</span></div></div>`).join('') || `<div class="empty">No projects yet.${state.models.length ? '' : ' Add a model connection first.'}</div>`}</section>
+    <section class="stack" style="gap:16px" id="projPanel"></section></div>`;
+  if (w) $('#addProject').onclick = () => projectForm();
+  on(app, '[data-edit]', 'click', b => projectForm(state.projects.find(p => p.id == b.dataset.edit)));
+  on(app, '[data-metrics]', 'click', b => { state.openProject = Number(b.dataset.metrics); $$('[data-card]', app).forEach(c => c.classList.toggle('sel', Number(c.dataset.card) === state.openProject)); $$('[data-metrics]', app).forEach(x => x.setAttribute('aria-pressed', Number(x.dataset.metrics) === state.openProject)); projectPanel(); });
+  if (state.openProject) projectPanel();
 }
-function projectForm(p){
-  modal(p?'Edit project':'New project', `
-    ${field('Name', input('name', p?.name||'', 'required'))}
-    ${field('Model connection', select('model_connection_id', state.models.map(m=>({value:m.id,label:`${m.name} (${m.provider_type} · ${m.model_name})`})), p?.model_connection_id))}
-    ${field('RAG store (optional)', select('rag_store_id', [{value:0,label:'— none —'}, ...state.rag.map(r=>({value:r.id,label:r.name}))], p?.rag_store_id||0))}
-    ${field('Project system prompt (optional, prepended to every request)', `<textarea name="system_prompt">${esc(p?.system_prompt||'')}</textarea>`)}
-    <div class="row"><div style="flex:1">${field('Requests / minute', input('rate_limit_rpm', p?.rate_limit_rpm||0, 'type=number min=0 step=1'))}</div>
-    <div style="flex:1">${field('Tokens / minute', input('rate_limit_tpm', p?.rate_limit_tpm||0, 'type=number min=0 step=1'))}</div></div>
-    <div class="row"><div style="flex:1">${field('Daily token budget', input('budget_daily_tokens', p?.budget_daily_tokens||0, 'type=number min=0 step=1'))}</div>
-    <div style="flex:1">${field('Monthly token budget', input('budget_monthly_tokens', p?.budget_monthly_tokens||0, 'type=number min=0 step=1'))}</div></div>
-    <p class="muted" style="margin-top:-6px">0 = unlimited. Windows are UTC minute / day / month; budgets count prompt + completion tokens and are checked before each call, so one request can overshoot by its own size. Over the limit the API answers <code>429</code> with <code>Retry-After</code>.</p>
-    ${field('Members (Ctrl/Cmd-click for several; you stay a member of projects you create)', multiSelect('members', state.users.map(u=>({value:u.id,label:`${u.username} (${u.role})`})), p?.member_ids||[state.user.id]))}`,
-    async (d, form) => { const members=[...form.querySelector('[name=members]').selectedOptions].map(o=>Number(o.value));
-      const body={name:d.name, model_connection_id:Number(d.model_connection_id), rag_store_id:Number(d.rag_store_id)||null, system_prompt:d.system_prompt,
-        rate_limit_rpm:Number(d.rate_limit_rpm)||0, rate_limit_tpm:Number(d.rate_limit_tpm)||0, budget_daily_tokens:Number(d.budget_daily_tokens)||0, budget_monthly_tokens:Number(d.budget_monthly_tokens)||0};
-      if (p) { await api('/projects/'+p.id,{method:'PUT',body}); await api(`/projects/${p.id}/members`,{method:'PUT',body:{user_ids:members}}); toast('Saved'); }
-      else { const r=await api('/projects',{method:'POST',body:{...body, member_user_ids:members}}); showKey(r.project, r.api_key); }
-      await loadAll(); render(); });
+function projectForm(p) {
+  drawer({ eyebrow: p ? 'Edit' : 'New', title: 'Project', submitLabel: p ? 'Save project' : 'Create project', body: `
+    ${field('name', 'Name', input('name', p ? p.name : '', 'required'))}
+    ${field('model_connection_id', 'Model connection', select('model_connection_id', state.models.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), p ? p.model_connection_id : undefined))}
+    ${field('rag_store_id', 'RAG store (optional)', select('rag_store_id', [{ value: 0, label: '— none —' }, ...state.rag.map(r => ({ value: r.id, label: r.name }))], p ? p.rag_store_id || 0 : 0))}
+    ${field('system_prompt', 'Project system prompt', textarea('system_prompt', p ? p.system_prompt : ''), 'Optional; prepended to every request.')}
+    ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', p ? p.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', p ? p.rate_limit_tpm : 0, 'type=number min=0 step=1')))}
+    ${twoCol(field('budget_daily_tokens', 'Daily token budget', input('budget_daily_tokens', p ? p.budget_daily_tokens : 0, 'type=number min=0 step=1')), field('budget_monthly_tokens', 'Monthly token budget', input('budget_monthly_tokens', p ? p.budget_monthly_tokens : 0, 'type=number min=0 step=1')))}
+    <p class="hint">0 = unlimited. Windows are UTC minute / day / month; budgets count prompt + completion tokens and are checked before each call, so one request can overshoot by its own size. Over the limit the API answers <code>429</code> with <code>Retry-After</code>.</p>
+    <div class="field"><span class="field"><label>Members</label></span>${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p ? p.member_ids || [] : [state.user.id])}<div class="hint">You stay a member of projects you create; an editor cannot remove themselves.</div></div>`,
+    onSubmit: async (d, form) => { const members = checkedValues(form, 'members');
+      const body = { name: d.name, model_connection_id: Number(d.model_connection_id), rag_store_id: Number(d.rag_store_id) || null, system_prompt: d.system_prompt, rate_limit_rpm: Number(d.rate_limit_rpm) || 0, rate_limit_tpm: Number(d.rate_limit_tpm) || 0, budget_daily_tokens: Number(d.budget_daily_tokens) || 0, budget_monthly_tokens: Number(d.budget_monthly_tokens) || 0 };
+      if (p) { await api('/projects/' + p.id, { method: 'PUT', body }); await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: members } }); toast('Saved', 3000, 'ok'); }
+      else { const r = await api('/projects', { method: 'POST', body: { ...body, member_user_ids: members } }); state.openProject = r.project.id; showKey(r.project, r.api_key); }
+      await loadAll(); render(); } });
 }
-function showKey(p, key){
+function membersForm(p) {
+  drawer({ eyebrow: 'Members', title: p.name, submitLabel: 'Save members', body: `${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p.member_ids || [])}<p class="hint">Members see the project, its metrics and usage; editors among them can change it. An editor cannot remove themselves.</p>`,
+    onSubmit: async (d, form) => { await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: checkedValues(form, 'members') } }); toast('Members saved', 3000, 'ok'); await loadAll(); render(); } });
+}
+function showKey(p, key) {
   const origin = location.origin;
-  modal(`API key for ${p.name}`, `<p>Copy this key now — it is not stored and cannot be shown again.</p><pre id="keyBox">${esc(key)}</pre>
-    <h3>Example</h3><pre>curl ${origin}/v1/chat/completions \\
+  modal(`API key for ${p.name}`, `<p class="dim">Copy this key now — it is not stored and cannot be shown again.</p><pre class="mono" style="font-size:13px;color:var(--amber)">${esc(key)}</pre>
+    <h3>Example</h3><pre>curl ${esc(origin)}/v1/chat/completions \\
   -H "Authorization: Bearer ${esc(key)}" \\
   -H "Content-Type: application/json" \\
   -d '{"model":"default","messages":[{"role":"user","content":"Hello"}]}'</pre>
-    <p class="muted">Python: <code>OpenAI(base_url="${origin}/v1", api_key="${esc(key)}")</code></p>`,
-    async()=>{}, 'Done');
+    <p class="hint">Python: <code>OpenAI(base_url="${esc(origin)}/v1", api_key="${esc(key)}")</code> · the Playground has this key pre-filled until you reload.</p>`, { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
   state.playground.key = key;
 }
-async function projectMetrics(id){
-  const panel=$('#projPanel'); panel.innerHTML='<div class="card">Loading…</div>';
-  try{ const [m,u]=await Promise.all([api(`/projects/${id}/metrics?window=24h`), api(`/projects/${id}/usage`)]); const p=state.projects.find(x=>x.id===id); const w=m.window, t=m.total;
-    const usageTile = (label, used, limit, pct, resets) => `<div class="stat"><div class="v">${fmtN(used)}${limit?` <span class="muted" style="font-size:13px">/ ${fmtN(limit)}</span>`:''}</div><div class="l">${label}${limit?` · ${pct}% · resets ${fmtDate(resets)}`:' · unlimited'}</div>${limit?meter(pct):''}</div>`;
-    panel.innerHTML=`<div class="card"><h2>${esc(p.name)} · metrics</h2>
-      <h3>Limits &amp; usage</h3><div class="grid" style="margin-bottom:14px">
-      ${usageTile('requests this minute', u.minute.requests, u.minute.request_limit, u.minute.request_percent, u.minute.resets_at)}
-      ${usageTile('tokens this minute', u.minute.tokens, u.minute.token_limit, u.minute.token_percent, u.minute.resets_at)}
-      ${usageTile('tokens today (UTC)', u.day.tokens, u.day.token_limit, u.day.token_percent, u.day.resets_at)}
-      ${usageTile('tokens this month (UTC)', u.month.tokens, u.month.token_limit, u.month.token_percent, u.month.resets_at)}</div>
-      <h3>Last 24 hours</h3><div class="grid">
-      <div class="stat"><div class="v">${fmtN(w.requests)}</div><div class="l">requests 24h (${fmtN(w.errors)} errors · ${fmtN(w.rate_limited)} rate limited)</div></div>
-      <div class="stat"><div class="v">${fmtN(w.prompt_tokens)} / ${fmtN(w.completion_tokens)}</div><div class="l">prompt / completion tokens 24h</div></div>
-      <div class="stat"><div class="v">${Math.round(w.avg_latency_ms)} ms</div><div class="l">avg latency · p95 ${fmtN(w.p95_latency_ms)} ms</div></div>
-      <div class="stat"><div class="v">${fmtN(t.requests)}</div><div class="l">requests all time · ${fmtN(t.prompt_tokens+t.completion_tokens)} tokens</div></div></div>
-      <h3 style="margin-top:14px">Recent</h3><div class="tbl"><table><thead><tr><th>Time</th><th>Status</th><th>Tokens (p/c)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
-      ${m.recent.map(r=>`<tr><td>${fmtDate(r.created_at)}</td><td><span class="pill ${r.status_code<400?'ok':'err'}">${r.status_code}</span></td><td>${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated?' ~':''}</td><td>${fmtN(r.latency_ms)} ms</td><td>${r.streamed?'stream ':''}${r.rag_used?'rag':''}</td><td class="muted">${esc(r.error)}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
-  }catch(e){ panel.innerHTML=`<div class="card">Error: ${esc(e.message)}</div>`; }
+async function projectPanel() {
+  const id = state.openProject; const panel = $('#projPanel'); const p = state.projects.find(x => x.id === id); if (!p || !panel) return;
+  panel.innerHTML = '<div class="card">Loading…</div>'; clearInterval(ringTimer);
+  let m, u; try { [m, u] = await Promise.all([api(`/projects/${id}/metrics?window=24h`), api(`/projects/${id}/usage`)]); } catch (e) { panel.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  if (state.openProject !== id) return;
+  const w = can('editor'); const win = m.window, t = m.total;
+  const tile = (label, used, limit, percent, resetsAt, color, key) => `<div class="ring-tile">${ring(limit ? percent : 0, limit ? color : '#3fd0a4', label)}<div class="grow"><div class="hint">${label}</div><div class="big">${fmtK(used)}${limit ? ` / ${fmtK(limit)}` : ''}</div><div class="hint mono" data-reset="${key}">${limit ? `resets in ${fmtDur(new Date(resetsAt) - Date.now())}` : 'unlimited'}</div></div></div>`;
+  const f = u.forecast || {}; const fc = f.daily_exhausted_at ? { kind: 'Daily', at: f.daily_exhausted_at, resets: u.day.resets_at } : f.monthly_exhausted_at ? { kind: 'Monthly', at: f.monthly_exhausted_at, resets: u.month.resets_at } : null;
+  panel.innerHTML = `<div class="card stack" style="gap:16px">
+      <div class="card-head m0"><div><h2>${esc(p.name)} · limits &amp; usage</h2><div class="hint">UTC windows · budgets count prompt + completion · checked before each call</div></div>
+        <div class="row wrap">${w ? `<button class="btn sm" id="rotate">Rotate key</button><button class="btn sm" id="members">Members</button>` : ''}<a class="btn sm" href="/admin/api/projects/${id}/metrics.csv?window=24h">${ICON.download} CSV</a>${w ? '<button class="btn sm ghost danger" id="delProject">Delete</button>' : ''}</div></div>
+      <div class="rings">
+        ${tile('requests this minute', u.minute.requests, u.minute.request_limit, u.minute.request_percent, u.minute.resets_at, '#f2b632', 'minute')}
+        ${tile('tokens this minute', u.minute.tokens, u.minute.token_limit, u.minute.token_percent, u.minute.resets_at, '#6fb0ff', 'minute')}
+        ${tile('tokens today', u.day.tokens, u.day.token_limit, u.day.token_percent, u.day.resets_at, usageColor(u.day.token_percent), 'day')}
+        ${tile('tokens this month', u.month.tokens, u.month.token_limit, u.month.token_percent, u.month.resets_at, usageColor(u.month.token_percent), 'month')}</div>
+      ${fc ? `<div class="note err"><span class="pill err">budget</span><span class="dim">${fc.kind} budget reaches 100% ${new Date(fc.at) <= Date.now() ? 'now' : 'in about ' + fmtDur(new Date(fc.at) - Date.now())} at the current rate. Requests will get <code>429 insufficient_quota</code> until ${esc(fmtDay(fc.resets))}.</span><span class="grow"></span>${w ? '<button class="btn sm" id="raise">Raise budget</button>' : ''}</div>` : ''}</div>
+    <div class="stats four">
+      <div class="stat"><div class="l">Requests 24h</div><div class="v">${fmtN(win.requests)}</div><div class="d">${fmtN(win.errors)} errors · ${fmtN(win.rate_limited)} rate limited</div></div>
+      <div class="stat"><div class="l">Tokens 24h · p / c</div><div class="v" style="font-size:22px">${fmtK(win.prompt_tokens)} / ${fmtK(win.completion_tokens)}</div><div class="d">${fmtN(win.rag_requests)} RAG-augmented</div></div>
+      <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(win.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(win.p95_latency_ms)} ms</div></div>
+      <div class="stat"><div class="l">All time</div><div class="v">${fmtN(t.requests)}</div><div class="d">${fmtK(t.prompt_tokens + t.completion_tokens)} tokens</div></div></div>
+    <div class="card"><div class="card-head"><h2>Recent</h2><span class="hint">last 50 · newest first</span></div>
+      <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
+      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
+  // Live countdown on the reset labels; the minute ring is refetched when its window rolls over.
+  const resets = { minute: u.minute.resets_at, day: u.day.resets_at, month: u.month.resets_at };
+  ringTimer = setInterval(() => { if (state.tab !== 'projects' || state.openProject !== id) { clearInterval(ringTimer); return; }
+    let rolled = false; $$('[data-reset]', panel).forEach(el => { const left = new Date(resets[el.dataset.reset]) - Date.now(); if (el.textContent.startsWith('resets')) { el.textContent = `resets in ${fmtDur(left)}`; if (left <= 0) rolled = true; } });
+    if (rolled) { clearInterval(ringTimer); projectPanel(); } }, 1000);
+  if (w) {
+    $('#rotate').onclick = async () => { if (!await confirmDialog('Rotate the key? The current key stops working immediately.', { label: 'Rotate key' })) return; try { const r = await api(`/projects/${id}/rotate-key`, { method: 'POST' }); showKey(r.project, r.api_key); await loadAll(); } catch (e) { toast(e.message, 5000, 'err'); } };
+    $('#members').onclick = () => membersForm(p);
+    $('#delProject').onclick = async () => { if (!await confirmDialog('Delete this project and its metrics?', { label: 'Delete project' })) return; try { await api('/projects/' + id, { method: 'DELETE' }); state.openProject = null; await loadAll(); render(); } catch (e) { toast(e.message, 5000, 'err'); } };
+    const raise = $('#raise'); if (raise) raise.onclick = () => projectForm(p);
+  }
 }
 
-// ---------- users (admin) ----------
-async function renderUsers(){
-  const app=$('#app'); app.innerHTML='<div class="card">Loading…</div>';
-  let users; try{ users=await api('/users'); }catch(e){ app.innerHTML=`<div class="card">Error: ${esc(e.message)}</div>`; return; }
-  app.innerHTML = `<div class="card"><div class="row between"><h2>Users</h2><button class="primary" id="addUser">+ Add user</button></div>
-    <p class="muted"><b>admin</b> manages everything including users; <b>editor</b> manages models, RAG stores and the projects it belongs to; <b>viewer</b> is read-only. Deactivated users cannot sign in and lose their sessions.</p>
-    <div class="tbl"><table><thead><tr><th>Username</th><th>Role</th><th>Active</th><th>Last login</th><th>Created</th><th></th></tr></thead><tbody>
-    ${users.map(u=>`<tr><td><b>${esc(u.username)}</b>${u.id===state.user.id?' <span class="muted">(you)</span>':''}</td><td><span class="pill">${esc(u.role)}</span></td><td>${u.is_active?'<span class="pill ok">active</span>':'<span class="pill err">inactive</span>'}</td><td>${fmtDate(u.last_login_at)||'<span class="muted">never</span>'}</td><td>${fmtDate(u.created_at)}</td>
-      <td style="white-space:nowrap"><button class="small" data-edit="${u.id}">Edit</button> <button class="small" data-reset="${u.id}">Reset password</button> <button class="small" data-revoke="${u.id}">Revoke sessions</button> <button class="small danger" data-del="${u.id}" ${u.id===state.user.id?'disabled':''}>Delete</button></td></tr>`).join('')}
-    </tbody></table></div></div>`;
-  const reload = async()=>{ await loadAll(); render(); };
-  $('#addUser').onclick=()=>modal('New user', `${field('Username', input('username','','required autocomplete=off'))}${field('Password (min 8)', input('password','','type=password required minlength=8 autocomplete=new-password'))}${field('Role', select('role', ROLES, 'viewer'))}`,
-    async d=>{ await api('/users',{method:'POST',body:d}); toast('User created'); await reload(); }, 'Create');
-  app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{ const u=users.find(x=>x.id==b.dataset.edit);
-    modal(`Edit ${u.username}`, `${field('Role', select('role', ROLES, u.role))}${field('Status', select('is_active', [{value:'true',label:'active'},{value:'false',label:'inactive — cannot sign in'}], String(u.is_active)))}`,
-      async d=>{ await api('/users/'+u.id,{method:'PUT',body:{role:d.role, is_active:d.is_active==='true'}}); toast('Saved'); if(u.id===state.user.id){ state.user=await api('/me'); } await reload(); }); });
-  app.querySelectorAll('[data-reset]').forEach(b=>b.onclick=()=>{ const u=users.find(x=>x.id==b.dataset.reset);
-    modal(`Reset password for ${u.username}`, `${field('New password (min 8)', input('new_password','','type=password required minlength=8 autocomplete=new-password'))}<p class="muted">All sessions of this user are revoked.</p>`,
-      async d=>{ await api(`/users/${u.id}/reset-password`,{method:'POST',body:d}); toast('Password reset'); }, 'Reset'); });
-  app.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Sign this user out everywhere?')) return; try{ await api(`/users/${b.dataset.revoke}/sessions/revoke`,{method:'POST'}); toast('Sessions revoked'); }catch(e){ toast(e.message); } });
-  app.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{ if(!await confirmDialog('Delete this user? Their sessions and project memberships are removed; audit entries keep the username.')) return; try{ await api('/users/'+b.dataset.del,{method:'DELETE'}); toast('Deleted'); await reload(); }catch(e){ toast(e.message); } });
+// ---------------------------------------------------------------------------
+// playground
+// ---------------------------------------------------------------------------
+const resolveProject = key => key ? state.projects.find(p => p.api_key_prefix && key.startsWith(p.api_key_prefix)) : null;
+function renderPlayground() {
+  const app = $('#app'); const pg = state.playground; const proj = resolveProject(pg.key); const model = proj ? modelById(proj.model_connection_id) : null;
+  const last = pg.last;
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Playground · real requests</div><h1>Playground</h1><p class="lede">Sends real requests to <code>/v1/chat/completions</code> with a project key kept only in this page's memory.</p></div>
+    <div class="actions"><div class="tabs" role="tablist" aria-label="Response mode"><button class="tab" role="tab" data-stream="1" aria-selected="${pg.stream}">stream</button><button class="tab" role="tab" data-stream="0" aria-selected="${!pg.stream}">json</button></div><button class="btn" id="pgClear">Clear</button></div></div>
+    <div class="split pg"><section class="card chat-card"><div class="chat" id="chat">
+        <div class="hint mono" style="text-align:center">${proj ? `${esc(proj.name)} · ${esc(model ? model.model_name : '')}${proj.rag_store_id ? ' · ' + esc(ragName(proj.rag_store_id)) : ''}` : 'enter a project key to start'}</div>
+        ${pg.msgs.map(msg => msg.role === 'user' ? `<div class="bubble user">${esc(msg.content)}</div>` : `<div class="bubble asst">${providerBadge(model ? model.provider_type : '', 'sm')}<div class="body ${msg.error ? 'err' : ''}">${esc(msg.content)}${msg.pending ? '<span class="caret" aria-hidden="true"></span>' : ''}</div></div>${msgMeta(msg)}`).join('')}</div>
+      <form class="composer" id="pgForm"><label for="pg-text" class="sr">Message</label><textarea id="pg-text" class="input" name="text" placeholder="Message… Enter to send, Shift+Enter for a newline"></textarea><button class="btn primary" id="pgSend" style="min-height:56px;padding:0 20px">${ICON.send} Send</button></form></section>
+    <aside class="stack" style="gap:14px"><div class="card stack" style="gap:14px"><h3>Session</h3>
+        ${field('key', 'Project API key', input('key', pg.key, 'type=password placeholder="sk-proj-…" autocomplete=off spellcheck=false'), `<span id="keyHint">${keyHint(proj, model)}</span>`)}
+        ${field('system', 'Extra system prompt', textarea('system', pg.system, 'style="min-height:72px" placeholder="Optional; sent as the first system message"'))}
+        ${toggle('stream', pg.stream, 'Streaming')}
+        ${toggle('sources', pg.sources, 'Show RAG sources', 'JSON mode asks for <code>ragmux.include_context</code>; streams read the sources header.')}</div>
+      <div class="card stack" style="gap:10px"><h3>Last response</h3>${last ? `<div class="resp"><span class="muted">status</span><span style="color:${last.status < 400 ? '#8fe9c9' : '#ffa3b0'}">${last.status}</span><span class="muted">latency</span><span>${fmtMs(last.latency)}</span><span class="muted">first token</span><span>${last.firstToken != null ? fmtMs(last.firstToken) : '—'}</span><span class="muted">prompt</span><span>${last.usage ? fmtN(last.usage.prompt_tokens) : '—'}</span><span class="muted">completion</span><span>${last.usage ? fmtN(last.usage.completion_tokens) : '—'}</span><span class="muted">rag hits</span><span>${last.ragHits ?? '—'}</span><span class="muted">remaining rpm</span><span>${last.remaining != null ? `${last.remaining}${last.limit != null ? ' / ' + last.limit : ''}` : '—'}</span></div>
+        <div class="hint" style="border-top:1px solid var(--line);padding-top:10px">Headers: ${last.headers.length ? last.headers.map(([k, v]) => `<code>${esc(k)}: ${esc(v)}</code>`).join(' · ') : 'none of the ragmux/ratelimit headers were present'}</div>` : '<div class="hint">No request sent yet.</div>'}</div></aside></div>`;
+  $('[name=key]', app).oninput = e => { pg.key = e.target.value; const p = resolveProject(pg.key); $('#keyHint').innerHTML = keyHint(p, p ? modelById(p.model_connection_id) : null); };
+  $('[name=system]', app).oninput = e => { pg.system = e.target.value; };
+  $('[name=stream]', app).onchange = e => { pg.stream = e.target.checked; $$('[data-stream]', app).forEach(b => b.setAttribute('aria-selected', (b.dataset.stream === '1') === pg.stream)); };
+  $('[name=sources]', app).onchange = e => { pg.sources = e.target.checked; };
+  on(app, '[data-stream]', 'click', b => { pg.stream = b.dataset.stream === '1'; $('[name=stream]', app).checked = pg.stream; $$('[data-stream]', app).forEach(x => x.setAttribute('aria-selected', x === b)); });
+  $('#pgClear').onclick = () => { pg.msgs = []; pg.last = null; renderPlayground(); };
+  const ta = $('#pg-text'); ta.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#pgForm').requestSubmit(); } };
+  const chat = $('#chat'); chat.scrollTop = chat.scrollHeight;
+  $('#pgForm').onsubmit = e => { e.preventDefault(); const text = ta.value.trim(); if (!text || !pg.key) { toast('Enter a project key and a message', 3000, 'err'); return; } ta.value = ''; sendMessage(text); };
+}
+const keyHint = (proj, model) => proj ? `Resolved to <strong>${esc(proj.name)}</strong>${model ? ' · ' + esc(model.model_name) : ''}${proj.rag_store_id ? ' · ' + esc(ragName(proj.rag_store_id)) : ''}` : 'Not matched to a project you can see (keys are matched by prefix).';
+const msgMeta = msg => msg.role === 'assistant' && !msg.pending && (msg.stats || (msg.sources || []).length) ? `<div class="meta">${msg.stats ? msg.stats.map(s => `<span class="pill ${s.cls || ''}">${esc(s.text)}</span>`).join('') : ''}${(msg.sources || []).map((s, i) => `<span class="pill info" title="${esc([s.section, s.page ? 'p.' + s.page : '', s.score != null ? 'score ' + Number(s.score).toFixed(4) : ''].filter(Boolean).join(' · '))}">[${i + 1}] ${esc(s.filename)}</span>`).join('')}</div>` : '';
+async function sendMessage(text) {
+  const pg = state.playground;
+  pg.msgs.push({ role: 'user', content: text }); const asst = { role: 'assistant', content: '', pending: true }; pg.msgs.push(asst); renderPlayground();
+  const body = $('.bubble.asst:last-of-type .body', $('#chat')); const chat = $('#chat'); $('#pgSend').disabled = true;
+  const t0 = performance.now(); let firstToken = null, usage = null, ragHits = null, sources = [], status = 0; const headers = [];
+  const history = pg.msgs.filter(m => m.content && !m.error).map(m => ({ role: m.role, content: m.content }));
+  const messages = pg.system.trim() ? [{ role: 'system', content: pg.system.trim() }, ...history] : history;
+  const payload = { model: 'default', stream: pg.stream, messages }; if (pg.sources && !pg.stream) payload.ragmux = { include_context: true };
+  try {
+    const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + pg.key, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    status = r.status;
+    for (const h of ['x-ragmux-rag-hits', 'x-ratelimit-remaining-requests', 'x-ratelimit-limit-requests', 'x-ragmux-budget-daily-remaining', 'x-ragmux-budget-monthly-remaining']) { const v = r.headers.get(h); if (v != null) headers.push([h, v]); }
+    if (r.headers.get('x-ragmux-rag-hits') != null) ragHits = Number(r.headers.get('x-ragmux-rag-hits'));
+    const src = r.headers.get('x-ragmux-rag-sources'); if (src) { try { sources = JSON.parse(src); } catch (e) { /* trimmed header, ignore */ } }
+    if (!r.ok) { const err = await r.json().catch(() => ({})); const ra = r.headers.get('Retry-After');
+      throw new Error((r.status === 429 ? '429 ' + ((err.error || {}).type || 'rate limited') + ': ' : `${r.status} `) + ((err.error || {}).message || r.statusText) + (ra ? ` (Retry-After: ${ra}s)` : '')); }
+    if (pg.stream) {
+      const rd = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
+      while (true) { const { done, value } = await rd.read(); if (done) break; buf += dec.decode(value, { stream: true }); let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) { const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+          for (const line of ev.split('\n')) { if (!line.startsWith('data:')) continue; const d = line.slice(5).trim(); if (d === '[DONE]') continue;
+            try { const j = JSON.parse(d); if (j.error) throw new Error(j.error.message); if (j.usage) usage = j.usage; const c = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+              if (c) { if (firstToken == null) firstToken = performance.now() - t0; asst.content += c; body.textContent = asst.content; body.insertAdjacentHTML('beforeend', '<span class="caret" aria-hidden="true"></span>'); chat.scrollTop = chat.scrollHeight; } }
+            catch (pe) { if (pe.message) asst.content += `\n[error: ${pe.message}]`; } } } }
+    } else {
+      const j = await r.json(); firstToken = performance.now() - t0; asst.content = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || ''; usage = j.usage || null;
+      if (j.ragmux && Array.isArray(j.ragmux.sources)) sources = j.ragmux.sources;
+    }
+  } catch (err) { asst.error = true; asst.content = asst.content || `[error: ${err.message}]`; }
+  finally {
+    const latency = performance.now() - t0; asst.pending = false;
+    asst.stats = [ragHits != null ? { text: `rag ${ragHits} hit${ragHits === 1 ? '' : 's'}`, cls: 'violet' } : null, usage ? { text: `${fmtN(usage.prompt_tokens)} → ${fmtN(usage.completion_tokens)} tokens` } : null, { text: `${(latency / 1000).toFixed(1)} s · ${pg.stream ? 'stream' : 'json'}` }].filter(Boolean);
+    asst.sources = sources;
+    const rem = headers.find(h => h[0] === 'x-ratelimit-remaining-requests'), lim = headers.find(h => h[0] === 'x-ratelimit-limit-requests');
+    pg.last = { status, latency, firstToken, usage, ragHits, remaining: rem ? rem[1] : null, limit: lim ? lim[1] : null, headers };
+    renderPlayground(); $('#pg-text').focus();
+  }
 }
 
-// ---------- audit (admin) ----------
-const auditState = { rows:[], action:'', done:false };
-async function renderAudit(){
-  const app=$('#app');
-  app.innerHTML = `<div class="card"><div class="row between"><h2>Audit log</h2>
-      <form id="auditFilter" class="row"><input name="action" placeholder="filter by action prefix, e.g. login. or project.create" value="${esc(auditState.action)}" style="width:320px"><button>Filter</button></form></div>
-    <div class="tbl"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th><th>Details</th></tr></thead><tbody id="auditRows"></tbody></table></div>
-    <div class="row" style="margin-top:10px"><button id="auditMore">Load more</button><span class="muted" id="auditInfo"></span></div></div>`;
-  const draw = () => { $('#auditRows').innerHTML = auditState.rows.map(a=>`<tr><td style="white-space:nowrap">${fmtDate(a.created_at)}</td><td>${esc(a.actor_username||'—')}${a.actor_user_id?` <span class="muted">#${a.actor_user_id}</span>`:''}</td><td><code>${esc(a.action)}</code></td><td class="muted">${esc(a.target_type)}${a.target_id!=null?' #'+a.target_id:''}</td><td class="muted">${esc(a.ip)}</td><td class="json">${esc(JSON.stringify(a.details))}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">No entries.</td></tr>';
-    $('#auditMore').disabled=auditState.done; $('#auditInfo').textContent=`${auditState.rows.length} entries${auditState.done?' · end':''}`; };
-  const load = async (more) => { try{ const q=new URLSearchParams({limit:'100'}); if(auditState.action) q.set('action',auditState.action);
-      if(more && auditState.rows.length) q.set('before', auditState.rows[auditState.rows.length-1].created_at);
-      const res=await api('/audit?'+q); const rows=res.entries||[]; auditState.rows = more ? auditState.rows.concat(rows) : rows; auditState.done = !res.has_more; draw(); }catch(e){ toast(e.message); } };
-  $('#auditFilter').onsubmit=e=>{ e.preventDefault(); auditState.action=$('[name=action]',e.target).value.trim(); load(false); };
-  $('#auditMore').onclick=()=>load(true);
+// ---------------------------------------------------------------------------
+// users (admin)
+// ---------------------------------------------------------------------------
+async function renderUsers() {
+  const app = $('#app'); app.innerHTML = '<div class="card">Loading…</div>';
+  let users, sec = null;
+  try { [users, sec] = await Promise.all([api('/users'), api('/security/logins').catch(() => null)]); } catch (e) { app.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  state.users = users; updateBadges();
+  const f = state.users_filter; const count = r => users.filter(u => u.role === r).length; const inactive = users.filter(u => !u.is_active).length;
+  const rows = users.filter(u => (f.role === 'all' || (f.role === 'inactive' ? !u.is_active : u.role === f.role)) && (!f.q || u.username.toLowerCase().includes(f.q.toLowerCase())));
+  const lock = sec && sec.active_lockouts && sec.active_lockouts.length ? sec.active_lockouts : [];
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Users · admin only · ${users.length} account${users.length === 1 ? '' : 's'}</div><h1>Users</h1><p class="lede"><strong>admin</strong> manages everything including users, <strong>editor</strong> manages models, RAG stores and the projects it belongs to, <strong>viewer</strong> is read-only. Deactivated users cannot sign in and lose their sessions.</p></div>
+    <div class="actions"><button class="btn primary" id="addUser">${ICON.plus} Add user</button></div></div>
+    <div class="stats four">
+      <div class="stat"><div class="l">Admins</div><div class="v">${count('admin')}</div><div class="d">last active admin is protected</div></div>
+      <div class="stat"><div class="l">Editors</div><div class="v">${count('editor')}</div><div class="d">across ${state.projects.length} project${state.projects.length === 1 ? '' : 's'}</div></div>
+      <div class="stat"><div class="l">Viewers</div><div class="v">${count('viewer')}</div><div class="d">${inactive ? `${inactive} inactive account${inactive === 1 ? '' : 's'}` : 'read-only'}</div></div>
+      <div class="stat"><div class="l">Failed logins · 1h</div><div class="v">${sec ? fmtN(sec.failed_last_hour) : '—'}</div><div class="d ${lock.length ? 'down' : ''}">${sec ? (lock.length ? `${lock.length} lockout${lock.length === 1 ? '' : 's'} active · ${esc(lock[0].username)} @ ${esc(lock[0].ip)}` : `${fmtN(sec.failed_last_24h)} in 24h · no lockouts`) : 'unavailable'}</div></div></div>
+    <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:300px">${ICON.search}<label for="u-q" class="sr">Search users</label><input id="u-q" class="input" placeholder="Search username" value="${esc(f.q)}" style="min-height:38px" autocomplete="off"></div>
+        <div class="tabs" role="tablist" aria-label="Filter">${['all', 'admin', 'editor', 'viewer', 'inactive'].map(r => `<button class="tab" role="tab" data-role-filter="${r}" aria-selected="${f.role === r}">${r}</button>`).join('')}</div></div><span class="hint">${rows.length} of ${users.length} users</span></div>
+      <div class="tbl"><table><thead><tr><th>User</th><th>Role</th><th>Status</th><th>Last login</th><th>Created</th><th></th></tr></thead><tbody>
+      ${rows.map(u => `<tr><td><div class="row" style="gap:10px">${avatar(u.username, 'sm')}<div><div style="font-weight:500">${esc(u.username)}</div><div class="hint">${[u.id === state.user.id ? 'you' : '', `${u.project_count || 0} project${u.project_count === 1 ? '' : 's'}`, u.active_sessions ? `${u.active_sessions} session${u.active_sessions === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')}</div></div></div></td>
+        <td><span class="pill ${u.role === 'admin' ? 'warn' : u.role === 'editor' ? 'info' : ''}">${esc(u.role)}</span></td><td>${u.is_active ? '<span class="pill ok">active</span>' : '<span class="pill err">inactive</span>'}</td><td class="mono muted nowrap">${u.last_login_at ? fmtDay(u.last_login_at) : 'never'}</td><td class="mono muted nowrap">${fmtMonthDay(u.created_at)}</td>
+        <td class="right nowrap"><button class="btn sm ghost" data-edit="${u.id}">Edit</button> <button class="btn sm ghost" data-reset="${u.id}">Reset password</button> <button class="btn sm ghost" data-revoke="${u.id}">Revoke sessions</button> <button class="btn sm ghost danger" data-del="${u.id}" ${u.id === state.user.id ? 'disabled' : ''}>Delete</button></td></tr>`).join('') || '<tr><td colspan="6" class="muted">No users match.</td></tr>'}</tbody></table></div></section>`;
+  const reload = async () => { await loadAll(); render(); };
+  let qTimer; $('#u-q').oninput = e => { f.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(renderUsers, 200); };
+  on(app, '[data-role-filter]', 'click', b => { f.role = b.dataset.roleFilter; renderUsers(); });
+  $('#addUser').onclick = () => { const form = drawer({ eyebrow: 'New', title: 'User', submitLabel: 'Create user', body: `
+      ${field('username', 'Username', input('username', '', 'required autocomplete=off autocapitalize=none spellcheck=false maxlength=64'), 'Up to 64 characters; matched case-insensitively at sign-in.')}
+      ${field('password', 'Password', input('password', '', 'type=password required minlength=8 maxlength=72 autocomplete=new-password'), strengthMeter('upw'))}
+      ${roleCards('viewer')}
+      <div class="field"><span class="field"><label>Add to projects</label></span>${checklist('project_ids', state.projects.map(p => ({ value: p.id, label: p.name })), [], 'No projects yet.')}</div>`,
+      onSubmit: async (d, fm) => { const project_ids = checkedValues(fm, 'project_ids'); await api('/users', { method: 'POST', body: { username: d.username, password: d.password, role: d.role, ...(project_ids.length ? { project_ids } : {}) } }); toast('User created', 3000, 'ok'); await reload(); } });
+    bindStrength($('[name=password]', form), 'upw', 8); };
+  on(app, '[data-edit]', 'click', b => { const u = users.find(x => x.id == b.dataset.edit);
+    drawer({ eyebrow: 'Edit', title: u.username, submitLabel: 'Save', body: `${roleCards(u.role)}${toggle('is_active', u.is_active, 'Active', 'Inactive users cannot sign in and lose their sessions.')}`,
+      onSubmit: async d => { await api('/users/' + u.id, { method: 'PUT', body: { role: d.role, is_active: d.is_active } }); toast('Saved', 3000, 'ok'); if (u.id === state.user.id) state.user = await api('/me'); await reload(); } }); });
+  on(app, '[data-reset]', 'click', b => { const u = users.find(x => x.id == b.dataset.reset);
+    const form = drawer({ eyebrow: 'Reset password', title: u.username, submitLabel: 'Reset password', body: `${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=8 maxlength=72 autocomplete=new-password'), strengthMeter('rpw'))}<p class="hint">All sessions of this user are revoked.</p>`,
+      onSubmit: async d => { await api(`/users/${u.id}/reset-password`, { method: 'POST', body: { new_password: d.new_password } }); toast('Password reset', 3000, 'ok'); } });
+    bindStrength($('[name=new_password]', form), 'rpw', 8); });
+  on(app, '[data-revoke]', 'click', async b => { if (!await confirmDialog('Sign this user out everywhere?', { label: 'Revoke sessions' })) return; try { await api(`/users/${b.dataset.revoke}/sessions/revoke`, { method: 'POST' }); toast('Sessions revoked', 3000, 'ok'); renderUsers(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this user? Their sessions and project memberships are removed; audit entries keep the username.', { label: 'Delete user' })) return; try { await api('/users/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); await reload(); } catch (e) { toast(e.message, 5000, 'err'); } });
+}
+
+// ---------------------------------------------------------------------------
+// audit log (admin)
+// ---------------------------------------------------------------------------
+const auditState = { rows: [], total: 0, action: '', actor: '', range: '', done: false, loading: false };
+const QUICK = ['login.failure', 'login.locked', 'project.rotate_key', 'user.update', 'model.update', 'setup.complete'];
+const actionCls = a => /fail|locked|rate_limited|delete/.test(a) ? 'err' : /rotate|reset|revoke|reprocess/.test(a) ? 'warn' : /create|success|upload/.test(a) ? 'ok' : /setup|export/.test(a) ? 'violet' : /update|members|change|test/.test(a) ? 'info' : '';
+function auditQuery(extra = {}) {
+  const q = new URLSearchParams(extra); if (auditState.action) q.set('action', auditState.action); if (auditState.actor) q.set('actor_user_id', auditState.actor);
+  const hours = { '24h': 24, '7d': 168, '30d': 720 }[auditState.range]; if (hours) q.set('since', new Date(Date.now() - hours * 3600e3).toISOString());
+  return q;
+}
+async function renderAudit() {
+  const app = $('#app'); const s = auditState;
+  const actors = state.users.length ? state.users : [];
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Audit · admin only</div><h1>Audit log</h1><p class="lede">Every create, update, delete, key rotation, login and password change, with actor, target and source address.</p></div>
+    <div class="actions"><a class="btn" id="exportLink" href="/admin/api/audit/export?${auditQuery()}">${ICON.download} Export NDJSON</a></div></div>
+    <section class="card stack" style="gap:14px">
+      <form class="row wrap" id="auditFilter" style="gap:10px"><div class="search grow">${ICON.search}<label for="a-q" class="sr">Filter by action prefix</label><input id="a-q" class="input" name="action" placeholder="action prefix, e.g. login. or project.create" value="${esc(s.action)}" autocomplete="off"></div>
+        <select class="input" name="actor" style="width:200px" aria-label="Actor"><option value="">any actor</option>${actors.map(u => `<option value="${u.id}" ${String(u.id) === String(s.actor) ? 'selected' : ''}>${esc(u.username)}</option>`).join('')}</select>
+        <select class="input" name="range" style="width:180px" aria-label="Range"><option value="">all time</option>${[['24h', 'last 24 hours'], ['7d', 'last 7 days'], ['30d', 'last 30 days']].map(([v, l]) => `<option value="${v}" ${s.range === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <button class="btn">Filter</button></form>
+      <div class="row wrap" style="gap:8px"><span class="hint">Quick:</span>${QUICK.map(a => `<button type="button" class="chip ${s.action === a ? 'on' : ''}" data-quick="${a}">${a}</button>`).join('')}</div>
+      <div class="tbl"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th><th>Details</th></tr></thead><tbody id="auditRows"></tbody></table></div>
+      <div class="row between" style="border-top:1px solid var(--line);padding-top:12px"><span class="hint mono" id="auditInfo"></span><button class="btn sm" id="auditMore">Load 100 more</button></div></section>`;
+  const draw = () => {
+    $('#auditRows').innerHTML = s.rows.map(a => { const det = a.details ? JSON.stringify(a.details) : ''; const tname = a.details && a.details.name ? ` · ${a.details.name}` : ''; return `<tr><td class="mono muted nowrap" title="${esc(fmtDate(a.created_at))}">${fmtDay(a.created_at)}</td>
+      <td><div class="row" style="gap:8px">${a.actor_username ? avatar(a.actor_username, 'xs') : '<div class="avatar xs" style="background:#2a3242;color:var(--tx2)" aria-hidden="true">?</div>'}<span>${esc(a.actor_username || '—')}</span></div></td>
+      <td><code class="pill ${actionCls(a.action)}">${esc(a.action)}</code></td><td class="dim">${esc(a.target_type)}${a.target_id != null ? ' #' + a.target_id : ''}${esc(tname)}</td><td class="mono muted">${esc(a.ip)}</td><td class="json" title="${esc(det)}">${esc(det)}</td></tr>`; }).join('') || '<tr><td colspan="6" class="muted">No entries.</td></tr>';
+    $('#auditMore').disabled = s.done || s.loading; $('#auditInfo').textContent = `${fmtN(s.rows.length)} of ${fmtN(s.total)} entries · newest first`;
+    const link = $('#exportLink'); if (link) link.href = '/admin/api/audit/export?' + auditQuery();
+  };
+  const load = async more => { if (s.loading) return; s.loading = true;
+    try { const q = auditQuery({ limit: '100' }); if (more && s.rows.length) q.set('before', s.rows[s.rows.length - 1].created_at);
+      const res = await api('/audit?' + q); const rows = res.entries || []; s.rows = more ? s.rows.concat(rows) : rows; s.total = res.total || 0; s.done = !res.has_more; }
+    catch (e) { toast(e.message, 5000, 'err'); } finally { s.loading = false; if (state.tab === 'audit' && $('#auditRows')) draw(); } };
+  $('#auditFilter').onsubmit = e => { e.preventDefault(); const f = e.target; s.action = f.action.value.trim(); s.actor = f.actor.value; s.range = f.range.value; $$('[data-quick]', app).forEach(c => c.classList.toggle('on', c.dataset.quick === s.action)); load(false); };
+  on(app, '[data-quick]', 'click', c => { s.action = s.action === c.dataset.quick ? '' : c.dataset.quick; $('#a-q').value = s.action; $$('[data-quick]', app).forEach(x => x.classList.toggle('on', x.dataset.quick === s.action)); load(false); });
+  $('#auditMore').onclick = () => load(true);
   await load(false);
 }
 
-// ---------- playground ----------
-function renderPlayground(){
-  const app=$('#app'); const pg=state.playground;
-  app.innerHTML=`<div class="card"><h2>Playground</h2><p class="muted">Sends real requests to <code>/v1/chat/completions</code> using a project key (only kept in this page's memory).</p>
-    <div class="row"><div style="flex:2">${field('Project API key', input('key', pg.key, 'type=password placeholder="sk-proj-…" id="pgKey"'))}</div>
-      <div style="flex:1"><label>Streaming</label><select id="pgStream"><option value="1">on</option><option value="0">off</option></select></div>
-      <div><label>&nbsp;</label><button id="pgClear">Clear</button></div></div>
-    <div class="chat" id="chat">${pg.msgs.map(m=>`<div class="msg ${m.role}">${esc(m.content)}</div>`).join('')||'<span class="muted">No messages yet.</span>'}</div>
-    <form id="pgForm" class="row" style="margin-top:10px"><textarea name="text" placeholder="Message… (Enter to send, Shift+Enter for newline)" style="flex:1;min-height:60px"></textarea><button class="primary" id="pgSend">Send</button></form>
-    <p class="muted" id="pgInfo"></p></div>`;
-  $('#pgKey').oninput=e=>pg.key=e.target.value;
-  $('#pgClear').onclick=()=>{ pg.msgs=[]; renderPlayground(); };
-  const ta=$('textarea',app); ta.onkeydown=e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); $('#pgForm').requestSubmit(); } };
-  $('#pgForm').onsubmit=async e=>{ e.preventDefault(); const text=ta.value.trim(); if(!text||!pg.key){ toast('Enter a project key and a message'); return; }
-    ta.value=''; pg.msgs.push({role:'user',content:text}); const asst={role:'assistant',content:''}; pg.msgs.push(asst); renderPlayground(); $('#pgSend').disabled=true;
-    const chat=$('#chat'); const last=()=>chat.lastElementChild; const t0=performance.now();
-    try{ const stream=$('#pgStream').value==='1';
-      const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Authorization':'Bearer '+pg.key,'Content-Type':'application/json'},body:JSON.stringify({model:'default',stream,messages:pg.msgs.filter(m=>m.content).map(m=>({role:m.role,content:m.content}))})});
-      if(!r.ok){ const err=await r.json().catch(()=>({})); const ra=r.headers.get('Retry-After');
-        throw new Error((r.status===429?'429 '+(err.error?.type||'rate limited')+': ':'')+(err.error?.message||r.statusText)+(ra?` (Retry-After: ${ra}s)`:'')); }
-      if(stream){ const rd=r.body.getReader(); const dec=new TextDecoder(); let buf=''; let usage=null;
-        while(true){ const {done,value}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true}); let i;
-          while((i=buf.indexOf('\n\n'))>=0){ const ev=buf.slice(0,i); buf=buf.slice(i+2); for(const line of ev.split('\n')){ if(!line.startsWith('data:')) continue; const d=line.slice(5).trim(); if(d==='[DONE]') continue;
-            try{ const j=JSON.parse(d); if(j.error) throw new Error(j.error.message); if(j.usage) usage=j.usage; const c=j.choices?.[0]?.delta?.content; if(c){ asst.content+=c; last().textContent=asst.content; chat.scrollTop=chat.scrollHeight; } }catch(pe){ if(pe.message) asst.content+=`\n[error: ${pe.message}]`; } } } }
-        $('#pgInfo').textContent=`${Math.round(performance.now()-t0)} ms` + (usage?` · ${usage.prompt_tokens}/${usage.completion_tokens} tokens`:'');
-      } else { const j=await r.json(); asst.content=j.choices?.[0]?.message?.content||''; last().textContent=asst.content; $('#pgInfo').textContent=`${Math.round(performance.now()-t0)} ms · ${j.usage?.prompt_tokens}/${j.usage?.completion_tokens} tokens`; }
-    }catch(err){ asst.content=asst.content||`[error: ${err.message}]`; last().textContent=asst.content; }
-    finally{ $('#pgSend').disabled=false; } };
-}
-
-// ---------- header actions ----------
-$('#nav').addEventListener('click', e => { const b=e.target.closest('button'); if(!b) return; state.tab=b.dataset.tab; render(); });
-$('#btnLogout').onclick = async()=>{ try{ await api('/logout',{method:'POST'}); }catch(e){} state.user=null; render(); };
-$('#btnPassword').onclick = ()=> modal('Change password', `${field('Current password', input('current_password','','type=password required'))}${field('New password (min 8)', input('new_password','','type=password required minlength=8'))}`,
-  async d=>{ await api('/me/password',{method:'POST',body:d}); toast('Password changed'); });
-
-(async function init(){
-  try { state.user = await api('/me'); } catch(e) { state.user=null; if (e.message!=='session expired') toast('Could not load session: '+e.message); }
-  if (state.user) { try { await loadAll(); } catch(e) { toast(e.message); } }
-  else { try { state.needsSetup = !!(await api('/setup')).needs_setup; } catch(e) { state.needsSetup=false; } }
+// ---------------------------------------------------------------------------
+// boot
+// ---------------------------------------------------------------------------
+(async function init() {
+  try { const me = await api('/me'); state.user = me; state.sessionExp = me.session_expires_at || null; } catch (e) { state.user = null; if (e.message !== 'session expired') toast('Could not load session: ' + e.message, 5000, 'err'); }
+  if (state.user) { try { await loadAll(); } catch (e) { toast(e.message, 5000, 'err'); } }
+  else { try { const s = await api('/setup'); state.setup = s; state.needsSetup = !!s.needs_setup; } catch (e) { state.needsSetup = false; } }
   render();
 })();
 </script>
