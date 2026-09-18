@@ -183,7 +183,7 @@ func (s *Store) BackupInfo(ctx context.Context) (*BackupInfo, error) {
 // serialise instead of racing on DDL.
 func migrate(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
 	err := withLockedTx(ctx, conn, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+		if _, err := tx.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public"); err != nil {
 			return fmt.Errorf("create vector extension: %w", err)
 		}
 		_, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
