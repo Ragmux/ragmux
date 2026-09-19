@@ -1175,7 +1175,7 @@ async function renderKeys() {
   const live = keys.filter(k => !k.revoked_at && (!k.expires_at || new Date(k.expires_at) > Date.now()));
   const soon = live.filter(k => k.expires_at && new Date(k.expires_at) - Date.now() <= KEY_EXPIRY_WARN_DAYS * 86400e3);
   app.innerHTML = `<div class="topbar"><div><div class="eyebrow">API keys · ${mine ? 'yours' : 'all users'} · ${keys.length} key${keys.length === 1 ? '' : 's'}</div><h1>API keys</h1>
-      <p class="lede">Your own credentials, separate from a project's default key: <code>sk-user-…</code> calls <code>/v1</code> on the projects you grant it, <code>sk-mgmt-…</code> calls <code>/admin/api</code> within its scopes. A key never outranks your role, and revoking one takes effect on the next request.</p></div>
+      <p class="lede">Your own credentials, separate from a project's default key: <code>sk-user-…</code> calls <code>/v1</code> on the projects you grant it, <code>sk-mgmt-…</code> calls <code>/admin/api</code> within its scopes. An <code>sk-mgmt-…</code> key never outranks your role, which is read on every request; an <code>sk-user-…</code> key is bounded by its grants and limits instead, since <code>/v1</code> checks only that your account is active. Revoking either takes effect on the next request.</p></div>
     <div class="actions"><button class="btn primary" id="addKey">${ICON.plus} New key</button></div></div>
     <div class="stats four">
       <div class="stat"><div class="l">Active</div><div class="v">${fmtN(live.length)}</div><div class="d">${fmtN(keys.length - live.length)} revoked or expired</div></div>
@@ -1219,7 +1219,7 @@ function keyForm(k) {
     ${editing ? '' : field('kind', 'Kind', select('kind', [{ value: 'gateway', label: 'gateway — calls /v1 with a project key' }, { value: 'management', label: 'management — calls /admin/api' }], kind), 'A gateway key routes chat traffic; a management key drives the dashboard API. The kind cannot be changed later.')}
     ${field('name', 'Name', input('name', k ? k.name : '', 'required maxlength=64 placeholder="e.g. ci-pipeline"'), 'Unique among your keys; it is how the key is identified once the secret is gone.')}
     ${can('admin') && !editing ? field('user_id', 'Owner', select('user_id', [{ value: state.user.id, label: `${state.user.username} (you)` }, ...state.users.filter(u => u.id !== state.user.id).map(u => ({ value: u.id, label: `${u.username} (${u.role})` }))], state.user.id), 'The key can never do more than this account, whatever you grant it.') : ''}
-    <fieldset class="field" style="border:0;padding:0;margin:0;gap:4px" id="scopeBox"><legend>Scopes</legend><div id="scopeList"></div><div class="hint">A scope only narrows: the owner's role is checked on every request as well.</div></fieldset>
+    <fieldset class="field" style="border:0;padding:0;margin:0;gap:4px" id="scopeBox"><legend>Scopes</legend><div id="scopeList"></div><div class="hint" id="scopeHint"></div></fieldset>
     ${field('expires', 'Expiry', select('expires', editing && k.expires_at ? [{ value: 'keep', label: `keep ${fmtDate(k.expires_at)}` }, ...EXPIRY_CHOICES] : EXPIRY_CHOICES, editing && k.expires_at ? 'keep' : ''), 'An expired key stops resolving; the row is kept for 30 days so its usage history stays readable.')}
     <div id="gatewayBox" class="stack" style="gap:16px">
       <div class="field"><span class="field"><label>Projects this key may call</label></span>${checklist('project_ids', projectOpts, k ? k.project_ids || [] : [], 'You are not a member of any project yet.')}<div class="hint">Checked once, here: a later change to the project's member list never breaks the key. With more than one, callers pick with the <code>X-Ragmux-Project</code> header.</div></div>
@@ -1248,6 +1248,12 @@ function keyForm(k) {
     const chosen = k ? k.scopes || [] : scopesFor(kd);
     $('#scopeList').innerHTML = checklist('scopes', scopesFor(kd).map(s => ({ value: s, label: `${s} — ${SCOPE_HINTS[s]}` })), chosen);
     $('#gatewayBox').classList.toggle('hidden', kd !== 'gateway');
+    // The owner is looked up on every request either way, but only /admin/api
+    // intersects the role. Saying "the role is checked as well" on a gateway
+    // key would promise that demoting the owner narrows it, and it does not.
+    $('#scopeHint').textContent = kd === 'gateway'
+      ? 'A scope only narrows. /v1 checks that the owner\'s account is active, not their role, so demoting the owner does not narrow this key — revoke it, give it a smaller sub-limit, or deactivate the account.'
+      : 'A scope only narrows. /admin/api intersects it with the owner\'s role, read on every request, so demoting the owner narrows this key at once.';
   };
   if (!editing) $('[name=kind]', form).onchange = paint;
   paint();

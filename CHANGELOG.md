@@ -72,6 +72,11 @@ All notable changes to Ragmux are documented here. The format follows
 - The Go runtime gauges shared one `runtime/metrics` sample buffer across every gauge and
   every concurrent scrape, so two overlapping scrapes could race and report one another's
   numbers.
+- Step 3 of the first-run wizard no longer offers a project form it cannot submit. The
+  model-connection picker is built from what the dashboard loaded at boot, so a reload
+  where that call failed drew an empty picker and a submit that posted a null connection
+  id and came back a validation error nobody could act on. The step now says the
+  connections could not be loaded, keeps the submit disabled, and offers a retry.
 - **`PG_SEARCH_TOKENIZER` stemming works.** `en_stem` — the only stemming value the
   documentation named — is not a tokenizer *type* `pg_search` 0.25 knows, so it rejected
   the BM25 index DDL and every rag store set to the `pg_search` backend fell back to
