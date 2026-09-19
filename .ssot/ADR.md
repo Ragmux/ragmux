@@ -228,9 +228,12 @@ yumuşatıldı.
 - Dışa doğru amplifikasyon kapalı kalırken içe doğru kiracılar-arası
   açlık da kapanır.
 - 429 semantik olarak doğru olanı söyler: bu bir kaynak sınırlaması,
-  sunucu arızası değil. OpenAI SDK'ları ≥500'ü üssel backoff ile otomatik
-  retry ediyor; 503 seçilseydi tavan dolu kaldığı sürece her istek 3×
-  kuyrukta bekleyecekti.
+  sunucu arızası değil. İki SDK da 429'u retry ediyor — 429 seçmenin
+  amacı retry'ı engellemek değil, **arıza bildirmemek**: 5xx bir
+  kurulumun sağlıksız olduğunu söyler ve operatörün alarmlarını
+  tetikler, oysa burada gateway doğru çalışıyor ve yalnız kapasitesi
+  dolu. `Retry-After` de indirme bütçesi mertebesinde verilir, kuyruk
+  bütçesi mertebesinde değil: slot ancak bir indirme bitince boşalır.
 - `docs/api.md` durum kodu tablosuna yeni bir satır girer.
 - Pay ayrımı biraz kod maliyeti getirir (kiracı başına `inflight` ve
   süreç geneli `waiting` sayacı) ve tek kiracılı kurulumlarda hiç devreye
