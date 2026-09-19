@@ -108,15 +108,16 @@ type geminiResponse struct {
 	} `json:"usageMetadata"`
 }
 
-func translateGemini(cfg Config, req ChatRequest) (geminiRequest, error) {
+func translateGemini(ctx context.Context, cfg Config, req ChatRequest) (geminiRequest, error) {
 	out := geminiRequest{}
+	images := cfg.imageBudget(ctx)
 	var system []string
 	for i, m := range req.Messages {
 		switch m.Role {
 		case "system", "developer":
 			system = append(system, m.Text())
 		case "user":
-			parts, err := openAIPartsToGemini(m.Content)
+			parts, err := openAIPartsToGemini(images, m.Content)
 			if err != nil {
 				return out, err
 			}
@@ -332,20 +333,42 @@ func appendGemini(cs []geminiContent, role string, parts []geminiPart) []geminiC
 	return append(cs, geminiContent{Role: role, Parts: parts})
 }
 
-func openAIPartsToGemini(raw json.RawMessage) ([]geminiPart, error) {
+// geminiFilesPrefix is the Files API namespace; together with gs:// it is
+// everything fileData accepts. An ordinary web URL sent here is rejected
+// upstream, so it has to be inlined instead.
+const geminiFilesPrefix = "https://generativelanguage.googleapis.com/v1beta/files/"
+
+func geminiFileURI(u string) bool {
+	return strings.HasPrefix(u, "gs://") || strings.HasPrefix(u, geminiFilesPrefix)
+}
+
+func openAIPartsToGemini(images *imageBudget, raw json.RawMessage) ([]geminiPart, error) {
 	parts, err := parseContent(raw)
 	if err != nil {
 		return nil, err
 	}
 	var out []geminiPart
 	for _, p := range parts {
-		switch {
-		case p.Type == "text":
+		if p.Type == "text" {
 			out = append(out, geminiPart{Text: p.Text})
-		case p.Image.Base64 != "":
-			out = append(out, geminiPart{InlineData: &geminiInline{MimeType: p.Image.MediaType, Data: p.Image.Base64}})
-		case p.Image.URL != "":
-			out = append(out, geminiPart{FileData: &geminiFileData{FileURI: p.Image.URL}})
+			continue
+		}
+		ref := p.Image
+		if geminiFileURI(ref.URL) {
+			out = append(out, geminiPart{FileData: &geminiFileData{FileURI: ref.URL}})
+			continue
+		}
+		if geminiInlineImages {
+			if ref, err = images.inline(ref); err != nil {
+				return nil, err
+			}
+		}
+		switch {
+		case ref.Base64 != "":
+			out = append(out, geminiPart{InlineData: &geminiInline{MimeType: ref.MediaType, Data: ref.Base64}})
+		case ref.URL != "":
+			return nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error",
+				Message: "gemini accepts inline base64 images (data: URLs), Files API URIs and gs:// URIs; remote image fetching is disabled"}
 		}
 	}
 	if len(out) == 0 {
@@ -388,7 +411,7 @@ func geminiToolCalls(c geminiContent) []toolCall {
 }
 
 func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	body, err := translateGemini(p.cfg, req)
+	body, err := translateGemini(ctx, p.cfg, req)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +440,7 @@ func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 }
 
 func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
-	body, err := translateGemini(p.cfg, req)
+	body, err := translateGemini(ctx, p.cfg, req)
 	if err != nil {
 		return err
 	}

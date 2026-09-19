@@ -46,7 +46,7 @@ func TestTranslateAnthropic(t *testing.T) {
 		{"role":"user","content":[{"type":"text","text":"b"}]},
 		{"role":"assistant","content":"c"},
 		{"role":"user","content":"d"}],"max_tokens":10,"stop":"END"}`), &r)
-	ar, err := translateAnthropic(r, "claude-x")
+	ar, err := translateAnthropic(context.Background(), Config{Model: "claude-x"}, r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestTranslateAnthropic(t *testing.T) {
 func TestTranslateGemini(t *testing.T) {
 	var r ChatRequest
 	json.Unmarshal([]byte(`{"model":"x","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"},{"role":"assistant","content":"a"},{"role":"user","content":"u2"}],"temperature":0.2}`), &r)
-	g, err := translateGemini(Config{ProviderType: "gemini"}, r)
+	g, err := translateGemini(context.Background(), Config{ProviderType: "gemini"}, r)
 	if err != nil {
 		t.Fatal(err)
 	}

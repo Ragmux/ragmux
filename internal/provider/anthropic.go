@@ -89,8 +89,9 @@ type anthropicResponse struct {
 }
 
 // translateAnthropic converts an OpenAI request into the Messages format.
-func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error) {
-	out := anthropicRequest{Model: model, MaxTokens: defaultMaxTokens}
+func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthropicRequest, error) {
+	out := anthropicRequest{Model: cfg.Model, MaxTokens: defaultMaxTokens}
+	images := cfg.imageBudget(ctx)
 	if n := req.MaxOutputTokens(); n > 0 {
 		out.MaxTokens = n
 	}
@@ -104,7 +105,7 @@ func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error)
 		case "system", "developer":
 			system = append(system, m.Text())
 		case "user":
-			parts, err := openAIPartsToAnthropic(m.Content)
+			parts, err := openAIPartsToAnthropic(images, m.Content)
 			if err != nil {
 				return out, err
 			}
@@ -203,20 +204,28 @@ func appendAnthropic(msgs []anthropicMessage, role string, parts []anthropicCont
 	return append(msgs, anthropicMessage{Role: role, Content: parts})
 }
 
-func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
+func openAIPartsToAnthropic(images *imageBudget, raw json.RawMessage) ([]anthropicContent, error) {
 	parts, err := parseContent(raw)
 	if err != nil {
 		return nil, err
 	}
 	var out []anthropicContent
 	for _, p := range parts {
-		switch {
-		case p.Type == "text":
+		if p.Type == "text" {
 			out = append(out, anthropicContent{Type: "text", Text: p.Text})
-		case p.Image.Base64 != "":
-			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: p.Image.MediaType, Data: p.Image.Base64}})
-		case p.Image.URL != "":
-			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: p.Image.URL}})
+			continue
+		}
+		ref := p.Image
+		if anthropicInlineImages {
+			if ref, err = images.inline(ref); err != nil {
+				return nil, err
+			}
+		}
+		switch {
+		case ref.Base64 != "":
+			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: ref.MediaType, Data: ref.Base64}})
+		case ref.URL != "":
+			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: ref.URL}})
 		}
 	}
 	if len(out) == 0 {
@@ -240,7 +249,7 @@ func anthropicFinish(stop string) *string {
 }
 
 func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	body, err := translateAnthropic(req, p.cfg.Model)
+	body, err := translateAnthropic(ctx, p.cfg, req)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +281,7 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 }
 
 func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
-	body, err := translateAnthropic(req, p.cfg.Model)
+	body, err := translateAnthropic(ctx, p.cfg, req)
 	if err != nil {
 		return err
 	}

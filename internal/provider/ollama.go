@@ -74,8 +74,9 @@ type ollamaResponse struct {
 }
 
 // translateOllama converts an OpenAI request into the native payload.
-func translateOllama(req ChatRequest, model string) (ollamaRequest, error) {
-	out := ollamaRequest{Model: model, Options: map[string]any{}}
+func translateOllama(ctx context.Context, cfg Config, req ChatRequest) (ollamaRequest, error) {
+	out := ollamaRequest{Model: cfg.Model, Options: map[string]any{}}
+	images := cfg.imageBudget(ctx)
 	for _, m := range req.Messages {
 		om := ollamaMessage{Role: m.Role}
 		switch m.Role {
@@ -83,11 +84,11 @@ func translateOllama(req ChatRequest, model string) (ollamaRequest, error) {
 			om.Role = "system"
 			om.Content = m.Text()
 		case "user":
-			text, images, err := openAIPartsToOllama(m.Content)
+			text, inline, err := openAIPartsToOllama(images, m.Content)
 			if err != nil {
 				return out, err
 			}
-			om.Content, om.Images = text, images
+			om.Content, om.Images = text, inline
 		case "assistant":
 			om.Content = m.Text()
 			if len(m.ToolCalls) > 0 {
@@ -178,7 +179,7 @@ func translateOllama(req ChatRequest, model string) (ollamaRequest, error) {
 }
 
 // openAIPartsToOllama splits a user message into text and base64 images.
-func openAIPartsToOllama(raw json.RawMessage) (string, []string, error) {
+func openAIPartsToOllama(images *imageBudget, raw json.RawMessage) (string, []string, error) {
 	if len(raw) == 0 {
 		return "", nil, nil
 	}
@@ -187,22 +188,30 @@ func openAIPartsToOllama(raw json.RawMessage) (string, []string, error) {
 		return "", nil, err
 	}
 	var text strings.Builder
-	var images []string
+	var inline []string
 	for _, p := range parts {
-		switch {
-		case p.Type == "text":
+		if p.Type == "text" {
 			if text.Len() > 0 {
 				text.WriteString("\n")
 			}
 			text.WriteString(p.Text)
-		case p.Image.Base64 != "":
-			images = append(images, p.Image.Base64)
-		case p.Image.URL != "":
+			continue
+		}
+		ref := p.Image
+		if ollamaInlineImages {
+			if ref, err = images.inline(ref); err != nil {
+				return "", nil, err
+			}
+		}
+		switch {
+		case ref.Base64 != "":
+			inline = append(inline, ref.Base64)
+		case ref.URL != "":
 			return "", nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error",
 				Message: "ollama only accepts inline base64 images (data: URLs)"}
 		}
 	}
-	return text.String(), images, nil
+	return text.String(), inline, nil
 }
 
 // ollamaToolCallsJSON renders native tool calls in OpenAI's shape. Ollama
@@ -233,7 +242,7 @@ func ollamaUsage(r ollamaResponse) *Usage {
 }
 
 func (p *ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	body, err := translateOllama(req, p.cfg.Model)
+	body, err := translateOllama(ctx, p.cfg, req)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +263,7 @@ func (p *ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 }
 
 func (p *ollama) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
-	body, err := translateOllama(req, p.cfg.Model)
+	body, err := translateOllama(ctx, p.cfg, req)
 	if err != nil {
 		return err
 	}

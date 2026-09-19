@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,7 +39,7 @@ func TestTranslateGeminiTools(t *testing.T) {
 		{"role":"tool","tool_call_id":"call_1","content":"sunny"},
 		{"role":"tool","tool_call_id":"call_gone","content":"nobody asked"}],
 		"tools":[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}]}`)
-	g, err := translateGemini(Config{ProviderType: "gemini"}, req)
+	g, err := translateGemini(context.Background(), Config{ProviderType: "gemini"}, req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +84,7 @@ func TestTranslateGeminiToolChoice(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			g, err := translateGemini(Config{}, parseReq(t, `{"messages":[{"role":"user","content":"hi"}],`+tc.choice+tools+`}`))
+			g, err := translateGemini(context.Background(), Config{}, parseReq(t, `{"messages":[{"role":"user","content":"hi"}],`+tc.choice+tools+`}`))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -102,6 +104,44 @@ func TestTranslateGeminiToolChoice(t *testing.T) {
 				t.Errorf("allowed = %v", g.ToolConfig.FunctionCallingConfig.AllowedFunctionNames)
 			}
 		})
+	}
+}
+
+func TestTranslateGeminiImages(t *testing.T) {
+	img := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write([]byte("JPEG"))
+	}))
+	defer img.Close()
+	content := func(url string) ChatRequest {
+		return parseReq(t, `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"`+url+`"}}]}]}`)
+	}
+	// fileData only takes what Gemini can resolve itself: a Files API object
+	// or a Cloud Storage path. Anything else used to be sent here too and was
+	// rejected upstream.
+	for _, uri := range []string{geminiFilesPrefix + "abc123", "gs://bucket/a.png"} {
+		g, err := translateGemini(context.Background(), Config{}, content(uri))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fd := g.Contents[0].Parts[0].FileData; fd == nil || fd.FileURI != uri {
+			t.Errorf("%s: parts = %+v", uri, g.Contents[0].Parts)
+		}
+	}
+	// Every other URL is fetched and inlined.
+	g, err := translateGemini(context.Background(), Config{Images: &ImageFetcher{Client: img.Client()}}, content(img.URL+"/a.jpg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in := g.Contents[0].Parts[0].InlineData; in == nil || in.MimeType != "image/jpeg" ||
+		in.Data != base64.StdEncoding.EncodeToString([]byte("JPEG")) {
+		t.Errorf("parts = %+v", g.Contents[0].Parts)
+	}
+	// With fetching disabled there is nothing honest left to send.
+	_, err = translateGemini(context.Background(), Config{}, content(img.URL+"/a.jpg"))
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Status != 400 {
+		t.Errorf("err = %v", err)
 	}
 }
 
