@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,11 +31,14 @@ import (
 	"github.com/ragmux/ragmux/internal/gateway"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/maintenance"
+	"github.com/ragmux/ragmux/internal/metrics"
 	"github.com/ragmux/ragmux/internal/netguard"
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/tracing"
 	"github.com/ragmux/ragmux/web"
 )
 
@@ -140,6 +145,23 @@ func run(cfg config.Config) error {
 		return err
 	}
 
+	registry, met := buildMetrics(cfg, st, log)
+	tracer := tracing.New(tracing.Config{
+		Endpoint: cfg.OTLPEndpoint, Headers: cfg.OTLPHeaders,
+		ServiceName: cfg.ServiceName, ServiceVersion: version, ResourceAttrs: cfg.ResourceAttrs,
+		SampleRatio: cfg.TraceSampleRatio, TrustIncoming: cfg.TracingTrustIncoming, Logger: log,
+	})
+	if !cfg.TracingEnabled {
+		// An explicit TRACING_ENABLED=false while an endpoint is configured:
+		// the empty endpoint is what makes a tracer a no-op.
+		tracer = tracing.New(tracing.Config{Logger: log})
+	}
+	if tracer.Enabled() {
+		log.Info("tracing enabled", "endpoint", cfg.OTLPEndpoint, "service", cfg.ServiceName,
+			"sample_ratio", cfg.TraceSampleRatio, "trust_incoming", cfg.TracingTrustIncoming)
+		met.RegisterTracing(tracer)
+	}
+
 	// Outbound provider calls: the dialer refuses private and local
 	// addresses unless ALLOW_PRIVATE_UPSTREAMS / PRIVATE_UPSTREAM_ALLOWLIST
 	// say otherwise. A proxy would connect on our behalf and bypass that
@@ -183,7 +205,7 @@ func run(cfg config.Config) error {
 		return provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey,
 			Model: c.ModelName, Timeout: cfg.UpstreamTimeout, Client: httpClient,
 			StreamMaxDuration: cfg.StreamMaxDuration, StreamMaxBytes: cfg.StreamMaxBytes, Logger: log,
-			Images: images}
+			Images: images, Tracer: tracer}
 	}
 	providers := func(c *store.ModelConnection) (provider.Provider, error) { return provider.New(provCfg(c)) }
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) { return provider.NewEmbedder(provCfg(c)) }
@@ -195,7 +217,8 @@ func run(cfg config.Config) error {
 	}
 	ingester := rag.NewIngester(bgCtx, st, embedders, cfg.IngestWorkers, log, rag.Settings{
 		Lease: cfg.IngestLease, PollInterval: cfg.IngestPollInterval,
-		MaxAttempts: cfg.IngestMaxAttempts, MaxPending: cfg.MaxPendingDocuments})
+		MaxAttempts: cfg.IngestMaxAttempts, MaxPending: cfg.MaxPendingDocuments,
+		Metrics: met, Tracer: tracer})
 	ingester.MaxChunksPerDocument = cfg.MaxChunksPerDocument
 	defer ingester.Stop()
 	// Nothing to resume: the dispatcher's first poll claims every pending
@@ -207,6 +230,8 @@ func run(cfg config.Config) error {
 		"max_attempts", cfg.IngestMaxAttempts, "max_pending", cfg.MaxPendingDocuments)
 	retriever := rag.NewRetriever(st, embedders)
 	retriever.Log = log
+	retriever.Metrics = met
+	retriever.Tracer = tracer
 	// Rerankers resolves a store's rerank backend to a reranker. The API
 	// backends read their credentials from the model connection the store
 	// points at, so they go through the same decrypting Store lookup and the
@@ -236,7 +261,7 @@ func run(cfg config.Config) error {
 		TrustProxy: cfg.TrustProxyHeaders}
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
-		Limiter: usage, Prices: prices}
+		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer}
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
 		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
@@ -254,6 +279,8 @@ func run(cfg config.Config) error {
 	if cfg.TrustProxyHeaders {
 		r.Use(realIP(cfg.TrustedProxyCIDRs))
 	}
+	r.Use(obs.HTTPMetrics(met))
+	r.Use(obs.HTTPTracing(tracer))
 	r.Use(requestLogger(log))
 	r.Use(middleware.Recoverer)
 	r.Use(securityHeaders(scriptHash))
@@ -268,11 +295,30 @@ func run(cfg config.Config) error {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok","version":"` + version + `"}`))
 	})
+	r.Get("/readyz", readyz(st, log))
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusFound)
 	})
 	r.Route("/v1", gw.Routes)
 	r.Route("/admin", adm.Routes)
+
+	// /metrics is either mounted here or served by a second listener, never
+	// both: with METRICS_LISTEN set it stays off the main router entirely,
+	// so no reverse-proxy rule can expose it by accident.
+	var metricsSrv *http.Server
+	if registry != nil {
+		h := registry.Handler(cfg.MetricsToken)
+		if cfg.MetricsListen != "" {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", h)
+			metricsSrv = &http.Server{Addr: cfg.MetricsListen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		} else {
+			r.Method(http.MethodGet, "/metrics", h)
+			r.Method(http.MethodHead, "/metrics", h)
+		}
+		log.Info("metrics enabled", "listen", or(cfg.MetricsListen, "main listener"),
+			"authenticated", cfg.MetricsToken != "", "max_series", cfg.MetricsMaxSeries)
+	}
 
 	srv := &http.Server{
 		Addr:              ":" + strconv.Itoa(cfg.Port),
@@ -299,6 +345,14 @@ func run(cfg config.Config) error {
 			errc <- err
 		}
 	}()
+	if metricsSrv != nil {
+		go func() {
+			log.Info("metrics listening", "addr", metricsSrv.Addr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errc <- err
+			}
+		}()
+	}
 
 	select {
 	case err := <-errc:
@@ -316,9 +370,24 @@ func run(cfg config.Config) error {
 	if shutErr != nil {
 		log.Warn("http shutdown", "err", shutErr)
 	}
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutCtx); err != nil {
+			log.Warn("metrics shutdown", "err", err)
+		}
+	}
 	log.Info("shutting down: waiting for ingestion jobs")
 	if !ingester.StopWithTimeout(30 * time.Second) {
 		log.Warn("ingestion jobs cancelled; their documents go back into the queue for another replica or the next start")
+	}
+	// After the drained requests and the last ingestion job, before the
+	// background context is cancelled: their spans are queued by then and
+	// this is what gets them out of the process.
+	if tracer.Enabled() {
+		traceCtx, traceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := tracer.Shutdown(traceCtx); err != nil {
+			log.Warn("tracing shutdown", "err", err)
+		}
+		traceCancel()
 	}
 	stopBackground()
 	<-janitorDone
@@ -365,11 +434,96 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 			if strings.HasPrefix(r.URL.Path, "/admin/") && !strings.HasPrefix(r.URL.Path, "/admin/api") {
 				return // static assets
 			}
+			if r.URL.Path == "/metrics" {
+				// A fifteen-second scrape would drown the JSON log, and the
+				// scrape is already counted in the metrics it fetches.
+				return
+			}
 			log.Info("http", "method", r.Method, "path", r.URL.Path, "status", ww.Status(),
 				"bytes", ww.BytesWritten(), "dur_ms", time.Since(start).Milliseconds(),
 				"req_id", middleware.GetReqID(r.Context()))
 		})
 	}
+}
+
+// buildMetrics creates the registry and the metric set, or returns nils when
+// METRICS_ENABLED is off. A nil *obs.Metrics is valid everywhere it is
+// passed, so nothing downstream needs a branch for the disabled case.
+func buildMetrics(cfg config.Config, st *store.Store, log *slog.Logger) (*metrics.Registry, *obs.Metrics) {
+	if !cfg.MetricsEnabled {
+		return nil, nil
+	}
+	reg := metrics.New(metrics.Options{MaxSeries: cfg.MetricsMaxSeries})
+	reg.OnSeriesDropped = func(metric string) {
+		log.Warn("metrics: series cap reached, new label combinations are being dropped; "+
+			"look for an unbounded label before raising METRICS_MAX_SERIES",
+			"metric", metric, "max_series", cfg.MetricsMaxSeries)
+	}
+	reg.RegisterRuntime(version, runtime.Version())
+	m := obs.New(reg)
+	m.RegisterStore(st)
+	return reg, m
+}
+
+// readyz reports whether this replica should take traffic: the pool answers
+// and the schema is at the version this binary embeds. During a rolling
+// upgrade that second half is what keeps requests off a replica whose
+// database another replica has already migrated past it.
+//
+// A RAG store configured for a search backend this server does not carry is
+// deliberately NOT a readiness failure. The search falls back to pgvector
+// and keeps answering, so removing the replica from rotation would turn a
+// degraded-but-working condition into an outage; it is reported as an
+// informational "degraded" entry alongside a 200.
+//
+// /healthz stays liveness-only and unchanged, so the container HEALTHCHECK
+// and every existing probe keep their meaning.
+func readyz(st *store.Store, log *slog.Logger) http.HandlerFunc {
+	type response struct {
+		Status             string   `json:"status"`
+		Version            string   `json:"version"`
+		Migrations         int      `json:"migrations"`
+		ExpectedMigrations int      `json:"expected_migrations"`
+		Degraded           []string `json:"degraded,omitempty"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		head := store.HeadMigration()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+
+		applied, err := st.AppliedMigration(ctx)
+		if err != nil {
+			log.Warn("readiness: read schema version", "err", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(response{Status: "db unavailable", Version: version,
+				ExpectedMigrations: head})
+			return
+		}
+		if applied != head {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(response{Status: "migrating", Version: version,
+				Migrations: applied, ExpectedMigrations: head})
+			return
+		}
+		res := response{Status: "ok", Version: version, Migrations: applied, ExpectedMigrations: head}
+		if n, err := st.DegradedRAGStores(ctx); err != nil {
+			log.Warn("readiness: count degraded rag stores", "err", err)
+		} else if n > 0 {
+			res.Degraded = append(res.Degraded, fmt.Sprintf(
+				"pg_search is not installed on this server; %d rag store(s) configured for it fall back to pgvector", n))
+		}
+		_ = json.NewEncoder(w).Encode(res)
+	}
+}
+
+// or is the first non-empty of two strings, for log lines.
+func or(v, def string) string {
+	if v != "" {
+		return v
+	}
+	return def
 }
 
 // realIP replaces RemoteAddr with the client address a trusted reverse proxy

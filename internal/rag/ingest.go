@@ -36,6 +36,10 @@ type Settings struct {
 	MaxAttempts int
 	// MaxPending is the cluster-wide backlog ceiling Enqueue enforces.
 	MaxPending int
+	// Metrics counts claims, jobs and chunks; nil records nothing.
+	Metrics *obs.Metrics
+	// Tracer opens the ingest.document span; nil is a disabled tracer.
+	Tracer *tracing.Tracer
 }
 
 // Ingester processes uploaded documents in the background. One dispatcher
@@ -76,10 +80,11 @@ type Ingester struct {
 	// MaxChunksPerDocument fails a document that splits into more chunks
 	// than this before anything is embedded; 0 means DefaultMaxChunks.
 	MaxChunksPerDocument int
-	// Metrics counts claims, jobs and chunks; nil records nothing.
-	Metrics *obs.Metrics
-	// Tracer opens the ingest.document span; nil is a disabled tracer.
-	Tracer *tracing.Tracer
+	// metrics and tracer come in through Settings rather than as exported
+	// fields: the dispatcher polls from the moment NewIngester returns, so
+	// anything assigned afterwards would be a data race with it.
+	metrics *obs.Metrics
+	tracer  *tracing.Tracer
 }
 
 // DefaultMaxChunks is the chunk cap used when MaxChunksPerDocument is 0.
@@ -135,6 +140,7 @@ func NewIngester(ctx context.Context, st *store.Store, factory EmbedderFactory, 
 		maxAttempts: orInt(s.MaxAttempts, DefaultMaxAttempts), maxPending: orInt(s.MaxPending, DefaultMaxPending),
 		workers: workers, jobs: make(chan *store.Document), notify: make(chan struct{}, 1),
 		cancel: cancel, stopping: make(chan struct{}), batchSize: 32,
+		metrics: s.Metrics, tracer: s.Tracer,
 	}
 	for i := 0; i < workers; i++ {
 		ing.wg.Add(1)
@@ -298,17 +304,17 @@ func (ing *Ingester) claimAll(ctx context.Context) {
 	for ing.busy.Load() < int64(ing.workers) {
 		doc, err := ing.store.ClaimDocument(ctx, ing.owner, ing.lease, ing.maxAttempts)
 		if errors.Is(err, store.ErrNotFound) {
-			ing.Metrics.RecordIngestClaim(obs.ClaimEmpty)
+			ing.metrics.RecordIngestClaim(obs.ClaimEmpty)
 			return
 		}
 		if err != nil {
-			ing.Metrics.RecordIngestClaim(obs.ClaimError)
+			ing.metrics.RecordIngestClaim(obs.ClaimError)
 			if ctx.Err() == nil {
 				ing.log.Warn("claim document for ingestion", "err", err)
 			}
 			return
 		}
-		ing.Metrics.RecordIngestClaim(obs.ClaimClaimed)
+		ing.metrics.RecordIngestClaim(obs.ClaimClaimed)
 		ing.busy.Add(1)
 		select {
 		case ing.jobs <- doc:
@@ -346,18 +352,18 @@ func (ing *Ingester) runJob(ctx context.Context, doc *store.Document) {
 	took := time.Since(start)
 	switch {
 	case err == nil:
-		ing.Metrics.RecordIngestJob(obs.IngestReady, chunks, took)
+		ing.metrics.RecordIngestJob(obs.IngestReady, chunks, took)
 	case errors.Is(err, errLeaseLost):
 		// The row belongs to whoever claimed it next; writing a status
 		// here would overwrite their work.
-		ing.Metrics.RecordIngestJob(obs.IngestLeaseLost, 0, took)
+		ing.metrics.RecordIngestJob(obs.IngestLeaseLost, 0, took)
 		ing.log.Warn("lost ingestion lease; another replica took over", "doc", doc.ID, "file", doc.Filename)
 	case ctx.Err() != nil:
 		// Shutdown, not a bad document: Stop puts it back in the queue.
-		ing.Metrics.RecordIngestJob(obs.IngestCancelled, 0, took)
+		ing.metrics.RecordIngestJob(obs.IngestCancelled, 0, took)
 		ing.log.Info("ingestion cancelled by shutdown", "doc", doc.ID)
 	default:
-		ing.Metrics.RecordIngestJob(obs.IngestFailed, 0, took)
+		ing.metrics.RecordIngestJob(obs.IngestFailed, 0, took)
 		ing.log.Error("ingest failed", "doc", doc.ID, "err", err)
 		_ = ing.store.SetDocumentStatus(context.Background(), doc.ID, store.DocFailed, truncate(err.Error(), 1000))
 	}
@@ -390,7 +396,7 @@ func (ing *Ingester) process(ctx context.Context, doc *store.Document) (int, err
 	// dashboard would otherwise hang a job that may run for minutes off the
 	// HTTP request that only queued it, and that request's span closes in
 	// milliseconds.
-	ctx, span := ing.Tracer.Start(tracing.ContextWithSpanContext(ctx, tracing.SpanContext{}),
+	ctx, span := ing.tracer.Start(tracing.ContextWithSpanContext(ctx, tracing.SpanContext{}),
 		"ingest.document", tracing.KindInternal)
 	defer span.End()
 	span.SetAttributes(
