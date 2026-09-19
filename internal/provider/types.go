@@ -178,6 +178,13 @@ func (r ChatRequest) StopSequences() []string {
 // Usage mirrors OpenAI's usage block. PromptTokens always includes the
 // cached part of the prompt, whichever provider answered, so the number
 // means the same thing on every connection and prompt + completion == total.
+//
+// One known exception: a Gemini request that called tools. Its
+// usageMetadata.toolUsePromptTokenCount is not read, and TotalTokens is
+// copied from Gemini's own totalTokenCount, so the total can exceed the two
+// parts. Google's REST reference and its published protobuf disagree on what
+// that total sums and neither says whether tool-use tokens are inside it, so
+// nothing is derived from a guess. docs/providers.md carries the limit.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`

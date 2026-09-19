@@ -218,6 +218,18 @@ more work than elsewhere:
   emitted as one `tool_calls` delta carrying the index, id, name and arguments together.
   No argument fragments are invented.
 
+**Known limit — tool-use tokens.** On a tool round Gemini also reports
+`usageMetadata.toolUsePromptTokenCount`, which Ragmux neither reads nor maps. Gemini's
+`totalTokenCount` is relayed as `total_tokens` as it arrives, so on those requests
+`prompt_tokens + completion_tokens` can be **less than** `total_tokens`, and whatever the
+difference covers is not priced: the cost estimate is built from the prompt and
+completion counts alone. Google's own references disagree on what `totalTokenCount`
+sums — the REST reference says prompt + thoughts + candidates, the published
+`generativelanguage` protobuf says prompt + candidates — and neither states whether
+tool-use tokens are inside it, so Ragmux does not guess. Every other provider keeps
+`prompt_tokens + completion_tokens == total_tokens`. Read a Gemini tool-round bill from
+Google's console, not from here.
+
 ### Tool schema sanitising
 
 Gemini's `parameters` take an OpenAPI 3.0 subset and **reject** keywords they do not know,
@@ -371,9 +383,10 @@ every connection:
 ```
 
 `prompt_tokens` **always includes** the cached and freshly written parts, and
-`prompt_tokens + completion_tokens == total_tokens` holds everywhere.
-`cache_creation_tokens` has no OpenAI equivalent — OpenAI does not bill cache writes,
-Anthropic does.
+`prompt_tokens + completion_tokens == total_tokens` holds everywhere except a Gemini
+request that called tools, where Gemini's own total can be larger — see
+[Tool calling](#tool-calling). `cache_creation_tokens` has no OpenAI equivalent —
+OpenAI does not bill cache writes, Anthropic does.
 
 | Provider | What it reports | How it is mapped |
 |---|---|---|
