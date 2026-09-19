@@ -448,7 +448,18 @@ func Load() (Config, error) {
 // that would publish per-project usage and spend to anyone who can reach the
 // port.
 func loadMetrics(c *Config) error {
-	c.MetricsEnabled = os.Getenv("METRICS_ENABLED") == "true"
+	// Only the two spellings TRACING_ENABLED accepts. A silent fallback to
+	// false would turn METRICS_ENABLED=1 or =yes into metrics that never
+	// appear, which is discovered by missing dashboards rather than by the
+	// start-up that could have said so.
+	switch strings.TrimSpace(os.Getenv("METRICS_ENABLED")) {
+	case "true":
+		c.MetricsEnabled = true
+	case "false", "":
+		c.MetricsEnabled = false
+	default:
+		return fmt.Errorf("invalid METRICS_ENABLED %q (true or false)", os.Getenv("METRICS_ENABLED"))
+	}
 	token, err := envOrFile("METRICS_TOKEN")
 	if err != nil {
 		return err
