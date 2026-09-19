@@ -171,9 +171,11 @@ func TestNegativeUpstreamUsageIsClamped(t *testing.T) {
 // TestBrokenCacheSplitDoesNotFlagTheRowEstimated: the "estimated" flag is
 // rendered as "~" beside the prompt and completion counts, so it must only
 // be set when one of those two was guessed. An unusable cache split floors
-// to zero — which over-states the share billed at the full input rate and
-// never invents a discount — while the two counts the upstream reported
-// exactly keep saying so.
+// to zero instead, which moves those tokens into the share billed at the
+// full input rate — a defined reading, not a cheaper or dearer one in
+// general — while the two counts the upstream reported exactly keep saying
+// so. The row below prices cache writes at the input rate, so the floor is
+// cost-neutral here; TestCostMicros covers the rates that differ.
 func TestBrokenCacheSplitDoesNotFlagTheRowEstimated(t *testing.T) {
 	e := newCostEnv(t, "custom_openai", "gpt-4o", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)

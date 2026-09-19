@@ -705,9 +705,6 @@ relayed as it comes, and some send frames of their own with an empty `choices` a
 Azure's content-filter chunk, a proxy's keep-alive. Ragmux does not drop those: they
 carry information it does not own. Guard the array before indexing it.
 
-Response headers, only for limits that are set on the project or the key. Where both
-tiers have a limit, the header describes whichever has the smaller remaining allowance:
-
 `usage` carries OpenAI's breakdown objects whenever the provider reports them:
 
 ```json
@@ -716,25 +713,35 @@ tiers have a limit, the header describes whichever has the smaller remaining all
           "completion_tokens_details": {"reasoning_tokens": 30}}
 ```
 
-`prompt_tokens` always includes the cached and freshly written parts, on every provider,
-and `prompt_tokens + completion_tokens == total_tokens` — with one known exception, a
-Gemini request that called tools, where Gemini's own total can be larger and the
-difference is neither mapped nor priced (see
-[Gemini tool-use tokens](providers.md#tool-calling)). `cache_creation_tokens` has no
-OpenAI equivalent (OpenAI does not bill cache writes, Anthropic does). See
+`prompt_tokens` always includes the cached and freshly written parts, on every provider:
+that is a property of the mapping, so it holds whatever the upstream's own spelling was.
+`prompt_tokens + completion_tokens == total_tokens` is weaker — it describes how each
+adapter assembles the block from an upstream that reports its counts consistently, and
+it is not checked. Two things break it: a Gemini request that called tools, where
+Gemini's own total can be larger and the difference is neither mapped nor priced (see
+[Gemini tool-use tokens](providers.md#tool-calling)), and any upstream that reports
+something that does not add up, which is relayed as it came (below). A client that
+relies on the sum should verify it. `cache_creation_tokens` has no OpenAI equivalent
+(OpenAI does not bill cache writes, Anthropic does). See
 [Prompt caching](providers.md#prompt-caching) for the per-provider mapping, including
 the accounting change for cached Anthropic requests.
 
-The `usage` block in the response is the **upstream's own**, normalised in shape but not
-in value: it is relayed as it came, so a provider that reports something impossible —
-a negative count, a total that does not add up — reaches you that way. What Ragmux
-records is cleaned: the request log, the budget counters and the cost estimate floor
-every count at zero, and a count that arrived unusable is replaced with a character
-estimate and the row is flagged `estimated`. So a request log row and the `usage` of
-the same request can differ when the upstream misreported. Trust the row for spend, and
-treat a mismatch as a signal about that provider.
+The `usage` block in the response is the **upstream's own**. Normalising renames fields
+into the OpenAI shape and fills two gaps — a `total_tokens` of `0` is computed from the
+two parts, and DeepSeek's top-level `prompt_cache_hit_tokens` is folded into
+`cached_tokens` — but it validates nothing. A provider that reports something impossible,
+a negative count or a total that does not add up, reaches you that way.
 
-Response headers, only for limits the project has set:
+What Ragmux **records** is cleaned. The request log, the budget counters and the cost
+estimate floor every count at zero; a `prompt_tokens` or `completion_tokens` that arrived
+unusable is replaced with a character estimate and the row is flagged `estimated`; an
+unusable cache split drops to zero without that flag, because the flag speaks for those
+two counts and they were fine. So a request log row and the `usage` of the same request
+can differ when the upstream misreported. Trust the row for spend, and treat a mismatch
+as a signal about that provider.
+
+Response headers, only for limits that are set on the project or the key. Where both
+tiers have a limit, the header describes whichever has the smaller remaining allowance:
 
 | Header | Meaning |
 |---|---|

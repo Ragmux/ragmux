@@ -261,10 +261,16 @@ anything about projects or usage.
 `/healthz` is deliberately untouched, so every existing probe and the image's
 `HEALTHCHECK` keep their meaning.
 
+In the bodies below **`N` stands for a migration number, not a literal**: `migrations` is
+whatever `MAX(version)` in `schema_migrations` is and `expected_migrations` is the head
+the running binary embeds. Only the relation between the two decides the answer, and both
+numbers move with every release, so they are written symbolically here rather than pinned
+to whatever the repository happened to be at.
+
 `/readyz` answers `200`:
 
 ```json
-{"status":"ok","version":"0.4.0","migrations":13,"expected_migrations":13}
+{"status":"ok","version":"0.4.0","migrations":N,"expected_migrations":N}
 ```
 
 and `503` with `"status":"migrating"` while the applied version is **behind** the binary's:
@@ -283,9 +289,9 @@ working against the newer schema. It answers `200` and says so:
 {
   "status": "ok",
   "version": "0.4.0",
-  "migrations": 14,
-  "expected_migrations": 13,
-  "degraded": ["the database schema is at migration 14, ahead of the 13 this binary embeds; this replica is running older code against a newer schema"]
+  "migrations": N+1,
+  "expected_migrations": N,
+  "degraded": ["the database schema is at migration N+1, ahead of the N this binary embeds; this replica is running older code against a newer schema"]
 }
 ```
 
@@ -308,8 +314,8 @@ condition into an outage. It is reported instead as an informational field along
 {
   "status": "ok",
   "version": "0.4.0",
-  "migrations": 13,
-  "expected_migrations": 13,
+  "migrations": N,
+  "expected_migrations": N,
   "degraded": ["pg_search is not installed on this server; 2 rag store(s) configured for it fall back to pgvector"]
 }
 ```

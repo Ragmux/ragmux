@@ -382,11 +382,13 @@ every connection:
           "completion_tokens_details": {"reasoning_tokens": 30}}
 ```
 
-`prompt_tokens` **always includes** the cached and freshly written parts, and
-`prompt_tokens + completion_tokens == total_tokens` holds everywhere except a Gemini
-request that called tools, where Gemini's own total can be larger — see
-[Tool calling](#tool-calling). `cache_creation_tokens` has no OpenAI equivalent —
-OpenAI does not bill cache writes, Anthropic does.
+`prompt_tokens` **always includes** the cached and freshly written parts: the mapping
+guarantees that. `prompt_tokens + completion_tokens == total_tokens` is weaker — it is
+how each adapter assembles the block from an upstream that reports consistently, and it
+is not checked, so a Gemini tool round (see [Tool calling](#tool-calling)) or any
+upstream reporting a total that does not add up breaks it; the block is relayed as it
+came. `cache_creation_tokens` has no OpenAI equivalent — OpenAI does not bill cache
+writes, Anthropic does.
 
 | Provider | What it reports | How it is mapped |
 |---|---|---|

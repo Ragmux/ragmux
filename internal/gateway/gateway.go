@@ -951,13 +951,19 @@ func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars 
 			rec.CompletionTokens, rec.Estimated = compEstimate, true
 		}
 		// The cache split has no characters to estimate from, so an unusable
-		// one simply drops to zero. It does not set Estimated: that flag is
-		// rendered as "~" beside the prompt and completion counts and says
-		// those two are guesses, which would be a lie about numbers the
-		// upstream reported exactly. Zero here only over-states the share
-		// billed at the full input rate, never invents a discount, and the
-		// row shows no cache pill, which is the honest reading of a cache
-		// split that arrived unusable.
+		// one drops to zero. It does not set Estimated: that flag renders as
+		// "~" beside the prompt and completion counts and says those two are
+		// guesses, which would be a lie about numbers the upstream reported
+		// exactly. The row also shows no cache pill, which is the honest
+		// reading of a split that arrived unusable.
+		//
+		// Zero is a defined reading, not a conservative one. CostMicros bills
+		// prompt - cached - written at the input rate, so zeroing moves those
+		// tokens into that share: the estimate lands low wherever cache_write
+		// is dearer than input, which is every Anthropic row in prices.json,
+		// and high wherever cache_read is cheaper, which is every row that
+		// sets one. Either way it stays what cost_micros always is, an
+		// estimate rather than a bill; what it must not be is negative.
 		rec.CachedPromptTokens = nonNegative(rec.CachedPromptTokens)
 		rec.CacheWriteTokens = nonNegative(rec.CacheWriteTokens)
 		return
