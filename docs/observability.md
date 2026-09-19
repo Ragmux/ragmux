@@ -224,10 +224,29 @@ label added to this repository has to pass this list:
       which orphans a series, and a name is user-supplied text.
 - [ ] **Failure reasons are constants from a closed set.** `rerank_failures_total` takes
       `timeout|upstream|parse|unavailable`, never `err.Error()`, which quotes upstream
-      bodies and model replies. `errors_total` takes `provider.Error.Type`.
-      `limits_denied_total` takes the `limits.Reason*` constants.
+      bodies and model replies. `limits_denied_total` takes the `limits.Reason*`
+      constants.
+- [ ] **Values the client or the upstream chooses are mapped onto a closed set plus
+      `other`.** Two labels look bounded and are not, so both go through an explicit
+      allowlist in `internal/obs`:
+    - `method` is whatever token the client wrote on the request line. `GET POST PUT
+      PATCH DELETE HEAD OPTIONS` pass through; every other verb — `PROPFIND`, a
+      lowercase `get`, a per-request UUID — becomes `other`.
+    - `errors_total{type}` is `provider.Error.Type`, which `upstreamError` copies out of
+      the upstream response body. The upstream therefore picks the value, and an
+      upstream that returns an id per response would mint a series per response. Known
+      types (Ragmux's own `upstream_error`, `invalid_request_error`, `timeout`, plus the
+      documented OpenAI and Anthropic vocabularies) pass through; anything else becomes
+      `other`. The error is still counted — only the label is collapsed.
 - [ ] **Never** a label taken from a header, an error message, a filename, a query
       string, a user agent or an IP address.
+
+The same rule binds span attributes, which leave the process for a third-party
+collector: `http.request.method` on `http.server` goes through the same mapping, and
+`ragmux.request_id` is dropped unless it is shaped like a generated id, because chi's
+`middleware.RequestID` echoes the client's `X-Request-Id` header verbatim. A value that
+fails the shape check is dropped whole rather than trimmed — a truncated secret is still
+a secret.
 
 The registry enforces a backstop regardless: at `METRICS_MAX_SERIES` new combinations are
 refused, counted in `ragmux_metrics_series_dropped_total` and logged at **`error`** (at
