@@ -725,6 +725,15 @@ OpenAI equivalent (OpenAI does not bill cache writes, Anthropic does). See
 [Prompt caching](providers.md#prompt-caching) for the per-provider mapping, including
 the accounting change for cached Anthropic requests.
 
+The `usage` block in the response is the **upstream's own**, normalised in shape but not
+in value: it is relayed as it came, so a provider that reports something impossible —
+a negative count, a total that does not add up — reaches you that way. What Ragmux
+records is cleaned: the request log, the budget counters and the cost estimate floor
+every count at zero, and a count that arrived unusable is replaced with a character
+estimate and the row is flagged `estimated`. So a request log row and the `usage` of
+the same request can differ when the upstream misreported. Trust the row for spend, and
+treat a mismatch as a signal about that provider.
+
 Response headers, only for limits the project has set:
 
 | Header | Meaning |

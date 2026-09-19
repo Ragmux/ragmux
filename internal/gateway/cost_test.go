@@ -168,6 +168,44 @@ func TestNegativeUpstreamUsageIsClamped(t *testing.T) {
 	}
 }
 
+// TestBrokenCacheSplitDoesNotFlagTheRowEstimated: the "estimated" flag is
+// rendered as "~" beside the prompt and completion counts, so it must only
+// be set when one of those two was guessed. An unusable cache split floors
+// to zero — which over-states the share billed at the full input rate and
+// never invents a discount — while the two counts the upstream reported
+// exactly keep saying so.
+func TestBrokenCacheSplitDoesNotFlagTheRowEstimated(t *testing.T) {
+	e := newCostEnv(t, "custom_openai", "gpt-4o", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},
+			"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,
+			"prompt_tokens_details":{"cached_tokens":-5,"cache_creation_tokens":-7}}}`))
+	})
+	if _, err := e.st.CreateModelPrice(context.Background(), &store.ModelPrice{ProviderType: "custom_openai",
+		ModelPattern: "gpt-4o*", InputPerMTok: 2.5, OutputPerMTok: 10, Currency: "USD"}); err != nil {
+		t.Fatal(err)
+	}
+	e.prices.Invalidate()
+
+	resp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": userMsg}, e.key)
+	resp.Body.Close()
+
+	rec := e.lastLog()
+	if rec.Estimated {
+		t.Error("a broken cache split marked the prompt and completion counts as estimates")
+	}
+	if rec.PromptTokens != 100 || rec.CompletionTokens != 20 {
+		t.Errorf("the counts the upstream reported exactly were replaced: %+v", rec)
+	}
+	if rec.CachedPromptTokens != 0 || rec.CacheWriteTokens != 0 {
+		t.Errorf("cache split = %d/%d, want both floored", rec.CachedPromptTokens, rec.CacheWriteTokens)
+	}
+	// The whole prompt at the full input rate: 100 x 2.5 + 20 x 10 = 450.
+	if rec.CostMicros != 450 {
+		t.Errorf("cost = %d micros, want 450", rec.CostMicros)
+	}
+}
+
 // TestFullyNegativeUpstreamUsageFallsBackToTheEstimate: a usage block with
 // nothing usable in it is no usage at all, so the row is marked estimated
 // rather than recorded as a request that spent nothing.

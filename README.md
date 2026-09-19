@@ -158,7 +158,11 @@ client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-proj-...")
 resp = client.chat.completions.create(model="default", stream=True,
     messages=[{"role": "user", "content": "How many vacation days do I get?"}])
 for chunk in resp:
-    print(chunk.choices[0].delta.content or "", end="")
+    # Guard the array: an upstream may send a frame of its own with no
+    # choices (a content filter result, a proxy keep-alive), and asking for
+    # usage adds a final chunk that carries only the token counts.
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="")
 ```
 
 ## Dashboard

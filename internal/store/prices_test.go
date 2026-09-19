@@ -264,37 +264,72 @@ func TestSeedNeverRemovesRows(t *testing.T) {
 	}
 }
 
-// TestMigrationRetiredTheCustomOpenAICatchAll: 0015 removes the row on an
-// install that already had it seeded, and leaves one the operator edited.
-func TestMigrationRetiredTheCustomOpenAICatchAll(t *testing.T) {
-	ctx := context.Background()
-	s := testdb.Open(t)
-	// The migration has already run on this fresh schema, so re-run its
-	// statement against rows planted the way an older install holds them.
-	insertPriceRow(t, s, "custom_openai", "*", store.PriceSourceBuiltin, 1)
-	insertPriceRow(t, s, "custom_openai", "mine*", store.PriceSourceUser, 1)
+// runRetirementMigration replays 0015 against the current schema. The
+// migration has already run on a database testdb just opened, so each test
+// plants the rows an older install would be holding and re-executes the
+// statement. Reading the file rather than restating the SQL is the point:
+// editing the migration has to move these tests.
+func runRetirementMigration(t *testing.T, s *store.Store) {
+	t.Helper()
 	// go test runs with the package directory as the working directory, so
 	// this reads the very file that ships in the embedded migration set.
 	sql, err := os.ReadFile(filepath.Join("migrations", "0015_drop_custom_openai_catch_all_price.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.DB().Exec(ctx, string(sql)); err != nil {
+	if _, err := s.DB().Exec(context.Background(), string(sql)); err != nil {
 		t.Fatal(err)
 	}
-	list, err := s.ListModelPrices(ctx)
+}
+
+// priceSources maps "provider/pattern" to the row's source.
+func priceSources(t *testing.T, s *store.Store) map[string]string {
+	t.Helper()
+	list, err := s.ListModelPrices(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	have := map[string]string{}
+	out := map[string]string{}
 	for _, p := range list {
-		have[p.ProviderType+"/"+p.ModelPattern] = p.Source
+		out[p.ProviderType+"/"+p.ModelPattern] = p.Source
 	}
+	return out
+}
+
+// TestMigrationRetiredTheCustomOpenAICatchAll: 0015 removes the seeded row on
+// an install that already had it, and touches no other custom_openai row.
+func TestMigrationRetiredTheCustomOpenAICatchAll(t *testing.T) {
+	s := testdb.Open(t)
+	insertPriceRow(t, s, "custom_openai", "*", store.PriceSourceBuiltin, 1)
+	insertPriceRow(t, s, "custom_openai", "mine*", store.PriceSourceUser, 1)
+	runRetirementMigration(t, s)
+
+	have := priceSources(t, s)
 	if _, ok := have["custom_openai/*"]; ok {
 		t.Error("the seeded custom_openai catch-all survived the migration")
 	}
 	if have["custom_openai/mine*"] != store.PriceSourceUser {
-		t.Error("the migration removed a row the operator owns")
+		t.Error("the migration reached a pattern it was not meant to touch")
+	}
+}
+
+// TestMigrationSparesAnEditedCatchAll is the guard ADR-004 actually asked
+// for, and it needs its own database: (provider_type, model_pattern) is
+// unique, so the operator's catch-all and the seeded one cannot both exist
+// and the test above can only ever plant one of them.
+//
+// An operator who edited the catch-all owns it — PUT flips a built-in row to
+// 'user' — and the price they set must survive the upgrade. Only the
+// `source = 'builtin'` clause protects it here; the `model_pattern = '*'`
+// clause does not, because this row is that pattern. Delete that clause from
+// the migration and this is the test that fails.
+func TestMigrationSparesAnEditedCatchAll(t *testing.T) {
+	s := testdb.Open(t)
+	insertPriceRow(t, s, "custom_openai", "*", store.PriceSourceUser, 1)
+	runRetirementMigration(t, s)
+
+	if have := priceSources(t, s); have["custom_openai/*"] != store.PriceSourceUser {
+		t.Errorf("the migration deleted a catch-all the operator owns: %v", have)
 	}
 }
 

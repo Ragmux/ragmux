@@ -18,7 +18,12 @@ All notable changes to Ragmux are documented here. The format follows
   is limited to that pattern and to rows still marked `builtin` — one you edited is
   `user`, keeps your price and is left alone. Nothing else about the table changes: the
   seed still only inserts and refreshes, and retiring a row stays a numbered migration
-  rather than something an upgrade decides on its own.
+  rather than something an upgrade decides on its own. **Rolling back to 0.4.0 brings
+  the row back for good:** that binary's shipped table still lists it, so its seed
+  re-inserts it, and coming forward again finds `0015` already recorded and does not
+  re-run. Built-in rows cannot be deleted through the API, so the way to correct it is
+  to **edit** it — `PUT /admin/api/prices/{id}` flips a built-in row to `user`, which
+  lets you give the catch-all the real price of the endpoint it covers.
 - **The streaming usage trailer follows `include_usage` on every provider.** The final
   usage-only chunk (`"choices": []` with `usage`) is now sent only to a client that set
   `stream_options: {"include_usage": true}`, the way OpenAI behaves. Previously

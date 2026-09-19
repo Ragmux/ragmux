@@ -950,14 +950,16 @@ func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars 
 		if rec.CompletionTokens < 0 {
 			rec.CompletionTokens, rec.Estimated = compEstimate, true
 		}
-		// The cache split has no character to estimate from: an unusable
-		// one drops to zero, and the row is marked estimated all the same.
-		if rec.CachedPromptTokens < 0 {
-			rec.CachedPromptTokens, rec.Estimated = 0, true
-		}
-		if rec.CacheWriteTokens < 0 {
-			rec.CacheWriteTokens, rec.Estimated = 0, true
-		}
+		// The cache split has no characters to estimate from, so an unusable
+		// one simply drops to zero. It does not set Estimated: that flag is
+		// rendered as "~" beside the prompt and completion counts and says
+		// those two are guesses, which would be a lie about numbers the
+		// upstream reported exactly. Zero here only over-states the share
+		// billed at the full input rate, never invents a discount, and the
+		// row shows no cache pill, which is the honest reading of a cache
+		// split that arrived unusable.
+		rec.CachedPromptTokens = nonNegative(rec.CachedPromptTokens)
+		rec.CacheWriteTokens = nonNegative(rec.CacheWriteTokens)
 		return
 	}
 	rec.Estimated = true
