@@ -583,10 +583,13 @@ function renderLogin() {
 // ordinary authenticated calls to POST /api/models and POST /api/projects,
 // already role-gated and already audited, so the wizard adds no new
 // unauthenticated surface at all.
+// A reload lands here with setupStep back at 0, so the step is picked from the
+// connections the signed-in session can already see. GET /setup no longer
+// answers that question: once the first administrator exists it reports
+// needs_setup and nothing else.
 function renderSetup() {
   if (!state.user) { renderSetupAdmin(); return; }
-  const s = state.setup || {};
-  if (state.setupStep === 3 || (state.setupStep !== 2 && s.has_connections)) renderSetupProject();
+  if (state.setupStep === 3 || (state.setupStep !== 2 && state.models.length)) renderSetupProject();
   else renderSetupModel();
 }
 // setupCard renders one wizard step into the auth screen.
@@ -632,11 +635,11 @@ function renderSetupModel() {
     catch (e) { out.innerHTML = `<div class="note err"><span class="hint">${esc(e.message)}</span></div>`; } finally { btn.disabled = false; } };
   // Skipping without a connection auto-skips step 3 too: a project needs one.
   $('#setupSkipModel').onclick = async () => {
-    if (!state.setup.has_connections) { toast('Add a model connection first — a project needs one. You can do both from the Models tab.', 6000); await finishWizard(); return; }
+    if (!state.models.length) { toast('Add a model connection first — a project needs one. You can do both from the Models tab.', 6000); await finishWizard(); return; }
     state.setupStep = 3; renderSetup(); };
   form.onsubmit = async e => { e.preventDefault(); const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true;
     try { await api('/models', { method: 'POST', body: { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name } });
-      state.models = await api('/models'); state.setup.has_connections = true; state.setupStep = 3; renderSetup(); }
+      state.models = await api('/models'); state.setupStep = 3; renderSetup(); }
     catch (err) { toast(err.message, 6000, 'err'); btn.disabled = false; } };
 }
 // Step 3: a project, which is what mints the first client key.
@@ -1366,8 +1369,10 @@ async function renderAudit() {
 // ---------------------------------------------------------------------------
 (async function init() {
   try { const me = await api('/me'); state.user = me; state.sessionExp = me.session_expires_at || null; } catch (e) { state.user = null; if (e.message !== 'session expired') toast('Could not load session: ' + e.message, 5000, 'err'); }
-  // /setup is unauthenticated and cheap; it is read on every boot because
-  // has_connections / has_projects pick the step a resumed wizard lands on.
+  // /setup is unauthenticated and cheap; it is read on every boot to decide
+  // between the login form and step 1 of the wizard. Once a user exists it
+  // answers needs_setup alone, so the database facts in state.setup are only
+  // ever there while step 1 is the screen that shows them.
   try { const s = await api('/setup'); state.setup = s; state.needsSetup = !state.user && !!s.needs_setup; } catch (e) { state.setup = {}; state.needsSetup = false; }
   if (state.user) { try { await loadAll(); } catch (e) { toast(e.message, 5000, 'err'); } }
   render();
