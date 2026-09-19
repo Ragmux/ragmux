@@ -232,3 +232,170 @@ func TestBudgetForecast(t *testing.T) {
 		t.Errorf("exhausted: %v", got)
 	}
 }
+
+// ---- key sub-limits ----
+
+// keySubject creates a gateway key owned by a fresh user and returns the
+// Subject the gateway would build for it.
+func keySubject(t *testing.T, l *Limiter, p *store.Project, caps Caps) Subject {
+	t.Helper()
+	ctx := context.Background()
+	u, err := l.Store.CreateUser(ctx, "owner", "h", "editor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, _, err := l.Store.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "k", UserID: u.ID,
+		Scopes: store.DefaultGatewayScopes, ProjectIDs: []int64{p.ID},
+		RateLimitRPM: caps.RPM, RateLimitTPM: caps.TPM,
+		BudgetDailyTokens: caps.DailyTokens, BudgetMonthlyTokens: caps.MonthlyTokens})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Subject{Project: p, KeyID: &k.ID, Key: caps}
+}
+
+func mustCheckSubject(t *testing.T, l *Limiter, s Subject, est int) Decision {
+	t.Helper()
+	d, err := l.CheckSubject(context.Background(), s, est)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func mustKey(t *testing.T, l *Limiter, s Subject) *store.APIKey {
+	t.Helper()
+	k, err := l.Store.GetAPIKey(context.Background(), *s.KeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+func TestKeyOnlyLimits(t *testing.T) {
+	l, p, _ := setup(t, store.Project{})
+	ctx := context.Background()
+	s := keySubject(t, l, p, Caps{RPM: 2, DailyTokens: 50})
+
+	for i := 1; i <= 2; i++ {
+		d := mustCheckSubject(t, l, s, 1)
+		if !d.Allowed || d.Reserved || d.LimitRequests != 2 || d.RemainingRequests != 2-i {
+			t.Fatalf("check %d: %+v", i, d)
+		}
+		// The project has no RPM limit, so Reserved stays false even though
+		// the key slot was taken; RecordSubject derives the key tier itself.
+		if err := l.RecordSubject(ctx, s, 10, 2, !d.Reserved); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := mustCheckSubject(t, l, s, 1)
+	if d.Allowed || d.Reason != ReasonRPM || d.Scope != ScopeKey || d.RemainingRequests != 0 {
+		t.Fatalf("third request: %+v", d)
+	}
+	// The rejected key reservation was released: two requests, not three.
+	u, err := l.KeyUsage(ctx, mustKey(t, l, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.APIKeyID != *s.KeyID || u.ProjectID != 0 || u.Minute.Requests != 2 || u.Minute.Tokens != 24 || u.Day.TokenPercent != 48 {
+		t.Fatalf("key usage: %+v %+v", u.Minute, u.Day)
+	}
+	// The project counters ran alongside without a project limit.
+	pu, err := l.Usage(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pu.Minute.Requests != 2 || pu.Minute.RequestLimit != 0 {
+		t.Fatalf("project usage: %+v", pu.Minute)
+	}
+}
+
+func TestKeyAndProjectTiersPickTheTighterBound(t *testing.T) {
+	ctx := context.Background()
+
+	// The key budget is the smaller one: it denies, and the headers describe it.
+	l, p, _ := setup(t, store.Project{BudgetDailyTokens: 1000})
+	s := keySubject(t, l, p, Caps{DailyTokens: 20})
+	if err := l.RecordSubject(ctx, s, 15, 10, true); err != nil {
+		t.Fatal(err)
+	}
+	d := mustCheckSubject(t, l, s, 1)
+	if d.Allowed || d.Scope != ScopeKey || d.Reason != ReasonBudgetDaily || d.DailyLimit != 20 || d.DailyUsed != 25 {
+		t.Fatalf("key budget denies: %+v", d)
+	}
+
+	// The project budget is the smaller one: same request, other scope.
+	l, p, _ = setup(t, store.Project{BudgetDailyTokens: 20})
+	s = keySubject(t, l, p, Caps{DailyTokens: 1000})
+	if err := l.RecordSubject(ctx, s, 15, 10, true); err != nil {
+		t.Fatal(err)
+	}
+	d = mustCheckSubject(t, l, s, 1)
+	if d.Allowed || d.Scope != ScopeProject || d.DailyLimit != 20 || d.DailyUsed != 25 {
+		t.Fatalf("project budget denies: %+v", d)
+	}
+
+	// Both set and neither exhausted: the headers report the tighter tier.
+	l, p, _ = setup(t, store.Project{BudgetMonthlyTokens: 1000, RateLimitRPM: 10})
+	s = keySubject(t, l, p, Caps{MonthlyTokens: 100, RPM: 3})
+	d = mustCheckSubject(t, l, s, 1)
+	if !d.Allowed || d.MonthlyLimit != 100 || d.LimitRequests != 3 || d.RemainingRequests != 2 || !d.Reserved {
+		t.Fatalf("tighter tier in headers: %+v", d)
+	}
+}
+
+// The project slot is taken before the key slot; when the key slot overflows
+// both have to be released or the project leaks a reservation for the minute.
+func TestRPMReservationRollsBackBothTiers(t *testing.T) {
+	l, p, _ := setup(t, store.Project{RateLimitRPM: 10})
+	ctx := context.Background()
+	s := keySubject(t, l, p, Caps{RPM: 1})
+
+	d := mustCheckSubject(t, l, s, 1)
+	if !d.Allowed || !d.Reserved {
+		t.Fatalf("first: %+v", d)
+	}
+	if err := l.RecordSubject(ctx, s, 1, 1, !d.Reserved); err != nil {
+		t.Fatal(err)
+	}
+	d = mustCheckSubject(t, l, s, 1)
+	if d.Allowed || d.Scope != ScopeKey || d.Reason != ReasonRPM || d.Reserved {
+		t.Fatalf("second: %+v", d)
+	}
+	// One request got through, so exactly one slot is held on each tier.
+	pu, err := l.Usage(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ku, err := l.KeyUsage(ctx, mustKey(t, l, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pu.Minute.Requests != 1 || pu.Minute.RequestLimit != 10 || pu.Minute.RequestPercent != 10 {
+		t.Errorf("project leaked a reservation: %+v", pu.Minute)
+	}
+	if ku.Minute.Requests != 1 {
+		t.Errorf("key leaked a reservation: %+v", ku.Minute)
+	}
+}
+
+func TestPurgeUsageCoversBothTiers(t *testing.T) {
+	l, p, c := setup(t, store.Project{})
+	ctx := context.Background()
+	s := keySubject(t, l, p, Caps{})
+	if err := l.RecordSubject(ctx, s, 5, 5, true); err != nil {
+		t.Fatal(err)
+	}
+	c.t = c.t.Add(3 * time.Hour)
+	if err := l.PurgeUsage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.t = c.t.Add(-3 * time.Hour)
+	ku, err := l.KeyUsage(ctx, mustKey(t, l, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ku.Minute.Requests != 0 || ku.Day.Requests != 1 || ku.Month.Tokens != 10 {
+		t.Fatalf("key usage after purge: %+v", ku)
+	}
+}
