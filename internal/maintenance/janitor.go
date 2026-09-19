@@ -21,6 +21,10 @@ const (
 	// LoginAttemptRetention bounds how long login attempts are kept; the
 	// login limiter only looks back minutes, so a day is plenty.
 	LoginAttemptRetention = 24 * time.Hour
+	// APIKeyRetention is how long a revoked or expired api key row is kept
+	// before it is removed. Keys that request logs still attribute spend to
+	// are never removed, whatever their age.
+	APIKeyRetention = 30 * 24 * time.Hour
 	// StartDelay is how long Run waits before its first pass so a freshly
 	// started replica does not compete with its own migration and warm-up.
 	StartDelay = time.Minute
@@ -46,6 +50,8 @@ type Report struct {
 	AuditLogs     int64
 	LoginAttempts int64
 	Sessions      int64
+	// APIKeys counts retired api keys removed in the pass.
+	APIKeys int64
 	// UsagePurged reports whether the usage counter purge ran.
 	UsagePurged bool
 }
@@ -95,6 +101,11 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 		errs = append(errs, fmt.Errorf("sessions: %w", err))
 	}
 	rep.Sessions = n
+	n, err = j.Store.PurgeRetiredAPIKeys(ctx, now.Add(-APIKeyRetention))
+	if err != nil {
+		errs = append(errs, fmt.Errorf("api keys: %w", err))
+	}
+	rep.APIKeys = n
 	if j.Limiter != nil {
 		if err := j.Limiter.PurgeUsage(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("usage counters: %w", err))
@@ -140,5 +151,6 @@ func (j *Janitor) runLogged(ctx context.Context) {
 		j.log().Warn("retention pass failed", "err", err)
 	}
 	j.log().Info("retention pass", "request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
-		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "usage_purged", rep.UsagePurged)
+		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "api_keys", rep.APIKeys,
+		"usage_purged", rep.UsagePurged)
 }
