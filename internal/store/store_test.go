@@ -801,4 +801,46 @@ func TestMetricsIgnoreNegativeRows(t *testing.T) {
 	if len(series) != 1 || series[0].PromptTokens != 10 || series[0].CompletionTokens != 22 || series[0].CostMicros != 1500 {
 		t.Errorf("daily series = %+v", series)
 	}
+
+	// The row surfaces floor the same way. A summary of 22 completion tokens
+	// beside a CSV of -78 for the same window would leave the operator with
+	// no way to tell which figure to believe.
+	recent, err := s.RecentRequests(ctx, store.MetricsFilter{ProjectID: &p.ID}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent) != 2 {
+		t.Fatalf("recent returned %d rows", len(recent))
+	}
+	for _, l := range recent {
+		if l.PromptTokens < 0 || l.CompletionTokens < 0 || l.CachedPromptTokens < 0 ||
+			l.CacheWriteTokens < 0 || l.CostMicros < 0 || l.CostUSD < 0 {
+			t.Errorf("recent row kept a negative figure: %+v", l)
+		}
+	}
+	var exported []*store.RequestExportRow
+	if err := s.ExportRequests(ctx, store.MetricsFilter{ProjectID: &p.ID}, since, func(r *store.RequestExportRow) error {
+		exported = append(exported, r)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(exported) != 2 {
+		t.Fatalf("export returned %d rows", len(exported))
+	}
+	var exportPrompt, exportCompletion int
+	var exportCost int64
+	for _, r := range exported {
+		if r.PromptTokens < 0 || r.CompletionTokens < 0 || r.CostMicros < 0 || r.CostUSD < 0 {
+			t.Errorf("exported row kept a negative figure: %+v", r)
+		}
+		exportPrompt += r.PromptTokens
+		exportCompletion += r.CompletionTokens
+		exportCost += r.CostMicros
+	}
+	// Summing the export reproduces the summary, which is the whole point.
+	if int64(exportPrompt) != m.PromptTokens || int64(exportCompletion) != m.CompletionTokens || exportCost != m.CostMicros {
+		t.Errorf("export sums to %d/%d/%d, summary says %d/%d/%d", exportPrompt, exportCompletion, exportCost,
+			m.PromptTokens, m.CompletionTokens, m.CostMicros)
+	}
 }
