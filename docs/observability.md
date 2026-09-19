@@ -242,11 +242,21 @@ label added to this repository has to pass this list:
       string, a user agent or an IP address.
 
 The same rule binds span attributes, which leave the process for a third-party
-collector: `http.request.method` on `http.server` goes through the same mapping, and
-`ragmux.request_id` is dropped unless it is shaped like a generated id, because chi's
-`middleware.RequestID` echoes the client's `X-Request-Id` header verbatim. A value that
-fails the shape check is dropped whole rather than trimmed — a truncated secret is still
-a secret.
+collector: `http.request.method` on `http.server` goes through the same mapping.
+
+`ragmux.request_id` is generated, never read from the request. Ragmux installs its own
+`obs.RequestID` in place of chi's `middleware.RequestID`, because chi's starts from the
+client's `X-Request-Id` header and only generates an id when it is absent — which would
+put attacker-chosen bytes on a span, in the `X-Request-Id` response header and in the
+request log.
+
+Validating the header instead was tried and does not work, which is worth stating
+plainly: a charset-and-length filter cannot tell a generated id from a credential,
+because they are the same shape. A Ragmux gateway key is `sk-user-` plus 43 characters
+from an unreserved alphabet — 51 bytes that pass any such filter — and so are an AWS
+`AKIA…` key, an OpenAI `sk-` key and every hex or base64url token short enough to fit a
+length cap. The header is therefore not read at all, which makes the guarantee
+structural rather than a question of how good the filter is.
 
 The registry enforces a backstop regardless: at `METRICS_MAX_SERIES` new combinations are
 refused, counted in `ragmux_metrics_series_dropped_total` and logged at **`error`** (at

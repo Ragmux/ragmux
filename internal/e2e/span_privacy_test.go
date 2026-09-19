@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,55 @@ import (
 	"github.com/ragmux/ragmux/internal/testdb"
 	"github.com/ragmux/ragmux/internal/tracing"
 )
+
+// TestRequestIDHeaderNeverReachesASpan is the wired-up half of
+// obs.TestRequestIDIgnoresTheClientHeader: that one proves the middleware
+// generates its own id, this one proves the middleware is the one main.go
+// and this harness actually install, and that the id which lands on the
+// http.server span is therefore not the client's.
+//
+// The secret is shaped exactly like a Ragmux gateway key, which is the value
+// a charset filter could not tell from a generated id.
+func TestRequestIDHeaderNeverReachesASpan(t *testing.T) {
+	secret := "sk-user-" + strings.Repeat("Z", 43)
+
+	col := newCollector(t)
+	tracer := tracing.New(tracing.Config{Endpoint: col.URL, ServiceName: "ragmux-test",
+		SampleRatio: 1, Timeout: 5 * time.Second})
+	e := newEnvOpts(t, testdb.Config(t), envOpts{bootstrap: true, tracer: tracer})
+
+	req, err := http.NewRequest("GET", e.srv.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Request-Id", secret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	echoed := resp.Header.Get("X-Request-Id")
+	resp.Body.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tracer.Shutdown(ctx); err != nil {
+		t.Fatalf("flush spans: %v", err)
+	}
+
+	payload := col.payload()
+	if payload == "" {
+		t.Fatal("the collector received no spans at all; the test proves nothing")
+	}
+	if names := col.spanNames(); names["http.server"] == 0 {
+		t.Fatalf("no http.server span was exported; got %v", names)
+	}
+	if strings.Contains(payload, secret) {
+		t.Error("the client's X-Request-Id reached a span; PRD rule 10 keeps a header off a span")
+	}
+	if echoed == secret {
+		t.Error("the client's X-Request-Id was echoed back in the response header")
+	}
+}
 
 // TestIngestFailureSpanCarriesNoFilename is the failing-ingest half of the
 // tracing rule. TestSpansCarryNoSecrets covers a document that ingests

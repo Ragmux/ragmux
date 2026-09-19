@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ragmux/ragmux/internal/admin"
 	"github.com/ragmux/ragmux/internal/auth"
@@ -192,7 +191,9 @@ func newEnvOpts(t *testing.T, cfg store.OpenConfig, opts envOpts) *env {
 		tune(adm)
 	}
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
+	// The same middleware main.go uses, so the tests exercise the real
+	// request id path rather than chi's header-echoing one.
+	r.Use(obs.RequestID)
 	r.Use(obs.HTTPMetrics(met))
 	r.Use(obs.HTTPTracing(tracer))
 	r.Route("/v1", gw.Routes)

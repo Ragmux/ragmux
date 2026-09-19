@@ -289,7 +289,10 @@ func run(cfg config.Config) error {
 	}
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
+	// obs.RequestID, not middleware.RequestID: chi's starts from the
+	// client's X-Request-Id header, which would put attacker-chosen bytes on
+	// a span exported to a third-party collector.
+	r.Use(obs.RequestID)
 	if cfg.TrustProxyHeaders {
 		r.Use(realIP(cfg.TrustedProxyCIDRs))
 	}

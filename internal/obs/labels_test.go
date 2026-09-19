@@ -1,6 +1,13 @@
 package obs
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5/middleware"
+)
 
 // TestMethodIsBounded: r.Method is whatever the client wrote on the request
 // line. Only the seven verbs this repository serves may become a label
@@ -47,42 +54,61 @@ func TestErrorTypeIsBounded(t *testing.T) {
 	}
 }
 
-// TestSafeRequestIDRejectsClientInput: chi's middleware.RequestID echoes the
-// client's X-Request-Id header verbatim, so GetReqID returns bytes an
-// outsider chose. PRD rule 10 keeps a header off a span, so anything not
-// shaped like a generated id is dropped whole -- a trimmed secret is still a
-// secret.
-func TestSafeRequestIDRejectsClientInput(t *testing.T) {
-	// chi's own shape, and the plain ids a well-behaved proxy sends.
-	for _, id := range []string{
-		"ragmux/server-01/000001",
-		"c7f1a2b3d4e5",
-		"01JD8Q4X9K2M7P.reqid",
-		"YWJjZGVm+/=",
-	} {
-		if got := safeRequestID(id); got != id {
-			t.Errorf("safeRequestID(%q) = %q, want it kept", id, got)
+// TestRequestIDIgnoresTheClientHeader: the request id reaches the
+// ragmux.request_id span attribute, the X-Request-Id response header and the
+// request log, so it may never come from the client.
+//
+// A charset filter was tried first and does not work, which is what this
+// table is really about: every value below is a credential or a token, every
+// one of them is unreserved ASCII of a plausible length, and so is a
+// generated id. Nothing about the shape separates them. The middleware
+// therefore does not read the header at all.
+func TestRequestIDIgnoresTheClientHeader(t *testing.T) {
+	var got []string
+	h := RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, middleware.GetReqID(r.Context()))
+	}))
+
+	sent := []string{
+		// Ragmux's own gateway key: "sk-user-" plus 43 keyAlphabet
+		// characters. It passed the charset filter this replaced.
+		"sk-user-" + strings.Repeat("a", 43),
+		"sk-mgmt-" + strings.Repeat("b", 43),
+		"AKIAIOSFODNN7EXAMPLE",
+		"sk-" + strings.Repeat("c", 48),
+		"ghp_" + strings.Repeat("d", 36),
+		strings.Repeat("0123456789abcdef", 2), // a plain hex token
+		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0",
+		"",                            // no header at all
+		strings.Repeat("x", 1<<16),    // a megabyte-ish header
+		"has spaces and \n newlines ", // the shapes a filter does catch
+	}
+	for _, v := range sent {
+		req := httptest.NewRequest("GET", "/healthz", nil)
+		if v != "" {
+			req.Header.Set("X-Request-Id", v)
 		}
+		h.ServeHTTP(httptest.NewRecorder(), req)
 	}
 
-	long := make([]byte, maxRequestIDLen+1)
-	for i := range long {
-		long[i] = 'a'
+	if len(got) != len(sent) {
+		t.Fatalf("handler ran %d times, want %d", len(got), len(sent))
 	}
-	for name, id := range map[string]string{
-		"empty":            "",
-		"too long":         string(long),
-		"newline":          "abc\ndef",
-		"quote":            `abc"def`,
-		"space":            "abc def",
-		"a parked secret":  "sk-live-51H8xYzAbCdEf GhIj",
-		"non-ascii":        "abcçdef",
-		"control byte":     "abc\x00def",
-		"json fragment":    `{"a":1}`,
-		"an entire header": "Bearer sk-user-0123456789",
-	} {
-		if got := safeRequestID(id); got != "" {
-			t.Errorf("safeRequestID(%s) = %q, want it dropped", name, got)
+	seen := map[string]bool{}
+	for i, id := range got {
+		if id == "" {
+			t.Errorf("request %d got no id; one must always be generated", i)
 		}
+		// The point of the test: nothing the client sent survives.
+		if sent[i] != "" && strings.Contains(id, sent[i]) {
+			t.Errorf("request %d: the client's X-Request-Id reached the id as %q", i, id)
+		}
+		if !strings.HasPrefix(id, requestIDPrefix+"-") {
+			t.Errorf("request %d: id %q is not one this process generated", i, id)
+		}
+		if seen[id] {
+			t.Errorf("request %d: id %q was handed out twice", i, id)
+		}
+		seen[id] = true
 	}
 }
