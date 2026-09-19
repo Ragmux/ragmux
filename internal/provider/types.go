@@ -140,6 +140,25 @@ func (r ChatRequest) MaxOutputTokens() int {
 	return 0
 }
 
+// IncludeUsage reports whether the client asked for the usage-only trailer
+// chunk with stream_options.include_usage. OpenAI sends no such chunk
+// without it, and a client that reaches for chunk.choices[0] on every chunk
+// breaks on one that carries an empty choices array, so the gateway holds
+// the trailer back unless it was asked for. A malformed stream_options is
+// read as "not asked for": the upstream would reject it anyway.
+func (r ChatRequest) IncludeUsage() bool {
+	if len(r.StreamOptions) == 0 {
+		return false
+	}
+	var o struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
+	if json.Unmarshal(r.StreamOptions, &o) != nil {
+		return false
+	}
+	return o.IncludeUsage
+}
+
 // StopSequences normalises the stop field into a slice.
 func (r ChatRequest) StopSequences() []string {
 	if len(r.Stop) == 0 {

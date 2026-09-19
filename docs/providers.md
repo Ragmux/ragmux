@@ -119,6 +119,12 @@ model name), `stream` (set by the gateway) and `stream_options` (set to
 `{"include_usage": true}` on streams so token counts are recorded; removed on
 non-streaming calls). Responses and SSE chunks are relayed in the OpenAI schema.
 
+What the gateway asks the upstream for is not what it passes on: the usage-only trailer
+chunk reaches the client only when the client itself sent
+`stream_options: {"include_usage": true}`. The same rule covers `anthropic`, `gemini`
+and `ollama`, whose adapters all emit that trailer so token counts are recorded — see
+[the streaming contract](api.md#post-v1chatcompletions).
+
 `custom_openai` covers vLLM, LM Studio, LiteLLM, text-generation-inference's OpenAI
 route, Ollama's `/v1` shim and any other server speaking the Chat Completions format.
 

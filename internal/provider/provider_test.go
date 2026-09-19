@@ -37,6 +37,34 @@ func TestChatRequestExtraRoundTrip(t *testing.T) {
 	}
 }
 
+// TestIncludeUsage: the gateway holds the usage-only trailer back unless the
+// client asked for it, so "asked for it" has to be read the way OpenAI reads
+// it — and anything unreadable has to mean no.
+func TestIncludeUsage(t *testing.T) {
+	cases := []struct {
+		streamOptions string
+		want          bool
+	}{
+		{``, false},
+		{`null`, false},
+		{`{}`, false},
+		{`{"include_usage":true}`, true},
+		{`{"include_usage":false}`, false},
+		{`{"include_usage":true,"something_else":1}`, true},
+		// Neither a wrong type nor a broken object is a yes.
+		{`{"include_usage":"yes"}`, false},
+		{`{"include_usage":1}`, false},
+		{`["include_usage"]`, false},
+		{`not json`, false},
+	}
+	for _, c := range cases {
+		r := ChatRequest{StreamOptions: json.RawMessage(c.streamOptions)}
+		if got := r.IncludeUsage(); got != c.want {
+			t.Errorf("IncludeUsage(%q) = %v, want %v", c.streamOptions, got, c.want)
+		}
+	}
+}
+
 func TestTranslateAnthropic(t *testing.T) {
 	var r ChatRequest
 	json.Unmarshal([]byte(`{"model":"x","messages":[

@@ -460,8 +460,11 @@ func TestStreamSuccess(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		t.Fatalf("status %d content-type %q", resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
+	// Two content chunks and [DONE]. The upstream's usage trailer is not
+	// among them: this request did not ask for one, and a client indexing
+	// choices[0] would break on a chunk whose choices array is empty.
 	events := readSSE(t, resp.Body)
-	if len(events) != 4 || events[3] != "[DONE]" {
+	if len(events) != 3 || events[2] != "[DONE]" {
 		t.Fatalf("events = %v", events)
 	}
 	var chunk provider.StreamChunk
@@ -469,9 +472,45 @@ func TestStreamSuccess(t *testing.T) {
 	if chunk.Model != "mock-model" || chunk.Object != "chat.completion.chunk" || *chunk.Choices[0].Delta.Content != "Hel" {
 		t.Errorf("first chunk = %s", events[0])
 	}
+	for _, ev := range events[:2] {
+		var c provider.StreamChunk
+		if err := json.Unmarshal([]byte(ev), &c); err != nil {
+			t.Fatalf("chunk %s: %v", ev, err)
+		}
+		if len(c.Choices) == 0 || c.Usage != nil {
+			t.Errorf("chunk without include_usage = %s", ev)
+		}
+	}
+	// Withholding the chunk does not lose the tokens: they are still what
+	// the request log, the budgets and the cost are built from.
 	rec := e.lastLog()
 	if rec.StatusCode != 200 || !rec.Streamed || rec.PromptTokens != 7 || rec.CompletionTokens != 2 {
 		t.Errorf("log = %+v", rec)
+	}
+}
+
+func TestStreamUsageTrailerOnlyWhenAsked(t *testing.T) {
+	e := newEnv(t, nil)
+	resp := e.post(context.Background(), "/v1/chat/completions", map[string]any{
+		"messages": userMsg, "stream": true,
+		"stream_options": map[string]any{"include_usage": true}}, e.key)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	events := readSSE(t, resp.Body)
+	if len(events) != 4 || events[3] != "[DONE]" {
+		t.Fatalf("events = %v", events)
+	}
+	var trailer provider.StreamChunk
+	if err := json.Unmarshal([]byte(events[2]), &trailer); err != nil {
+		t.Fatalf("trailer %s: %v", events[2], err)
+	}
+	if len(trailer.Choices) != 0 || trailer.Usage == nil {
+		t.Fatalf("trailer = %s", events[2])
+	}
+	if trailer.Usage.PromptTokens != 7 || trailer.Usage.CompletionTokens != 2 || trailer.Model != "mock-model" {
+		t.Errorf("trailer usage = %+v model %q", trailer.Usage, trailer.Model)
 	}
 }
 

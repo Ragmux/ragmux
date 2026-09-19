@@ -518,7 +518,7 @@ discount and change prices without telling the gateway.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 1, "unit": "per_million_tokens"}` |
+| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 2, "unit": "per_million_tokens"}` |
 | POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
 | PUT | `/prices/{id}` | editor | Same body without `provider_type`/`model_pattern` (they are fixed); sets `source: "user"` → `{price}` |
 | DELETE | `/prices/{id}` | editor | `{"ok": true}`; `409 {"code":"builtin_price"}` for a built-in row — reset it instead |
@@ -534,7 +534,7 @@ A row:
 {"id": 4, "provider_type": "anthropic", "model_pattern": "claude-sonnet-4-5*",
  "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_write_per_mtok": 3.75,
  "cache_read_per_mtok": 0.30, "currency": "USD", "source": "builtin",
- "builtin_version": 1, "created_at": "…", "updated_at": "…"}
+ "builtin_version": 2, "created_at": "…", "updated_at": "…"}
 ```
 
 Prices are **per million tokens** and prices are between 0 and 100000. The two cache
@@ -551,6 +551,12 @@ Longest prefix is why `gpt-4o-mini*` beats `gpt-4o*` for `gpt-4o-mini-2024-07-18
 no match the request is logged with `cost_micros: 0` and `cost_source: "none"` — a
 missing price is reported as missing, never guessed.
 
+`source` plays no part in matching. Your own row wins where its pattern is the more
+specific one, and you override a shipped number by **editing that row** (which keeps its
+pattern and flips it to `"user"`) rather than by adding a broader one — a `*` row that
+outranked every built-in pattern would silently re-price every model the shipped table
+already knows.
+
 **Built-in rows and upgrades.** The shipped table is seeded on every start.
 
 - Editing a built-in row flips its `source` to `"user"`, and **upgrades never touch a
@@ -559,8 +565,16 @@ missing price is reported as missing, never guessed.
   **increases**; a release that does not bump it changes nothing.
 - **Built-in rows cannot be deleted**, only edited or reset. That removes the "deleted
   row resurrects on upgrade" problem without a tombstone column to remember it by.
-- `ollama` and `custom_openai` ship a `*` row at 0, so local models never report
-  phantom spend. Add your own row for a paid `custom_openai` endpoint.
+- **A model dropped from the shipped table is retired** on the next start: the seed
+  removes rows that are still `"builtin"` and not newer than the shipped version, so a
+  price that turned out to be wrong does not live on in existing installs. A row you
+  edited is yours and stays.
+- `ollama` ships a `*` row at 0: it runs on your own hardware, so it must never report
+  phantom spend. **`custom_openai` ships no row at all** — it is a URL, and it points at
+  a paid API as readily as at vLLM, so its models are `cost_source: "none"` until you
+  add a price. A catch-all at 0 would report a real bill as `$0.00` with
+  `cost_source: "builtin"`, which reads as a priced zero rather than the missing price
+  it is.
 
 ### Users and audit log
 
@@ -677,6 +691,14 @@ Non-streaming responses are the provider's answer normalised to the OpenAI schem
 (`choices[].message`, `finish_reason`, `usage`). Streaming responses are
 `text/event-stream` with `data: {chunk}` lines and a final `data: [DONE]`; a failure
 after the stream has started is emitted as a `data: {"error": …}` event before `[DONE]`.
+
+Every chunk carries a non-empty `choices` array unless you set
+`stream_options: {"include_usage": true}`, which adds one final usage-only chunk
+(`"choices": []` with `usage`) before `[DONE]`, exactly as OpenAI does. This holds on
+every provider: the gateway always asks its upstream for token counts, because the
+request log, the budgets and the cost are built from them, but it does not pass a
+trailer on to a client that did not ask for one — a client indexing `choices[0]` on
+every chunk would break on it.
 
 Response headers, only for limits that are set on the project or the key. Where both
 tiers have a limit, the header describes whichever has the smaller remaining allowance:
