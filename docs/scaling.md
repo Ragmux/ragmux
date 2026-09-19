@@ -26,6 +26,8 @@ than one replica, and what is deliberately not replicated.
 
 ## What you must set
 
+<a id="secret-key"></a>
+
 ### SECRET_KEY
 
 `SECRET_KEY` is the AES-256 key that encrypts provider credentials at rest. With
