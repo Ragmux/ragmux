@@ -176,7 +176,12 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 func (r *Retriever) embedQuery(ctx context.Context, emb provider.Embedder, providerType, query string) ([][]float32, error) {
 	ctx, span := r.Tracer.Start(ctx, "rag.embed_query", tracing.KindClient)
 	defer span.End()
-	span.SetAttributes(tracing.String("gen_ai.system", providerType))
+	// Guarded: Attr.Value is an any, so providerType is boxed onto the heap
+	// before SetAttributes can discard it. Unguarded that is one allocation
+	// per retrieval even when tracing is off.
+	if span.IsRecording() {
+		span.SetAttributes(tracing.String("gen_ai.system", providerType))
+	}
 	start := time.Now()
 	vecs, err := emb.Embed(ctx, []string{query})
 	r.Metrics.RecordEmbedQuery(providerType, time.Since(start))

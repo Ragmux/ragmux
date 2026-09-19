@@ -272,7 +272,14 @@ func doRequest(ctx context.Context, cfg Config, op, url string, headers map[stri
 		span.End()
 		return nil, span, e
 	}
-	span.SetAttributes(tracing.Int("http.response.status_code", resp.StatusCode))
+	// Guarded: Attr.Value is an any, so the status code is boxed onto the
+	// heap before SetAttributes ever gets the chance to discard it. Unguarded
+	// that is one allocation per upstream call in a deployment with tracing
+	// switched off, which is the default. This is the hottest span site in
+	// the gateway.
+	if span.IsRecording() {
+		span.SetAttributes(tracing.Int("http.response.status_code", resp.StatusCode))
+	}
 	return resp, span, nil
 }
 
