@@ -7,8 +7,8 @@ seriously and fix them quickly. Thank you for helping keep it safe.
 
 | Version | Supported |
 |---|---|
-| 0.3.x | yes |
-| < 0.3 | no, upgrade to the latest 0.3.x |
+| 0.4.x | yes |
+| < 0.4 | no, upgrade to the latest 0.4.x |
 
 Fixes ship as patch releases of the current minor version; older lines do not receive
 backports.
