@@ -110,7 +110,7 @@ The same policy applies to the `POST /admin/api/models/{id}/test` ping.
 Without flags the binary loads the configuration, connects to the database, applies
 pending migrations under an advisory lock (several replicas may start against the same
 database), checks that `SECRET_KEY` is the one the database was written with (see
-[SECRET_KEY](scaling.md#secret-key)), creates the first admin if needed, starts working
+[SECRET_KEY](scaling.md#secret_key)), creates the first admin if needed, starts working
 the document ingestion queue and starts listening.
 
 ## Subcommands
