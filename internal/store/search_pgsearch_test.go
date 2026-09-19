@@ -139,27 +139,22 @@ func TestHybridQueriesShareTheColumnContract(t *testing.T) {
 }
 
 func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
-	t.Setenv("PG_SEARCH_TOKENIZER", "")
-	if got := pgSearchTokenizer(); got != "default" {
+	// The tokenizer is validated by config.Load, which is the only way it
+	// reaches a Store; see TestPgSearchTokenizerRejectsInjection there.
+	s := &Store{}
+	if got := s.pgSearchTokenizer(); got != "default" {
 		t.Errorf("default tokenizer = %q", got)
 	}
-	if ddl := bm25IndexDDL(); !strings.Contains(ddl, `"tokenizer":{"type":"default"}`) ||
+	ddl := s.bm25IndexDDL()
+	if !strings.Contains(ddl, `"tokenizer":{"type":"default"}`) ||
 		!strings.Contains(ddl, "CREATE INDEX IF NOT EXISTS idx_chunks_bm25 ON chunks") ||
 		!strings.Contains(ddl, `key_field = 'id'`) ||
 		!strings.Contains(ddl, `"rag_store_id":{"fast":true}`) {
 		t.Errorf("index DDL:\n%s", ddl)
 	}
-	t.Setenv("PG_SEARCH_TOKENIZER", "en_stem")
-	if !strings.Contains(bm25IndexDDL(), `"type":"en_stem"`) {
-		t.Errorf("tokenizer override ignored:\n%s", bm25IndexDDL())
-	}
-	// The tokenizer is interpolated into DDL, which cannot take a bind
-	// parameter, so anything but a plain identifier falls back to the default.
-	for _, bad := range []string{"default'} , x => '", "DROP TABLE", "en stem", ""} {
-		t.Setenv("PG_SEARCH_TOKENIZER", bad)
-		if got := pgSearchTokenizer(); got != "default" {
-			t.Errorf("tokenizer %q was accepted as %q", bad, got)
-		}
+	stemmed := &Store{pgSearchTok: "en_stem"}
+	if !strings.Contains(stemmed.bm25IndexDDL(), `"type":"en_stem"`) {
+		t.Errorf("tokenizer override ignored:\n%s", stemmed.bm25IndexDDL())
 	}
 }
 

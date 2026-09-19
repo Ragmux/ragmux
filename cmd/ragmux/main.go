@@ -114,6 +114,8 @@ func run(cfg config.Config) error {
 		MaxConns:     cfg.DBMaxConns,
 		SecretKeyHex: cfg.SecretKeyHex,
 		DataDir:      cfg.DataDir,
+
+		PgSearchTokenizer: cfg.PgSearchTokenizer,
 	}, log)
 	if err != nil {
 		return err
@@ -238,7 +240,7 @@ func run(cfg config.Config) error {
 	// same hardened outbound client as every other upstream call.
 	retriever.Rerankers = func(ctx context.Context, rs *store.RAGStore) (rag.Reranker, error) {
 		if rs.RerankBackend == "" || rs.RerankBackend == store.RerankLLM {
-			return &rag.LLMReranker{}, nil
+			return &rag.LLMReranker{Timeout: cfg.RerankTimeout}, nil
 		}
 		if rs.RerankConnectionID == nil {
 			// The connection was deleted (ON DELETE SET NULL). Reranking is
@@ -254,7 +256,7 @@ func run(cfg config.Config) error {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", rag.ErrRerankUnavailable, err)
 		}
-		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client}, nil
+		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client, Timeout: cfg.RerankTimeout}, nil
 	}
 
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",

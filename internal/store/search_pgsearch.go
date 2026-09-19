@@ -3,8 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"os"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -23,12 +21,7 @@ func (pgSearchBackend) Prepare(ctx context.Context, s *Store) error { return s.e
 // bm25Index is the name of the one global BM25 index over chunks.
 const bm25Index = "idx_chunks_bm25"
 
-// pgSearchTokenizerPattern bounds the tokenizer name. It is the only part of
-// the index DDL that comes from the environment, and DDL cannot take bind
-// parameters, so it is matched against this before it is interpolated.
-var pgSearchTokenizerPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
-
-// pgSearchTokenizer reads PG_SEARCH_TOKENIZER.
+// pgSearchTokenizer is the ParadeDB analyser for the BM25 index.
 //
 // The default is ParadeDB's "default" tokenizer: unicode word split plus
 // lowercasing, with no stemming and no stop-word removal. That is the
@@ -38,12 +31,14 @@ var pgSearchTokenizerPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 // quality without changing which words match. Operators who want stemming
 // ("en_stem") opt into it knowingly, for the whole instance: the index is
 // global, so the tokenizer cannot be a per-store setting.
-func pgSearchTokenizer() string {
-	t := strings.TrimSpace(os.Getenv("PG_SEARCH_TOKENIZER"))
-	if t == "" || !pgSearchTokenizerPattern.MatchString(t) {
+//
+// The value is validated by config.Load, which is the only place it enters
+// the process; it is the one part of the index DDL that is interpolated.
+func (s *Store) pgSearchTokenizer() string {
+	if s.pgSearchTok == "" {
 		return "default"
 	}
-	return t
+	return s.pgSearchTok
 }
 
 // bm25IndexDDL builds the CREATE INDEX statement for the global BM25 index.
@@ -54,12 +49,12 @@ func pgSearchTokenizer() string {
 // amplification grow with the store count rather than with the corpus. The
 // store is a fast numeric field inside the one index instead, and every
 // query filters on it with paradedb.term.
-func bm25IndexDDL() string {
+func (s *Store) bm25IndexDDL() string {
 	return fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON chunks
 USING bm25 (id, content, rag_store_id, document_id)
 WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":{"type":"%s"},"record":"position"}}',
       numeric_fields = '{"rag_store_id":{"fast":true},"document_id":{"fast":true}}')`,
-		bm25Index, pgSearchTokenizer())
+		bm25Index, s.pgSearchTokenizer())
 }
 
 // bm25BuildLockWait bounds how long a search waits for another replica's
@@ -110,11 +105,11 @@ func (s *Store) ensureBM25Index(ctx context.Context) error {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	if _, err := s.pool.Exec(ctx, bm25IndexDDL()); err != nil {
+	if _, err := s.pool.Exec(ctx, s.bm25IndexDDL()); err != nil {
 		return fmt.Errorf("create %s: %w", bm25Index, err)
 	}
 	s.bm25Ready.Store(true)
-	s.log.Info("bm25 index ready", "index", bm25Index, "tokenizer", pgSearchTokenizer())
+	s.log.Info("bm25 index ready", "index", bm25Index, "tokenizer", s.pgSearchTokenizer())
 	return nil
 }
 

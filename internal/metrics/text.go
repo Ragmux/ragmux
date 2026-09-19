@@ -217,6 +217,15 @@ func (g *funcGauge) appendTo(b []byte) []byte {
 	return b
 }
 
+func (c *funcCounter) appendTo(b []byte) []byte {
+	b = appendHeader(b, c.name, c.help, "counter")
+	b = append(b, c.name...)
+	b = append(b, ' ')
+	b = strconv.AppendUint(b, c.f(), 10)
+	b = append(b, '\n')
+	return b
+}
+
 func (c *cachedGaugeVec) appendTo(b []byte) []byte {
 	vals := c.load()
 	b = appendHeader(b, c.name, c.help, "gauge")

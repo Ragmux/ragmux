@@ -434,21 +434,16 @@ type TraceCounters interface {
 
 // RegisterTracing exports the exporter's own failure counters, so a
 // collector that is refusing spans is visible in the same scrape as
-// everything else.
-//
-// They are registered as scrape-time gauges because the registry has no
-// counter-valued function collector; the values are monotonic all the same
-// and rate() over them behaves.
+// everything else. The tracer owns the values, so they are read at scrape
+// time rather than incremented here.
 func (m *Metrics) RegisterTracing(tr TraceCounters) {
 	if m == nil || tr == nil {
 		return
 	}
-	m.reg.GaugeFunc("ragmux_tracing_spans_dropped_total",
-		"Spans discarded because the export queue was full.",
-		func() float64 { return float64(tr.Dropped()) })
-	m.reg.GaugeFunc("ragmux_tracing_export_failures_total",
-		"Span export attempts abandoned after their retry.",
-		func() float64 { return float64(tr.ExportFailures()) })
+	m.reg.CounterFunc("ragmux_tracing_spans_dropped_total",
+		"Spans discarded because the export queue was full.", tr.Dropped)
+	m.reg.CounterFunc("ragmux_tracing_export_failures_total",
+		"Span export attempts abandoned after their retry.", tr.ExportFailures)
 }
 
 func boolGauge(b bool) float64 {

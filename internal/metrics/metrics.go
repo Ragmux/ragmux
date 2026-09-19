@@ -356,6 +356,20 @@ func (r *Registry) GaugeFunc(name, help string, f func() float64) {
 	r.register(name, nil, g)
 }
 
+// funcCounter is a counter read at scrape time. It exists for totals owned by
+// another package, which hands out a value rather than a series to increment.
+type funcCounter struct {
+	name, help string
+	f          func() uint64
+}
+
+// CounterFunc registers a counter evaluated at scrape time. f must be cheap,
+// and must be monotonic: exporting a value that can fall as a counter breaks
+// every rate() over it.
+func (r *Registry) CounterFunc(name, help string, f func() uint64) {
+	r.register(name, nil, &funcCounter{name: name, help: help, f: f})
+}
+
 // cachedGaugeVec is a labelled gauge whose values cost a query, refreshed at
 // most once per TTL however often the endpoint is scraped. Without this a
 // scrape storm becomes a query storm.

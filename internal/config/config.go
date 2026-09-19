@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -79,6 +80,13 @@ type Config struct {
 	PrivateUpstreamAllowlist map[string]bool
 	// StreamMaxDuration bounds one streaming provider response end to end.
 	StreamMaxDuration time.Duration
+	// RerankTimeout overrides both reranker timeouts: the LLM backend's
+	// default 10 s (a full chat completion) and an API backend's 5 s (a
+	// single scoring call). Zero keeps each default.
+	RerankTimeout time.Duration
+	// PgSearchTokenizer names the ParadeDB analyser for the BM25 index.
+	// The index is global, so it cannot be a per-store setting.
+	PgSearchTokenizer string
 	// StreamMaxBytes caps the bytes read from one streaming response.
 	StreamMaxBytes int64
 	// ImageFetch lets the gateway download an image_url a chat request
@@ -138,6 +146,11 @@ type Config struct {
 }
 
 // Load reads configuration from the environment, applying defaults.
+// pgSearchTokenizerPattern bounds the tokenizer name. It is the only part of
+// the BM25 index DDL that is not a bind parameter, so it is validated before
+// it can reach a statement.
+var pgSearchTokenizerPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+
 func Load() (Config, error) {
 	dbURL, err := envOrFile("DATABASE_URL")
 	if err != nil {
@@ -148,18 +161,19 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c := Config{
-		DatabaseURL:     dbURL,
-		DBMaxConns:      10,
-		SecretKeyHex:    secretKey,
-		DataDir:         env("DATA_DIR", "/app/data"),
-		Port:            8765,
-		AdminUser:       env("ADMIN_USER", "admin"),
-		AdminPassword:   os.Getenv("ADMIN_PASSWORD"),
-		LogLevel:        env("LOG_LEVEL", "info"),
-		SessionTTL:      24 * time.Hour,
-		UpstreamTimeout: 5 * time.Minute,
-		IngestWorkers:   2,
-		MaxUploadBytes:  50 << 20,
+		PgSearchTokenizer: "default",
+		DatabaseURL:       dbURL,
+		DBMaxConns:        10,
+		SecretKeyHex:      secretKey,
+		DataDir:           env("DATA_DIR", "/app/data"),
+		Port:              8765,
+		AdminUser:         env("ADMIN_USER", "admin"),
+		AdminPassword:     os.Getenv("ADMIN_PASSWORD"),
+		LogLevel:          env("LOG_LEVEL", "info"),
+		SessionTTL:        24 * time.Hour,
+		UpstreamTimeout:   5 * time.Minute,
+		IngestWorkers:     2,
+		MaxUploadBytes:    50 << 20,
 
 		IngestLease:         2 * time.Minute,
 		IngestPollInterval:  5 * time.Second,
@@ -202,6 +216,24 @@ func Load() (Config, error) {
 				c.CORSOrigins = append(c.CORSOrigins, o)
 			}
 		}
+	}
+	if v := os.Getenv("RERANK_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return c, fmt.Errorf("invalid RERANK_TIMEOUT %q: %w", v, err)
+		}
+		if d <= 0 {
+			return c, fmt.Errorf("RERANK_TIMEOUT must be positive, got %q", v)
+		}
+		c.RerankTimeout = d
+	}
+	if v := strings.TrimSpace(os.Getenv("PG_SEARCH_TOKENIZER")); v != "" {
+		// Interpolated into the index DDL, so the shape is checked here
+		// rather than trusted at the point of use.
+		if !pgSearchTokenizerPattern.MatchString(v) {
+			return c, fmt.Errorf("invalid PG_SEARCH_TOKENIZER %q: expected a name like \"default\" or \"en_stem\"", v)
+		}
+		c.PgSearchTokenizer = v
 	}
 	if v := os.Getenv("SESSION_TTL"); v != "" {
 		d, err := time.ParseDuration(v)

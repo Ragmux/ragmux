@@ -98,3 +98,46 @@ func TestLoadImageSettings(t *testing.T) {
 		})
 	}
 }
+
+// The tokenizer is the one part of the BM25 index DDL that is interpolated
+// rather than bound, so a value that is not a plain identifier must be
+// refused at boot. Falling back to the default instead would leave an
+// operator who typed "en-stem" silently running an unstemmed index.
+func TestPgSearchTokenizerRejectsInjection(t *testing.T) {
+	base := func() { t.Setenv("DATABASE_URL", "postgres://x/y"); t.Setenv("SECRET_KEY", strings.Repeat("a", 64)) }
+	for _, bad := range []string{"default'} , x => '", "DROP TABLE", "en stem", "en-stem", "En_Stem", "1stem"} {
+		base()
+		t.Setenv("PG_SEARCH_TOKENIZER", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("PG_SEARCH_TOKENIZER %q was accepted", bad)
+		}
+	}
+	base()
+	t.Setenv("PG_SEARCH_TOKENIZER", "en_stem")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("en_stem rejected: %v", err)
+	}
+	if c.PgSearchTokenizer != "en_stem" {
+		t.Errorf("tokenizer = %q", c.PgSearchTokenizer)
+	}
+}
+
+func TestRerankTimeoutMustParse(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x/y")
+	t.Setenv("SECRET_KEY", strings.Repeat("a", 64))
+	for _, bad := range []string{"5", "-1s", "soon"} {
+		t.Setenv("RERANK_TIMEOUT", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("RERANK_TIMEOUT %q was accepted", bad)
+		}
+	}
+	t.Setenv("RERANK_TIMEOUT", "8s")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("8s rejected: %v", err)
+	}
+	if c.RerankTimeout != 8*time.Second {
+		t.Errorf("timeout = %v", c.RerankTimeout)
+	}
+}

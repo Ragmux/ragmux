@@ -51,6 +51,9 @@ type OpenConfig struct {
 	SecretKeyHex string
 	// DataDir is only used for the secret.key fallback.
 	DataDir string
+	// PgSearchTokenizer names the ParadeDB analyser for the BM25 index;
+	// empty selects "default". config.Load validates it.
+	PgSearchTokenizer string
 }
 
 // Store wraps the connection pool and the credential cipher.
@@ -66,6 +69,8 @@ type Store struct {
 	vecTables sync.Map
 	// caps are the optional server features detected once at Open.
 	caps Capabilities
+	// pgSearchTok is the analyser the BM25 index is built with.
+	pgSearchTok string
 	// bm25Ready remembers that the ParadeDB index has been created.
 	bm25Ready atomic.Bool
 }
@@ -128,7 +133,7 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	s := &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log, caps: caps}
+	s := &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log, caps: caps, pgSearchTok: cfg.PgSearchTokenizer}
 	// Before any stored credential is read (UpgradeConnectionKeys is the
 	// first caller and would fail with a raw decrypt error): prove this
 	// process holds the key the database was written with.

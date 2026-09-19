@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -51,31 +50,23 @@ var ErrRerankUnavailable = errors.New("reranker not configured")
 // a model that answered with prose, without matching on error strings.
 var errRerankParse = errors.New("unreadable ranking")
 
-// Rerank timeouts. The LLM path keeps its original 10 s: it is a full chat
-// completion over a prompt that can run to tens of thousands of characters.
-// A rerank API answers a single scoring call and gets 5 s. RERANK_TIMEOUT
-// overrides both.
+// Rerank timeouts, used when the caller sets none. The LLM path keeps its
+// original 10 s: it is a full chat completion over a prompt that can run to
+// tens of thousands of characters. A rerank API answers a single scoring
+// call and gets 5 s. RERANK_TIMEOUT overrides both, and is read once by
+// config.Load rather than here, so a malformed value fails at boot instead
+// of silently leaving the default in place.
 const (
 	llmRerankTimeout = 10 * time.Second
 	apiRerankTimeout = 5 * time.Second
 )
-
-// rerankTimeout applies the RERANK_TIMEOUT override to a backend default.
-func rerankTimeout(def time.Duration) time.Duration {
-	if v := strings.TrimSpace(os.Getenv("RERANK_TIMEOUT")); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			return d
-		}
-	}
-	return def
-}
 
 // LLMReranker reorders retrieval candidates with a chat model. The model
 // sees the numbered passages and returns the relevant ones ordered by
 // relevance; anything it omits is appended in the original order so nothing
 // is lost.
 type LLMReranker struct {
-	// Timeout bounds the model call (default 10 s, or RERANK_TIMEOUT).
+	// Timeout bounds the model call; zero selects llmRerankTimeout.
 	Timeout time.Duration
 }
 
@@ -100,7 +91,7 @@ func (rr *LLMReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 	}
 	timeout := rr.Timeout
 	if timeout <= 0 {
-		timeout = rerankTimeout(llmRerankTimeout)
+		timeout = llmRerankTimeout
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -148,7 +139,7 @@ type APIReranker struct {
 	// Client is the provider adapter built from the store's rerank
 	// connection; it already carries the hardened outbound HTTP client.
 	Client provider.Reranker
-	// Timeout bounds the call (default 5 s, or RERANK_TIMEOUT).
+	// Timeout bounds the call; zero selects apiRerankTimeout.
 	Timeout time.Duration
 }
 
@@ -167,7 +158,7 @@ func (rr *APIReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 	}
 	timeout := rr.Timeout
 	if timeout <= 0 {
-		timeout = rerankTimeout(apiRerankTimeout)
+		timeout = apiRerankTimeout
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

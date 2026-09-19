@@ -296,3 +296,17 @@ var errFake = fakeErr{}
 type fakeErr struct{}
 
 func (fakeErr) Error() string { return "boom" }
+
+func TestCounterFuncIsTypedAsACounter(t *testing.T) {
+	// A _total exported with "# TYPE ... gauge" is a lint failure and misleads
+	// anything that reads the type line to decide whether rate() applies.
+	r := New(Options{})
+	r.CounterFunc("ragmux_tracing_spans_dropped_total", "Dropped spans.", func() uint64 { return 9 })
+	got := r.Text()
+	if !strings.Contains(got, "# TYPE ragmux_tracing_spans_dropped_total counter") {
+		t.Errorf("not typed as a counter:\n%s", got)
+	}
+	if !strings.Contains(got, "ragmux_tracing_spans_dropped_total 9") {
+		t.Errorf("value missing:\n%s", got)
+	}
+}
