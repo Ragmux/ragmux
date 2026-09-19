@@ -16,6 +16,8 @@ func New(cfg Config) (Provider, error) {
 		return newAnthropic(cfg), nil
 	case "gemini":
 		return newGemini(cfg), nil
+	case "cohere_rerank", "voyage_rerank":
+		return nil, fmt.Errorf("%s connections only offer a rerank API; they cannot back a project's chat model", cfg.ProviderType)
 	}
 	return nil, fmt.Errorf("unsupported provider type %q", cfg.ProviderType)
 }
@@ -40,6 +42,8 @@ func NewEmbedder(cfg Config) (Embedder, error) {
 		return &geminiEmbedder{cfg: cfg, base: cfg.baseURL(geminiBase)}, nil
 	case "anthropic":
 		return nil, fmt.Errorf("anthropic does not offer an embeddings API; choose another connection for embeddings")
+	case "cohere_rerank", "voyage_rerank":
+		return nil, fmt.Errorf("%s connections only offer a rerank API; choose another connection for embeddings", cfg.ProviderType)
 	}
 	return nil, fmt.Errorf("unsupported provider type %q", cfg.ProviderType)
 }

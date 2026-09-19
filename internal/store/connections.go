@@ -39,7 +39,16 @@ type ModelConnection struct {
 const MaxTestError = 512
 
 // ValidProviderTypes lists the supported provider identifiers.
-var ValidProviderTypes = []string{"openai", "anthropic", "gemini", "deepseek", "ollama", "custom_openai"}
+//
+// cohere_rerank and voyage_rerank can neither chat nor embed; they exist as
+// connection types so a rerank API's credentials get the same treatment as
+// every other one: AES-256-GCM at rest with the connection id as additional
+// authenticated data, key_version rotation through `ragmux rotate-key`,
+// MaskKey in the API, the netguard check on save and an audit trail. A
+// separate credential path would have to re-implement all of that, and
+// rotate-key would skip it in silence.
+var ValidProviderTypes = []string{"openai", "anthropic", "gemini", "deepseek", "ollama", "custom_openai",
+	"cohere_rerank", "voyage_rerank"}
 
 // IsValidProviderType checks membership in ValidProviderTypes.
 func IsValidProviderType(t string) bool {

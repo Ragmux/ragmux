@@ -175,19 +175,33 @@ func TestPrivateUpstreamFlag(t *testing.T) {
 func TestProviderTypeCapabilities(t *testing.T) {
 	e := newEnv(t, testdb.Config(t))
 	list := e.call("GET", "/admin/api/provider-types", nil, "")["_list"].([]any)
-	// Every adapter now translates tools, Gemini included.
+	// Every chat adapter now translates tools, Gemini included.
 	wantTools := map[string]bool{"openai": true, "anthropic": true, "gemini": true, "deepseek": true, "ollama": true, "custom_openai": true}
 	// Gemini sends a function call whole inside one chunk rather than as
 	// argument deltas, which is the one capability that separates it here.
 	wantToolStreaming := map[string]bool{"openai": true, "anthropic": true, "gemini": false, "deepseek": true, "ollama": false, "custom_openai": true}
+	// The rerank-only types sit outside those tables: they neither chat nor
+	// embed, so the dashboard's chat and embedding pickers must skip them.
+	wantRerankOnly := map[string]bool{"cohere_rerank": true, "voyage_rerank": true}
 	seen := 0
 	for _, it := range list {
 		m := it.(map[string]any)
 		typ := m["type"].(string)
+		if wantRerankOnly[typ] {
+			caps, _ := m["capabilities"].(map[string]any)
+			if caps == nil || caps["rerank"] != true || caps["chat"] != false ||
+				caps["embeddings"] != false || m["supports_embeddings"] != false {
+				t.Errorf("%s should be rerank-only: %v", typ, m)
+			}
+			continue
+		}
 		want, ok := wantTools[typ]
 		if !ok {
 			t.Errorf("unexpected type %q", typ)
 			continue
+		}
+		if caps, _ := m["capabilities"].(map[string]any); caps != nil && caps["chat"] != true {
+			t.Errorf("%s: chat capability = %v, want true", typ, caps["chat"])
 		}
 		seen++
 		if m["supports_tools"] != want || m["supports_streaming"] != true {
