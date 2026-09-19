@@ -198,3 +198,99 @@ func TestPriceCacheServesEditsAfterInvalidate(t *testing.T) {
 		t.Errorf("after invalidate = %+v, want the edited user price", p)
 	}
 }
+
+// insertPriceRow writes a row straight into the table, the way an older
+// release's seed would have left it.
+func insertPriceRow(t *testing.T, s *store.Store, providerType, pattern, source string, version int) {
+	t.Helper()
+	_, err := s.DB().Exec(context.Background(), `INSERT INTO model_prices
+		(provider_type, model_pattern, input_per_mtok, output_per_mtok, currency, source, builtin_version)
+		VALUES ($1, $2, 1, 2, 'USD', $3, $4)`, providerType, pattern, source, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSeedRetiresRowsDroppedFromTheShippedTable covers the other half of the
+// upgrade contract. Dropping an entry from prices.json has to reach existing
+// installs: the custom_openai catch-all priced a paid endpoint at $0.00 with
+// cost_source "builtin", and leaving it seeded forever would mean the fix
+// only ever helped fresh installs. An operator who made the row theirs keeps
+// it, and a newer table's rows survive an older binary.
+func TestSeedRetiresRowsDroppedFromTheShippedTable(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	version, err := pricing.BuiltinVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shipped, err := pricing.Builtin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Three rows the shipped table does not list.
+	insertPriceRow(t, s, "custom_openai", "*", store.PriceSourceBuiltin, version-1)
+	insertPriceRow(t, s, "openai", "retired-by-the-operator*", store.PriceSourceUser, version-1)
+	insertPriceRow(t, s, "openai", "from-a-newer-release*", store.PriceSourceBuiltin, version+1)
+
+	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListModelPrices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := map[string]bool{}
+	for _, p := range list {
+		have[p.ProviderType+"/"+p.ModelPattern] = true
+	}
+	if have["custom_openai/*"] {
+		t.Error("a builtin row the shipped table dropped survived the seed")
+	}
+	if !have["openai/retired-by-the-operator*"] {
+		t.Error("the seed retired a row an operator owns")
+	}
+	if !have["openai/from-a-newer-release*"] {
+		t.Error("an older binary retired a row a newer table seeded")
+	}
+	for _, r := range shipped {
+		if !have[r.ProviderType+"/"+r.Pattern] {
+			t.Errorf("shipped row %s/%s went missing", r.ProviderType, r.Pattern)
+		}
+	}
+	if len(list) != len(shipped)+2 {
+		t.Errorf("table has %d rows, want the %d shipped plus the two kept", len(list), len(shipped))
+	}
+}
+
+// TestNoPriceForAPaidCustomOpenAI is what the dropped catch-all was hiding:
+// custom_openai points at vLLM as readily as at a paid API, so an unpriced
+// model must be reported as unpriced rather than billed at zero.
+func TestNoPriceForAPaidCustomOpenAI(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	cache := pricing.NewCache(s.DB(), quietLog())
+	if p, ok := cache.Lookup(ctx, "custom_openai", "deepseek-ai/DeepSeek-V3"); ok {
+		t.Errorf("custom_openai priced out of the box: %+v", p)
+	}
+	// Ollama keeps its free catch-all: it runs on the operator's hardware.
+	if p, ok := cache.Lookup(ctx, "ollama", "llama3.1:8b"); !ok || p.Input != 0 || p.Output != 0 {
+		t.Errorf("ollama lookup = %+v (ok=%v), want a free catch-all", p, ok)
+	}
+	// An operator pointing custom_openai at a paid API adds their own row.
+	if _, err := s.CreateModelPrice(ctx, &store.ModelPrice{ProviderType: "custom_openai",
+		ModelPattern: "deepseek-ai/DeepSeek-V3*", InputPerMTok: 0.27, OutputPerMTok: 1.1, Currency: "USD"}); err != nil {
+		t.Fatal(err)
+	}
+	cache.Invalidate()
+	if p, ok := cache.Lookup(ctx, "custom_openai", "deepseek-ai/DeepSeek-V3"); !ok || p.Input != 0.27 || p.Source != pricing.SourceUser {
+		t.Errorf("after adding a row: %+v (ok=%v)", p, ok)
+	}
+}
