@@ -6,195 +6,6 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
-- **`IMAGE_FETCH_MAX_CONCURRENT`** (default `16`): image fetches the process runs at once,
-  and the image transport's per-host connection ceiling. `IMAGE_FETCH_MAX_PER_REQUEST`
-  bounds one request and nothing across them, so without this a key holder could aim the
-  gateway's own address at a host of their choosing. While another project is queueing, no
-  single one **takes** more than half the slots, so a tenant pointed at a slow image host
-  cannot starve the rest. Takes, not holds: a slot already taken is not reclaimed, so a
-  tenant can still be above half while those downloads finish. With nobody else waiting,
-  one project reaches the full value.
-- **`IMAGE_CACHE_MAX_MB`**: byte ceiling for the fetched-image cache. Unset, it follows
-  `IMAGE_FETCH_MAX_MB` — 64 MiB, or enough for two images of the largest size accepted,
-  capped at 256 MiB. A value too small to hold one encoded image is refused at startup,
-  and a derived ceiling that ends up below one is warned about, because such a cache
-  silently stores nothing.
-
-### Changed
-- **The request id is generated, never taken from `X-Request-Id`.** Ragmux previously used
-  chi's `middleware.RequestID`, which starts from the client's `X-Request-Id` header and
-  only generates an id when it is absent. That id reaches the `ragmux.request_id` span
-  attribute exported to your collector, the `X-Request-Id` response header and the request
-  log, so a client chose all three. Filtering the header by shape was considered and does
-  not work: a Ragmux gateway key, an AWS key and a bare hex token are the same shape as a
-  generated id, so the header is no longer read at all.
-  **If a proxy in front of Ragmux generates `X-Request-Id` and you correlate on it**, that
-  correlation stops here: Ragmux now answers with its own id. Configure the proxy to emit
-  `traceparent` and set `TRACING_TRUST_INCOMING=true` to join the two sides **in your
-  tracing backend** — see [the trust gate](docs/observability.md#the-trust-gate) for what
-  that opens up. Note this recovers trace correlation, not log correlation: Ragmux log
-  lines carry `req_id`, not a trace id, so a proxy log line and a Ragmux log line still
-  cannot be matched on a shared field. Proxies that mint `X-Request-Id` (nginx
-  `$request_id`, HAProxy `unique-id`) do not emit `traceparent` on their own.
-- The `method` label on `ragmux_http_requests_total` and
-  `ragmux_http_request_duration_seconds`, and the `type` label on
-  `ragmux_gateway_errors_total`, are now drawn from a closed set; unrecognised values are
-  counted under `other`. Both were bounded by traffic rather than by the size of the
-  installation — an invented HTTP verb or an upstream returning a fresh error type per
-  response minted a series per request. Metric names, label names and buckets are
-  unchanged, so existing dashboards keep working.
-- `ragmux_tracing_spans_dropped_total` now also counts spans that end after the exporter
-  has stopped, which previously vanished silently. The count is logged at shutdown as well.
-
-- **`custom_openai` ships without a price row.** The built-in table used to price every
-  `custom_openai` model at 0, which reported a paid endpoint's real bill as `$0.00` with
-  `cost_source: "builtin"` — a priced zero rather than the missing price it is. Those
-  models are now `cost_source: "none"` until you add a row (**Prices** tab, or
-  `POST /admin/api/prices`), and the shipped table's `version` moved to `2`. `ollama`
-  keeps its free catch-all: it runs on your own hardware. **On upgrade**, migration
-  `0015` deletes that one seeded row, so a `custom_openai` connection that was showing
-  `$0.00` starts showing no cost at all; add your own row to keep a figure. The delete
-  is limited to that pattern and to rows still marked `builtin` — one you edited is
-  `user`, keeps your price and is left alone. Nothing else about the table changes: the
-  seed still only inserts and refreshes, and retiring a row stays a numbered migration
-  rather than something an upgrade decides on its own. **Rolling back to 0.4.0 brings
-  the row back for good:** that binary's shipped table still lists it, so its seed
-  re-inserts it, and coming forward again finds `0015` already recorded and does not
-  re-run. Built-in rows cannot be deleted through the API, so the way to correct it is
-  to **edit** it — `PUT /admin/api/prices/{id}` flips a built-in row to `user`, which
-  lets you give the catch-all the real price of the endpoint it covers.
-- **The streaming usage trailer follows `include_usage` on every provider.** The final
-  usage-only chunk (`"choices": []` with `usage`) is now sent only to a client that set
-  `stream_options: {"include_usage": true}`, the way OpenAI behaves. Previously
-  `anthropic`, `gemini` and `ollama` always sent it, and the OpenAI-compatible path
-  relayed the one it requests upstream, so clients that index `chunk.choices[0]` on every
-  chunk could break. **If you read token counts off a stream, set `include_usage`**; the
-  request log, budgets and cost estimate are unaffected either way, because the gateway
-  still asks its upstream for the counts.
-- **`METRICS_ENABLED` rejects values that are neither `true` nor `false`.** It was
-  compared against `"true"` and everything else silently meant off, so `METRICS_ENABLED=1`
-  or `=yes` started a gateway whose `/metrics` answered `404` and was discovered from a
-  scrape target that never came up. `TRACING_ENABLED` already refused what it did not
-  understand; metrics now match it. **Upgrade note:** an installation setting anything but
-  `true`, `false` or nothing will fail to start until the value is corrected — the error
-  names the variable and the two values it accepts. Metrics were already off in every such
-  installation, so fixing the value is a no-op unless `true` was what was meant.
-- **Inline `data:` images are validated** before anything is sent upstream, for the
-  `gemini`, `anthropic` and `ollama` connections. The URL must carry `;base64`, its media
-  type must be one the connection's upstream accepts, and the payload must decode as
-  standard base64 (padding included) and not be empty. Each failure is the gateway's own
-  `400` naming what is wrong; these used to travel to the provider and come back as an
-  upstream `400` that named nothing. The OpenAI-compatible types relay the body verbatim,
-  as before, so their images are still read by the upstream.
-- **Image media types are per connection.** `gemini` accepts png, jpeg, webp, **heic** and
-  **heif**; `anthropic` and `ollama` accept png, jpeg, gif and webp. One shared list was
-  wrong in both directions.
-- **A saturated image fetch queue answers `429`** with `Retry-After` and
-  `code: "image_fetch_saturated"`, rather than holding the request for the whole fetch
-  timeout. Queueing now has its own budget, so a wait is never charged to the image host
-  as a download timeout. `Retry-After` names `IMAGE_FETCH_TIMEOUT`, because a slot frees
-  when a download finishes.
-- **A redirect that drops from `https` to `http` is refused**, on the same host as well as
-  across hosts: same host is not the same connection, and the retry would put the
-  `Authorization` header on the wire in the clear.
-- **Gemini tool schemas are validated, not just filtered.** A keyword is kept only with
-  the type Gemini's `Schema` declares for it, so `{"type":"integer","enum":[1,2,3]}`,
-  `{"description":{...}}` and an out-of-range bound lose that keyword instead of
-  travelling to a rejection. `$ref` is matched on its full JSON Pointer, so two
-  same-named definitions no longer collide and an external reference resolves to none of
-  them; the same schema now sanitises to the same bytes every time. A malformed `required`
-  and an `anyOf`/`oneOf` that nothing survived in are now named in the per-tool `debug`
-  line rather than vanishing from it.
-- **Gemini's count bounds are held to `int64`.** `minItems`, `maxItems`, `minLength` and
-  `maxLength` are `int64` in Gemini's `Schema`, not doubles, so a fractional, negative or
-  oversized one (`{"minItems":1.5}`, `{"maxLength":1e30}`) is now dropped instead of
-  travelling to an `Invalid value at 'min_items'`.
-- **An `enum` on an `anyOf` node is dropped rather than typing the node.** A union is
-  typed by its branches, and `{"anyOf":[…],"enum":["a"]}` used to come out carrying
-  `"type":"string"` as well, contradicting every branch.
-- **A Gemini tool schema node with no `type` is given one**, inferred from the keywords
-  that survived, because Gemini rejects an untyped node and took the whole tool down with
-  it. The inference is lossy — a node carrying only `minimum`/`maximum` becomes `number`,
-  so a field meant as an integer can come back fractional — so give a `type` to anything
-  whose shape matters. `required` from an `allOf` is merged as a set rather than
-  concatenated, which also changes the list a tool sees.
-- **An inline `data:` URL is recognised whatever the case of its scheme.** `DATA:image/png`
-  used to be treated as a remote URL and skip every check.
-
-### Fixed
-- A document whose file type is unsupported no longer quotes the rejected extension into
-  its error, which put a piece of a user-supplied filename on the `ingest.document` span.
-- The Go runtime gauges shared one `runtime/metrics` sample buffer across every gauge and
-  every concurrent scrape, so two overlapping scrapes could race and report one another's
-  numbers.
-- Step 3 of the first-run wizard no longer offers a project form it cannot submit. The
-  model-connection picker is built from what the dashboard loaded at boot, so a reload
-  where that call failed drew an empty picker and a submit that posted a null connection
-  id and came back a validation error nobody could act on. The step now says the
-  connections could not be loaded, keeps the submit disabled, and offers a retry.
-- **`PG_SEARCH_TOKENIZER` stemming works.** `en_stem` — the only stemming value the
-  documentation named — is not a tokenizer *type* `pg_search` 0.25 knows, so it rejected
-  the BM25 index DDL and every rag store set to the `pg_search` backend fell back to
-  `pgvector` for the life of the process: retrieval kept answering, BM25 never ran.
-  Stemming now reaches `pg_search` as the `default` tokenizer carrying a Snowball
-  stemmer, spelled `<iso-639-1>_stem` for twenty languages
-  (`ar cs da de el en es fi fr hu it nl no pl pt ro ru sv ta tr`); a code outside that
-  set is refused at startup instead of degrading silently. Pointing the setting somewhere
-  new on an installation that already has the index still keeps the old analyser — the
-  DDL is `CREATE INDEX IF NOT EXISTS` — but that is reported as a mismatch naming both
-  the analyser the index carries and the one the configuration asks for, and `bm25 index
-  ready` now logs the analyser queries actually use rather than the configured one.
-
-### Upgrade notes
-- **An installation running `PG_SEARCH_TOKENIZER=<code>_stem` never built its BM25
-  index.** After this fix the first hybrid search of a `pg_search` store builds it, over
-  every row in `chunks`, inside that HTTP request. The build takes a `SHARE` lock, so
-  ingest writes to `chunks` block until it finishes, and it is not `CONCURRENTLY`: if the
-  client gives up, the build is rolled back and the next request starts over. On a large
-  corpus that is minutes. Build it ahead of the upgrade instead, without blocking writes:
-
-  ```sql
-  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_bm25 ON chunks
-  USING bm25 (id, content, rag_store_id, document_id)
-  WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":{"type":"default","stemmer":"English"},"record":"position"}}',
-        numeric_fields = '{"rag_store_id":{"fast":true},"document_id":{"fast":true}}');
-  ```
-
-  Substitute the Snowball language for the code you run (`cs` → `Czech`, `tr` → `Turkish`,
-  …), or `{"type":"default"}` with no `stemmer` for the default analyser. Installations on
-  the default tokenizer already have the index and are unaffected.
-
-  `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so send it on its own
-  — not through `psql -1`, and not from a migration tool that wraps each step in one.
-
-  **Copy the statement exactly.** The gateway only ever checks the analyser: it compares
-  `text_fields.content.tokenizer` against `PG_SEARCH_TOKENIZER` and warns when they differ.
-  Nothing compares `key_field` or `numeric_fields`, so an index built here without
-  `numeric_fields` is accepted in silence, answers queries, and keeps `rag_store_id` off
-  the fast-field path for good — `CREATE INDEX IF NOT EXISTS` will never replace it. The
-  check is deliberately that narrow: it exists to explain a setting that looks applied and
-  is not, and comparing whole reloptions would warn on cosmetic JSON differences a future
-  ParadeDB might render. Verify instead, and drop and rebuild if it does not match:
-
-  ```sql
-  SELECT unnest(reloptions) FROM pg_class WHERE relname = 'idx_chunks_bm25';
-  ```
-- **A dump from a ParadeDB server needs a TOC filter to restore onto a plain pgvector
-  one.** Dropping `idx_chunks_bm25` first is not enough; see
-  [Backup and restore](docs/backup-restore.md#restoring-a-paradedb-dump-onto-a-plain-pgvector-server).
-
-### Security
-- `GET /admin/api/setup` stops describing the installation once setup is done. The
-  endpoint is unauthenticated by design, and it used to answer in full whether or not
-  setup was still pending, handing an anonymous request the migrations version, the
-  PostgreSQL role, where `SECRET_KEY` came from and — since the wizard landed —
-  `has_connections` and `has_projects`. No one field is an opening; together they are a
-  free reconnaissance call on an internet-facing install. **Once any user exists the
-  response is `{"needs_setup": false}` and nothing else.** While setup is still pending
-  nothing changes: the wizard's first screen gets everything it shows. The dashboard now
-  resumes a reloaded wizard from its own stored step instead of from this endpoint.
-
 ## [0.4.0] — 2026-09-19
 
 ### Added
@@ -251,6 +62,17 @@ All notable changes to Ragmux are documented here. The format follows
   their own rates. Editing a shipped row makes it yours and upgrades never overwrite it
   again. Summaries, the daily series, the by-project table and the CSV export all carry
   the figure. **It is an estimate, not a bill.**
+- **`custom_openai` ships without a price row.** It is a URL, and it points at a paid API
+  as readily as at a local vLLM, so its models report `cost_source: "none"` until you add a
+  row (**Prices** tab, or `POST /admin/api/prices`). A catch-all at 0 would report a real
+  bill as `$0.00` with `cost_source: "builtin"` — a priced zero reads as authoritative
+  where a missing price reads as missing. `ollama` keeps its free catch-all: it runs on
+  your own hardware. The shipped table drops the row as of `version` 2, so a fresh install
+  never gets it; migration `0015` deletes it from a database seeded by a pre-release build
+  off the `v0.4` branch, limited to that pattern and to rows still marked `builtin`, so a
+  row an operator edited is `user`, keeps its price and is left alone. The seed itself
+  still only inserts and refreshes — retiring a row stays a numbered migration rather than
+  something an upgrade decides on its own.
 - **A ParadeDB search backend**: a RAG store can set `search_backend: "pg_search"` and get
   real BM25 ranking for the lexical half of a hybrid search instead of Postgres full-text
   ranking, fused with the vector half by the same reciprocal-rank formula. Switching
@@ -258,6 +80,16 @@ All notable changes to Ragmux are documented here. The format follows
   the index is built lazily on first use. A server without the extension falls back to the
   existing backend with a warning rather than failing. Ships as
   `docker-compose.paradedb.yml` and a `:<version>-paradedb` image.
+- **`PG_SEARCH_TOKENIZER`**: the analyser for that BM25 index, instance-wide because the
+  index is global. `default` splits on unicode word boundaries and lowercases, matching the
+  tsvector backend, so a store can move between the two without changing which words match.
+  `<iso-639-1>_stem` adds a Snowball stemmer for twenty languages
+  (`ar cs da de el en es fi fr hu it nl no pl pt ro ru sv ta tr`); a code outside that set
+  is refused at startup rather than leaving the store on the `pgvector` fallback at
+  runtime. Pointing the setting somewhere new once the index exists keeps the old analyser
+  — the DDL is `CREATE INDEX IF NOT EXISTS` — but that is reported as a mismatch naming
+  both the analyser the index carries and the one the configuration asks for, and `bm25
+  index ready` logs the analyser queries actually use rather than the configured one.
 - **Cohere and Voyage rerankers**: `rerank_backend` selects the existing LLM reranker,
   `cohere` or `voyage`. Their credentials live in a `model_connections` row like every
   other provider secret, so they are encrypted at rest and covered by `ragmux rotate-key`.
@@ -295,6 +127,23 @@ All notable changes to Ragmux are documented here. The format follows
 - `GET /admin/api/search-backends` reports which backends this server can actually run.
   `/admin/api/provider-types` now carries a full `capabilities` object taken from the
   provider package, so it cannot drift from what the adapters do.
+- **`IMAGE_FETCH_MAX_CONCURRENT`** (default `16`): image fetches the process runs at once,
+  and the image transport's per-host connection ceiling. `IMAGE_FETCH_MAX_PER_REQUEST`
+  bounds one request and nothing across them, so without this a key holder could aim the
+  gateway's own address at a host of their choosing. While another project is queueing, no
+  single one **takes** more than half the slots, so a tenant pointed at a slow image host
+  cannot starve the rest. Takes, not holds: a slot already taken is not reclaimed, so a
+  tenant can still be above half while those downloads finish. With nobody else waiting,
+  one project reaches the full value. A fetch that cannot get a slot answers `429` with
+  `Retry-After` and `code: "image_fetch_saturated"` instead of holding the request:
+  queueing has its own budget, so a wait is never charged to the image host as a download
+  timeout, and `Retry-After` names `IMAGE_FETCH_TIMEOUT`, because a slot frees when a
+  download finishes.
+- **`IMAGE_CACHE_MAX_MB`**: byte ceiling for the fetched-image cache. Unset, it follows
+  `IMAGE_FETCH_MAX_MB` — 64 MiB, or enough for two images of the largest size accepted,
+  capped at 256 MiB. A value too small to hold one encoded image is refused at startup,
+  and a derived ceiling that ends up below one is warned about, because such a cache
+  silently stores nothing.
 
 ### Changed
 - **A wrong `SECRET_KEY` is now a boot failure rather than a per-request error.** The
@@ -323,12 +172,53 @@ All notable changes to Ragmux are documented here. The format follows
 - Content parts without a `type` are treated as text on every provider, matching OpenAI.
 - `Ingester.Resume` is gone. Unfinished work is found by the lease-based claim on every
   poll, on every replica, so there is nothing left to resume at start.
+- **The request id is generated, never taken from `X-Request-Id`.** Ragmux previously used
+  chi's `middleware.RequestID`, which starts from the client's `X-Request-Id` header and
+  only generates an id when it is absent. That id reaches the `ragmux.request_id` span
+  attribute exported to your collector, the `X-Request-Id` response header and the request
+  log, so a client chose all three. Filtering the header by shape was considered and does
+  not work: a Ragmux gateway key, an AWS key and a bare hex token are the same shape as a
+  generated id, so the header is no longer read at all.
+  **If a proxy in front of Ragmux generates `X-Request-Id` and you correlate on it**, that
+  correlation stops here: Ragmux now answers with its own id. Configure the proxy to emit
+  `traceparent` and set `TRACING_TRUST_INCOMING=true` to join the two sides **in your
+  tracing backend** — see [the trust gate](docs/observability.md#the-trust-gate) for what
+  that opens up. Note this recovers trace correlation, not log correlation: Ragmux log
+  lines carry `req_id`, not a trace id, so a proxy log line and a Ragmux log line still
+  cannot be matched on a shared field. Proxies that mint `X-Request-Id` (nginx
+  `$request_id`, HAProxy `unique-id`) do not emit `traceparent` on their own.
+- **The streaming usage trailer follows `include_usage` on every provider.** The final
+  usage-only chunk (`"choices": []` with `usage`) is now sent only to a client that set
+  `stream_options: {"include_usage": true}`, the way OpenAI behaves. Previously
+  `anthropic`, `gemini` and `ollama` always sent it, and the OpenAI-compatible path
+  relayed the one it requests upstream, so clients that index `chunk.choices[0]` on every
+  chunk could break. **If you read token counts off a stream, set `include_usage`**; the
+  request log, budgets and cost estimate are unaffected either way, because the gateway
+  still asks its upstream for the counts.
+- **Inline `data:` images are validated** before anything is sent upstream, for the
+  `gemini`, `anthropic` and `ollama` connections. The URL must carry `;base64`, its media
+  type must be one the connection's upstream accepts, and the payload must decode as
+  standard base64 (padding included) and not be empty. Each failure is the gateway's own
+  `400` naming what is wrong; these used to travel to the provider and come back as an
+  upstream `400` that named nothing. The OpenAI-compatible types relay the body verbatim,
+  as before, so their images are still read by the upstream.
+- **Image media types are per connection.** `gemini` accepts png, jpeg, webp, **heic** and
+  **heif**; `anthropic` and `ollama` accept png, jpeg, gif and webp.
+- **A redirect that drops from `https` to `http` is refused**, on the same host as well as
+  across hosts: same host is not the same connection, and the retry would put the
+  `Authorization` header on the wire in the clear.
+- **An inline `data:` URL is recognised whatever the case of its scheme.** `DATA:image/png`
+  used to be forwarded as a remote URL.
 
 ### Fixed
 - Ollama tool calls spread over several streaming lines were all given index `0` and
   merged by clients into one corrupt call; they are now numbered across the whole stream.
 - Browser clients could not read `x-ratelimit-*`, `x-ragmux-*` or `Retry-After`: the
   responses never carried `Access-Control-Expose-Headers`.
+- A document whose file type is unsupported no longer has the rejected extension quoted
+  into its error; the message names the supported types instead, so a piece of a
+  user-supplied filename no longer travels into the error or onto the `ingest.document`
+  span.
 
 ### Security
 - A management key is accepted **only** from the `Authorization` header. One pasted into
@@ -342,6 +232,53 @@ All notable changes to Ragmux are documented here. The format follows
 - An expired, revoked or deactivated-owner key answers `401` with a `code` explaining
   which; an unknown key keeps the previous opaque message, so nothing can be enumerated by
   a caller who does not already hold a valid key.
+- `GET /admin/api/setup` stops describing the installation once setup is done. The
+  endpoint is unauthenticated by design, and it used to answer in full whether or not
+  setup was still pending, handing an anonymous request the migrations version, the
+  PostgreSQL role, where `SECRET_KEY` came from and — since the wizard landed —
+  `has_connections` and `has_projects`. No one field is an opening; together they are a
+  free reconnaissance call on an internet-facing install. **Once any user exists the
+  response is `{"needs_setup": false}` and nothing else.** While setup is still pending
+  nothing changes: the wizard's first screen gets everything it shows. The dashboard now
+  resumes a reloaded wizard from its own stored step instead of from this endpoint.
+
+### Upgrade notes
+- **Moving an existing store to `search_backend: "pg_search"` builds the BM25 index inside
+  a request.** The first hybrid search of such a store indexes every row in `chunks` before
+  it answers. The build takes a `SHARE` lock, so ingest writes to `chunks` block until it
+  finishes, and it is not `CONCURRENTLY`: if the client gives up, the build is rolled back
+  and the next request starts over. On a corpus carried over from 0.3.x that is minutes.
+  Build it ahead of the switch instead, without blocking writes:
+
+  ```sql
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_bm25 ON chunks
+  USING bm25 (id, content, rag_store_id, document_id)
+  WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":{"type":"default","stemmer":"English"},"record":"position"}}',
+        numeric_fields = '{"rag_store_id":{"fast":true},"document_id":{"fast":true}}');
+  ```
+
+  Substitute the Snowball language for the code you run (`cs` → `Czech`, `tr` → `Turkish`,
+  …), or `{"type":"default"}` with no `stemmer` for the default analyser — whichever
+  matches `PG_SEARCH_TOKENIZER`.
+
+  `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so send it on its own
+  — not through `psql -1`, and not from a migration tool that wraps each step in one.
+
+  **Copy the statement exactly.** The gateway only ever checks the analyser: it compares
+  `text_fields.content.tokenizer` against `PG_SEARCH_TOKENIZER` and warns when they differ.
+  Nothing compares `key_field` or `numeric_fields`, so an index built here without
+  `numeric_fields` is accepted in silence, answers queries, and keeps `rag_store_id` off
+  the fast-field path for good — `CREATE INDEX IF NOT EXISTS` will never replace it. The
+  check is deliberately that narrow: it exists to explain a setting that looks applied and
+  is not, and comparing whole reloptions would warn on cosmetic JSON differences a future
+  ParadeDB might render. Verify instead, and drop and rebuild if it does not match:
+
+  ```sql
+  SELECT unnest(reloptions) FROM pg_class WHERE relname = 'idx_chunks_bm25';
+  ```
+- **A dump from a ParadeDB server needs a TOC filter to restore onto a plain pgvector
+  one.** Dropping `idx_chunks_bm25` first is not enough; see
+  [Backup and restore](docs/backup-restore.md#restoring-a-paradedb-dump-onto-a-plain-pgvector-server).
 
 ## [0.3.1] — 2026-09-18
 
@@ -702,7 +639,8 @@ Initial release: single-container gateway with SQLite + sqlite-vec, OpenAI-compa
 for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over PDF/TXT/MD,
 projects with `sk-proj-` keys, metrics and an embedded dashboard.
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ragmux/ragmux/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ragmux/ragmux/releases/tag/v0.3.1
 [0.3.0]: https://github.com/ragmux/ragmux/releases/tag/v0.3.0
 [0.2.3]: https://github.com/ragmux/ragmux/releases/tag/v0.2.3
