@@ -91,6 +91,60 @@ pending migrations under an advisory lock (several replicas may start against th
 database), creates the first admin if needed, resumes unfinished document ingestion and
 starts listening.
 
+## Subcommands
+
+Both open the database directly and need `DATABASE_URL` plus the current `SECRET_KEY`
+(or `SECRET_KEY_FILE` / the `secret.key` fallback); neither needs a running gateway.
+
+| Subcommand | Purpose |
+|---|---|
+| `ragmux rotate-key --new <hex>` | Re-encrypt the stored provider credentials with a new `SECRET_KEY`. Stop the gateway first; see [Rotating SECRET_KEY](backup-restore.md#rotating-secret_key). |
+| `ragmux reset-password <username> …` | Set a dashboard password from the command line, for when every administrator is locked out. |
+
+### reset-password
+
+```
+ragmux reset-password <username> [--generate|--stdin] [--force] [--no-revoke] [--revoke-keys]
+```
+
+| Flag | Effect |
+|---|---|
+| `--generate` | Generate a 24-character password and print it after the reset. |
+| `--stdin` | Read the new password from the first line of standard input. |
+| `--force` | Skip the confirmation prompt. |
+| `--no-revoke` | Keep the user's dashboard sessions; by default they are all revoked. |
+| `--revoke-keys` | Also set `revoked_at` on every API key the account owns. |
+
+Exactly one of `--generate` and `--stdin` is required. There is deliberately **no
+`--password` flag and no interactive prompt**: a flag value lands in `ps` output and the
+shell history, and a no-echo prompt would need `golang.org/x/term`, which is not a
+dependency of this project and is not worth adding for one emergency command. The
+minimum length is 12 characters (the first-run setup's floor, not the dashboard's 8 — an
+emergency admin reset should not create a weak credential) and the maximum is bcrypt's
+72 bytes.
+
+```bash
+# print a fresh password
+DATABASE_URL=… SECRET_KEY=… ragmux reset-password admin --generate
+# or pipe one in, without a confirmation prompt
+printf '%s\n' "$NEW_PASSWORD" | ragmux reset-password admin --stdin
+# in the all-in-one container
+docker compose run --rm ragmux reset-password admin --generate
+```
+
+An unknown username exits `1` with a clear message; the command **never creates an
+account**, so a typo cannot quietly add an administrator. Usernames are matched
+case-insensitively. A deactivated account is reported as such: the password is set but
+the user still cannot sign in until an admin reactivates it. When standard input is a
+terminal and neither `--stdin` nor `--force` is given, the reset is confirmed
+interactively first.
+
+This grants no new privilege. Anyone holding `DATABASE_URL` and `SECRET_KEY` can already
+rewrite any row, provider credentials included; the subcommand only makes the recovery
+path an obvious, audited one instead of hand-written SQL. The run is recorded in the
+audit log as the actor `cli` with a null `actor_user_id` and `details` carrying `via`,
+`host`, `os_user`, `revoked_sessions` and `revoked_keys`.
+
 ## Fixed server limits
 
 These are not configurable:
@@ -295,7 +349,12 @@ From v0.3.1 on both are signed with cosign; see
 - **CORS.** If browsers call the API from another origin, set `CORS_ORIGINS`; the
   gateway answers preflight `OPTIONS` requests itself with
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS` and
-  `Access-Control-Allow-Headers: Authorization, Content-Type`.
+  `Access-Control-Allow-Headers: Authorization, Content-Type, X-Ragmux-Project`. The
+  rate-limit, budget, RAG and `Retry-After` headers are listed in
+  `Access-Control-Expose-Headers`, without which browser JavaScript cannot read any of
+  them. With `CORS_ORIGINS` empty (the default) no preflight is ever answered, which is
+  also what keeps a management key in an `Authorization` header unforgeable from a
+  foreign page.
 
 ## Database privileges
 

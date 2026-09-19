@@ -270,6 +270,7 @@ td.json{font-family:var(--mono);font-size:11.5px;color:var(--tx2);max-width:360p
       <button class="nav-item" data-tab="models" title="Models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg><span class="nav-text">Models</span><span class="nav-badge" data-badge="models"></span></button>
       <button class="nav-item" data-tab="rag" title="RAG stores"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nav-text">RAG stores</span><span class="nav-badge" data-badge="rag"></span></button>
       <button class="nav-item" data-tab="projects" title="Projects"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.9 12.1 20 3M15 8l2 2M18 5l2 2"/></svg><span class="nav-text">Projects</span><span class="nav-badge" data-badge="projects"></span></button>
+      <button class="nav-item" data-tab="keys" title="API keys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v4M15 12v3"/></svg><span class="nav-text">API keys</span><span class="nav-badge" data-badge="keys"></span></button>
       <button class="nav-item" data-tab="playground" title="Playground"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12 15h5"/></svg><span class="nav-text">Playground</span></button>
       <div class="nav-label" data-role="admin">Administer</div>
       <button class="nav-item" data-tab="users" data-role="admin" title="Users"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><circle cx="17" cy="9" r="2.5"/><path d="M16 14.5c3 0 5.5 2 5.5 5.5"/></svg><span class="nav-text">Users</span><span class="nav-badge" data-badge="users"></span></button>
@@ -335,9 +336,20 @@ const ICON = {
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12m0 0 4-4m-4 4-4-4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>',
 };
 
-const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], users: [], system: null, sessionExp: null,
+const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], users: [], keys: [], system: null, sessionExp: null,
   overview: { window: '24h' }, openStore: null, openProject: null, users_filter: { q: '', role: 'all' },
+  keys_filter: { q: '', kind: 'all', mine: true }, setupStep: 0,
   playground: { key: '', system: '', stream: true, sources: true, msgs: [], last: null } };
+// The first-run wizard spans three screens and one of them creates the
+// session, so "am I mid-wizard?" has to survive a reload. sessionStorage
+// keeps it to the tab that started it: an established install where someone
+// deleted every project never falls back into the wizard.
+const WIZARD_KEY = 'ragmux_wizard';
+const wizard = {
+  get active() { try { return sessionStorage.getItem(WIZARD_KEY) === '1'; } catch (e) { return false; } },
+  start() { try { sessionStorage.setItem(WIZARD_KEY, '1'); } catch (e) { /* private mode: the wizard just does not resume */ } },
+  done() { try { sessionStorage.removeItem(WIZARD_KEY); } catch (e) { /* nothing to clean up */ } },
+};
 const ROLE_RANK = { viewer: 1, editor: 2, admin: 3 };
 // can('editor') is true for editors and admins; the API enforces the same matrix.
 const can = role => !!state.user && (ROLE_RANK[state.user.role] || 0) >= (ROLE_RANK[role] || 99);
@@ -415,6 +427,7 @@ function bindStrength(inputEl, id, min) {
 }
 const formData = form => { const d = Object.fromEntries(new FormData(form).entries()); for (const cb of $$('input[type=checkbox]', form)) d[cb.name] = cb.checked; return d; };
 const checkedValues = (form, name) => $$(`input[name="${name}"]:checked`, form).map(i => Number(i.value));
+const checkedStrings = (form, name) => $$(`input[name="${name}"]:checked`, form).map(i => i.value);
 
 // ---------------------------------------------------------------------------
 // drawer (forms) and modal (confirm / key reveal)
@@ -461,10 +474,12 @@ document.addEventListener('keydown', e => { if (e.key !== 'Escape') return; cons
 // ---------------------------------------------------------------------------
 // shell: sidebar, session, health line
 // ---------------------------------------------------------------------------
-function signedOut() { state.user = null; state.sessionExp = null; closeDrawer(); render(); }
+function signedOut() { state.user = null; state.sessionExp = null; wizard.done(); closeDrawer(); render(); }
 function render() {
   const shell = $('#shell'), auth = $('#auth');
   if (!state.user) { shell.classList.add('hidden'); auth.classList.remove('hidden'); if (state.needsSetup) renderSetup(); else renderLogin(); return; }
+  // Steps 2 and 3 of the wizard are signed in but still on the setup card.
+  if (wizard.active) { shell.classList.add('hidden'); auth.classList.remove('hidden'); renderSetup(); return; }
   auth.classList.add('hidden'); shell.classList.remove('hidden');
   $('#meName').textContent = state.user.username;
   $('#meAvatar').outerHTML = avatar(state.user.username).replace('class="avatar "', 'class="avatar" id="meAvatar"');
@@ -472,13 +487,13 @@ function render() {
   $$('[data-role]', $('#nav')).forEach(el => el.classList.toggle('hidden', !can(el.dataset.role)));
   $$('.nav-item').forEach(b => { const active = b.dataset.tab === state.tab; b.classList.toggle('active', active); if (active) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
   updateBadges();
-  const tabs = { overview: renderOverview, models: renderModels, rag: renderRAG, projects: renderProjects, playground: renderPlayground, users: renderUsers, audit: renderAudit };
+  const tabs = { overview: renderOverview, models: renderModels, rag: renderRAG, projects: renderProjects, keys: renderKeys, playground: renderPlayground, users: renderUsers, audit: renderAudit };
   if (!tabs[state.tab] || ($('.nav-item[data-tab=' + state.tab + ']').dataset.role && !can('admin'))) state.tab = 'overview';
   clearTimeout(pollTimer); clearInterval(ringTimer);
   tabs[state.tab]();
 }
 function updateBadges() {
-  const b = { models: state.models.length, rag: state.rag.length, projects: state.projects.length, users: state.users.length && can('admin') ? state.users.length : '' };
+  const b = { models: state.models.length, rag: state.rag.length, projects: state.projects.length, keys: state.keys.length, users: state.users.length && can('admin') ? state.users.length : '' };
   for (const [k, v] of Object.entries(b)) { const el = $(`[data-badge=${k}]`); if (el) el.textContent = v ? String(v) : ''; }
 }
 function updateSession() {
@@ -546,13 +561,88 @@ function renderLogin() {
       else note.innerHTML = `<div class="note err"><span class="hint">${esc(errMsg(r.data, r.statusText))}</span></div>`;
     } catch (err) { toast(err.message, 4000, 'err'); } finally { btn.disabled = false; } };
 }
-// Shown instead of the login form while the users table is empty (GET /setup
-// says needs_setup). The server refuses once any user exists, so a stale page
-// cannot create a second administrator.
+// The three-step first-run wizard. Only step 1 is unauthenticated: it posts
+// /setup exactly as before and gets the session cookie. Steps 2 and 3 are
+// ordinary authenticated calls to POST /api/models and POST /api/projects,
+// already role-gated and already audited, so the wizard adds no new
+// unauthenticated surface at all.
 function renderSetup() {
+  if (!state.user) { renderSetupAdmin(); return; }
+  const s = state.setup || {};
+  if (state.setupStep === 3 || (state.setupStep !== 2 && s.has_connections)) renderSetupProject();
+  else renderSetupModel();
+}
+// setupCard renders one wizard step into the auth screen.
+function setupCard(step, id, title, lede, body, submitLabel, extra = '') {
+  $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="${id}">
+    <div><div class="eyebrow">First run · step ${step} of 3</div><h2>${esc(title)}</h2><p class="lede" style="font-size:13.5px">${lede}</p></div>
+    ${body}
+    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">${esc(submitLabel)}</button>
+    ${extra}</form></section>`;
+  heroVersion();
+}
+// finishWizard leaves the setup screens for the dashboard.
+async function finishWizard() {
+  wizard.done(); state.setupStep = 0;
+  try { await loadAll(); } catch (e) { toast(e.message, 4000, 'err'); }
+  state.tab = 'overview'; render();
+}
+// Step 2: a model connection, created through the ordinary editor endpoint.
+function renderSetupModel() {
+  const types = state.providerTypes.map(t => ({ value: t.type, label: t.label }));
+  setupCard(2, 'setupModelForm', 'Connect a model',
+    'Ragmux proxies to your provider with a credential sealed in the database. You can add more connections later under <strong>Models</strong>.', `
+    ${field('name', 'Name', input('name', 'default', 'required placeholder="e.g. openai-gpt4o"'))}
+    ${field('provider_type', 'Provider', select('provider_type', types, 'openai'))}
+    ${field('model_name', 'Model', input('model_name', '', 'required placeholder="gpt-4o, claude-sonnet-4-5, qwen2.5:7b …"'))}
+    ${field('api_key', 'API key', input('api_key', '', 'type=password autocomplete=off'), 'Encrypted at rest and bound to this connection; never returned by the API.')}
+    ${field('base_url', 'Base URL (optional)', input('base_url', '', 'placeholder="https://…"'), '<span id="setupUrlHint">Blank uses the provider default.</span>')}
+    <div id="setupTestOut"></div>`,
+    'Save connection & continue',
+    `<div class="row" style="gap:10px"><button type="button" class="btn grow" id="setupTest" style="justify-content:center">Test connection</button><button type="button" class="btn ghost grow" id="setupSkipModel" style="justify-content:center">Skip for now</button></div>`);
+  const form = $('#setupModelForm');
+  const hint = () => { const t = ptype($('[name=provider_type]', form).value);
+    $('#setupUrlHint').textContent = `Default: ${t.default_base_url || 'none'}${t.type === 'custom_openai' ? ' — required for custom_openai.' : '.'}`;
+    $('[name=base_url]', form).placeholder = t.default_base_url || 'https://…'; };
+  $('[name=provider_type]', form).onchange = hint; hint();
+  $('#setupTest').onclick = async () => {
+    const d = formData(form); const btn = $('#setupTest'); btn.disabled = true; const out = $('#setupTestOut');
+    out.innerHTML = '<div class="note"><span class="hint">Testing…</span></div>';
+    try { const r = await api('/models/test', { method: 'POST', body: { provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name, mode: 'chat' } });
+      out.innerHTML = `<div class="note ${r.ok ? 'ok' : 'err'}"><span class="pill ${r.ok ? 'ok' : 'err'}">${r.ok ? 'ok' : 'failed'} · ${fmtN(r.latency_ms)} ms</span><span class="hint" style="white-space:pre-wrap">${esc(r.ok ? (r.reply ? 'reply: ' + r.reply : 'reachable') : r.error)}</span></div>`; }
+    catch (e) { out.innerHTML = `<div class="note err"><span class="hint">${esc(e.message)}</span></div>`; } finally { btn.disabled = false; } };
+  // Skipping without a connection auto-skips step 3 too: a project needs one.
+  $('#setupSkipModel').onclick = async () => {
+    if (!state.setup.has_connections) { toast('Add a model connection first — a project needs one. You can do both from the Models tab.', 6000); await finishWizard(); return; }
+    state.setupStep = 3; renderSetup(); };
+  form.onsubmit = async e => { e.preventDefault(); const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true;
+    try { await api('/models', { method: 'POST', body: { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name } });
+      state.models = await api('/models'); state.setup.has_connections = true; state.setupStep = 3; renderSetup(); }
+    catch (err) { toast(err.message, 6000, 'err'); btn.disabled = false; } };
+}
+// Step 3: a project, which is what mints the first client key.
+function renderSetupProject() {
+  const models = state.models.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` }));
+  setupCard(3, 'setupProjectForm', 'Create your first project',
+    'A project ties a client key to a model connection and, later, a RAG store. Its key is shown once — this is the credential your applications use.', `
+    ${field('name', 'Project name', input('name', 'default', 'required'))}
+    ${field('model_connection_id', 'Model connection', select('model_connection_id', models, models.length ? models[0].value : undefined))}
+    ${field('system_prompt', 'System prompt (optional)', textarea('system_prompt', '', 'placeholder="You are the company support assistant."'), 'Prepended to every request this project proxies.')}`,
+    'Create project & finish',
+    `<button type="button" class="btn ghost" id="setupSkipProject" style="justify-content:center">Skip for now</button>`);
+  $('#setupSkipProject').onclick = finishWizard;
+  $('#setupProjectForm').onsubmit = async e => { e.preventDefault(); const d = formData(e.target); const btn = $('button[type=submit]', e.target); btn.disabled = true;
+    try { const r = await api('/projects', { method: 'POST', body: { name: d.name, model_connection_id: Number(d.model_connection_id), system_prompt: d.system_prompt } });
+      showKey(r.project, r.api_key); await finishWizard(); }
+    catch (err) { toast(err.message, 6000, 'err'); btn.disabled = false; } };
+}
+// Step 1, shown instead of the login form while the users table is empty (GET
+// /setup says needs_setup). The server refuses once any user exists, so a
+// stale page cannot create a second administrator.
+function renderSetupAdmin() {
   const s = state.setup || {};
   $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="setupForm">
-    <div><div class="eyebrow">First run · step 1 of 1</div><h2>Create the first administrator</h2><p class="lede" style="font-size:13.5px">No users exist yet. This form works only once and is rate limited per address; afterwards sign in normally.</p></div>
+    <div><div class="eyebrow">First run · step 1 of 3</div><h2>Create the first administrator</h2><p class="lede" style="font-size:13.5px">No users exist yet. This form works only once and is rate limited per address; afterwards sign in normally.</p></div>
     ${field('username', 'Username', input('username', '', 'required autocomplete=username autocapitalize=none spellcheck=false pattern="[a-z0-9._-]{3,64}" title="3-64 characters: a-z, 0-9, . _ -"'), '3–64 characters: lowercase letters, digits, dot, dash, underscore.')}
     ${field('password', 'Password', input('password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('spw'))}
     ${field('confirm', 'Confirm password', input('confirm', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'))}
@@ -560,14 +650,17 @@ function renderSetup() {
       ${s.migrations_version != null ? `<div class="row" style="gap:8px"><span class="dot"></span><span class="dim">PostgreSQL connected · migrations ${esc(s.migrations_version)}${s.database_role ? ` · role ${esc(s.database_role)}` : ''}</span></div>` : ''}
       ${s.secret_key_source ? `<div class="row" style="gap:8px"><span class="dot"></span><span class="dim">SECRET_KEY from ${s.secret_key_source === 'env' ? 'environment' : esc(s.secret_key_source)}</span></div>` : ''}
     </div>
-    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Create administrator &amp; sign in</button>
+    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Create administrator &amp; continue</button>
     <div class="hint" style="text-align:center">Prefer automation? Set <code>ADMIN_USER</code> and <code>ADMIN_PASSWORD</code> before first start instead.</div></form></section>`;
   heroVersion();
   bindStrength($('[name=password]', $('#setupForm')), 'spw', 12);
   $('#setupForm').onsubmit = async e => { e.preventDefault(); const d = formData(e.target);
     if (d.password !== d.confirm) { toast('Passwords do not match', 3500, 'err'); return; }
     const btn = $('button', e.target); btn.disabled = true;
-    try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } }); state.needsSetup = false; state.user = r.user; await afterSignIn(); }
+    try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } });
+      // needsSetup drops before anything else can fail, so a reload can
+      // never land back on step 1 with the account already created.
+      state.needsSetup = false; state.user = r.user; wizard.start(); state.setupStep = 2; await afterSignIn(); }
     catch (err) { toast(err.message, 5000, 'err'); if (/already completed/.test(err.message)) { state.needsSetup = false; render(); } }
     finally { btn.disabled = false; } };
 }
@@ -859,15 +952,26 @@ function membersForm(p) {
   drawer({ eyebrow: 'Members', title: p.name, submitLabel: 'Save members', body: `${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p.member_ids || [])}<p class="hint">Members see the project, its metrics and usage; editors among them can change it. An editor cannot remove themselves.</p>`,
     onSubmit: async (d, form) => { await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: checkedValues(form, 'members') } }); toast('Members saved', 3000, 'ok'); await loadAll(); render(); } });
 }
-function showKey(p, key) {
+// showSecret is the reveal-once modal for every credential the API returns.
+// A gateway key that grants more than one project gets the routing header in
+// its snippet; a management key gets the header-only warning instead.
+function showSecret({ title, key, kind = 'gateway', projects = [] }) {
   const origin = location.origin;
-  modal(`API key for ${p.name}`, `<p class="dim">Copy this key now — it is not stored and cannot be shown again.</p><pre class="mono" style="font-size:13px;color:var(--amber)">${esc(key)}</pre>
-    <h3>Example</h3><pre>curl ${esc(origin)}/v1/chat/completions \\
-  -H "Authorization: Bearer ${esc(key)}" \\
+  const projHeader = projects.length > 1 ? `\n  -H "X-Ragmux-Project: ${esc(projects[0])}"` : '';
+  const gateway = `<h3>Example</h3><pre>curl ${esc(origin)}/v1/chat/completions \\
+  -H "Authorization: Bearer ${esc(key)}" \\${projHeader}
   -H "Content-Type: application/json" \\
   -d '{"model":"default","messages":[{"role":"user","content":"Hello"}]}'</pre>
-    <p class="hint">Python: <code>OpenAI(base_url="${esc(origin)}/v1", api_key="${esc(key)}")</code> · the Playground has this key pre-filled until you reload.</p>`, { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
-  state.playground.key = key;
+    <p class="hint">Python: <code>OpenAI(base_url="${esc(origin)}/v1", api_key="${esc(key)}")</code> · the Playground has this key pre-filled until you reload.${projects.length > 1 ? ` Without <code>X-Ragmux-Project</code> the call is refused with <code>400 project_required</code>; valid values: ${projects.map(esc).join(', ')}.` : ''}</p>`;
+  const management = `<h3>Example</h3><pre>curl ${esc(origin)}/admin/api/projects \\
+  -H "Authorization: Bearer ${esc(key)}"</pre>
+    <p class="hint">Management keys are only accepted in the <code>Authorization</code> header — never in the session cookie — and can do no more than the scopes above intersected with your role.</p>`;
+  modal(title, `<p class="dim">Copy this key now — it is not stored and cannot be shown again.</p><pre class="mono" style="font-size:13px;color:var(--amber)">${esc(key)}</pre>
+    ${kind === 'management' ? management : gateway}`, { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
+  if (kind !== 'management') state.playground.key = key;
+}
+function showKey(p, key) {
+  showSecret({ title: `API key for ${p.name}`, key, kind: 'gateway', projects: [p.name] });
 }
 async function projectPanel() {
   const id = state.openProject; const panel = $('#projPanel'); const p = state.projects.find(x => x.id === id); if (!p || !panel) return;
@@ -979,6 +1083,115 @@ async function sendMessage(text) {
 }
 
 // ---------------------------------------------------------------------------
+// api keys (every role: each user manages their own)
+// ---------------------------------------------------------------------------
+const KEY_EXPIRY_WARN_DAYS = 7;
+// "active" / "expires in 12 d" (amber under a week) / "expired" / "revoked".
+function keyStatus(k) {
+  if (k.revoked_at) return '<span class="pill err">revoked</span>';
+  if (!k.expires_at) return '<span class="pill ok">active</span>';
+  const left = new Date(k.expires_at) - Date.now();
+  if (left <= 0) return '<span class="pill err">expired</span>';
+  const days = Math.ceil(left / 86400e3);
+  return `<span class="pill ${days <= KEY_EXPIRY_WARN_DAYS ? 'warn' : 'ok'}">expires in ${days} d</span>`;
+}
+const keyLastUsed = k => k.last_used_at ? `${fmtDur(Date.now() - new Date(k.last_used_at))} ago` : 'never';
+const keyKindPill = k => `<span class="pill ${k.kind === 'management' ? 'violet' : 'info'}">${esc(k.kind)}</span>`;
+const SCOPE_HINTS = { chat: 'POST /v1/chat/completions', models: 'GET /v1/models', read: 'every listing', write: 'the editor routes', admin: 'users and the audit log', keys: 'minting api keys' };
+const scopesFor = kind => kind === 'management' ? ['read', 'write', 'admin', 'keys'] : ['chat', 'models'];
+const EXPIRY_CHOICES = [{ value: '', label: 'never expires' }, { value: '30', label: 'in 30 days' }, { value: '90', label: 'in 90 days' }, { value: '365', label: 'in a year' }];
+const expiryISO = days => days ? new Date(Date.now() + Number(days) * 86400e3).toISOString() : '';
+
+async function renderKeys() {
+  const app = $('#app'); app.innerHTML = '<div class="card">Loading…</div>';
+  const f = state.keys_filter;
+  const mine = !can('admin') || f.mine;
+  let keys;
+  try { keys = await api('/keys' + (mine ? `?user_id=${state.user.id}` : '')); } catch (e) { app.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  state.keys = keys; updateBadges();
+  const rows = keys.filter(k => (f.kind === 'all' || k.kind === f.kind) && (!f.q || k.name.toLowerCase().includes(f.q.toLowerCase()) || (k.username || '').toLowerCase().includes(f.q.toLowerCase())));
+  const live = keys.filter(k => !k.revoked_at && (!k.expires_at || new Date(k.expires_at) > Date.now()));
+  const soon = live.filter(k => k.expires_at && new Date(k.expires_at) - Date.now() <= KEY_EXPIRY_WARN_DAYS * 86400e3);
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">API keys · ${mine ? 'yours' : 'all users'} · ${keys.length} key${keys.length === 1 ? '' : 's'}</div><h1>API keys</h1>
+      <p class="lede">Your own credentials, separate from a project's default key: <code>sk-user-…</code> calls <code>/v1</code> on the projects you grant it, <code>sk-mgmt-…</code> calls <code>/admin/api</code> within its scopes. A key never outranks your role, and revoking one takes effect on the next request.</p></div>
+    <div class="actions"><button class="btn primary" id="addKey">${ICON.plus} New key</button></div></div>
+    <div class="stats four">
+      <div class="stat"><div class="l">Active</div><div class="v">${fmtN(live.length)}</div><div class="d">${fmtN(keys.length - live.length)} revoked or expired</div></div>
+      <div class="stat"><div class="l">Gateway</div><div class="v">${fmtN(keys.filter(k => k.kind === 'gateway').length)}</div><div class="d">call <code>/v1</code></div></div>
+      <div class="stat"><div class="l">Management</div><div class="v">${fmtN(keys.filter(k => k.kind === 'management').length)}</div><div class="d">call <code>/admin/api</code></div></div>
+      <div class="stat"><div class="l">Expiring soon</div><div class="v ${soon.length ? '' : 'muted'}">${fmtN(soon.length)}</div><div class="d ${soon.length ? 'down' : ''}">within ${KEY_EXPIRY_WARN_DAYS} days</div></div></div>
+    <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:280px">${ICON.search}<label for="k-q" class="sr">Search keys</label><input id="k-q" class="input" placeholder="Search name" value="${esc(f.q)}" style="min-height:38px" autocomplete="off"></div>
+        <div class="tabs" role="tablist" aria-label="Kind">${['all', 'gateway', 'management'].map(k => `<button class="tab" role="tab" data-kind="${k}" aria-selected="${f.kind === k}">${k}</button>`).join('')}</div>
+        ${can('admin') ? `<div class="tabs" role="tablist" aria-label="Owner"><button class="tab" role="tab" data-mine="1" aria-selected="${f.mine}">mine</button><button class="tab" role="tab" data-mine="0" aria-selected="${!f.mine}">all users</button></div>` : ''}</div>
+      <span class="hint">${rows.length} of ${keys.length} keys</span></div>
+      <div class="tbl"><table><thead><tr><th>Key</th><th>Scopes</th><th>Projects</th><th>Limits</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>
+      ${rows.map(k => `<tr><td><div style="font-weight:500">${esc(k.name)} ${keyKindPill(k)}</div><div class="hint mono">${esc(k.key_prefix)}…${!mine && k.username ? ` · ${esc(k.username)}` : ''}</div></td>
+        <td class="mono muted">${(k.scopes || []).map(s => esc(s)).join(' ') || '—'}</td>
+        <td class="ellip" style="max-width:220px">${k.kind === 'management' ? '<span class="muted">—</span>' : ((k.project_ids || []).map(id => esc(projectName(id))).join(', ') || '<span class="pill err">no grants</span>')}${k.default_project_id ? `<div class="hint">default ${esc(projectName(k.default_project_id))}</div>` : ''}</td>
+        <td class="mono dim">${k.kind === 'management' ? '—' : esc(limitSummary(k))}</td><td>${keyStatus(k)}</td><td class="mono muted nowrap">${esc(keyLastUsed(k))}</td>
+        <td class="right nowrap"><button class="btn sm ghost" data-usage="${k.id}">Usage</button> <button class="btn sm ghost" data-edit="${k.id}">Edit</button> <button class="btn sm ghost" data-revoke="${k.id}" ${k.revoked_at ? 'disabled' : ''}>Revoke</button>${can('admin') ? ` <button class="btn sm ghost danger" data-del="${k.id}">Delete</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No keys yet. A new key is shown once and cannot be retrieved again.</td></tr>'}</tbody></table></div></section>`;
+  let qTimer; $('#k-q').oninput = e => { f.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(renderKeys, 200); };
+  on(app, '[data-kind]', 'click', b => { f.kind = b.dataset.kind; renderKeys(); });
+  on(app, '[data-mine]', 'click', b => { f.mine = b.dataset.mine === '1'; renderKeys(); });
+  $('#addKey').onclick = () => keyForm(null);
+  on(app, '[data-edit]', 'click', b => keyForm(keys.find(k => k.id == b.dataset.edit)));
+  on(app, '[data-usage]', 'click', b => keyUsageModal(keys.find(k => k.id == b.dataset.usage)));
+  on(app, '[data-revoke]', 'click', async b => { if (!await confirmDialog('Revoke this key? Requests with it stop working immediately; its usage history stays.', { label: 'Revoke key' })) return;
+    try { await api(`/keys/${b.dataset.revoke}/revoke`, { method: 'POST' }); toast('Key revoked', 3000, 'ok'); renderKeys(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this key for good? Revoking is usually enough; deleting is refused while request logs still attribute usage to it.', { label: 'Delete key' })) return;
+    try { await api('/keys/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); renderKeys(); } catch (e) { toast(e.message, 6000, 'err'); } });
+}
+async function keyUsageModal(k) {
+  if (!k) return;
+  let u; try { u = await api(`/keys/${k.id}/usage`); } catch (e) { toast(e.message, 5000, 'err'); return; }
+  const line = (label, w) => `<div class="row between"><span class="dim">${label}</span><span class="mono">${fmtK(w.tokens)}${w.token_limit ? ` / ${fmtK(w.token_limit)}` : ''} tokens · ${fmtN(w.requests)} req</span></div>${w.token_limit ? meter(w.token_percent) : ''}`;
+  modal(`Usage · ${k.name}`, `<div class="stack" style="gap:10px">${line('this minute', u.minute)}${line('today', u.day)}${line('this month', u.month)}</div>
+    <p class="hint">The key's own counters against its own limits. The project it routes to has a second, independent ceiling; whichever is tighter decides.</p>`,
+    { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
+}
+function keyForm(k) {
+  const editing = !!k;
+  const kind = k ? k.kind : 'gateway';
+  const projectOpts = state.projects.map(p => ({ value: p.id, label: p.name }));
+  const form = drawer({ eyebrow: editing ? 'Edit' : 'New', title: editing ? k.name : 'API key', submitLabel: editing ? 'Save key' : 'Create key', body: `
+    ${editing ? '' : field('kind', 'Kind', select('kind', [{ value: 'gateway', label: 'gateway — calls /v1 with a project key' }, { value: 'management', label: 'management — calls /admin/api' }], kind), 'A gateway key routes chat traffic; a management key drives the dashboard API. The kind cannot be changed later.')}
+    ${field('name', 'Name', input('name', k ? k.name : '', 'required maxlength=64 placeholder="e.g. ci-pipeline"'), 'Unique among your keys; it is how the key is identified once the secret is gone.')}
+    ${can('admin') && !editing ? field('user_id', 'Owner', select('user_id', [{ value: state.user.id, label: `${state.user.username} (you)` }, ...state.users.filter(u => u.id !== state.user.id).map(u => ({ value: u.id, label: `${u.username} (${u.role})` }))], state.user.id), 'The key can never do more than this account, whatever you grant it.') : ''}
+    <fieldset class="field" style="border:0;padding:0;margin:0;gap:4px" id="scopeBox"><legend>Scopes</legend><div id="scopeList"></div><div class="hint">A scope only narrows: the owner's role is checked on every request as well.</div></fieldset>
+    ${field('expires', 'Expiry', select('expires', editing && k.expires_at ? [{ value: 'keep', label: `keep ${fmtDate(k.expires_at)}` }, ...EXPIRY_CHOICES] : EXPIRY_CHOICES, editing && k.expires_at ? 'keep' : ''), 'An expired key stops resolving; the row is kept for 30 days so its usage history stays readable.')}
+    <div id="gatewayBox" class="stack" style="gap:16px">
+      <div class="field"><span class="field"><label>Projects this key may call</label></span>${checklist('project_ids', projectOpts, k ? k.project_ids || [] : [], 'You are not a member of any project yet.')}<div class="hint">Checked once, here: a later change to the project's member list never breaks the key. With more than one, callers pick with the <code>X-Ragmux-Project</code> header.</div></div>
+      ${field('default_project_id', 'Default project', select('default_project_id', [{ value: 0, label: '— none —' }, ...projectOpts], k ? k.default_project_id || 0 : 0), 'Used when a request names no project. Must be one of the checked projects.')}
+      ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', k ? k.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', k ? k.rate_limit_tpm : 0, 'type=number min=0 step=1')))}
+      ${twoCol(field('budget_daily_tokens', 'Daily token budget', input('budget_daily_tokens', k ? k.budget_daily_tokens : 0, 'type=number min=0 step=1')), field('budget_monthly_tokens', 'Monthly token budget', input('budget_monthly_tokens', k ? k.budget_monthly_tokens : 0, 'type=number min=0 step=1')))}
+      <p class="hint">0 = unlimited. These sit under the project's own limits, against separate counters: the tighter of the two decides and the <code>429</code> says which with <code>"scope"</code>.</p></div>`,
+    onSubmit: async (d, fm) => {
+      const kd = editing ? k.kind : d.kind;
+      const body = { kind: kd, name: d.name, scopes: checkedStrings(fm, 'scopes') };
+      if (!editing && can('admin') && Number(d.user_id) !== state.user.id) body.user_id = Number(d.user_id);
+      body.expires_at = d.expires === 'keep' ? (k.expires_at || '') : expiryISO(d.expires);
+      if (kd === 'gateway') {
+        body.project_ids = checkedValues(fm, 'project_ids');
+        body.default_project_id = Number(d.default_project_id) || null;
+        body.rate_limit_rpm = Number(d.rate_limit_rpm) || 0; body.rate_limit_tpm = Number(d.rate_limit_tpm) || 0;
+        body.budget_daily_tokens = Number(d.budget_daily_tokens) || 0; body.budget_monthly_tokens = Number(d.budget_monthly_tokens) || 0;
+      }
+      if (editing) { await api('/keys/' + k.id, { method: 'PUT', body }); toast('Saved', 3000, 'ok'); }
+      else { const r = await api('/keys', { method: 'POST', body });
+        showSecret({ title: `New ${kd} key · ${r.key.name}`, key: r.api_key, kind: kd, projects: (r.key.project_ids || []).map(projectName) }); }
+      renderKeys(); } });
+  // The scope list and the gateway-only block follow the chosen kind.
+  const paint = () => {
+    const kd = editing ? kind : $('[name=kind]', form).value;
+    const chosen = k ? k.scopes || [] : scopesFor(kd);
+    $('#scopeList').innerHTML = checklist('scopes', scopesFor(kd).map(s => ({ value: s, label: `${s} — ${SCOPE_HINTS[s]}` })), chosen);
+    $('#gatewayBox').classList.toggle('hidden', kd !== 'gateway');
+  };
+  if (!editing) $('[name=kind]', form).onchange = paint;
+  paint();
+}
+
+// ---------------------------------------------------------------------------
 // users (admin)
 // ---------------------------------------------------------------------------
 async function renderUsers() {
@@ -1069,8 +1282,10 @@ async function renderAudit() {
 // ---------------------------------------------------------------------------
 (async function init() {
   try { const me = await api('/me'); state.user = me; state.sessionExp = me.session_expires_at || null; } catch (e) { state.user = null; if (e.message !== 'session expired') toast('Could not load session: ' + e.message, 5000, 'err'); }
+  // /setup is unauthenticated and cheap; it is read on every boot because
+  // has_connections / has_projects pick the step a resumed wizard lands on.
+  try { const s = await api('/setup'); state.setup = s; state.needsSetup = !state.user && !!s.needs_setup; } catch (e) { state.setup = {}; state.needsSetup = false; }
   if (state.user) { try { await loadAll(); } catch (e) { toast(e.message, 5000, 'err'); } }
-  else { try { const s = await api('/setup'); state.setup = s; state.needsSetup = !!s.needs_setup; } catch (e) { state.needsSetup = false; } }
   render();
 })();
 </script>

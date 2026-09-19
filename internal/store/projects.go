@@ -53,7 +53,7 @@ const keyAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456
 
 // GenerateProjectKey produces a fresh "sk-proj-..." credential.
 func GenerateProjectKey() (string, error) {
-	return generateToken("sk-proj-", 43)
+	return generateToken(ProjectKeyPrefix, keyBodyLen)
 }
 
 // GenerateSessionToken produces a random opaque session token.

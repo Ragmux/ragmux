@@ -326,6 +326,16 @@ type SetupInfo struct {
 	DatabaseRole      string
 }
 
+// SetupProgress reports whether any model connection and any project exist,
+// so the first-run wizard can resume at the step it left off. Both are EXISTS
+// probes rather than counts: the page only needs the booleans, and this stays
+// cheap on an unauthenticated route.
+func (s *Store) SetupProgress(ctx context.Context) (hasConnections, hasProjects bool, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM model_connections), EXISTS (SELECT 1 FROM projects)`).
+		Scan(&hasConnections, &hasProjects)
+	return hasConnections, hasProjects, err
+}
+
 // SetupInfo reads the migration version and the connected role in one
 // round trip.
 func (s *Store) SetupInfo(ctx context.Context) (*SetupInfo, error) {

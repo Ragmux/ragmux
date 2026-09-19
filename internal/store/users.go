@@ -320,8 +320,18 @@ func (s *Store) DeleteSession(ctx context.Context, token string) error {
 
 // DeleteUserSessions revokes every session of one user.
 func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) error {
-	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", userID)
+	_, err := s.RevokeUserSessions(ctx, userID)
 	return err
+}
+
+// RevokeUserSessions is DeleteUserSessions reporting how many rows it
+// removed, which the CLI records in its audit entry.
+func (s *Store) RevokeUserSessions(ctx context.Context, userID int64) (int64, error) {
+	res, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected(), nil
 }
 
 // DeleteUserSessionsExcept revokes every session of one user except the one

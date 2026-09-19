@@ -104,59 +104,79 @@ func requestIDHeader(next http.Handler) http.Handler {
 }
 
 // authenticated mounts every route behind the session middleware.
+//
+// A management key's scopes map onto the same three groups as the roles:
+// "read" for the listings, "write" for the editor routes, "admin" for the
+// admin-only ones, and "keys" for /api/keys* so a leaked write key cannot
+// mint more keys. RequireScope only narrows key principals and always runs
+// alongside RequireRole, so a key can never exceed its owner's live role.
 func (a *Admin) authenticated(r chi.Router) {
 	r.Use(a.Auth.Middleware)
-	editor := r.With(auth.RequireRole(auth.RoleEditor))
-	adminOnly := r.With(auth.RequireRole(auth.RoleAdmin))
+	read := r.With(auth.RequireScope(store.ScopeRead))
+	editor := r.With(auth.RequireRole(auth.RoleEditor), auth.RequireScope(store.ScopeWrite))
+	adminOnly := r.With(auth.RequireRole(auth.RoleAdmin), auth.RequireScope(store.ScopeAdmin))
+	keys := r.With(auth.RequireScope(store.ScopeKeys))
 
+	// Identity routes carry no scope: /api/me is how a key holder finds out
+	// what it is, and a logout is a no-op without a session to end.
 	r.Post("/api/logout", a.logout)
 	r.Get("/api/me", a.me)
 	r.Post("/api/me/password", a.changePassword)
 
-	r.Get("/api/provider-types", a.providerTypes)
+	read.Get("/api/provider-types", a.providerTypes)
 
 	// Model connections: viewers may read, editors mutate and test (a
 	// test spends provider quota and is audited as a write).
-	r.Get("/api/models", a.listConnections)
+	read.Get("/api/models", a.listConnections)
 	editor.Post("/api/models", a.createConnection)
-	r.Get("/api/models/{id}", a.getConnection)
+	read.Get("/api/models/{id}", a.getConnection)
 	editor.Put("/api/models/{id}", a.updateConnection)
 	editor.Delete("/api/models/{id}", a.deleteConnection)
 	editor.Post("/api/models/{id}/test", a.testConnection)
 	editor.Post("/api/models/test", a.testUnsavedConnection)
 
 	// RAG stores and documents: same split; search is a read.
-	r.Get("/api/rag-stores", a.listRAGStores)
+	read.Get("/api/rag-stores", a.listRAGStores)
 	editor.Post("/api/rag-stores", a.createRAGStore)
-	r.Get("/api/rag-stores/{id}", a.getRAGStore)
+	read.Get("/api/rag-stores/{id}", a.getRAGStore)
 	editor.Put("/api/rag-stores/{id}", a.updateRAGStore)
 	editor.Delete("/api/rag-stores/{id}", a.deleteRAGStore)
-	r.Get("/api/rag-stores/{id}/documents", a.listDocuments)
+	read.Get("/api/rag-stores/{id}/documents", a.listDocuments)
 	editor.With(httpx.ReadDeadline(uploadReadDeadline)).Post("/api/rag-stores/{id}/documents", a.uploadDocument)
-	r.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
+	read.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
 	editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
-	r.Get("/api/documents/{id}", a.getDocument)
+	read.Get("/api/documents/{id}", a.getDocument)
 	editor.Delete("/api/documents/{id}", a.deleteDocument)
 	editor.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
 
 	// Projects: membership is checked inside the handlers (404 for
 	// non-members); mutation additionally needs the editor role.
-	r.Get("/api/projects", a.listProjects)
+	read.Get("/api/projects", a.listProjects)
 	editor.Post("/api/projects", a.createProject)
-	r.Get("/api/projects/{id}", a.getProject)
+	read.Get("/api/projects/{id}", a.getProject)
 	editor.Put("/api/projects/{id}", a.updateProject)
 	editor.Delete("/api/projects/{id}", a.deleteProject)
 	editor.Post("/api/projects/{id}/rotate-key", a.rotateKey)
-	r.Get("/api/projects/{id}/metrics", a.projectMetrics)
-	r.Get("/api/projects/{id}/metrics.csv", a.projectMetricsCSV)
-	r.Get("/api/projects/{id}/usage", a.projectUsage)
-	r.Get("/api/projects/{id}/members", a.listMembers)
+	read.Get("/api/projects/{id}/metrics", a.projectMetrics)
+	read.Get("/api/projects/{id}/metrics.csv", a.projectMetricsCSV)
+	read.Get("/api/projects/{id}/usage", a.projectUsage)
+	read.Get("/api/projects/{id}/members", a.listMembers)
 	editor.Put("/api/projects/{id}/members", a.setMembers)
 
-	r.Get("/api/metrics/summary", a.metricsSummary)
-	r.Get("/api/metrics/requests", a.recentRequests)
-	r.Get("/api/metrics/requests.csv", a.requestsCSV)
-	r.Get("/api/system", a.systemInfo)
+	// API keys: ownership is checked inside the handlers (404 for someone
+	// else's key). Deleting one is admin-only; everyone else revokes.
+	keys.Get("/api/keys", a.listKeys)
+	keys.Post("/api/keys", a.createKey)
+	keys.Get("/api/keys/{id}", a.getKey)
+	keys.Put("/api/keys/{id}", a.updateKey)
+	keys.Post("/api/keys/{id}/revoke", a.revokeKey)
+	keys.Get("/api/keys/{id}/usage", a.keyUsage)
+	keys.With(auth.RequireRole(auth.RoleAdmin)).Delete("/api/keys/{id}", a.deleteKey)
+
+	read.Get("/api/metrics/summary", a.metricsSummary)
+	read.Get("/api/metrics/requests", a.recentRequests)
+	read.Get("/api/metrics/requests.csv", a.requestsCSV)
+	read.Get("/api/system", a.systemInfo)
 
 	// User management and the audit trail are admin-only; the lite user
 	// list lets editors pick project members.
@@ -171,6 +191,19 @@ func (a *Admin) authenticated(r chi.Router) {
 	adminOnly.Get("/api/audit", a.listAudit)
 	adminOnly.Get("/api/audit/export", a.exportAudit)
 	adminOnly.Get("/api/security/logins", a.loginSecurity)
+}
+
+// sessionOnly refuses an api-key principal. It guards the three actions that
+// could take an account over — changing a password, resetting one and minting
+// a management key — so a leaked key cannot lock its owner out or extend its
+// own reach beyond the key that leaked.
+func sessionOnly(w http.ResponseWriter, r *http.Request) bool {
+	if auth.SessionFrom(r.Context()).IsKey() {
+		writeErrCode(w, http.StatusForbidden, "session_required",
+			"this action requires a signed-in dashboard session, not an api key")
+		return false
+	}
+	return true
 }
 
 // ---- helpers ----
@@ -401,22 +434,30 @@ func (a *Admin) auditAs(r *http.Request, actor *store.User, action, targetType s
 
 func ptr(id int64) *int64 { return &id }
 
-// me returns the caller's account plus the session it is using: when it
-// expires and whether it arrived as a bearer token.
+// me returns the caller's account plus the credential it is using: when it
+// expires, whether it arrived as a bearer token, and whether it is a
+// dashboard session or a management key (with that key's scopes).
 func (a *Admin) me(w http.ResponseWriter, r *http.Request) {
 	out := struct {
 		*store.User
-		SessionExpiresAt string `json:"session_expires_at"`
-		SessionBearer    bool   `json:"session_bearer"`
-	}{User: auth.UserFrom(r.Context())}
+		SessionExpiresAt string   `json:"session_expires_at"`
+		SessionBearer    bool     `json:"session_bearer"`
+		SessionKind      string   `json:"session_kind"`
+		Scopes           []string `json:"scopes,omitempty"`
+	}{User: auth.UserFrom(r.Context()), SessionKind: "session"}
 	if se := auth.SessionFrom(r.Context()); se != nil {
-		out.SessionExpiresAt = se.ExpiresAt.UTC().Format(time.RFC3339)
-		out.SessionBearer = se.Bearer
+		if !se.ExpiresAt.IsZero() {
+			out.SessionExpiresAt = se.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		out.SessionBearer, out.SessionKind, out.Scopes = se.Bearer, se.Kind(), se.Scopes
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
+	if !sessionOnly(w, r) {
+		return
+	}
 	var in struct {
 		Current string `json:"current_password"`
 		New     string `json:"new_password"`

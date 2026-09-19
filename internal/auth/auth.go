@@ -22,11 +22,27 @@ type sessionKey struct{}
 
 // Session describes the session a request authenticated with.
 type Session struct {
-	// ExpiresAt is when the session stops resolving.
+	// ExpiresAt is when the session stops resolving. It is the zero time for
+	// a management key without an expiry.
 	ExpiresAt time.Time
 	// Bearer is true when the token came in the Authorization header
 	// rather than the cookie.
 	Bearer bool
+	// KeyID and Scopes are set when the request authenticated with an
+	// "sk-mgmt-" key rather than a dashboard session.
+	KeyID  *int64
+	Scopes []string
+}
+
+// IsKey reports whether the request authenticated with an api key.
+func (s *Session) IsKey() bool { return s != nil && s.KeyID != nil }
+
+// Kind names how the request authenticated, as /admin/api/me reports it.
+func (s *Session) Kind() string {
+	if s.IsKey() {
+		return "api_key"
+	}
+	return "session"
 }
 
 // HashPassword bcrypt-hashes a password.
@@ -139,8 +155,8 @@ func IsBearer(r *http.Request) bool {
 	return strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ")
 }
 
-// Middleware rejects requests without a valid session, and cookie-
-// authenticated state changes that a foreign origin initiated.
+// Middleware rejects requests without a valid session or management key, and
+// cookie-authenticated state changes that a foreign origin initiated.
 func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := TokenFromRequest(r)
@@ -150,6 +166,32 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 		}
 		if !IsBearer(r) && !SameOriginOK(r) {
 			forbiddenCrossSite(w)
+			return
+		}
+		// A management key is only ever accepted from the Authorization
+		// header, and a key pasted into the cookie is refused before it is
+		// even looked up. That is what keeps the bearer exemption above
+		// sound for keys: a browser cannot attach an Authorization header
+		// cross-origin without a CORS preflight, and cors() only answers
+		// preflights for the origins in CORS_ORIGINS (empty by default),
+		// while it would attach a cookie to any cross-site form post.
+		if strings.HasPrefix(tok, store.ManagementKeyPrefix) {
+			if !IsBearer(r) {
+				unauthorized(w)
+				return
+			}
+			k, u, err := s.Store.ResolveManagementKey(r.Context(), tok)
+			if err != nil {
+				unauthorized(w)
+				return
+			}
+			var expires time.Time
+			if k.ExpiresAt != nil {
+				expires = *k.ExpiresAt
+			}
+			ctx := ContextWithUser(r.Context(), u)
+			ctx = ContextWithSession(ctx, &Session{ExpiresAt: expires, Bearer: true, KeyID: &k.ID, Scopes: k.Scopes})
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 		u, expires, err := s.Store.UserAndExpiryBySession(r.Context(), tok)

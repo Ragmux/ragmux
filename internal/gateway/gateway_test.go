@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -109,6 +111,8 @@ type env struct {
 	proj *store.Project
 	key  string
 	gw   *Gateway
+	// owner is created lazily by userKey and owns every key it mints.
+	owner *store.User
 }
 
 // newEnv wires a gateway against a fresh schema and one project whose model
@@ -145,6 +149,45 @@ func newEnv(t *testing.T, mutate func(p *store.Project)) *env {
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return &env{t: t, st: st, up: up, srv: srv, conn: conn, proj: proj, key: key, gw: gw}
+}
+
+// userKey mints an "sk-user-" key owned by a lazily created editor and
+// returns the key row and its plaintext credential. mutate shapes the key
+// before it is written (scopes, limits, expiry); nil keeps the defaults.
+func (e *env) userKey(name string, projects []int64, mutate func(*store.APIKey)) (*store.APIKey, string) {
+	e.t.Helper()
+	ctx := context.Background()
+	if e.owner == nil {
+		u, err := e.st.CreateUser(ctx, "owner", "h", "editor")
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		e.owner = u
+	}
+	k := &store.APIKey{Kind: store.KindGateway, Name: name, UserID: e.owner.ID,
+		Scopes: store.DefaultGatewayScopes, ProjectIDs: projects}
+	if mutate != nil {
+		mutate(k)
+	}
+	out, raw, err := e.st.CreateAPIKey(ctx, k)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return out, raw
+}
+
+// newProject adds a second project on the same connection.
+func (e *env) newProject(name string, mutate func(*store.Project)) *store.Project {
+	e.t.Helper()
+	p := &store.Project{Name: name, ModelConnectionID: e.conn.ID}
+	if mutate != nil {
+		mutate(p)
+	}
+	out, _, err := e.st.CreateProject(context.Background(), p)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return out
 }
 
 // attachRAG creates a RAG store with one ingested document and attaches it
@@ -753,5 +796,276 @@ func TestSourcesHeaderIsCappedToWholeEntries(t *testing.T) {
 	}
 	if h := sourcesHeader(nil); h != "[]" {
 		t.Errorf("nil sources: %q", h)
+	}
+}
+
+// ---- user-owned gateway keys ----
+
+// call is post with extra request headers, for the project selection header.
+func (e *env) call(method, path string, body any, bearer string, headers map[string]string) (*http.Response, map[string]any) {
+	e.t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, e.srv.URL+path, rdr)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return resp, out
+}
+
+// logFor waits for the deferred request log of one project.
+func (e *env) logFor(projectID int64) *store.RequestLog {
+	e.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := e.st.RecentRequests(context.Background(), store.MetricsFilter{ProjectID: &projectID}, 1)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if len(rows) > 0 {
+			return rows[0]
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	e.t.Fatalf("no request log written for project %d", projectID)
+	return nil
+}
+
+func TestUserKeyHappyPathAndAttribution(t *testing.T) {
+	e := newEnv(t, nil)
+	k, raw := e.userKey("ci", []int64{e.proj.ID}, nil)
+	resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, raw, nil)
+	if resp.StatusCode != 200 || out["model"] != "mock-model" {
+		t.Fatalf("chat with a user key: %d %v", resp.StatusCode, out)
+	}
+	rec := e.lastLog()
+	if rec.APIKeyID == nil || *rec.APIKeyID != k.ID || rec.UserID == nil || *rec.UserID != e.owner.ID {
+		t.Errorf("attribution = %+v", rec)
+	}
+	// last_used_at moves on the first call and is stamped from the deferred
+	// record path, so it may land just after the response.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := e.st.GetAPIKey(context.Background(), k.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.LastUsedAt != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("last_used_at was never stamped")
+}
+
+func TestUserKeyRejections(t *testing.T) {
+	e := newEnv(t, nil)
+	past := time.Now().UTC().Add(-time.Hour)
+	revoked, revokedRaw := e.userKey("revoked", []int64{e.proj.ID}, nil)
+	if _, err := e.st.RevokeAPIKey(context.Background(), revoked.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, expiredRaw := e.userKey("expired", []int64{e.proj.ID}, func(k *store.APIKey) { k.ExpiresAt = &past })
+	_, liveRaw := e.userKey("live", []int64{e.proj.ID}, nil)
+
+	cases := []struct {
+		name, bearer string
+		wantCode     any
+		wantMsg      string
+	}{
+		// An unknown key of either shape keeps exactly the pre-0.4 body.
+		{"unknown project key", "sk-proj-doesnotexist", nil, "invalid project api key"},
+		{"unknown user key", store.GatewayKeyPrefix + strings.Repeat("x", 43), nil, "invalid project api key"},
+		{"revoked", revokedRaw, "key_revoked", "this api key has been revoked"},
+		{"expired", expiredRaw, "key_expired", "this api key has expired"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp, out := e.call(http.MethodGet, "/v1/models", nil, c.bearer, nil)
+			if resp.StatusCode != http.StatusUnauthorized || errorField(t, out, "type") != "invalid_api_key" ||
+				errorField(t, out, "code") != c.wantCode || errorField(t, out, "message") != c.wantMsg {
+				t.Errorf("status %d body %v", resp.StatusCode, out)
+			}
+		})
+	}
+	// Deactivating the owner narrows every key it holds on the next request.
+	if _, err := e.st.UpdateUser(context.Background(), e.owner.ID, "editor", false); err != nil {
+		t.Fatal(err)
+	}
+	resp, out := e.call(http.MethodGet, "/v1/models", nil, liveRaw, nil)
+	if resp.StatusCode != http.StatusUnauthorized || errorField(t, out, "code") != "key_owner_inactive" {
+		t.Errorf("deactivated owner: %d %v", resp.StatusCode, out)
+	}
+}
+
+func TestUserKeyProjectSelection(t *testing.T) {
+	e := newEnv(t, nil)
+	staging := e.newProject("staging", nil)
+	other := e.newProject("not-granted", nil)
+	_, multi := e.userKey("multi", []int64{e.proj.ID, staging.ID}, nil)
+
+	// Several grants and no header: 400 naming the valid values.
+	resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, multi, nil)
+	if resp.StatusCode != http.StatusBadRequest || errorField(t, out, "code") != "project_required" {
+		t.Fatalf("ambiguous: %d %v", resp.StatusCode, out)
+	}
+	if got := resp.Header.Get(projectsHeader); got != "p,staging" {
+		t.Errorf("%s = %q", projectsHeader, got)
+	}
+	// The header picks one, by name and by id alike.
+	for _, want := range []string{"staging", strconv.FormatInt(staging.ID, 10)} {
+		resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, multi,
+			map[string]string{projectHeader: want})
+		if resp.StatusCode != 200 {
+			t.Fatalf("header %q: %d %v", want, resp.StatusCode, out)
+		}
+	}
+	if rec := e.logFor(staging.ID); rec.ProjectID != staging.ID {
+		t.Errorf("routed to %d", rec.ProjectID)
+	}
+	// A project the key does not grant, and one that does not exist at all,
+	// get the same answer so names cannot be probed.
+	for _, name := range []string{"not-granted", strconv.FormatInt(other.ID, 10), "no-such-project"} {
+		resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, multi,
+			map[string]string{projectHeader: name})
+		if resp.StatusCode != http.StatusForbidden || errorField(t, out, "code") != "project_not_granted" ||
+			errorField(t, out, "message") != "this api key is not authorised for the requested project" {
+			t.Errorf("%q: %d %v", name, resp.StatusCode, out)
+		}
+	}
+	// A default project resolves the ambiguity without a header.
+	_, withDefault := e.userKey("default", []int64{e.proj.ID, staging.ID}, func(k *store.APIKey) {
+		k.DefaultProjectID = &staging.ID
+	})
+	if resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, withDefault, nil); resp.StatusCode != 200 {
+		t.Errorf("default project: %d %v", resp.StatusCode, out)
+	}
+}
+
+// A key whose last grant was removed routes nowhere and must fail closed
+// rather than fall back to the owner's projects.
+func TestUserKeyWithNoGrantsFailsClosed(t *testing.T) {
+	e := newEnv(t, nil)
+	k, raw := e.userKey("orphan", []int64{e.proj.ID}, nil)
+	k.ProjectIDs = nil
+	if _, err := e.st.UpdateAPIKey(context.Background(), k); err != nil {
+		t.Fatal(err)
+	}
+	resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, raw, nil)
+	if resp.StatusCode != http.StatusForbidden || errorField(t, out, "code") != "project_not_granted" {
+		t.Errorf("no grants: %d %v", resp.StatusCode, out)
+	}
+	// Deleting the granted project empties the set the same way.
+	k2, raw2 := e.userKey("dangling", []int64{e.proj.ID}, nil)
+	_ = k2
+	if err := e.st.DeleteProject(context.Background(), e.proj.ID); err != nil {
+		t.Fatal(err)
+	}
+	resp, out = e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, raw2, nil)
+	if resp.StatusCode != http.StatusForbidden || errorField(t, out, "code") != "project_not_granted" {
+		t.Errorf("deleted project: %d %v", resp.StatusCode, out)
+	}
+}
+
+func TestUserKeyScopes(t *testing.T) {
+	e := newEnv(t, nil)
+	_, modelsOnly := e.userKey("models-only", []int64{e.proj.ID}, func(k *store.APIKey) {
+		k.Scopes = []string{store.ScopeModels}
+	})
+	_, chatOnly := e.userKey("chat-only", []int64{e.proj.ID}, func(k *store.APIKey) {
+		k.Scopes = []string{store.ScopeChat}
+	})
+	resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, modelsOnly, nil)
+	if resp.StatusCode != http.StatusForbidden || errorField(t, out, "type") != "insufficient_scope" ||
+		errorField(t, out, "message") != "api key is not authorised for chat completions" {
+		t.Errorf("chat without the scope: %d %v", resp.StatusCode, out)
+	}
+	if resp, _ := e.call(http.MethodGet, "/v1/models", nil, modelsOnly, nil); resp.StatusCode != 200 {
+		t.Errorf("models with the scope: %d", resp.StatusCode)
+	}
+	if resp, out := e.call(http.MethodGet, "/v1/models", nil, chatOnly, nil); resp.StatusCode != http.StatusForbidden ||
+		errorField(t, out, "code") != "insufficient_scope" {
+		t.Errorf("models without the scope: %d %v", resp.StatusCode, out)
+	}
+	// A project's default key has no scopes and is narrowed by none.
+	if resp, _ := e.call(http.MethodGet, "/v1/models", nil, e.key, nil); resp.StatusCode != 200 {
+		t.Errorf("project key on models: %d", resp.StatusCode)
+	}
+}
+
+func TestUserKeyModelsAcrossGrants(t *testing.T) {
+	e := newEnv(t, nil)
+	conn2, err := e.st.CreateConnection(context.Background(), &store.ModelConnection{Name: "second",
+		ProviderType: "custom_openai", BaseURL: e.up.srv.URL + "/v1", APIKey: "k", ModelName: "other-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := e.newProject("staging", func(p *store.Project) { p.ModelConnectionID = conn2.ID })
+	// A third project reuses the first connection, so its model is a duplicate.
+	dup := e.newProject("dup", nil)
+	_, raw := e.userKey("multi", []int64{e.proj.ID, staging.ID, dup.ID}, nil)
+
+	resp, out := e.call(http.MethodGet, "/v1/models", nil, raw, nil)
+	data, _ := out["data"].([]any)
+	if resp.StatusCode != 200 || len(data) != 2 {
+		t.Fatalf("listing across grants: %d %v", resp.StatusCode, out)
+	}
+	ids := []string{data[0].(map[string]any)["id"].(string), data[1].(map[string]any)["id"].(string)}
+	sort.Strings(ids)
+	if ids[0] != "mock-model" || ids[1] != "other-model" {
+		t.Errorf("models = %v", ids)
+	}
+	// With a header the listing narrows to that project's connection.
+	resp, out = e.call(http.MethodGet, "/v1/models", nil, raw, map[string]string{projectHeader: "staging"})
+	data, _ = out["data"].([]any)
+	if resp.StatusCode != 200 || len(data) != 1 || data[0].(map[string]any)["id"] != "other-model" {
+		t.Errorf("narrowed listing: %d %v", resp.StatusCode, out)
+	}
+	// {id} picks one of the grants, and an unknown one is a 404.
+	if resp, out := e.call(http.MethodGet, "/v1/models/other-model", nil, raw, nil); resp.StatusCode != 200 ||
+		out["id"] != "other-model" {
+		t.Errorf("model by id: %d %v", resp.StatusCode, out)
+	}
+	if resp, _ := e.call(http.MethodGet, "/v1/models/nope", nil, raw, nil); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown model id: %d", resp.StatusCode)
+	}
+}
+
+// The key tier denies before the project ceiling is anywhere near reached.
+func TestKeySubLimitDeniesBeforeTheProjectCeiling(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RateLimitRPM = 100 })
+	_, raw := e.userKey("throttled", []int64{e.proj.ID}, func(k *store.APIKey) { k.RateLimitRPM = 1 })
+
+	resp, _ := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, raw, nil)
+	if resp.StatusCode != 200 || resp.Header.Get("x-ratelimit-limit-requests") != "1" ||
+		resp.Header.Get("x-ratelimit-remaining-requests") != "0" {
+		t.Fatalf("first: %d %v", resp.StatusCode, resp.Header)
+	}
+	resp, out := e.call(http.MethodPost, "/v1/chat/completions", map[string]any{"messages": userMsg}, raw, nil)
+	env, _ := out["error"].(map[string]any)
+	if resp.StatusCode != http.StatusTooManyRequests || errorField(t, out, "code") != limits.ReasonRPM ||
+		env["scope"] != limits.ScopeKey || !strings.Contains(errorField(t, out, "message").(string), "for this api key") {
+		t.Fatalf("denied by the key tier: %d %v", resp.StatusCode, out)
+	}
+	if rec := e.lastLog(); rec.StatusCode != 429 || rec.APIKeyID == nil {
+		t.Errorf("denied request is not attributed: %+v", rec)
 	}
 }
