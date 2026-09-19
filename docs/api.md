@@ -4,8 +4,8 @@ Ragmux exposes three HTTP surfaces:
 
 | Prefix | Audience | Authentication |
 |---|---|---|
-| `/v1/…` | your applications (OpenAI-compatible) | `Authorization: Bearer sk-proj-…` project key |
-| `/admin/api/…` | dashboard and management scripts | session cookie or bearer session token |
+| `/v1/…` | your applications (OpenAI-compatible) | `Authorization: Bearer sk-proj-…` project key, or a user's `sk-user-…` key |
+| `/admin/api/…` | dashboard and management scripts | session cookie, bearer session token, or a user's `sk-mgmt-…` key |
 | `/healthz` | load balancers, container healthchecks | none |
 
 All request and response bodies are JSON unless noted. `/admin/` (without `api`) serves
@@ -46,6 +46,21 @@ rejected","type":"forbidden"}}`), and JSON bodies must be sent as
 `Content-Type: application/json` (otherwise `415`). The login request itself always
 needs the JSON content type. Scripts should use the bearer token.
 
+A **management key** (`sk-mgmt-…`, see [API keys](#api-keys)) authenticates the same
+routes, but only from the `Authorization` header. One pasted into the `ragmux_session`
+cookie is refused `401` without even being looked up. That is deliberate and is what
+keeps the bearer exemption above sound for keys: a browser attaches cookies to
+cross-site requests on its own, whereas it cannot attach an `Authorization` header
+cross-origin without a CORS preflight, and Ragmux only answers preflights for the
+origins in `CORS_ORIGINS` (empty by default). The premise behind the existing exemption
+therefore holds identically for management keys, and nothing about the cookie path is
+loosened.
+
+Three routes refuse an api-key principal outright with
+`403 {"error":{"code":"session_required"}}` — `POST /me/password`,
+`POST /users/{id}/reset-password` and creating a `kind=management` key — so a leaked key
+cannot take over the account it belongs to.
+
 Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-Id`;
 unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
 and log the detail under that id.
@@ -64,10 +79,53 @@ case-insensitively.
 
 ### Client API
 
-`/v1` routes require `Authorization: Bearer sk-proj-…`, the key returned once when a
-project is created or its key is rotated. The key selects the project, and with it the
-model connection, system prompt, RAG store and limits. Missing or unknown keys answer
-`401` with type `invalid_request_error` (no bearer header) or `invalid_api_key`.
+`/v1` routes require `Authorization: Bearer <key>`, which is one of two things:
+
+- **`sk-proj-…`** — the project's default key, returned once when a project is created or
+  its key is rotated. It selects exactly that project, and with it the model connection,
+  system prompt, RAG store and limits. It has no owner, no scopes and no expiry, and can
+  only be rotated, not revoked.
+- **`sk-user-…`** — a user-owned gateway key (see [API keys](#api-keys)). It carries a set
+  of granted projects, its own scopes and its own limits under the project's, and can be
+  revoked or given an expiry.
+
+Missing or unknown keys answer `401` with type `invalid_request_error` (no bearer header)
+or `invalid_api_key`. An unknown key's body is exactly
+`{"error":{"message":"invalid project api key","type":"invalid_api_key","code":null}}`
+whatever its shape. A key that *is* known but no longer resolves carries a `code` on top
+— `key_revoked`, `key_expired` or `key_owner_inactive` — so the extra detail only ever
+reaches a caller who already holds the key bytes.
+
+#### Choosing a project
+
+A `sk-user-…` key may grant several projects, so each request resolves one, in this
+order:
+
+1. the `X-Ragmux-Project` request header, matched against the granted project names, or
+   against their ids when the value is numeric;
+2. the key's `default_project_id`;
+3. the single grant, when the key has exactly one.
+
+If none of those settles it, `POST /v1/chat/completions` answers
+`400 {"error":{"code":"project_required"}}` with an `X-Ragmux-Projects` response header
+listing the valid values (`prod,staging`). A header naming a project the key does not
+grant answers `403 {"error":{"code":"project_not_granted"}}` with a fixed message that
+does not distinguish "no such project" from "not granted", so a key holder cannot probe
+for project names. A key whose last grant was deleted has an empty grant set and gets the
+same `403`: it fails closed rather than falling back to anything.
+
+`GET /v1/models` is the exception: with several grants and no header it lists one entry
+per granted project's connection, deduplicated by model name, and `GET /v1/models/{id}`
+then has to name one of them.
+
+There is deliberately **no `"project/model"` convention** in the `model` field.
+`model_name` legitimately contains slashes (`org/model-1.5:latest@v2_x` is a valid model
+name), so the split would be ambiguous and would silently reroute clients that already
+send such a name. Use the header.
+
+The grants on the key, not the owner's project memberships, are what `/v1` enforces.
+Membership is checked once, when the key is created or updated; after that an admin
+editing a member list cannot break a running key.
 
 ## Roles
 
@@ -107,11 +165,17 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": 8, "secret_key_source": "env", "database_role": "ragmux"}`: `needs_setup` is `true` while the `users` table is empty; the other three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role) |
+| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": 10, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}`: `needs_setup` is `true` while the `users` table is empty; the next three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role); `has_connections` and `has_projects` are two `EXISTS` probes the first-run wizard uses to resume at the right step after a reload |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
 case setup is already complete (see [Configuration](configuration.md#environment-variables)).
+
+The dashboard's first-run wizard has three steps, but only this first one is
+unauthenticated. Step 2 (a model connection) and step 3 (a project) are ordinary
+authenticated calls to `POST /api/models` and `POST /api/projects` made with the session
+the first step established, so they are role-gated and audited like any other write and
+add no new unauthenticated surface. Both are skippable.
 
 ### Session and account
 
@@ -119,8 +183,8 @@ case setup is already complete (see [Configuration](configuration.md#environment
 |---|---|---|---|
 | POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
-| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339) and `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie) |
-| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked |
+| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
+| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools` (false for `gemini`), `supports_streaming` |
 
 ### Model connections
@@ -306,6 +370,62 @@ each budget would run out at that pace. A value is `null` when the budget is not
 nothing was consumed in the last hour, or the projection lands after the window resets
 (`resets_at`); an already exhausted budget projects to `generated_at`.
 
+### API keys
+
+User-owned credentials, separate from a project's default key. Everyone manages their
+own; admins see and manage everyone's. A key someone else owns answers `404`, not `403`,
+so key ids are not enumerable. All of these need the `keys` scope when the caller is
+itself a management key.
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/keys` | viewer | The caller's keys, newest first, each with the owner's `username`. Admins get every owner and may narrow with `?user_id=`; `?kind=gateway\|management` filters both. `user_id` is ignored for non-admins |
+| POST | `/keys` | viewer | Create → `201 {"key": {…}, "api_key": "sk-user-…"}`; the credential is returned once and never again |
+| GET | `/keys/{id}` | owner or admin | Read one |
+| PUT | `/keys/{id}` | owner or admin | Update the mutable fields (below); the credential and the `kind` never change — revoke and reissue instead |
+| POST | `/keys/{id}/revoke` | owner or admin | Sets `revoked_at` → the key object; effective on the next request |
+| GET | `/keys/{id}/usage` | owner or admin | The key's own counters, in the shape of `/projects/{id}/usage` with `api_key_id` instead of `project_id` |
+| DELETE | `/keys/{id}` | admin | Delete outright → `{"ok": true}`; `409 {"error":{"code":"key_in_use"}}` while request logs still reference the key. Revoking is almost always what you want |
+
+Request body:
+
+```json
+{"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models"],
+ "project_ids": [1, 2], "default_project_id": 1, "expires_at": "2027-01-01T00:00:00Z",
+ "user_id": 4,
+ "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
+```
+
+`kind` is `gateway` (default) or `management`. `name` is required, at most 64 characters
+and unique per owner (`409` otherwise). `scopes` defaults to `["chat","models"]` for a
+gateway key and is required for a management key; an unknown scope, or one the caller's
+own role does not cover, is a `400`. `expires_at` is RFC 3339, and `null` or `""` clears
+it. `user_id` mints the key for another account and needs the `admin` role; the grants
+are then checked against *that* account, not the admin's.
+
+For a `gateway` key, every id in `project_ids` must be a project the **owner** can access
+(`400` otherwise) and `default_project_id` must be one of them. For a `management` key,
+projects and limits are refused with a `400`: it has neither. Creating a `management` key
+additionally needs at least the `editor` role and a dashboard session
+(`403 session_required` for an api key); the `admin` scope needs the `admin` role.
+
+The key object never contains the credential:
+
+```json
+{"id": 7, "kind": "gateway", "name": "ci-pipeline", "key_prefix": "sk-user-Wg8TwBF",
+ "user_id": 1, "created_by": 1, "scopes": ["chat", "models"], "project_ids": [1, 2],
+ "default_project_id": null, "rate_limit_rpm": 0, "rate_limit_tpm": 0,
+ "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "expires_at": null, "revoked_at": null, "last_used_at": "2026-09-19T03:41:00Z",
+ "created_at": "…", "updated_at": "…"}
+```
+
+`key_prefix` is the first 15 characters, for identification in listings and the audit
+log. `last_used_at` is stamped by `/v1` at most once a minute per key, so a busy key does
+not rewrite its row on every request. Semantics, scopes and the interaction of the two
+limit tiers are described in
+[Users, roles and limits](users-and-limits.md#api-keys).
+
 ### Metrics
 
 | Method | Path | Role | Purpose |
@@ -331,7 +451,8 @@ The summary response (also used by `/projects/{id}/metrics`):
  "daily":  [{"day": "2026-09-05", "requests": 10, "errors": 0, "prompt_tokens": 4000, "completion_tokens": 900}],
  "recent": [{"id": 991, "project_id": 3, "model_name": "claude-sonnet-4-5", "status_code": 200,
              "prompt_tokens": 420, "completion_tokens": 80, "estimated": false, "latency_ms": 910,
-             "streamed": true, "rag_used": true, "rag_hits": 3, "error": "", "created_at": "…"}],
+             "streamed": true, "rag_used": true, "rag_hits": 3, "error": "",
+             "api_key_id": 7, "user_id": 4, "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
                "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70}]}
@@ -339,7 +460,10 @@ The summary response (also used by `/projects/{id}/metrics`):
 
 `daily` covers the last `days` days (14 by default), `recent` the last 50 requests.
 `rag_hits` is the number of retrieved passages injected into that request (`0` when
-`rag_used` is false). Status semantics (`429`, `499`, `502`/`504`) are described in
+`rag_used` is false). `api_key_id` and `user_id` attribute the request to the user-owned
+key that made it and are `null` for a project's default key; the owner is denormalised so
+deleting the key later leaves `user_id` in place. Status semantics (`429`, `499`,
+`502`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
 #### CSV export
@@ -357,6 +481,9 @@ estimated, latency_ms, streamed, rag_used, rag_hits, error
 Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
+
+The export does not yet carry `api_key_id` and `user_id`; read them from
+`GET /metrics/requests` in the meantime.
 
 ### Users and audit log
 
@@ -474,7 +601,8 @@ Non-streaming responses are the provider's answer normalised to the OpenAI schem
 `text/event-stream` with `data: {chunk}` lines and a final `data: [DONE]`; a failure
 after the stream has started is emitted as a `data: {"error": …}` event before `[DONE]`.
 
-Response headers, only for limits the project has set:
+Response headers, only for limits that are set on the project or the key. Where both
+tiers have a limit, the header describes whichever has the smaller remaining allowance:
 
 | Header | Meaning |
 |---|---|
@@ -485,15 +613,23 @@ Response headers, only for limits the project has set:
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
+| `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
+
+Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
+`Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`) and
+accepts `X-Ragmux-Project` in `Access-Control-Allow-Headers`, but a cross-origin page
+sees no response header outside the CORS safelist unless the request went through CORS
+at all.
 
 Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, or a translation error such as tools on a Gemini connection |
-| `401` | missing or invalid project key |
+| `400` | malformed JSON, missing `messages`, a translation error such as tools on a Gemini connection, or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
+| `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
+| `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `413` | body larger than 4 MiB |
-| `429` | project rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly"}}` |
+| `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
 | `4xx`/`5xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted) |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
 | `502` | transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
@@ -507,4 +643,7 @@ Return the project's single model in OpenAI's shape so SDK model listings work:
 {"object": "list", "data": [{"id": "claude-sonnet-4-5", "object": "model", "created": 1758190800, "owned_by": "anthropic"}]}
 ```
 
-`{id}` is ignored; both routes describe the project's connection.
+With one project resolved, `{id}` is ignored and both routes describe that project's
+connection. A `sk-user-…` key that grants several projects and names none lists one entry
+per granted project's connection instead, deduplicated by model name; `{id}` then has to
+match one of them (`404` otherwise). Both routes need the key's `models` scope.
