@@ -244,15 +244,29 @@ Kept: `type`, `description`, `enum`, `items`, `properties`, `required`, `nullabl
 `pattern`, and `format` only for `enum`/`date-time` on strings and
 `float`/`double`/`int32`/`int64` on numbers.
 
+Kept means kept as the type Gemini's `Schema` declares, not kept as written: `description`
+and `pattern` must be strings, `nullable` a boolean, the bounds numbers, and `enum` an
+array of strings, because `Schema.enum` is `repeated string`. A value of any other shape
+is dropped like an unknown keyword — `{"type":"integer","enum":[1,2,3]}` loses its `enum`,
+and so does an `enum` on a node that is not a string, rather than travelling to Gemini as
+something it rejects.
+
 Rewritten:
 
 | From | To |
 |---|---|
-| `const: X` | `enum: [X]` |
+| `const: "x"` | `enum: ["x"]` |
+| `const: 7`, `const: true`, `const: {…}` | `type: "integer"` / `"boolean"` / `"object"` — the value cannot be carried, but it still pins the type; dropped if the node already has one |
 | `oneOf`, `allOf` | `anyOf` — an `allOf` whose branches are all objects is shallow-merged into the node instead |
 | `type: ["string","null"]` | `type: "string"` + `nullable: true`; a wider union keeps its first non-`null` member |
 | `exclusiveMinimum: N`, `exclusiveMaximum: N` | `minimum: N`, `maximum: N` |
 | `$ref` | the definition from `$defs`/`definitions`, inlined |
+
+A `$ref` is matched on its full JSON Pointer, so `#/$defs/Foo`, `#/definitions/Foo` and a
+`Foo` nested under another node are three different definitions, and an external
+`https://…#/definitions/Foo` resolves to none of them (it is elided, since that document
+is never fetched). Properties and keywords are walked in sorted order, so the same schema
+always sanitises to the same bytes.
 
 Dropped: `$schema`, `additionalProperties`, `title`, `default`, `examples`, `$comment`,
 `patternProperties`, `not`, `if`/`then`/`else`, `unevaluated*`, other `format` values and
@@ -261,7 +275,7 @@ any keyword not listed above. The dropped names are logged once per tool at `deb
 
 `$ref` inlining is depth-capped at 8 and cycle-aware; a recursive or unresolvable
 reference becomes `{"type":"string","description":"(recursive schema elided)"}`. A node
-that is not an object becomes `{"type":"object"}`, and a declaration whose sanitised
+that is not an object, or one nothing survived in, becomes `{"type":"object"}`, and a declaration whose sanitised
 schema has no properties left is sent **without** `parameters` — several model versions
 reject `{"type":"object","properties":{}}`. Sanitising never fails; anything Gemini still
 objects to comes back relayed verbatim.
@@ -323,8 +337,8 @@ The native type is preferable for `keep_alive`, `num_ctx` and batch embeddings.
 
 A user message may carry OpenAI image parts:
 `{"type":"image_url","image_url":{"url":"…"}}`, either an inline
-`data:image/png;base64,…` URL or a remote one. Inline images are passed to every
-vision-capable provider as they are. Remote ones depend on the provider:
+`data:image/png;base64,…` URL or a remote one. Inline images are checked and then passed
+to every vision-capable provider as they are. Remote ones depend on the provider:
 
 | Provider | Remote `image_url` |
 |---|---|
@@ -333,10 +347,24 @@ vision-capable provider as they are. Remote ones depend on the provider:
 | `gemini` | Files API and `gs://` URIs are forwarded as `fileData`; anything else is fetched by the gateway and inlined |
 | `ollama` | fetched by the gateway and inlined — Ollama accepts nothing else |
 
+An inline `data:` URL is held to the same whitelist a downloaded image is, and refused
+with the gateway's own `400` when it does not meet it — before anything is sent upstream:
+
+- the URL must carry `;base64`, so `data:image/png,%89PNG…` is refused rather than
+  forwarded as if it were encoded;
+- the media type must be `image/png`, `image/jpeg`, `image/gif` or `image/webp`, so
+  `data:text/html;base64,…` no longer travels as an image;
+- the payload must decode as standard base64.
+
+These used to pass through untouched and came back as a provider `400` that named nothing
+the caller could act on. The check belongs to the translating adapters (`gemini`,
+`ollama`, `anthropic`); the OpenAI-compatible types relay the request body verbatim by
+design, so there the upstream is still the one that reads the part.
+
 The gateway's own fetch (`IMAGE_FETCH`, on by default) goes out over the same hardened
 transport as provider calls but under a **stricter** policy: an image URL that resolves to
-a loopback, link-local or private address is refused, and a redirect to another host is
-not followed.
+a loopback, link-local or private address is refused, and a redirect to another host — or
+one that drops from `https` to `http` on the same host — is not followed.
 
 The difference matters. `ALLOW_PRIVATE_UPSTREAMS` and `PRIVATE_UPSTREAM_ALLOWLIST` lift
 the private-address check for provider calls — allowlisting a host is the documented way
@@ -352,13 +380,20 @@ to probe the internal network. On top of that:
   response that declares nothing (or lies) cannot exceed it.
 - Images are fetched one at a time, at most `IMAGE_FETCH_MAX_PER_REQUEST` per chat
   request, each within `IMAGE_FETCH_TIMEOUT`.
+- Across requests, `IMAGE_FETCH_MAX_CONCURRENT` caps the fetches the whole process runs
+  at once and the connections it will hold to one host. A per-request limit bounds one
+  request and nothing at all when many arrive together, which is what would make the
+  gateway a useful amplifier for a target an API key chose. A fetch that cannot get a
+  slot within `IMAGE_FETCH_TIMEOUT` is answered `503` rather than `400`: that one is the
+  gateway running out, not the client getting anything wrong.
 
 Anything the client got wrong — a bad scheme, a non-image response, an oversized image,
 a non-2xx from the image host, too many images — is a `400 invalid_request_error` naming
 only the **host** of the offending URL, never the full URL (which may carry a signed query
 string). A non-2xx is deliberately a `400` and not a `502`: the client chose the host.
 
-Fetched images are cached in memory (`IMAGE_CACHE_ENTRIES`, `IMAGE_CACHE_TTL`) because a
+Fetched images are cached in memory (`IMAGE_CACHE_ENTRIES`, `IMAGE_CACHE_MAX_MB`,
+`IMAGE_CACHE_TTL`) because a
 multi-turn conversation resends the same image part on every turn. The cache is keyed on
 the URL alone and is not written to disk, so an image whose content changes within the TTL
 keeps serving the old bytes until it expires; a response carrying `Cache-Control: no-store`
