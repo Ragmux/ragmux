@@ -204,37 +204,19 @@ func appendAnthropic(msgs []anthropicMessage, role string, parts []anthropicCont
 }
 
 func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return []anthropicContent{{Type: "text", Text: s}}, nil
-	}
-	var parts []struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		ImageURL struct {
-			URL string `json:"url"`
-		} `json:"image_url"`
-	}
-	if err := json.Unmarshal(raw, &parts); err != nil {
-		return nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported message content"}
+	parts, err := parseContent(raw)
+	if err != nil {
+		return nil, err
 	}
 	var out []anthropicContent
 	for _, p := range parts {
-		switch p.Type {
-		case "text":
+		switch {
+		case p.Type == "text":
 			out = append(out, anthropicContent{Type: "text", Text: p.Text})
-		case "image_url":
-			u := p.ImageURL.URL
-			if strings.HasPrefix(u, "data:") {
-				meta, data, ok := strings.Cut(strings.TrimPrefix(u, "data:"), ",")
-				if !ok {
-					continue
-				}
-				mt := strings.TrimSuffix(meta, ";base64")
-				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: mt, Data: data}})
-			} else {
-				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: u}})
-			}
+		case p.Image.Base64 != "":
+			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: p.Image.MediaType, Data: p.Image.Base64}})
+		case p.Image.URL != "":
+			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: p.Image.URL}})
 		}
 	}
 	if len(out) == 0 {

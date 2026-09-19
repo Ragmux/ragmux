@@ -179,41 +179,27 @@ func translateOllama(req ChatRequest, model string) (ollamaRequest, error) {
 
 // openAIPartsToOllama splits a user message into text and base64 images.
 func openAIPartsToOllama(raw json.RawMessage) (string, []string, error) {
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil, nil
-	}
 	if len(raw) == 0 {
 		return "", nil, nil
 	}
-	var parts []struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		ImageURL struct {
-			URL string `json:"url"`
-		} `json:"image_url"`
-	}
-	if err := json.Unmarshal(raw, &parts); err != nil {
-		return "", nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported message content"}
+	parts, err := parseContent(raw)
+	if err != nil {
+		return "", nil, err
 	}
 	var text strings.Builder
 	var images []string
 	for _, p := range parts {
-		switch p.Type {
-		case "text", "":
+		switch {
+		case p.Type == "text":
 			if text.Len() > 0 {
 				text.WriteString("\n")
 			}
 			text.WriteString(p.Text)
-		case "image_url":
-			u := p.ImageURL.URL
-			if !strings.HasPrefix(u, "data:") {
-				return "", nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error",
-					Message: "ollama only accepts inline base64 images (data: URLs)"}
-			}
-			if _, data, ok := strings.Cut(u, ","); ok {
-				images = append(images, data)
-			}
+		case p.Image.Base64 != "":
+			images = append(images, p.Image.Base64)
+		case p.Image.URL != "":
+			return "", nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error",
+				Message: "ollama only accepts inline base64 images (data: URLs)"}
 		}
 	}
 	return text.String(), images, nil

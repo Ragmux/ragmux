@@ -138,36 +138,19 @@ func appendGemini(cs []geminiContent, role string, parts []geminiPart) []geminiC
 }
 
 func openAIPartsToGemini(raw json.RawMessage) ([]geminiPart, error) {
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return []geminiPart{{Text: s}}, nil
-	}
-	var parts []struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		ImageURL struct {
-			URL string `json:"url"`
-		} `json:"image_url"`
-	}
-	if err := json.Unmarshal(raw, &parts); err != nil {
-		return nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported message content"}
+	parts, err := parseContent(raw)
+	if err != nil {
+		return nil, err
 	}
 	var out []geminiPart
 	for _, p := range parts {
-		switch p.Type {
-		case "text":
+		switch {
+		case p.Type == "text":
 			out = append(out, geminiPart{Text: p.Text})
-		case "image_url":
-			u := p.ImageURL.URL
-			if strings.HasPrefix(u, "data:") {
-				meta, data, ok := strings.Cut(strings.TrimPrefix(u, "data:"), ",")
-				if !ok {
-					continue
-				}
-				out = append(out, geminiPart{InlineData: &geminiInline{MimeType: strings.TrimSuffix(meta, ";base64"), Data: data}})
-			} else {
-				out = append(out, geminiPart{FileData: &geminiFileData{FileURI: u}})
-			}
+		case p.Image.Base64 != "":
+			out = append(out, geminiPart{InlineData: &geminiInline{MimeType: p.Image.MediaType, Data: p.Image.Base64}})
+		case p.Image.URL != "":
+			out = append(out, geminiPart{FileData: &geminiFileData{FileURI: p.Image.URL}})
 		}
 	}
 	if len(out) == 0 {
