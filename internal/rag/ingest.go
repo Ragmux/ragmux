@@ -13,8 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/tracing"
 )
 
 // EmbedderFactory builds an embedder for a model connection.
@@ -34,6 +36,10 @@ type Settings struct {
 	MaxAttempts int
 	// MaxPending is the cluster-wide backlog ceiling Enqueue enforces.
 	MaxPending int
+	// Metrics counts claims, jobs and chunks; nil records nothing.
+	Metrics *obs.Metrics
+	// Tracer opens the ingest.document span; nil is a disabled tracer.
+	Tracer *tracing.Tracer
 }
 
 // Ingester processes uploaded documents in the background. One dispatcher
@@ -74,6 +80,11 @@ type Ingester struct {
 	// MaxChunksPerDocument fails a document that splits into more chunks
 	// than this before anything is embedded; 0 means DefaultMaxChunks.
 	MaxChunksPerDocument int
+	// metrics and tracer come in through Settings rather than as exported
+	// fields: the dispatcher polls from the moment NewIngester returns, so
+	// anything assigned afterwards would be a data race with it.
+	metrics *obs.Metrics
+	tracer  *tracing.Tracer
 }
 
 // DefaultMaxChunks is the chunk cap used when MaxChunksPerDocument is 0.
@@ -129,6 +140,7 @@ func NewIngester(ctx context.Context, st *store.Store, factory EmbedderFactory, 
 		maxAttempts: orInt(s.MaxAttempts, DefaultMaxAttempts), maxPending: orInt(s.MaxPending, DefaultMaxPending),
 		workers: workers, jobs: make(chan *store.Document), notify: make(chan struct{}, 1),
 		cancel: cancel, stopping: make(chan struct{}), batchSize: 32,
+		metrics: s.Metrics, tracer: s.Tracer,
 	}
 	for i := 0; i < workers; i++ {
 		ing.wg.Add(1)
@@ -292,14 +304,17 @@ func (ing *Ingester) claimAll(ctx context.Context) {
 	for ing.busy.Load() < int64(ing.workers) {
 		doc, err := ing.store.ClaimDocument(ctx, ing.owner, ing.lease, ing.maxAttempts)
 		if errors.Is(err, store.ErrNotFound) {
+			ing.metrics.RecordIngestClaim(obs.ClaimEmpty)
 			return
 		}
 		if err != nil {
+			ing.metrics.RecordIngestClaim(obs.ClaimError)
 			if ctx.Err() == nil {
 				ing.log.Warn("claim document for ingestion", "err", err)
 			}
 			return
 		}
+		ing.metrics.RecordIngestClaim(obs.ClaimClaimed)
 		ing.busy.Add(1)
 		select {
 		case ing.jobs <- doc:
@@ -332,17 +347,23 @@ func (ing *Ingester) worker(ctx context.Context) {
 }
 
 func (ing *Ingester) runJob(ctx context.Context, doc *store.Document) {
-	err := ing.process(ctx, doc)
+	start := time.Now()
+	chunks, err := ing.process(ctx, doc)
+	took := time.Since(start)
 	switch {
 	case err == nil:
+		ing.metrics.RecordIngestJob(obs.IngestReady, chunks, took)
 	case errors.Is(err, errLeaseLost):
 		// The row belongs to whoever claimed it next; writing a status
 		// here would overwrite their work.
+		ing.metrics.RecordIngestJob(obs.IngestLeaseLost, 0, took)
 		ing.log.Warn("lost ingestion lease; another replica took over", "doc", doc.ID, "file", doc.Filename)
 	case ctx.Err() != nil:
 		// Shutdown, not a bad document: Stop puts it back in the queue.
+		ing.metrics.RecordIngestJob(obs.IngestCancelled, 0, took)
 		ing.log.Info("ingestion cancelled by shutdown", "doc", doc.ID)
 	default:
+		ing.metrics.RecordIngestJob(obs.IngestFailed, 0, took)
 		ing.log.Error("ingest failed", "doc", doc.ID, "err", err)
 		_ = ing.store.SetDocumentStatus(context.Background(), doc.ID, store.DocFailed, truncate(err.Error(), 1000))
 	}
@@ -356,7 +377,8 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 	if err != nil {
 		return err
 	}
-	return ing.process(ctx, doc)
+	_, err = ing.process(ctx, doc)
+	return err
 }
 
 // process runs the pipeline for a document this ingester holds the lease
@@ -369,7 +391,20 @@ func (ing *Ingester) Process(ctx context.Context, docID int64) error {
 // the status write in it, so the last writer wins cleanly and no half
 // state is visible. The heartbeat, and the context it cancels the moment
 // the claim is gone, is what keeps that rare.
-func (ing *Ingester) process(ctx context.Context, doc *store.Document) error {
+func (ing *Ingester) process(ctx context.Context, doc *store.Document) (int, error) {
+	// Ingestion is its own trace root. A document reprocessed from the
+	// dashboard would otherwise hang a job that may run for minutes off the
+	// HTTP request that only queued it, and that request's span closes in
+	// milliseconds.
+	ctx, span := ing.tracer.Start(tracing.ContextWithSpanContext(ctx, tracing.SpanContext{}),
+		"ingest.document", tracing.KindInternal)
+	defer span.End()
+	span.SetAttributes(
+		tracing.Int64("ragmux.document.id", doc.ID),
+		tracing.Int64("ragmux.document.store_id", doc.RAGStoreID),
+		tracing.Int("ragmux.document.attempt", doc.Attempts),
+	)
+
 	ctx, cancel := context.WithTimeout(ctx, processTimeout)
 	defer cancel()
 
@@ -405,43 +440,49 @@ func (ing *Ingester) process(ctx context.Context, doc *store.Document) error {
 		beatWG.Wait()
 	}()
 
-	err := ing.pipeline(ctx, doc)
+	chunks, err := ing.pipeline(ctx, doc)
 	if lost.Load() {
-		return errLeaseLost
+		span.RecordError(errLeaseLost)
+		return 0, errLeaseLost
 	}
 	if err != nil {
-		return err
+		// The pipeline's errors are ours: a parse failure, the chunk cap, or
+		// a provider error that transportError has already redacted.
+		span.RecordError(err)
+		return 0, err
 	}
+	span.SetAttributes(tracing.Int("ragmux.document.chunks", chunks))
+	span.SetStatusOK()
 	if err := ing.store.ClearDocumentClaim(ctx, doc.ID, ing.owner); err != nil {
 		ing.log.Warn("clear ingestion claim", "doc", doc.ID, "err", err)
 	}
-	return nil
+	return chunks, nil
 }
 
 // pipeline parses, chunks, embeds and stores one claimed document.
-func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) error {
+func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, error) {
 	docID := doc.ID
 	rs, err := ing.store.GetRAGStore(ctx, doc.RAGStoreID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	conn, err := ing.store.GetConnection(ctx, rs.EmbeddingConnectionID)
 	if err != nil {
-		return fmt.Errorf("embedding connection: %w", err)
+		return 0, fmt.Errorf("embedding connection: %w", err)
 	}
 	embedder, err := ing.factory(conn)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	start := time.Now()
 	data, err := ing.store.DocumentContent(ctx, docID)
 	if err != nil {
-		return fmt.Errorf("load document content: %w", err)
+		return 0, fmt.Errorf("load document content: %w", err)
 	}
 	parsed, err := Extract(ctx, doc.Filename, data)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var pages *int
 	if parsed.PageCount > 0 {
@@ -450,7 +491,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) error {
 	ing.progress(ctx, docID, progressParsed, pages)
 	pieces := SplitBlocks(parsed.Blocks, rs.ChunkSize, rs.ChunkOverlap)
 	if len(pieces) == 0 {
-		return fmt.Errorf("document produced no text chunks")
+		return 0, fmt.Errorf("document produced no text chunks")
 	}
 	// The cap bounds the memory held by the chunk slice and the single
 	// ReplaceDocumentChunks write below, and the embedding calls it takes.
@@ -459,7 +500,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) error {
 		maxChunks = DefaultMaxChunks
 	}
 	if len(pieces) > maxChunks {
-		return fmt.Errorf("document splits into %d chunks, more than the limit of %d (MAX_CHUNKS_PER_DOCUMENT); raise the store's chunk_size or the limit", len(pieces), maxChunks)
+		return 0, fmt.Errorf("document splits into %d chunks, more than the limit of %d (MAX_CHUNKS_PER_DOCUMENT); raise the store's chunk_size or the limit", len(pieces), maxChunks)
 	}
 	title := parsed.Title
 	if title == "" {
@@ -486,7 +527,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) error {
 		inputs := inputs[i:end]
 		vecs, err := embedder.Embed(ctx, inputs)
 		if err != nil {
-			return fmt.Errorf("embed batch %d: %w", i/ing.batchSize, err)
+			return 0, fmt.Errorf("embed batch %d: %w", i/ing.batchSize, err)
 		}
 		for j := range vecs {
 			chunks[i+j].Embedding = vecs[j]
@@ -498,11 +539,11 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) error {
 		}
 	}
 	if err := ing.store.ReplaceDocumentChunks(ctx, doc, chunks); err != nil {
-		return fmt.Errorf("store chunks: %w", err)
+		return 0, fmt.Errorf("store chunks: %w", err)
 	}
 	ing.log.Info("document ingested", "doc", docID, "file", doc.Filename, "chunks", len(chunks),
 		"dims", len(chunks[0].Embedding), "took", time.Since(start).Round(time.Millisecond))
-	return nil
+	return len(chunks), nil
 }
 
 // Progress milestones of the pipeline, in percent; embedding batches fill

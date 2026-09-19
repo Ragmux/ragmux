@@ -20,7 +20,7 @@ func (e *openAIEmbedder) Embed(ctx context.Context, inputs []string) ([][]float3
 		} `json:"data"`
 	}
 	body := map[string]any{"model": e.cfg.Model, "input": inputs, "encoding_format": "float"}
-	if err := doJSON(ctx, e.cfg, e.base+"/embeddings",
+	if err := doJSON(ctx, e.cfg, opEmbed, e.base+"/embeddings",
 		map[string]string{"Authorization": "Bearer " + e.cfg.APIKey}, body, &out); err != nil {
 		return nil, err
 	}
@@ -52,7 +52,7 @@ func (e *ollamaEmbedder) Embed(ctx context.Context, inputs []string) ([][]float3
 	if e.cfg.APIKey != "" {
 		hdr["Authorization"] = "Bearer " + e.cfg.APIKey
 	}
-	if err := doJSON(ctx, e.cfg, e.base+"/api/embed", hdr, body, &out); err != nil {
+	if err := doJSON(ctx, e.cfg, opEmbed, e.base+"/api/embed", hdr, body, &out); err != nil {
 		return nil, err
 	}
 	if len(out.Embeddings) != len(inputs) {
@@ -81,7 +81,7 @@ func (e *geminiEmbedder) Embed(ctx context.Context, inputs []string) ([][]float3
 			Values []float32 `json:"values"`
 		} `json:"embeddings"`
 	}
-	if err := doJSON(ctx, e.cfg, e.base+path+":batchEmbedContents",
+	if err := doJSON(ctx, e.cfg, opEmbed, e.base+path+":batchEmbedContents",
 		map[string]string{"x-goog-api-key": e.cfg.APIKey}, map[string]any{"requests": reqs}, &out); err != nil {
 		return nil, err
 	}

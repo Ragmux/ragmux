@@ -247,7 +247,7 @@ func (p *ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, err
 	}
 	var or ollamaResponse
-	if err := doJSON(ctx, p.cfg, p.base+"/api/chat", p.headers(), body, &or); err != nil {
+	if err := doJSON(ctx, p.cfg, opChat, p.base+"/api/chat", p.headers(), body, &or); err != nil {
 		return nil, err
 	}
 	if or.Error != "" {

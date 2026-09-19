@@ -49,6 +49,19 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `LOGIN_LOCKOUT_MINUTES` | `15` | Lockout window in minutes. |
 | `LOG_RETENTION_DAYS` | `90` | Request logs older than this many days are deleted by the hourly retention job (`0` keeps them forever). |
 | `AUDIT_RETENTION_DAYS` | `365` | Audit entries older than this many days are deleted (`0` keeps them forever). |
+| `METRICS_ENABLED` | `false` | `true` serves the Prometheus text exposition at `/metrics`. Off, the route does not exist and returns `404`. See [Observability](observability.md). |
+| `METRICS_TOKEN` | *(none)* | Bearer token `/metrics` requires, compared in constant time. Required whenever `METRICS_LISTEN` is unset or binds a non-loopback address; see [Why the endpoint is authenticated](observability.md#why-the-endpoint-is-authenticated). |
+| `METRICS_TOKEN_FILE` | *(none)* | Path of a file whose trimmed content is used when `METRICS_TOKEN` is unset (Docker/Compose secrets). |
+| `METRICS_LISTEN` | *(none)* | `host:port` (e.g. `127.0.0.1:9090`). When set, `/metrics` is served by a **second** `http.Server` on that address and is **not mounted on the main router at all**, so no reverse-proxy rule can expose it. A loopback host (`127.0.0.1`, `::1`, `localhost`) is accepted without a token; any other host still needs one. Setting it without `METRICS_ENABLED=true` is a configuration error. |
+| `METRICS_MAX_SERIES` | `5000` | Ceiling on the registry's label combinations (`>= 1`). New combinations beyond it are dropped, counted in `ragmux_metrics_series_dropped_total` and logged once. |
+| `TRACING_ENABLED` | *(endpoint set)* | Defaults to `true` when an OTLP endpoint is configured and `false` otherwise; an explicit `false` always wins. `true` without an endpoint is a configuration error. |
+| `TRACING_TRUST_INCOMING` | `false` | `true` continues a trace a client started from its `traceparent` header. Off by default: a client could otherwise pin every request into one trace and force the sampled flag on all of it. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(none)* | Base URL of an OpenTelemetry Collector's OTLP/HTTP receiver, e.g. `http://otel-collector:4318`. `/v1/traces` is appended unless the URL already ends in it. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | *(none)* | Traces-signal URL; takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | *(none)* | `k=v,k2=v2` headers sent with every export request (a vendor's auth header). A value may contain `=`; only the first one separates. |
+| `OTEL_SERVICE_NAME` | `ragmux` | `service.name` resource attribute. |
+| `OTEL_RESOURCE_ATTRIBUTES` | *(none)* | Extra resource attributes in the same `k=v,k2=v2` form, e.g. `deployment.environment=prod`. |
+| `OTEL_TRACES_SAMPLER_ARG` | `0.05` | Head sampling probability for new traces, `0` to `1`. |
 
 The integer variables from `LOGIN_RATE_LIMIT_PER_MIN` down accept `0` or any positive
 number; a negative or non-numeric value is a configuration error.

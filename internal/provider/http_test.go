@@ -64,7 +64,7 @@ func TestDoRequestConnectionRefused(t *testing.T) {
 	addr := l.Addr().String()
 	_ = l.Close()
 	cfg := Config{APIKey: "k", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Client: &http.Client{Timeout: 5 * time.Second}}
-	_, err = doRequest(context.Background(), cfg, "http://"+addr+"/v1", nil, map[string]any{})
+	_, _, err = doRequest(context.Background(), cfg, opChat, "http://"+addr+"/v1", nil, map[string]any{})
 	var pe *Error
 	if !errors.As(err, &pe) || pe.Message != "upstream unreachable" {
 		t.Errorf("err = %v", err)
@@ -76,7 +76,7 @@ func TestDoRequestNetguardRejection(t *testing.T) {
 	defer srv.Close()
 	client := &http.Client{Transport: &http.Transport{DialContext: netguard.SafeDialContext(nil, false, nil)}}
 	cfg := Config{Client: client, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	_, err := doRequest(context.Background(), cfg, srv.URL, nil, nil)
+	_, _, err := doRequest(context.Background(), cfg, opChat, srv.URL, nil, nil)
 	var pe *Error
 	if !errors.As(err, &pe) || !strings.Contains(pe.Message, "PRIVATE_UPSTREAM_ALLOWLIST") {
 		t.Errorf("err = %v", err)
