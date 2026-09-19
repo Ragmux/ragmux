@@ -1,6 +1,6 @@
 # v0.4 review artıkları — genel plan
 
-- **Durum:** beklemede
+- **Durum:** sürüyor
 - **Tarih:** 2026-09-19
 - **Öncül:** `.ssot/plans/2026-09-19-v0.4/` (kod tamam, yayın bekliyor)
 
@@ -12,23 +12,26 @@ maddeler kaldı. **Hiçbiri güvenlik sınırını delmiyor** — o yüzden sür
 bunlarla da yayınlanabilir — ama her biri raporlanmış, çoğu ölçülmüş
 gerçek bir kusur ve hiçbiri "sonra bakarız" diye kaybolmamalı.
 
-İki madde kullanıcı kararı bekliyor (Faz 01). Kalanlar teknik.
+Kullanıcı kararı bekleyen üç madde 2026-09-19'da karara bağlandı ve
+`.ssot/ADR.md`'ye ADR-001, ADR-002, ADR-003 olarak girdi. Kalan her şey
+teknik.
 
 ## Faz tablosu
 
 | Faz | Başlık | Sahip | Durum | Bağımlılık |
 |---|---|---|---|---|
-| 01 | Hazır olma ve seri tavanı kararları | backend-engineer | **karar bekliyor** | — |
+| 01 | Hazır olma ve seri tavanı kararları | backend-engineer | sürüyor | — |
 | 02 | Metrik ve trace etiket sınırları | backend-engineer | beklemede | 01 |
-| 03 | Provider: şema ve görsel doğrulama | backend-engineer | beklemede | — |
-| 04 | Token muhasebesi ve fiyat tablosu | backend-engineer | beklemede | — |
-| 05 | Depolama ve ölçek temizliği | backend-engineer | beklemede | — |
-| 06 | Yapılandırma ve kapanış küçükleri | backend-engineer | beklemede | — |
-| 07 | ParadeDB yolunun canlı doğrulaması | backend-engineer | beklemede | — |
+| 03 | Provider: şema ve görsel doğrulama | backend-engineer | sürüyor | — |
+| 04 | Token muhasebesi ve fiyat tablosu | backend-engineer | sürüyor | — |
+| 05 | Depolama ve ölçek temizliği | backend-engineer | sürüyor | — |
+| 06 | Yapılandırma ve kapanış küçükleri | backend-engineer | sürüyor | — |
+| 07 | ParadeDB yolunun canlı doğrulaması | backend-engineer | sürüyor | — |
 | 08 | Yayın: push, PR, tag | — (kullanıcı onayı) | beklemede | 01–07 |
 
-02–07 birbirinden bağımsız; paralel verilebilir. 01 karar çıkmadan
-başlamaz. 08 hepsinin review'dan temiz geçmesini bekler.
+02–07 birbirinden bağımsız; paralel veriliyor. 02, 01'in dokunduğu
+`internal/metrics` dosyasına girmez. 08 hepsinin review'dan temiz
+geçmesini bekler.
 
 ## Ortak kurallar
 

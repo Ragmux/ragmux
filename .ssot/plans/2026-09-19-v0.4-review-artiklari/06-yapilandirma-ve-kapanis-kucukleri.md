@@ -3,7 +3,7 @@
 - **Durum:** beklemede
 - **Sahip:** backend-engineer
 - **Bağımlılık:** yok
-- **İlgili karar:** yok
+- **İlgili karar:** ADR-003 (5. madde)
 
 ## Amaç
 
@@ -40,8 +40,12 @@ Tek tek küçük ama her biri gerçek olan kusurları kapatmak.
    `docs/users-and-limits.md` rol matrisi `viewer`'ı salt-okunur diye
    tanımlıyor. Davranış kasıtlı görünüyor; **doküman ile kodun aynı şeyi
    söylemesi** gerekiyor. Ya matris "viewer kendi gateway key'ini
-   üretebilir" diye netleşir, ya da key basma `editor`'a bağlanır. İkincisi
-   davranış değişikliği: kullanıcıya sorulur.
+   üretebilir" diye netleşir, ya da key basma `editor`'a bağlanır.
+   **Karar verildi (ADR-003, 2026-09-19): davranış korunur, doküman
+   düzeltilir.** Kod değişmez; `docs/users-and-limits.md` rol matrisi
+   `viewer`'ın kendi gateway key'ini üretebildiğini ve harcamasının kendi
+   limitine yazıldığını yazar, rollerin **admin yüzeyini** sınırladığını
+   netleştirir. `internal/auth/policy.go` bu ayrımı bir yorumla kaydeder.
 6. **Session taşınabilir bir credential hâline geliyor.**
    `internal/admin/admin.go:349-352`, `{"bearer":true}` login yanıtında
    token'ı gövdeye koyuyor. `sessionOnly` koruması "session = klavyedeki
@@ -82,6 +86,9 @@ Tek tek küçük ama her biri gerçek olan kusurları kapatmak.
 3. madde yayınlanmış bir yanıt şeklini daraltıyor — `CHANGELOG.md` için
 faz raporunda listele.
 
-5. ve 6. maddeler kod değil karar isteyebilir: kod ile dokümanın
-çeliştiğini tespit etmek bu fazın işi, hangisinin düzeltileceği
-kullanıcının. Çelişkiyi raporla ve dur.
+5. madde karara bağlandı (ADR-003): doküman düzeltilir, kod değişmez.
+
+6. madde kod değişikliği değil: `{"bearer":true}` davranışı korunur,
+`sessionOnly`'nin dayandığı varsayım `docs/api.md`'de yazılı hâle gelir.
+Yeni bir kısıt getirme; yalnız varsayımı kaydet ve faz raporunda ADR adayı
+olarak bildir.

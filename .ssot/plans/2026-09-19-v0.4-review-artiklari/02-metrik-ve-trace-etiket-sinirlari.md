@@ -2,8 +2,8 @@
 
 - **Durum:** beklemede
 - **Sahip:** backend-engineer
-- **Bağımlılık:** Faz 01 (tavan davranışı kararı)
-- **İlgili karar:** PRD davranış kuralı 10
+- **Bağımlılık:** Faz 01 (tavan davranışı kararı — ADR-002 ile verildi)
+- **İlgili karar:** ADR-002; PRD davranış kuralı 10
 
 ## Amaç
 

@@ -1,14 +1,25 @@
 # Faz 01 — Hazır olma ve seri tavanı kararları
 
-- **Durum:** karar bekliyor
+- **Durum:** beklemede
 - **Sahip:** backend-engineer
 - **Bağımlılık:** yok
-- **İlgili karar:** PRD davranış kuralı 10 (etiketler kurulumla sınırlı,
-  trafikle değil). ADR yok — bu fazın çıktısı iki ADR adayı üretir.
+- **İlgili karar:** ADR-001, ADR-002 (ikisi de `.ssot/ADR.md`'de kabul
+  edildi, 2026-09-19). PRD davranış kuralı 10.
 
 ## Amaç
 
-İki işletme davranışını kullanıcı kararıyla sabitlemek ve uygulamak.
+Kullanıcının verdiği iki işletme kararını uygulamak.
+
+## Karar (verildi — 2026-09-19)
+
+- **(a) `/readyz`:** ADR-001. `applied < head` → 503 (`migrating`);
+  `applied > head` → **200**, gövdede `degraded` girdisiyle. Yani aşağıdaki
+  seçeneklerden **1.** uygulanacak.
+- **(b) Seri tavanı:** ADR-002. Tavan davranışı aynı kalır — yeni seri
+  düşer — ama olay sessiz olmaktan çıkar: `Error` seviyesinde loglanır ve
+  düşen seri sayısı dışarı verilen bir sayaçla görünür olur. Yani aşağıdaki
+  seçeneklerden **3.'ün alarm yarısı**, tavanı yükseltmeden. LRU tahliye
+  **reddedildi** (gerekçe ADR-002'de).
 
 ## Kapsam
 
@@ -77,4 +88,12 @@ dolduğunda ne olmalı?**
 
 ## Notlar
 
-Bu fazın kodu küçük; asıl iş kararın kendisi. Karar çıkmadan başlama.
+Aşağıdaki "Seçenekler" listeleri kararın alındığı bağlamı gösteriyor;
+artık tarihsel. Uygulanacak olan yukarıdaki **Karar** bölümüdür.
+
+ADR-001 bir koşula bağlı: Ragmux migration'larının **ekleyici** kalması.
+`docs/scaling.md` bu koşulu açıkça yazsın — kolon düşüren bir migration
+gelirse bu karar yeniden ele alınmalı.
+
+ADR-002'nin sayacı yayınlanmış metrik yüzeyine yeni bir isim ekliyor;
+`docs/observability.md`'deki metrik listesine de girsin.
