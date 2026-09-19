@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -32,7 +33,11 @@ var ErrNotFound = errors.New("not found")
 // replicas can start (or create a new embedding table) at the same time.
 const (
 	lockMigrations int64 = 0x7261676d75780001 // "ragmux" + 1
-	lockVecTables  int32 = 0x72616701
+	// LockJanitor is the leader lock the hourly retention pass takes so only
+	// one replica does the work. Exported: internal/maintenance takes it.
+	LockJanitor   int64 = 0x7261676d75780002 // "ragmux" + 2
+	lockVecTables int32 = 0x72616701
+	lockBM25Index int32 = 0x72616702
 )
 
 // OpenConfig carries everything Open needs.
@@ -59,6 +64,10 @@ type Store struct {
 	log             *slog.Logger
 	// vecTables remembers which chunk_embeddings_<dims> tables exist.
 	vecTables sync.Map
+	// caps are the optional server features detected once at Open.
+	caps Capabilities
+	// bm25Ready remembers that the ParadeDB index has been created.
+	bm25Ready atomic.Bool
 }
 
 // Open connects to PostgreSQL, ensures the vector extension exists, runs
@@ -95,6 +104,7 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		_ = conn.Close(ctx)
 		return nil, err
 	}
+	caps := detectCapabilities(ctx, conn, log)
 	if err := conn.Close(ctx); err != nil {
 		return nil, err
 	}
@@ -118,7 +128,7 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log}, nil
+	return &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log, caps: caps}, nil
 }
 
 // Close releases the connection pool.
@@ -134,6 +144,7 @@ func (s *Store) DB() *pgxpool.Pool { return s.pool }
 type DatabaseInfo struct {
 	PostgresVersion   string `json:"postgres_version"`
 	PgvectorVersion   string `json:"pgvector_version"`
+	PgSearchVersion   string `json:"pg_search_version"`
 	MigrationsVersion int    `json:"migrations_version"`
 	SizeBytes         int64  `json:"size_bytes"`
 }
@@ -149,7 +160,7 @@ type BackupInfo struct {
 
 // DatabaseInfo reports server, extension and migration versions plus size.
 func (s *Store) DatabaseInfo(ctx context.Context) (*DatabaseInfo, error) {
-	info := &DatabaseInfo{PostgresVersion: s.ServerVersion}
+	info := &DatabaseInfo{PostgresVersion: s.ServerVersion, PgSearchVersion: s.caps.PgSearchVersion}
 	err := s.pool.QueryRow(ctx, `SELECT
 		COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'vector'), ''),
 		COALESCE((SELECT MAX(version) FROM schema_migrations), 0),
