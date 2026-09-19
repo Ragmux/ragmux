@@ -215,8 +215,25 @@ func (s *Store) UpdateUser(ctx context.Context, id int64, role string, isActive 
 
 // DeleteUser removes an account; its sessions and memberships cascade.
 // Deleting the last active admin fails with ErrLastAdmin.
+//
+// It refuses with ErrKeyInUse while any of the account's api keys is still
+// named by a request log. Deleting the user would cascade to its keys, and
+// that in turn would null out request_logs.api_key_id and .user_id, wiping
+// who spent what -- in bulk and without a word, from a path that never
+// mentions keys. DeleteAPIKey already refuses the same thing one key at a
+// time; this closes the door the cascade left open beside it. Deactivate the
+// account instead: is_active already stops every session and every key.
 func (s *Store) DeleteUser(ctx context.Context, id int64) error {
 	return s.adminGuardedTx(ctx, id, func(tx pgx.Tx) error {
+		var attributed bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM request_logs l JOIN api_keys k ON k.id = l.api_key_id WHERE k.user_id = $1)`,
+			id).Scan(&attributed); err != nil {
+			return err
+		}
+		if attributed {
+			return ErrKeyInUse
+		}
 		res, err := tx.Exec(ctx, "DELETE FROM users WHERE id = $1", id)
 		if err != nil {
 			return err

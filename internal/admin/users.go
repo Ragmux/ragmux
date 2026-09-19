@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -217,6 +218,12 @@ func (a *Admin) deleteUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := a.Store.DeleteUser(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrKeyInUse) {
+			writeErrCode(w, http.StatusConflict, "user_has_attributed_usage",
+				"request logs still attribute spend to this account's api keys; deactivate it instead "+
+					"so its usage history stays attributed")
+			return
+		}
 		a.fail(w, err)
 		return
 	}
@@ -258,8 +265,17 @@ func (a *Admin) resetPassword(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "user.reset_password", "user", ptr(id), map[string]any{"username": target.Username})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// An administrator resetting someone else's password is a compromise or
+	// an offboarding response, so the account's management keys go with its
+	// sessions; they would otherwise keep acting on it.
+	revoked, err := a.Store.RevokeUserManagementKeys(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.audit(r, "user.reset_password", "user", ptr(id),
+		map[string]any{"username": target.Username, "revoked_management_keys": revoked})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "revoked_management_keys": revoked})
 }
 
 func (a *Admin) revokeSessions(w http.ResponseWriter, r *http.Request) {

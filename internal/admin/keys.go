@@ -90,8 +90,9 @@ func (a *Admin) validateKey(r *http.Request, in *keyInput, k *store.APIKey) erro
 	}
 	k.Scopes = scopes
 	if k.Kind == store.KindManagement {
-		// The table refuses these too; answering 400 here is friendlier than
-		// surfacing a constraint violation as a 409.
+		// The table refuses a default project and its own limits; the grant
+		// rows in api_key_projects it does not constrain, so this check is
+		// the only thing keeping a management key out of them.
 		if len(in.ProjectIDs) > 0 || in.DefaultProjectID != nil {
 			return errors.New("a management key has no projects")
 		}
@@ -280,6 +281,15 @@ func (a *Admin) updateKey(w http.ResponseWriter, r *http.Request) {
 	k, ok := a.loadKey(w, r)
 	if !ok {
 		return
+	}
+	if k.Kind == store.KindManagement {
+		// Minting a management key needs a session so a leaked one cannot
+		// extend its own reach. Editing one is the same step by another
+		// name: scopes and expiry are writable here, so without this the
+		// guard on create only costs an attacker one extra request.
+		if !sessionOnly(w, r) {
+			return
+		}
 	}
 	var in keyInput
 	if err := decode(r, &in); err != nil {

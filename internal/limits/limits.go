@@ -189,6 +189,18 @@ func (l *Limiter) CheckSubject(ctx context.Context, s Subject, estimatedPromptTo
 	if kc.RPM > 0 {
 		n, err := l.Store.ReserveKeyMinuteRequest(ctx, *s.KeyID, w.Minute)
 		if err != nil {
+			// The project slot is already taken and the caller aborts on the
+			// error without ever reaching Record, so give it back here too.
+			// Otherwise a failing key counter leaves the project a phantom
+			// request for the rest of the minute, and a few of those close a
+			// low-RPM project entirely.
+			if d.Reserved {
+				// A failed release is ignored: the reservation error below is
+				// what the caller acts on, and the minute row it leaves
+				// behind expires with the window anyway.
+				_ = l.rollback(ctx, s, w, true, false)
+				d.Reserved = false
+			}
 			return d, err
 		}
 		if n > kc.RPM {

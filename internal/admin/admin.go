@@ -504,8 +504,15 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "password.change", "user", ptr(u.ID), nil)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// ... and so do the management keys, which outlive a session and can act
+	// on the account just as well. Gateway keys are left running.
+	revoked, err := a.Store.RevokeUserManagementKeys(r.Context(), u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.audit(r, "password.change", "user", ptr(u.ID), map[string]any{"revoked_management_keys": revoked})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "revoked_management_keys": revoked})
 }
 
 func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {

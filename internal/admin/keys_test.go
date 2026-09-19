@@ -563,3 +563,129 @@ func TestSetupStatusReportsWizardProgress(t *testing.T) {
 }
 
 func itoa(id int64) string { return strconv.FormatInt(id, 10) }
+
+// A narrow management key must not be able to widen itself. Minting a
+// management key requires a session precisely so a leaked one cannot extend
+// its own reach; updating one has to hold the same line, or the guard on
+// create is decorative.
+func TestManagementKeyCannotWidenItself(t *testing.T) {
+	e := newAdminEnv(t)
+	ctx := context.Background()
+	admin := e.user("admin", "admin")
+	k, raw, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindManagement, Name: "ci",
+		UserID: admin.ID, Scopes: []string{store.ScopeKeys}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{"name": "ci", "scopes": store.ManagementScopes,
+		"expires_at": "2099-01-01T00:00:00Z"}
+	status, _ := e.do(http.MethodPut, "/api/keys/"+itoa(k.ID), body, raw)
+	if status != http.StatusForbidden {
+		t.Fatalf("widening its own scopes: %d, want 403", status)
+	}
+	after, err := e.st.GetAPIKey(ctx, k.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Scopes) != 1 || after.Scopes[0] != store.ScopeKeys {
+		t.Errorf("scopes after the refused update = %v", after.Scopes)
+	}
+	if after.ExpiresAt != nil {
+		t.Errorf("expiry was extended to %v", after.ExpiresAt)
+	}
+	// The owner, at a keyboard, can still do it.
+	if status, _ := e.do(http.MethodPut, "/api/keys/"+itoa(k.ID), body, admin.token); status != http.StatusOK {
+		t.Errorf("session update: %d, want 200", status)
+	}
+}
+
+// Changing a password is how someone reacts to a suspected leak. A
+// management key minted from the leaked session outlives every session, so
+// it has to die with them; a gateway key, which cannot touch the management
+// API, keeps running.
+func TestPasswordChangeRevokesManagementKeys(t *testing.T) {
+	e := newAdminEnv(t)
+	ctx := context.Background()
+	admin := e.user("admin", "admin")
+	// e.user stores a placeholder hash; the change has to verify the current
+	// password, so give the account a real one.
+	pw := "the-current-password"
+	hash, err := auth.HashPassword(pw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.UpdateUserPassword(ctx, admin.ID, hash); err != nil {
+		t.Fatal(err)
+	}
+	mgmt, mgmtRaw, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindManagement,
+		Name: "minted-by-the-attacker", UserID: admin.ID, Scopes: store.ManagementScopes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, _, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "app",
+		UserID: admin.ID, Scopes: store.DefaultGatewayScopes, ProjectIDs: []int64{e.proj.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := e.do(http.MethodGet, "/api/projects", nil, mgmtRaw); status != http.StatusOK {
+		t.Fatalf("the management key should work before the change")
+	}
+	status, out := e.do(http.MethodPost, "/api/me/password",
+		map[string]any{"current_password": pw, "new_password": "a-new-password"}, admin.token)
+	if status != http.StatusOK {
+		t.Fatalf("password change: %d %v", status, out)
+	}
+	if n, _ := out["revoked_management_keys"].(float64); n != 1 {
+		t.Errorf("revoked_management_keys = %v, want 1", out["revoked_management_keys"])
+	}
+	if status, _ := e.do(http.MethodGet, "/api/projects", nil, mgmtRaw); status != http.StatusUnauthorized {
+		t.Errorf("the management key still works after the password change: %d", status)
+	}
+	after, err := e.st.GetAPIKey(ctx, mgmt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.RevokedAt == nil {
+		t.Error("management key not revoked")
+	}
+	stillLive, err := e.st.GetAPIKey(ctx, gw.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillLive.RevokedAt != nil {
+		t.Error("a gateway key was revoked; it cannot reach the management API and should keep running")
+	}
+}
+
+// Deleting a user cascades to its api keys, and that would null the
+// attribution on every request log those keys made -- the same loss
+// DeleteAPIKey refuses one key at a time, arriving in bulk through a path
+// that never mentions keys.
+func TestDeletingAUserWithAttributedSpendIsRefused(t *testing.T) {
+	e := newAdminEnv(t)
+	ctx := context.Background()
+	admin := e.user("admin", "admin")
+	victim := e.user("app-owner", "editor", e.proj.ID)
+	k, _, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "app",
+		UserID: victim.ID, Scopes: store.DefaultGatewayScopes, ProjectIDs: []int64{e.proj.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.InsertRequestLog(ctx, &store.RequestLog{ProjectID: e.proj.ID, ModelName: "m",
+		StatusCode: 200, PromptTokens: 10, CompletionTokens: 2, APIKeyID: &k.ID, UserID: &victim.ID,
+		CostSource: store.CostSourceNone}); err != nil {
+		t.Fatal(err)
+	}
+	status, out := e.do(http.MethodDelete, "/api/users/"+itoa(victim.ID), nil, admin.token)
+	if status != http.StatusConflict || errCode(out) != "user_has_attributed_usage" {
+		t.Fatalf("delete: %d %v", status, out)
+	}
+	if _, err := e.st.GetUser(ctx, victim.ID); err != nil {
+		t.Errorf("the account was removed anyway: %v", err)
+	}
+	// Without spend history the account deletes as before.
+	spare := e.user("no-spend", "viewer")
+	if status, out := e.do(http.MethodDelete, "/api/users/"+itoa(spare.ID), nil, admin.token); status != http.StatusOK {
+		t.Errorf("deleting an account with no attributed usage: %d %v", status, out)
+	}
+}

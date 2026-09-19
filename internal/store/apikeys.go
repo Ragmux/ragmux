@@ -247,6 +247,25 @@ func (s *Store) RevokeUserAPIKeys(ctx context.Context, userID int64) (int64, err
 	return res.RowsAffected(), nil
 }
 
+// RevokeUserManagementKeys revokes the account's management keys and reports
+// how many were still live.
+//
+// A changed password kills every session, which is how someone reacts to a
+// suspected leak -- but a management key minted from that session outlives it
+// and can still act on the account, so it has to go with them. Gateway keys
+// are left alone deliberately: they cannot touch the management API, and
+// killing an application's credentials on a routine password change costs
+// more than it protects.
+func (s *Store) RevokeUserManagementKeys(ctx context.Context, userID int64) (int64, error) {
+	res, err := s.pool.Exec(ctx,
+		`UPDATE api_keys SET revoked_at = now(), updated_at = now()
+		 WHERE user_id = $1 AND kind = $2 AND revoked_at IS NULL`, userID, KindManagement)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected(), nil
+}
+
 // ErrKeyInUse is returned when a key cannot be deleted because request logs
 // still point at it.
 var ErrKeyInUse = errors.New("api key is still referenced by request logs")
