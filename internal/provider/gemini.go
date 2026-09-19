@@ -32,9 +32,44 @@ func (p *gemini) headers() map[string]string {
 }
 
 type geminiPart struct {
-	Text       string          `json:"text,omitempty"`
-	InlineData *geminiInline   `json:"inlineData,omitempty"`
-	FileData   *geminiFileData `json:"fileData,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	InlineData       *geminiInline           `json:"inlineData,omitempty"`
+	FileData         *geminiFileData         `json:"fileData,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+// Gemini correlates tool calls by function name; there are no call ids in
+// either direction.
+type geminiFunctionCall struct {
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args,omitempty"`
+}
+
+type geminiFunctionResponse struct {
+	Name     string          `json:"name"`
+	Response json.RawMessage `json:"response"`
+}
+
+type geminiFunctionDeclaration struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+// geminiTool holds every declaration: the API takes a list of tools, but
+// function declarations all belong to the one function-calling tool.
+type geminiTool struct {
+	FunctionDeclarations []geminiFunctionDeclaration `json:"functionDeclarations"`
+}
+
+type geminiToolConfig struct {
+	FunctionCallingConfig geminiFunctionCallingConfig `json:"functionCallingConfig"`
+}
+
+type geminiFunctionCallingConfig struct {
+	Mode                 string   `json:"mode"`
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
 }
 
 type geminiInline struct {
@@ -53,9 +88,11 @@ type geminiContent struct {
 }
 
 type geminiRequest struct {
-	SystemInstruction *geminiContent  `json:"systemInstruction,omitempty"`
-	Contents          []geminiContent `json:"contents"`
-	GenerationConfig  map[string]any  `json:"generationConfig,omitempty"`
+	SystemInstruction *geminiContent    `json:"systemInstruction,omitempty"`
+	Contents          []geminiContent   `json:"contents"`
+	GenerationConfig  map[string]any    `json:"generationConfig,omitempty"`
+	Tools             []geminiTool      `json:"tools,omitempty"`
+	ToolConfig        *geminiToolConfig `json:"toolConfig,omitempty"`
 }
 
 type geminiResponse struct {
@@ -71,14 +108,10 @@ type geminiResponse struct {
 	} `json:"usageMetadata"`
 }
 
-func translateGemini(req ChatRequest) (geminiRequest, error) {
+func translateGemini(cfg Config, req ChatRequest) (geminiRequest, error) {
 	out := geminiRequest{}
-	if len(req.Tools) > 0 {
-		return out, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error",
-			Message: "tool calling is not supported for gemini connections in this gateway version"}
-	}
 	var system []string
-	for _, m := range req.Messages {
+	for i, m := range req.Messages {
 		switch m.Role {
 		case "system", "developer":
 			system = append(system, m.Text())
@@ -89,11 +122,31 @@ func translateGemini(req ChatRequest) (geminiRequest, error) {
 			}
 			out.Contents = appendGemini(out.Contents, "user", parts)
 		case "assistant":
+			var parts []geminiPart
 			if t := m.Text(); t != "" {
-				out.Contents = appendGemini(out.Contents, "model", []geminiPart{{Text: t}})
+				parts = append(parts, geminiPart{Text: t})
 			}
+			parts = append(parts, geminiToolCallParts(m.ToolCalls)...)
+			if len(parts) == 0 {
+				continue
+			}
+			out.Contents = appendGemini(out.Contents, "model", parts)
 		case "tool":
-			out.Contents = appendGemini(out.Contents, "user", []geminiPart{{Text: m.Text()}})
+			name := geminiToolName(req.Messages, i, m.ToolCallID, m.Name)
+			if name == "" {
+				// Gemini attributes a result by function name, so a result
+				// whose call is not in the history has nowhere to go. Dropping
+				// it beats a 400 over one stray message.
+				cfg.logger().Debug("dropping tool result without a matching tool call", "provider", "gemini",
+					"tool_call_id", m.ToolCallID)
+				continue
+			}
+			// Role "user": Content.role only takes user or model, and
+			// appendGemini merges consecutive same-role contents, which is
+			// exactly what parallel tool results need.
+			out.Contents = appendGemini(out.Contents, "user", []geminiPart{{
+				FunctionResponse: &geminiFunctionResponse{Name: name, Response: geminiToolResponse(m.Text())},
+			}})
 		}
 	}
 	if len(system) > 0 {
@@ -123,10 +176,152 @@ func translateGemini(req ChatRequest) (geminiRequest, error) {
 	if len(gc) > 0 {
 		out.GenerationConfig = gc
 	}
+	translateGeminiTools(cfg, req, &out)
 	if len(out.Contents) == 0 {
 		return out, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "messages must contain at least one user message"}
 	}
 	return out, nil
+}
+
+// translateGeminiTools fills in functionDeclarations and toolConfig. A tool
+// whose schema Gemini cannot take is still declared: the sanitiser degrades
+// the parameters rather than dropping the tool.
+func translateGeminiTools(cfg Config, req ChatRequest, out *geminiRequest) {
+	if len(req.Tools) == 0 {
+		return
+	}
+	var tools []struct {
+		Type     string `json:"type"`
+		Function struct {
+			Name        string          `json:"name"`
+			Description string          `json:"description"`
+			Parameters  json.RawMessage `json:"parameters"`
+		} `json:"function"`
+	}
+	if json.Unmarshal(req.Tools, &tools) != nil {
+		return
+	}
+	var decls []geminiFunctionDeclaration
+	for _, t := range tools {
+		if t.Function.Name == "" {
+			continue
+		}
+		d := geminiFunctionDeclaration{Name: t.Function.Name, Description: t.Function.Description}
+		if len(t.Function.Parameters) > 0 {
+			schema, dropped := sanitizeGeminiSchema(t.Function.Parameters)
+			if len(dropped) > 0 {
+				cfg.logger().Debug("tool schema keywords dropped for gemini", "provider", "gemini",
+					"tool", t.Function.Name, "dropped", dropped)
+			}
+			// A parameterless declaration is sent without the field at all:
+			// several model versions reject an empty properties object.
+			if !geminiSchemaEmpty(schema) {
+				d.Parameters = schema
+			}
+		}
+		decls = append(decls, d)
+	}
+	if len(decls) == 0 {
+		return
+	}
+	out.Tools = []geminiTool{{FunctionDeclarations: decls}}
+	out.ToolConfig = geminiToolChoice(req.ToolChoice)
+}
+
+// geminiToolChoice maps OpenAI's tool_choice to a functionCallingConfig mode.
+// Unlike the Anthropic path, "none" keeps the declarations: Gemini has an
+// exact equivalent, so the model still knows the tools exist.
+func geminiToolChoice(raw json.RawMessage) *geminiToolConfig {
+	if len(raw) == 0 {
+		return nil
+	}
+	cfg := func(mode string, names ...string) *geminiToolConfig {
+		return &geminiToolConfig{FunctionCallingConfig: geminiFunctionCallingConfig{Mode: mode, AllowedFunctionNames: names}}
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		switch s {
+		case "auto":
+			return cfg("AUTO")
+		case "required":
+			return cfg("ANY")
+		case "none":
+			return cfg("NONE")
+		}
+		return nil
+	}
+	var obj struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if json.Unmarshal(raw, &obj) == nil && obj.Function.Name != "" {
+		return cfg("ANY", obj.Function.Name)
+	}
+	return nil
+}
+
+// geminiToolCallParts turns assistant tool_calls into functionCall parts.
+func geminiToolCallParts(raw json.RawMessage) []geminiPart {
+	if len(raw) == 0 {
+		return nil
+	}
+	var calls []struct {
+		ID       string `json:"id"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if json.Unmarshal(raw, &calls) != nil {
+		return nil
+	}
+	var parts []geminiPart
+	for _, c := range calls {
+		args := json.RawMessage(c.Function.Arguments)
+		if !json.Valid(args) || !strings.HasPrefix(strings.TrimSpace(c.Function.Arguments), "{") {
+			args = json.RawMessage("{}")
+		}
+		parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: c.Function.Name, Args: args}})
+	}
+	return parts
+}
+
+// geminiToolName recovers the function name a tool result belongs to by
+// scanning back through the assistant tool_calls that preceded it, because
+// Gemini has no call ids to echo. fallback is the deprecated "name" field
+// clients may still send; an empty return means the call is unknown.
+func geminiToolName(msgs []Message, upTo int, callID, fallback string) string {
+	for i := upTo - 1; i >= 0; i-- {
+		if msgs[i].Role != "assistant" || len(msgs[i].ToolCalls) == 0 {
+			continue
+		}
+		var calls []struct {
+			ID       string `json:"id"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if json.Unmarshal(msgs[i].ToolCalls, &calls) != nil {
+			continue
+		}
+		for _, c := range calls {
+			if c.ID == callID && c.Function.Name != "" {
+				return c.Function.Name
+			}
+		}
+	}
+	return fallback
+}
+
+// geminiToolResponse wraps a tool result: Gemini requires a JSON object here
+// and tool results are usually plain text.
+func geminiToolResponse(text string) json.RawMessage {
+	if raw := json.RawMessage(strings.TrimSpace(text)); len(raw) > 0 && raw[0] == '{' && json.Valid(raw) {
+		return raw
+	}
+	b, _ := json.Marshal(map[string]string{"result": text})
+	return b
 }
 
 func appendGemini(cs []geminiContent, role string, parts []geminiPart) []geminiContent {
@@ -181,8 +376,19 @@ func geminiText(c geminiContent) string {
 	return b.String()
 }
 
+// geminiToolCalls collects the functionCall parts of one candidate.
+func geminiToolCalls(c geminiContent) []toolCall {
+	var calls []toolCall
+	for _, p := range c.Parts {
+		if p.FunctionCall != nil {
+			calls = append(calls, toolCall{Name: p.FunctionCall.Name, Arguments: string(p.FunctionCall.Args)})
+		}
+	}
+	return calls
+}
+
 func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	body, err := translateGemini(req)
+	body, err := translateGemini(p.cfg, req)
 	if err != nil {
 		return nil, err
 	}
@@ -198,15 +404,20 @@ func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return resp, nil
 	}
 	for i, c := range gr.Candidates {
-		resp.Choices = append(resp.Choices, Choice{Index: i,
-			Message:      ResponseMessage{Role: "assistant", Content: strPtr(geminiText(c.Content))},
-			FinishReason: geminiFinish(c.FinishReason)})
+		msg := ResponseMessage{Role: "assistant", Content: strPtr(geminiText(c.Content))}
+		finish := geminiFinish(c.FinishReason)
+		if msg.ToolCalls = toolCallsJSON(geminiToolCalls(c.Content)); msg.ToolCalls != nil {
+			// Gemini reports STOP for a turn that only called tools; clients
+			// key their tool loop off the finish reason.
+			finish = strPtr("tool_calls")
+		}
+		resp.Choices = append(resp.Choices, Choice{Index: i, Message: msg, FinishReason: finish})
 	}
 	return resp, nil
 }
 
 func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
-	body, err := translateGemini(req)
+	body, err := translateGemini(p.cfg, req)
 	if err != nil {
 		return err
 	}
@@ -220,6 +431,7 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 	created := time.Now().Unix()
 	usage := &Usage{}
 	sentRole := false
+	var tools toolCallStream
 	emit := func(c StreamChunk) bool {
 		c.ID, c.Object, c.Created, c.Model = id, "chat.completion.chunk", created, req.Model
 		select {
@@ -239,16 +451,33 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 		}
 		for _, c := range gr.Candidates {
 			text := geminiText(c.Content)
+			calls := geminiToolCalls(c.Content)
 			delta := Delta{Content: strPtr(text)}
 			if !sentRole {
 				delta.Role = "assistant"
 				sentRole = true
 			}
-			if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}}) {
-				return false
+			if text != "" || len(calls) == 0 {
+				if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}}) {
+					return false
+				}
+				delta = Delta{}
+			}
+			// A functionCall always arrives complete inside one chunk, so each
+			// one is a single whole delta; Gemini never streams arguments.
+			for _, call := range calls {
+				delta.ToolCalls = tools.Whole("", call.Name, call.Arguments)
+				if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}}) {
+					return false
+				}
+				delta = Delta{}
 			}
 			if c.FinishReason != "" {
-				if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: geminiFinish(c.FinishReason)}}}) {
+				finish := geminiFinish(c.FinishReason)
+				if tools.Len() > 0 {
+					finish = strPtr("tool_calls")
+				}
+				if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}}}) {
 					return false
 				}
 			}

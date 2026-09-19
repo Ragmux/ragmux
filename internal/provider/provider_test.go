@@ -64,7 +64,7 @@ func TestTranslateAnthropic(t *testing.T) {
 func TestTranslateGemini(t *testing.T) {
 	var r ChatRequest
 	json.Unmarshal([]byte(`{"model":"x","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"},{"role":"assistant","content":"a"},{"role":"user","content":"u2"}],"temperature":0.2}`), &r)
-	g, err := translateGemini(r)
+	g, err := translateGemini(Config{ProviderType: "gemini"}, r)
 	if err != nil {
 		t.Fatal(err)
 	}
