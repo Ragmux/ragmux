@@ -245,13 +245,25 @@ be seamless empties the fleet instead - `maxUnavailable: 0` does not help,
 because the old pods take themselves out. Rolling back is worse: the previous
 image would never become ready against the schema the new one left behind.
 
-**This depends on migrations staying additive.** `ADD COLUMN IF NOT EXISTS`, new
-tables, no drops - the rule above. Old code running against a newer schema is
-only safe while that holds. A migration that drops a column, renames one or
-narrows a type breaks the replicas this behaviour deliberately keeps in
-rotation; such a change needs the staged expand/contract treatment (ship the
-additive half, roll every replica onto code that no longer uses the old column,
-then contract in a later release) rather than a single migration.
+**This depends on migrations staying additive *and* non-narrowing.** Old code
+running against a newer schema is only safe while both hold. A migration breaks
+the replicas this behaviour deliberately keeps in rotation if it:
+
+- drops or renames a column or table,
+- narrows a type or adds `NOT NULL` to an existing column,
+- **adds a constraint or a unique index to an existing column.** This last one
+  is not hypothetical: `0008_users_ci_audit.sql` added
+  `CREATE UNIQUE INDEX ... ON users (lower(username))`. During the upgrade
+  window an old replica still allows creating `Alice` next to an existing
+  `alice` - its code predates the rule - and the write now fails on a
+  constraint it does not know about. Narrow and admin-only here, but the shape
+  is general: a new constraint makes previously valid writes fail in old code.
+
+Any of those needs the staged expand/contract treatment - ship the additive
+half, roll every replica onto code that respects the new rule, then add the
+constraint or drop the column in a later release - rather than a single
+migration. If one has to ship as a single migration, this readiness behaviour
+is not enough on its own and the upgrade needs a maintenance window.
 
 The `degraded` entry is informational and `/readyz` still returns `200`, so
 nothing pages on it by itself. It is expected for the length of a deploy;

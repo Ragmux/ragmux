@@ -114,6 +114,14 @@ const notifyInterval = time.Minute
 // once the registry is at its cap, which is how a runaway label value degrades
 // into a counted drop instead of unbounded growth.
 //
+// A refusal also returns the call that announces it, or nil when there is
+// nothing to announce. Announcing is left to the caller because the caller
+// holds a lock: OnSeriesDropped logs, and a log collector that has gone slow
+// would otherwise hold the family's write lock for the length of that write,
+// stalling every other observation on the same metric -- every HTTP request,
+// in the case of ragmux_http_requests_total -- at exactly the moment a
+// cardinality attack is filling the cap. Run it after unlocking.
+//
 // Refusing is deliberately all this does: there is no eviction. Evicting the
 // least recently used series would keep the cap from freezing legitimate
 // metrics, but it would cost a write on every observation -- a lock or an
@@ -123,33 +131,33 @@ const notifyInterval = time.Minute
 // quietly wrong data, so the drop is reported instead: counted in
 // ragmux_metrics_series_dropped_total and handed to OnSeriesDropped, which the
 // owner logs at error level.
-func (r *Registry) admitSeries(metric string) bool {
+func (r *Registry) admitSeries(metric string) (admitted bool, report func()) {
 	if r.series.Add(1) > int64(r.maxSeries) {
 		r.series.Add(-1)
-		r.notifyDropped(metric, r.dropped.Add(1))
-		return false
+		return false, r.dropReport(metric, r.dropped.Add(1))
 	}
-	return true
+	return true, nil
 }
 
-// notifyDropped reports a refused series to the owner, at most once per
+// dropReport returns the call that reports a refused series to the owner, or
+// nil when the owner wants none or one has already gone out inside
 // notifyInterval. Reporting only the very first refusal would leave a process
 // that has been losing series for a week with one log line from the day it
 // started; the counter carries the total, the log carries the alarm.
-func (r *Registry) notifyDropped(metric string, dropped uint64) {
+func (r *Registry) dropReport(metric string, dropped uint64) func() {
 	if r.OnSeriesDropped == nil {
-		return
+		return nil
 	}
-	now := time.Now().UnixNano()
 	last := r.lastNotify.Load()
+	now := time.Now().UnixNano()
 	if last != 0 && now-last < int64(notifyInterval) {
-		return
+		return nil
 	}
-	// Losing the swap means another goroutine is reporting this window.
+	// Losing the swap means another goroutine has taken this window.
 	if !r.lastNotify.CompareAndSwap(last, now) {
-		return
+		return nil
 	}
-	r.OnSeriesDropped(metric, dropped)
+	return func() { r.OnSeriesDropped(metric, dropped) }
 }
 
 // Dropped reports how many label combinations have been refused.
@@ -285,16 +293,25 @@ func (v *vec[T]) with(vals []string) *T {
 		return s
 	}
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	if s, ok := v.series[key]; ok {
+		v.mu.Unlock()
 		return s
 	}
-	if !v.reg.admitSeries(v.name) {
+	admitted, report := v.reg.admitSeries(v.name)
+	if !admitted {
+		v.mu.Unlock()
+		// Deliberately after the unlock: report calls out to the owner's
+		// logger, and holding this family's write lock across that write
+		// would stall every other observation on the metric.
+		if report != nil {
+			report()
+		}
 		return v.overflow
 	}
 	s = v.mk()
 	v.series[key] = s
 	v.order = append(v.order, key)
+	v.mu.Unlock()
 	return s
 }
 

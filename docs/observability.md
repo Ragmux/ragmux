@@ -264,7 +264,7 @@ anything about projects or usage.
 `/readyz` answers `200`:
 
 ```json
-{"status":"ok","version":"0.4.0","migrations":24,"expected_migrations":24}
+{"status":"ok","version":"0.4.0","migrations":13,"expected_migrations":13}
 ```
 
 and `503` with `"status":"migrating"` while the applied version is **behind** the binary's:
@@ -275,26 +275,28 @@ one-directional. In a `maxSurge` rolling upgrade the first new pod migrates the 
 database; from that moment every old replica — all of them still carrying traffic — sees a
 schema newer than its own. Failing readiness there would take the entire fleet out of
 rotation in the middle of a deploy that is supposed to be seamless, and a rollback to the
-previous image could never become ready at all. Ragmux migrations are additive
-(`ADD COLUMN IF NOT EXISTS`, new tables, no drops), so the older code keeps working against
-the newer schema. It answers `200` and says so:
+previous image could never become ready at all. Ragmux migrations are additive and
+non-narrowing (`ADD COLUMN IF NOT EXISTS`, new tables, no drops), so the older code keeps
+working against the newer schema. It answers `200` and says so:
 
 ```json
 {
   "status": "ok",
   "version": "0.4.0",
-  "migrations": 25,
-  "expected_migrations": 24,
-  "degraded": ["the database schema is at migration 25, ahead of the 24 this binary embeds; this replica is running older code against a newer schema"]
+  "migrations": 14,
+  "expected_migrations": 13,
+  "degraded": ["the database schema is at migration 14, ahead of the 13 this binary embeds; this replica is running older code against a newer schema"]
 }
 ```
 
 Because `/readyz` returns `200`, nothing alerts on this by itself — that is the operator's
 to wire up. It is expected during a deploy and unexpected afterwards, so alert on the
 `degraded` entry persisting rather than on its appearance. **This rests on migrations
-staying additive**; a migration that drops a column or narrows a type would break old
-replicas that this decision keeps in rotation, and would have to be handled separately
-(see [Rolling restarts](scaling.md#rolling-restarts-and-shutdown)).
+staying additive and non-narrowing**; dropping a column, narrowing a type, or adding a
+constraint or unique index to an existing column would break the old replicas this
+decision keeps in rotation, and has to be staged instead — see
+[`/readyz` during a rolling upgrade](scaling.md#readyz-during-a-rolling-upgrade) for the
+full list and the expand/contract recipe.
 
 **A degraded search backend is not a readiness failure either.** A RAG store configured for
 `pg_search` on a server without the extension keeps answering — the search falls back to
@@ -306,8 +308,8 @@ condition into an outage. It is reported instead as an informational field along
 {
   "status": "ok",
   "version": "0.4.0",
-  "migrations": 24,
-  "expected_migrations": 24,
+  "migrations": 13,
+  "expected_migrations": 13,
   "degraded": ["pg_search is not installed on this server; 2 rag store(s) configured for it fall back to pgvector"]
 }
 ```

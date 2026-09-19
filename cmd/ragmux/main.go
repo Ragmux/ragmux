@@ -508,10 +508,14 @@ func mountMetrics(r chi.Router, cfg config.Config, registry *metrics.Registry) *
 // rolling upgrade the first new pod migrates the shared database, and if that
 // made every old replica unready the load balancer would empty the fleet in
 // the middle of a deploy that is supposed to be seamless — and a rollback
-// could never become ready at all. Ragmux migrations are additive
-// (ADD COLUMN IF NOT EXISTS, new tables, no drops), so the older code keeps
-// working against the newer schema. A migration that drops a column or
-// narrows a type would invalidate that; see docs/scaling.md.
+// could never become ready at all. Ragmux migrations are additive and
+// non-narrowing (ADD COLUMN IF NOT EXISTS, new tables, no drops), so the
+// older code keeps working against the newer schema. A migration that drops
+// or renames a column, narrows a type, or adds a constraint or unique index
+// to an existing column would invalidate that: the last one is not
+// hypothetical -- 0008 added a unique index on lower(username), which the
+// older code has no idea it must not violate. Such a change needs the staged
+// treatment described in docs/scaling.md, not this assumption.
 //
 // A RAG store configured for a search backend this server does not carry is
 // deliberately NOT a readiness failure either. The search falls back to

@@ -123,6 +123,13 @@ func TestMaxSeriesDropsAndCounts(t *testing.T) {
 	if total != 1 {
 		t.Errorf("OnSeriesDropped reported total %d, want the count at the time of the call", total)
 	}
+	got := r.Text()
+	if strings.Contains(got, `id="c"`) {
+		t.Error("a refused series was exported")
+	}
+	if !strings.Contains(got, "ragmux_metrics_series_dropped_total 2") {
+		t.Errorf("drop counter not exported:\n%s", got)
+	}
 }
 
 // TestSeriesCapKeepsReporting: the cap filling is an error condition that
@@ -142,13 +149,30 @@ func TestSeriesCapKeepsReporting(t *testing.T) {
 	if calls != 2 {
 		t.Errorf("OnSeriesDropped called %d times, want 2 once the interval passed", calls)
 	}
-	got := r.Text()
-	if strings.Contains(got, `id="c"`) {
-		t.Error("a refused series was exported")
+}
+
+// TestSeriesCapReportRunsOutsideTheLock: the owner's callback logs, and a log
+// collector that has gone slow must not stall every other observation on the
+// same metric family -- which is exactly the family under attack when the cap
+// fills. If the report ran under the vec's write lock, resolving an existing
+// series from inside it would block until the callback returned.
+func TestSeriesCapReportRunsOutsideTheLock(t *testing.T) {
+	r := New(Options{MaxSeries: 1})
+	c := r.Counter("ragmux_capped_total", "Capped.", "id")
+	r.OnSeriesDropped = func(string, uint64) {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c.With("a").Inc() // takes the family's read lock
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("an observation on an existing series blocked while a drop was being reported")
+		}
 	}
-	if !strings.Contains(got, "ragmux_metrics_series_dropped_total 2") {
-		t.Errorf("drop counter not exported:\n%s", got)
-	}
+	c.With("a").Inc()
+	c.With("b").Inc() // refused, reported
 }
 
 func TestRefusedSeriesStillAcceptsWrites(t *testing.T) {
