@@ -50,7 +50,8 @@ func TestTranslateAnthropic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ar.System != "be terse\n\nreally" || ar.MaxTokens != 10 || ar.Model != "claude-x" {
+	// Without a cache_control the system field stays a plain JSON string.
+	if string(ar.System) != `"be terse\n\nreally"` || ar.MaxTokens != 10 || ar.Model != "claude-x" {
 		t.Errorf("bad translation: %+v", ar)
 	}
 	if len(ar.Messages) != 3 || len(ar.Messages[0].Content) != 2 || ar.Messages[1].Role != "assistant" {

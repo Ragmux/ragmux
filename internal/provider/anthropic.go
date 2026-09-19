@@ -32,10 +32,11 @@ func (p *anthropic) headers() map[string]string {
 	}
 }
 
-// anthropicRequest is the Messages API payload.
+// anthropicRequest is the Messages API payload. System is raw because the
+// field is either a plain string or an array of blocks; see anthropicSystem.
 type anthropicRequest struct {
 	Model         string             `json:"model"`
-	System        string             `json:"system,omitempty"`
+	System        json.RawMessage    `json:"system,omitempty"`
 	Messages      []anthropicMessage `json:"messages"`
 	MaxTokens     int                `json:"max_tokens"`
 	Temperature   *float64           `json:"temperature,omitempty"`
@@ -60,6 +61,9 @@ type anthropicContent struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   string          `json:"content,omitempty"`
 	Source    *anthropicImage `json:"source,omitempty"`
+	// CacheControl is the client's prompt-caching breakpoint, relayed
+	// verbatim: the gateway does not interpret its contents.
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type anthropicImage struct {
@@ -70,22 +74,61 @@ type anthropicImage struct {
 }
 
 type anthropicTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
+}
+
+// anthropicUsageBlock is the Messages API usage object. input_tokens counts
+// only what was neither read from nor written to the cache.
+type anthropicUsageBlock struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+// usage maps Anthropic's counters onto the OpenAI shape. Anthropic excludes
+// both cache counters from input_tokens while OpenAI's prompt_tokens
+// includes cached_tokens, so they are added in: prompt_tokens then compares
+// across providers and prompt + completion stays equal to total.
+func (b anthropicUsageBlock) usage() *Usage {
+	prompt := b.InputTokens + b.CacheCreationInputTokens + b.CacheReadInputTokens
+	u := &Usage{PromptTokens: prompt, CompletionTokens: b.OutputTokens, TotalTokens: prompt + b.OutputTokens}
+	if b.CacheReadInputTokens > 0 || b.CacheCreationInputTokens > 0 {
+		u.PromptTokensDetails = &PromptTokensDetails{
+			CachedTokens:     b.CacheReadInputTokens,
+			CacheWriteTokens: b.CacheCreationInputTokens,
+		}
+	}
+	return u
+}
+
+// merge copies the non-zero counters of other over b. Newer API versions
+// repeat the cache fields in message_delta; an omitted (zero) field there
+// must not erase what message_start already reported.
+func (b *anthropicUsageBlock) merge(other anthropicUsageBlock) {
+	for _, f := range []struct{ dst, src *int }{
+		{&b.InputTokens, &other.InputTokens},
+		{&b.OutputTokens, &other.OutputTokens},
+		{&b.CacheCreationInputTokens, &other.CacheCreationInputTokens},
+		{&b.CacheReadInputTokens, &other.CacheReadInputTokens},
+	} {
+		if *f.src != 0 {
+			*f.dst = *f.src
+		}
+	}
 }
 
 type anthropicResponse struct {
-	ID         string             `json:"id"`
-	Type       string             `json:"type"`
-	Role       string             `json:"role"`
-	Model      string             `json:"model"`
-	Content    []anthropicContent `json:"content"`
-	StopReason string             `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	ID         string              `json:"id"`
+	Type       string              `json:"type"`
+	Role       string              `json:"role"`
+	Model      string              `json:"model"`
+	Content    []anthropicContent  `json:"content"`
+	StopReason string              `json:"stop_reason"`
+	Usage      anthropicUsageBlock `json:"usage"`
 }
 
 // translateAnthropic converts an OpenAI request into the Messages format.
@@ -98,11 +141,11 @@ func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error)
 	out.TopP = req.TopP
 	out.StopSequences = req.StopSequences()
 
-	var system []string
+	var system []anthropicContent
 	for _, m := range req.Messages {
 		switch m.Role {
 		case "system", "developer":
-			system = append(system, m.Text())
+			system = append(system, anthropicContent{Type: "text", Text: m.Text(), CacheControl: contentCacheControl(m.Content)})
 		case "user":
 			parts, err := openAIPartsToAnthropic(m.Content)
 			if err != nil {
@@ -143,15 +186,21 @@ func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error)
 		}
 	}
 	if len(system) > 0 {
-		out.System = strings.Join(system, "\n\n")
+		sys, err := anthropicSystem(system)
+		if err != nil {
+			return out, err
+		}
+		out.System = sys
 	}
 	if len(req.Tools) > 0 {
 		var tools []struct {
-			Type     string `json:"type"`
-			Function struct {
-				Name        string          `json:"name"`
-				Description string          `json:"description"`
-				Parameters  json.RawMessage `json:"parameters"`
+			Type         string          `json:"type"`
+			CacheControl json.RawMessage `json:"cache_control"`
+			Function     struct {
+				Name         string          `json:"name"`
+				Description  string          `json:"description"`
+				Parameters   json.RawMessage `json:"parameters"`
+				CacheControl json.RawMessage `json:"cache_control"`
 			} `json:"function"`
 		}
 		if err := json.Unmarshal(req.Tools, &tools); err == nil {
@@ -160,7 +209,14 @@ func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error)
 				if len(schema) == 0 {
 					schema = json.RawMessage(`{"type":"object","properties":{}}`)
 				}
-				out.Tools = append(out.Tools, anthropicTool{Name: t.Function.Name, Description: t.Function.Description, InputSchema: schema})
+				// Clients spell the breakpoint either on the tool object or
+				// inside function, depending on which SDK wrote the request.
+				cc := t.CacheControl
+				if len(cc) == 0 {
+					cc = t.Function.CacheControl
+				}
+				out.Tools = append(out.Tools, anthropicTool{Name: t.Function.Name, Description: t.Function.Description,
+					InputSchema: schema, CacheControl: cc})
 			}
 		}
 		if len(req.ToolChoice) > 0 {
@@ -203,6 +259,45 @@ func appendAnthropic(msgs []anthropicMessage, role string, parts []anthropicCont
 	return append(msgs, anthropicMessage{Role: role, Content: parts})
 }
 
+// anthropicSystem renders the system blocks. Without a single cache_control
+// the value is the joined plain string Anthropic has always been sent, so a
+// request that does not ask for caching keeps its previous wire shape byte
+// for byte; one breakpoint switches to the block array that can carry it.
+func anthropicSystem(blocks []anthropicContent) (json.RawMessage, error) {
+	texts := make([]string, len(blocks))
+	cached := false
+	for i, b := range blocks {
+		texts[i] = b.Text
+		if len(b.CacheControl) > 0 {
+			cached = true
+		}
+	}
+	if !cached {
+		return json.Marshal(strings.Join(texts, "\n\n"))
+	}
+	return json.Marshal(blocks)
+}
+
+// contentCacheControl returns the cache_control a client attached to a
+// parts-array content, or nil. The last marker wins: Anthropic caches the
+// prefix up to and including the marked block, so with several markers in
+// one message the final one is the breakpoint that covers all of it.
+func contentCacheControl(raw json.RawMessage) json.RawMessage {
+	var parts []struct {
+		CacheControl json.RawMessage `json:"cache_control"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	var cc json.RawMessage
+	for _, p := range parts {
+		if len(p.CacheControl) > 0 {
+			cc = p.CacheControl
+		}
+	}
+	return cc
+}
+
 func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
@@ -214,6 +309,7 @@ func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
 		ImageURL struct {
 			URL string `json:"url"`
 		} `json:"image_url"`
+		CacheControl json.RawMessage `json:"cache_control"`
 	}
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported message content"}
@@ -222,7 +318,7 @@ func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
 	for _, p := range parts {
 		switch p.Type {
 		case "text":
-			out = append(out, anthropicContent{Type: "text", Text: p.Text})
+			out = append(out, anthropicContent{Type: "text", Text: p.Text, CacheControl: p.CacheControl})
 		case "image_url":
 			u := p.ImageURL.URL
 			if strings.HasPrefix(u, "data:") {
@@ -231,9 +327,11 @@ func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
 					continue
 				}
 				mt := strings.TrimSuffix(meta, ";base64")
-				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: mt, Data: data}})
+				out = append(out, anthropicContent{Type: "image", CacheControl: p.CacheControl,
+					Source: &anthropicImage{Type: "base64", MediaType: mt, Data: data}})
 			} else {
-				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: u}})
+				out = append(out, anthropicContent{Type: "image", CacheControl: p.CacheControl,
+					Source: &anthropicImage{Type: "url", URL: u}})
 			}
 		}
 	}
@@ -294,8 +392,7 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 	return &ChatResponse{
 		ID: id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
 		Choices: []Choice{{Index: 0, Message: msg, FinishReason: anthropicFinish(ar.StopReason)}},
-		Usage: &Usage{PromptTokens: ar.Usage.InputTokens, CompletionTokens: ar.Usage.OutputTokens,
-			TotalTokens: ar.Usage.InputTokens + ar.Usage.OutputTokens},
+		Usage:   ar.Usage.usage(),
 	}, nil
 }
 
@@ -313,7 +410,7 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 
 	id := chatID()
 	created := time.Now().Unix()
-	usage := &Usage{}
+	var usage anthropicUsageBlock
 	emit := func(c StreamChunk) bool {
 		c.ID, c.Object, c.Created, c.Model = id, "chat.completion.chunk", created, req.Model
 		select {
@@ -341,17 +438,15 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 		case "message_start":
 			var ms struct {
 				Message struct {
-					ID    string `json:"id"`
-					Usage struct {
-						InputTokens int `json:"input_tokens"`
-					} `json:"usage"`
+					ID    string              `json:"id"`
+					Usage anthropicUsageBlock `json:"usage"`
 				} `json:"message"`
 			}
 			if json.Unmarshal([]byte(ev.Data), &ms) == nil {
 				if ms.Message.ID != "" {
 					id = ms.Message.ID
 				}
-				usage.PromptTokens = ms.Message.Usage.InputTokens
+				usage.merge(ms.Message.Usage)
 			}
 			sentRole = true
 			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{Role: "assistant", Content: strPtr("")}}}})
@@ -410,19 +505,16 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				Delta struct {
 					StopReason string `json:"stop_reason"`
 				} `json:"delta"`
-				Usage struct {
-					OutputTokens int `json:"output_tokens"`
-				} `json:"usage"`
+				Usage anthropicUsageBlock `json:"usage"`
 			}
 			if json.Unmarshal([]byte(ev.Data), &md) != nil {
 				return true
 			}
-			usage.CompletionTokens = md.Usage.OutputTokens
-			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			usage.merge(md.Usage)
 			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: anthropicFinish(md.Delta.StopReason)}}})
 		case "message_stop":
 			// Final usage-only chunk, mirroring OpenAI's include_usage behaviour.
-			return emit(StreamChunk{Choices: []StreamChoice{}, Usage: usage})
+			return emit(StreamChunk{Choices: []StreamChoice{}, Usage: usage.usage()})
 		case "error":
 			var e struct {
 				Error struct {

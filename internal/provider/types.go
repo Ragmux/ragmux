@@ -156,11 +156,74 @@ func (r ChatRequest) StopSequences() []string {
 	return nil
 }
 
-// Usage mirrors OpenAI's usage block.
+// Usage mirrors OpenAI's usage block. PromptTokens always includes the
+// cached part of the prompt, whichever provider answered, so the number
+// means the same thing on every connection and prompt + completion == total.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// PromptTokensDetails and CompletionTokensDetails are OpenAI's
+	// breakdowns; each adapter fills in what its own provider reports.
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+	// PromptCacheHitTokens and PromptCacheMissTokens are DeepSeek's
+	// top-level spelling of the same split; normalize folds them in.
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens,omitempty"`
+}
+
+// PromptTokensDetails breaks the prompt down by how it was billed.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+	// CacheWriteTokens has no OpenAI equivalent: OpenAI does not bill cache
+	// writes, Anthropic does.
+	CacheWriteTokens int `json:"cache_creation_tokens,omitempty"`
+	AudioTokens      int `json:"audio_tokens,omitempty"`
+}
+
+// CompletionTokensDetails carries the reasoning share of the completion.
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// normalize folds provider-specific spellings into the OpenAI shape and
+// computes a total the upstream left out. It is safe on a nil receiver so
+// callers can apply it to an optional usage block unconditionally.
+func (u *Usage) normalize() {
+	if u == nil {
+		return
+	}
+	if u.PromptCacheHitTokens > 0 && u.CachedTokens() == 0 {
+		u.promptDetails().CachedTokens = u.PromptCacheHitTokens
+	}
+	if u.TotalTokens == 0 {
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	}
+}
+
+// promptDetails returns the prompt breakdown, creating it on first use.
+func (u *Usage) promptDetails() *PromptTokensDetails {
+	if u.PromptTokensDetails == nil {
+		u.PromptTokensDetails = &PromptTokensDetails{}
+	}
+	return u.PromptTokensDetails
+}
+
+// CachedTokens is the part of the prompt a provider cache served.
+func (u *Usage) CachedTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
+}
+
+// CacheWriteTokens is the part of the prompt written into a provider cache.
+func (u *Usage) CacheWriteTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CacheWriteTokens
 }
 
 // Choice is one non-streaming completion choice.

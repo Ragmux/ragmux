@@ -57,6 +57,9 @@ func (p *openAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	if out.Created == 0 {
 		out.Created = time.Now().Unix()
 	}
+	// DeepSeek reports its cache split at the top level and some servers
+	// omit total_tokens; normalize brings both into the OpenAI shape.
+	out.Usage.normalize()
 	return &out, nil
 }
 
@@ -95,6 +98,7 @@ func (p *openAICompat) ChatStream(ctx context.Context, req ChatRequest, out chan
 		if chunk.Object == "" {
 			chunk.Object = "chat.completion.chunk"
 		}
+		chunk.Usage.normalize()
 		select {
 		case out <- chunk:
 			return true
