@@ -27,15 +27,24 @@ func TestAuditAndAuthHardening(t *testing.T) {
 	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
 	errOf := func(r map[string]any) map[string]any { m, _ := r["error"].(map[string]any); return m }
 
-	// Setup facts are readable without a session and do not name users.
+	// Setup is done here, so the unauthenticated status endpoint says that and
+	// nothing else: the migration version, the database role, where the key
+	// came from and how far the wizard got are for the setup page, and the
+	// setup page is gone. Only the wizard-time answer carries them, which
+	// admin.TestSetupStatusReportsWizardProgress covers.
 	setup := e.call("GET", "/admin/api/setup", nil, "x")
-	if setup["needs_setup"] != false || setup["migrations_version"].(float64) < 8 || setup["secret_key_source"] != "env" || setup["database_role"] == "" {
+	if setup["needs_setup"] != false {
 		t.Errorf("setup status: %v", setup)
 	}
-	for _, k := range []string{"users", "username", "postgres_version"} {
+	for _, k := range []string{"migrations_version", "secret_key_source", "database_role",
+		"has_connections", "has_projects", "users", "username", "postgres_version"} {
 		if _, ok := setup[k]; ok {
-			t.Errorf("setup status leaks %s: %v", k, setup)
+			t.Errorf("setup status leaks %s once setup is done: %v", k, setup)
 		}
+	}
+	// _status is the harness's own field; needs_setup is the only real one.
+	if len(setup) != 2 {
+		t.Errorf("setup status should carry needs_setup alone: %v", setup)
 	}
 
 	// /me describes the session: bearer here, cookie below.

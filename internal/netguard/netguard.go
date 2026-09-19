@@ -200,9 +200,10 @@ func HostIsPrivate(ctx context.Context, host string) (bool, error) {
 }
 
 // CheckRedirect is an http.Client CheckRedirect policy: at most maxHops
-// redirects, http/https only and never to a different host, so an upstream
-// cannot bounce the gateway to somewhere its base URL was not allowed to
-// reach.
+// redirects, http/https only, never to a different host and never down from
+// https to http, so an upstream cannot bounce the gateway to somewhere its
+// base URL was not allowed to reach, nor onto a connection the credentials
+// it carries were never meant to cross.
 func CheckRedirect(maxHops int) func(req *http.Request, via []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) > maxHops {
@@ -211,8 +212,24 @@ func CheckRedirect(maxHops int) func(req *http.Request, via []*http.Request) err
 		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 			return &RedirectError{Reason: fmt.Sprintf("unsupported scheme %q", req.URL.Scheme)}
 		}
-		if len(via) > 0 && !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+		if len(via) == 0 {
+			return nil
+		}
+		first := via[0].URL
+		if !strings.EqualFold(req.URL.Host, first.Host) {
 			return &RedirectError{Reason: "target host differs from the request host"}
+		}
+		// Same host is not the same connection. A 302 from https to http on
+		// the host itself puts the Authorization header, and the response
+		// body, on the wire in the clear; checking the host alone let that
+		// through because the host had not changed.
+		//
+		// The comparison is against the hop just taken, not the first one: an
+		// http -> https -> http chain would otherwise pass, having started in
+		// the clear, after the credentials had already crossed TLS once.
+		prev := via[len(via)-1].URL
+		if strings.EqualFold(prev.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+			return &RedirectError{Reason: "target downgrades https to http"}
 		}
 		return nil
 	}

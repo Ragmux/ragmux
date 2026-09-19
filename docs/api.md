@@ -4,8 +4,8 @@ Ragmux exposes three HTTP surfaces:
 
 | Prefix | Audience | Authentication |
 |---|---|---|
-| `/v1/…` | your applications (OpenAI-compatible) | `Authorization: Bearer sk-proj-…` project key |
-| `/admin/api/…` | dashboard and management scripts | session cookie or bearer session token |
+| `/v1/…` | your applications (OpenAI-compatible) | `Authorization: Bearer sk-proj-…` project key, or a user's `sk-user-…` key |
+| `/admin/api/…` | dashboard and management scripts | session cookie, bearer session token, or a user's `sk-mgmt-…` key |
 | `/healthz` | load balancers, container healthchecks | none |
 
 All request and response bodies are JSON unless noted. `/admin/` (without `api`) serves
@@ -46,6 +46,34 @@ rejected","type":"forbidden"}}`), and JSON bodies must be sent as
 `Content-Type: application/json` (otherwise `415`). The login request itself always
 needs the JSON content type. Scripts should use the bearer token.
 
+A **management key** (`sk-mgmt-…`, see [API keys](#api-keys)) authenticates the same
+routes, but only from the `Authorization` header. One pasted into the `ragmux_session`
+cookie is refused `401` without even being looked up. That is deliberate and is what
+keeps the bearer exemption above sound for keys: a browser attaches cookies to
+cross-site requests on its own, whereas it cannot attach an `Authorization` header
+cross-origin without a CORS preflight, and Ragmux only answers preflights for the
+origins in `CORS_ORIGINS` (empty by default). The premise behind the existing exemption
+therefore holds identically for management keys, and nothing about the cookie path is
+loosened.
+
+Three routes refuse an api-key principal outright with
+`403 {"error":{"code":"session_required"}}` — `POST /me/password`,
+`POST /users/{id}/reset-password` and creating a `kind=management` key — so a leaked key
+cannot take over the account it belongs to.
+
+**What that guard assumes.** It treats a session as a person at a keyboard and an api
+key as a stored credential, and grants the account-takeover routes only to the first.
+`"bearer": true` weakens the premise: the session token leaves the browser as a string
+in a JSON body, and a string can be pasted into a script, a CI secret or a chat window,
+at which point a "session" is doing exactly what the guard withholds from keys. The
+difference that remains is lifetime and revocation, not interactivity: a session token
+expires after `SESSION_TTL` (24 h by default), dies with a logout, a password change, a
+password reset, a session revoke or a deactivation, and cannot be listed, named or
+scoped — an api key outlives all of that until someone revokes it. Treat a bearer
+session token as a short-lived credential, keep it out of anything durable, and use a
+`sk-mgmt-…` key for automation that is supposed to persist; if a script genuinely needs
+one of the three routes above, it needs a human to sign in for it.
+
 Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-Id`;
 unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
 and log the detail under that id.
@@ -64,10 +92,53 @@ case-insensitively.
 
 ### Client API
 
-`/v1` routes require `Authorization: Bearer sk-proj-…`, the key returned once when a
-project is created or its key is rotated. The key selects the project, and with it the
-model connection, system prompt, RAG store and limits. Missing or unknown keys answer
-`401` with type `invalid_request_error` (no bearer header) or `invalid_api_key`.
+`/v1` routes require `Authorization: Bearer <key>`, which is one of two things:
+
+- **`sk-proj-…`** — the project's default key, returned once when a project is created or
+  its key is rotated. It selects exactly that project, and with it the model connection,
+  system prompt, RAG store and limits. It has no owner, no scopes and no expiry, and can
+  only be rotated, not revoked.
+- **`sk-user-…`** — a user-owned gateway key (see [API keys](#api-keys)). It carries a set
+  of granted projects, its own scopes and its own limits under the project's, and can be
+  revoked or given an expiry.
+
+Missing or unknown keys answer `401` with type `invalid_request_error` (no bearer header)
+or `invalid_api_key`. An unknown key's body is exactly
+`{"error":{"message":"invalid project api key","type":"invalid_api_key","code":null}}`
+whatever its shape. A key that *is* known but no longer resolves carries a `code` on top
+— `key_revoked`, `key_expired` or `key_owner_inactive` — so the extra detail only ever
+reaches a caller who already holds the key bytes.
+
+#### Choosing a project
+
+A `sk-user-…` key may grant several projects, so each request resolves one, in this
+order:
+
+1. the `X-Ragmux-Project` request header, matched against the granted project names, or
+   against their ids when the value is numeric;
+2. the key's `default_project_id`;
+3. the single grant, when the key has exactly one.
+
+If none of those settles it, `POST /v1/chat/completions` answers
+`400 {"error":{"code":"project_required"}}` with an `X-Ragmux-Projects` response header
+listing the valid values (`prod,staging`). A header naming a project the key does not
+grant answers `403 {"error":{"code":"project_not_granted"}}` with a fixed message that
+does not distinguish "no such project" from "not granted", so a key holder cannot probe
+for project names. A key whose last grant was deleted has an empty grant set and gets the
+same `403`: it fails closed rather than falling back to anything.
+
+`GET /v1/models` is the exception: with several grants and no header it lists one entry
+per granted project's connection, deduplicated by model name, and `GET /v1/models/{id}`
+then has to name one of them.
+
+There is deliberately **no `"project/model"` convention** in the `model` field.
+`model_name` legitimately contains slashes (`org/model-1.5:latest@v2_x` is a valid model
+name), so the split would be ambiguous and would silently reroute clients that already
+send such a name. Use the header.
+
+The grants on the key, not the owner's project memberships, are what `/v1` enforces.
+Membership is checked once, when the key is created or updated; after that an admin
+editing a member list cannot break a running key.
 
 ## Roles
 
@@ -107,11 +178,19 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": 8, "secret_key_source": "env", "database_role": "ragmux"}`: `needs_setup` is `true` while the `users` table is empty; the other three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role) |
+| GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
 case setup is already complete (see [Configuration](configuration.md#environment-variables)).
+
+The dashboard's first-run wizard has three steps, but only this first one is
+unauthenticated. Step 2 (a model connection) and step 3 (a project) are ordinary
+authenticated calls to `POST /api/models` and `POST /api/projects` made with the session
+the first step established, so they are role-gated and audited like any other write and
+add no new unauthenticated surface. Both are skippable. A reload during step 2 or 3
+picks the step back up from `GET /api/models`, which the session can already read —
+not from `GET /setup`, which by then answers `needs_setup` alone.
 
 ### Session and account
 
@@ -119,9 +198,9 @@ case setup is already complete (see [Configuration](configuration.md#environment
 |---|---|---|---|
 | POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
-| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339) and `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie) |
-| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked |
-| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools` (false for `gemini`), `supports_streaming` |
+| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
+| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
+| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
 
 ### Model connections
 
@@ -235,8 +314,10 @@ reached. `page_count` is the number of pages of a PDF and `null` for other forma
 until the document has been parsed).
 Accepted extensions: `.pdf`, `.docx`, `.html`, `.htm`, `.md`, `.markdown`, `.txt`; the
 request body is limited to `MAX_UPLOAD_MB`. Upload and reprocess answer
-`503 ingestion queue is full, retry later` when the background queue (1024 documents) is
-full; the documents concerned are marked `failed` with that message.
+`503 the ingestion backlog is full (MAX_PENDING_DOCUMENTS), retry later` when the queue
+of `pending` documents is at `MAX_PENDING_DOCUMENTS` (1024); the documents concerned are
+marked `failed` with that message. The backlog is counted across every replica, not per
+process.
 
 Search request and response:
 
@@ -306,6 +387,62 @@ each budget would run out at that pace. A value is `null` when the budget is not
 nothing was consumed in the last hour, or the projection lands after the window resets
 (`resets_at`); an already exhausted budget projects to `generated_at`.
 
+### API keys
+
+User-owned credentials, separate from a project's default key. Everyone manages their
+own; admins see and manage everyone's. A key someone else owns answers `404`, not `403`,
+so key ids are not enumerable. All of these need the `keys` scope when the caller is
+itself a management key.
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/keys` | viewer | The caller's keys, newest first, each with the owner's `username`. Admins get every owner and may narrow with `?user_id=`; `?kind=gateway\|management` filters both. `user_id` is ignored for non-admins |
+| POST | `/keys` | viewer | Create → `201 {"key": {…}, "api_key": "sk-user-…"}`; the credential is returned once and never again |
+| GET | `/keys/{id}` | owner or admin | Read one |
+| PUT | `/keys/{id}` | owner or admin | Update the mutable fields (below); the credential and the `kind` never change — revoke and reissue instead |
+| POST | `/keys/{id}/revoke` | owner or admin | Sets `revoked_at` → the key object; effective on the next request |
+| GET | `/keys/{id}/usage` | owner or admin | The key's own counters, in the shape of `/projects/{id}/usage` with `api_key_id` instead of `project_id` |
+| DELETE | `/keys/{id}` | admin | Delete outright → `{"ok": true}`; `409 {"error":{"code":"key_in_use"}}` while request logs still reference the key. Revoking is almost always what you want |
+
+Request body:
+
+```json
+{"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models"],
+ "project_ids": [1, 2], "default_project_id": 1, "expires_at": "2027-01-01T00:00:00Z",
+ "user_id": 4,
+ "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
+```
+
+`kind` is `gateway` (default) or `management`. `name` is required, at most 64 characters
+and unique per owner (`409` otherwise). `scopes` defaults to `["chat","models"]` for a
+gateway key and is required for a management key; an unknown scope, or one the caller's
+own role does not cover, is a `400`. `expires_at` is RFC 3339, and `null` or `""` clears
+it. `user_id` mints the key for another account and needs the `admin` role; the grants
+are then checked against *that* account, not the admin's.
+
+For a `gateway` key, every id in `project_ids` must be a project the **owner** can access
+(`400` otherwise) and `default_project_id` must be one of them. For a `management` key,
+projects and limits are refused with a `400`: it has neither. Creating a `management` key
+additionally needs at least the `editor` role and a dashboard session
+(`403 session_required` for an api key); the `admin` scope needs the `admin` role.
+
+The key object never contains the credential:
+
+```json
+{"id": 7, "kind": "gateway", "name": "ci-pipeline", "key_prefix": "sk-user-Wg8TwBF",
+ "user_id": 1, "created_by": 1, "scopes": ["chat", "models"], "project_ids": [1, 2],
+ "default_project_id": null, "rate_limit_rpm": 0, "rate_limit_tpm": 0,
+ "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "expires_at": null, "revoked_at": null, "last_used_at": "2026-09-19T03:41:00Z",
+ "created_at": "…", "updated_at": "…"}
+```
+
+`key_prefix` is the first 15 characters, for identification in listings and the audit
+log. `last_used_at` is stamped by `/v1` at most once a minute per key, so a busy key does
+not rewrite its row on every request. Semantics, scopes and the interaction of the two
+limit tiers are described in
+[Users, roles and limits](users-and-limits.md#api-keys).
+
 ### Metrics
 
 | Method | Path | Role | Purpose |
@@ -326,21 +463,44 @@ The summary response (also used by `/projects/{id}/metrics`):
 
 ```json
 {"window": {"requests": 120, "errors": 3, "prompt_tokens": 51000, "completion_tokens": 9800,
-            "avg_latency_ms": 840.5, "p95_latency_ms": 2100, "rag_requests": 95, "rate_limited": 2},
+            "avg_latency_ms": 840.5, "p95_latency_ms": 2100, "rag_requests": 95, "rate_limited": 2,
+            "cost_micros": 184500, "cost_usd": 0.1845},
  "total":  {"…": "same fields over all time"},
- "daily":  [{"day": "2026-09-05", "requests": 10, "errors": 0, "prompt_tokens": 4000, "completion_tokens": 900}],
+ "daily":  [{"day": "2026-09-05", "requests": 10, "errors": 0, "prompt_tokens": 4000,
+             "completion_tokens": 900, "cost_micros": 15400, "cost_usd": 0.0154}],
  "recent": [{"id": 991, "project_id": 3, "model_name": "claude-sonnet-4-5", "status_code": 200,
              "prompt_tokens": 420, "completion_tokens": 80, "estimated": false, "latency_ms": 910,
-             "streamed": true, "rag_used": true, "rag_hits": 3, "error": "", "created_at": "…"}],
+             "streamed": true, "rag_used": true, "rag_hits": 3, "cached_prompt_tokens": 200,
+             "cache_write_tokens": 0, "cost_micros": 1860, "cost_usd": 0.00186,
+             "cost_source": "builtin", "error": "", "api_key_id": 7, "user_id": 4,
+             "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
-               "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70}]}
+               "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70,
+               "cost_micros": 120000, "cost_usd": 0.12}]}
 ```
 
 `daily` covers the last `days` days (14 by default), `recent` the last 50 requests.
 `rag_hits` is the number of retrieved passages injected into that request (`0` when
-`rag_used` is false). Status semantics (`429`, `499`, `502`/`504`) are described in
+`rag_used` is false). `api_key_id` and `user_id` attribute the request to the user-owned
+key that made it and are `null` for a project's default key; the owner is denormalised so
+deleting the key later leaves `user_id` in place. Status semantics (`429`, `499`,
+`502`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
+
+Cost fields appear on the summary objects (`window`, `total`, `previous`), on each
+`daily` bucket, on each `projects` row and on each `recent` request:
+
+| Field | Meaning |
+|---|---|
+| `cost_micros` | the **estimated** cost in USD millionths; an integer, so sums are exact |
+| `cost_usd` | the same figure in dollars (`cost_micros / 1e6`) |
+| `cost_source` | on a request: `builtin` or `user` for the price row that matched, `none` when no row did (then the cost is `0`) |
+| `cached_prompt_tokens` | part of `prompt_tokens` that a provider cache served |
+| `cache_write_tokens` | part of `prompt_tokens` that was written into a provider cache (Anthropic only) |
+
+Cost is an estimate from the [price table](#model-prices), never a bill, and it is
+informational only — budgets are counted in tokens, not money.
 
 #### CSV export
 
@@ -351,12 +511,86 @@ request logs, oldest first and at most 50 000 rows, as `text/csv` with a
 
 ```
 created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
-estimated, latency_ms, streamed, rag_used, rag_hits, error
+estimated, latency_ms, streamed, rag_used, rag_hits, error,
+cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id
 ```
+
+New columns are appended at the end and existing ones never move, so an importer that
+reads by position keeps working. `cost_usd` is written with six decimals — the full
+precision of the stored micro-dollar integer, so a cheap request does not round to zero.
+`api_key_id` and `user_id` are empty for a request made with a project's default key,
+which has no owner; an empty cell says that where a `0` would read as user zero.
 
 Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
+
+### Model prices
+
+The price table turns the token counts of a finished request into the estimated
+`cost_micros` on its log row. **It is an estimate, not a bill**: providers round,
+discount and change prices without telling the gateway.
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 2, "unit": "per_million_tokens"}` |
+| POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
+| PUT | `/prices/{id}` | editor | Same body without `provider_type`/`model_pattern` (they are fixed); sets `source: "user"` → `{price}` |
+| DELETE | `/prices/{id}` | editor | `{"ok": true}`; `409 {"code":"builtin_price"}` for a built-in row — reset it instead |
+| POST | `/prices/{id}/reset` | editor | Restores the shipped values and marks the row built-in again → `{price}`; `409 {"code":"no_builtin_price"}` when the row has no shipped counterpart |
+
+Every mutation is audited as `price.create`, `price.update`, `price.delete` or
+`price.reset`, and drops the gateway's cached table so the next request is costed with
+the new numbers (it is otherwise re-read every 60 seconds).
+
+A row:
+
+```json
+{"id": 4, "provider_type": "anthropic", "model_pattern": "claude-sonnet-4-5*",
+ "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_write_per_mtok": 3.75,
+ "cache_read_per_mtok": 0.30, "currency": "USD", "source": "builtin",
+ "builtin_version": 2, "created_at": "…", "updated_at": "…"}
+```
+
+Prices are **per million tokens** and prices are between 0 and 100000. The two cache
+prices are **absolute prices, not multipliers** of `input_per_mtok` — every provider
+picks its own convention (Anthropic bills writes at 1.25x and reads at 0.1x, OpenAI does
+not bill writes at all and reads at 0.5x) — and both are nullable: `null` means the
+provider charges the input rate.
+
+**Matching.** A model name is resolved against the rows of its connection's provider
+type. An exact `model_pattern` wins; otherwise the pattern with the **longest literal
+prefix** (the text before its first `*`) that matches, ties going to the lowest `id`.
+`*` stands for any run of characters, `/` included, so `deepseek-ai/DeepSeek-V3*` works.
+Longest prefix is why `gpt-4o-mini*` beats `gpt-4o*` for `gpt-4o-mini-2024-07-18`. With
+no match the request is logged with `cost_micros: 0` and `cost_source: "none"` — a
+missing price is reported as missing, never guessed.
+
+`source` plays no part in matching. Your own row wins where its pattern is the more
+specific one, and you override a shipped number by **editing that row** (which keeps its
+pattern and flips it to `"user"`) rather than by adding a broader one — a `*` row that
+outranked every built-in pattern would silently re-price every model the shipped table
+already knows.
+
+**Built-in rows and upgrades.** The shipped table is seeded on every start.
+
+- Editing a built-in row flips its `source` to `"user"`, and **upgrades never touch a
+  `"user"` row again**.
+- An untouched built-in row is refreshed only when the shipped table's `version`
+  **increases**; a release that does not bump it changes nothing.
+- **Built-in rows cannot be deleted**, only edited or reset. That removes the "deleted
+  row resurrects on upgrade" problem without a tombstone column to remember it by.
+- The seed only inserts and refreshes; it **never removes a row**. Dropping a model from
+  the shipped table therefore leaves existing installs holding the old row, and retiring
+  one is a numbered migration you can read in the release — a general "remove whatever
+  the shipped table stopped listing" rule would let a pattern renamed in a later release
+  silently drop a model's price everywhere.
+- `ollama` ships a `*` row at 0: it runs on your own hardware, so it must never report
+  phantom spend. **`custom_openai` ships no row at all** — it is a URL, and it points at
+  a paid API as readily as at vLLM, so its models are `cost_source: "none"` until you
+  add a price. A catch-all at 0 would report a real bill as `$0.00` with
+  `cost_source: "builtin"`, which reads as a priced zero rather than the missing price
+  it is.
 
 ### Users and audit log
 
@@ -413,13 +647,14 @@ lockout ends (empty when the lockout is disabled).
 
 ### System
 
-`GET /system` (viewer):
+`GET /system` (viewer), with sample values — `migrations_version` and `version` are
+whatever the running build reports:
 
 ```json
-{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": 8, "size_bytes": 8787635},
+{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
- "version": "0.3.0"}
+ "version": "0.4.0"}
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
@@ -474,7 +709,55 @@ Non-streaming responses are the provider's answer normalised to the OpenAI schem
 `text/event-stream` with `data: {chunk}` lines and a final `data: [DONE]`; a failure
 after the stream has started is emitted as a `data: {"error": …}` event before `[DONE]`.
 
-Response headers, only for limits the project has set:
+**The usage-only trailer** — one final chunk carrying `"choices": []` and `usage`
+before `[DONE]` — is sent only when you set `stream_options: {"include_usage": true}`,
+exactly as OpenAI does. This holds on every provider: the gateway always asks its
+upstream for token counts, because the request log, the budgets and the cost are built
+from them, but it does not pass that trailer on to a client that did not ask for one,
+because a client indexing `choices[0]` on every chunk would break on it.
+
+That is a promise about Ragmux's own trailer, not about every chunk. An upstream is
+relayed as it comes, and some send frames of their own with an empty `choices` array —
+Azure's content-filter chunk, a proxy's keep-alive. Ragmux does not drop those: they
+carry information it does not own. Guard the array before indexing it.
+
+`usage` carries OpenAI's breakdown objects whenever the provider reports them:
+
+```json
+"usage": {"prompt_tokens": 250, "completion_tokens": 500, "total_tokens": 750,
+          "prompt_tokens_details": {"cached_tokens": 200, "cache_creation_tokens": 40},
+          "completion_tokens_details": {"reasoning_tokens": 30}}
+```
+
+`prompt_tokens` always includes the cached and freshly written parts, on every provider:
+that is a property of the mapping, so it holds whatever the upstream's own spelling was.
+`prompt_tokens + completion_tokens == total_tokens` is weaker — it describes how each
+adapter assembles the block from an upstream that reports its counts consistently, and
+it is not checked. Two things break it: a Gemini request that called tools, where
+Gemini's own total can be larger and the difference is neither mapped nor priced (see
+[Gemini tool-use tokens](providers.md#tool-calling)), and any upstream that reports
+something that does not add up, which is relayed as it came (below). A client that
+relies on the sum should verify it. `cache_creation_tokens` has no OpenAI equivalent
+(OpenAI does not bill cache writes, Anthropic does). See
+[Prompt caching](providers.md#prompt-caching) for the per-provider mapping, including
+the accounting change for cached Anthropic requests.
+
+The `usage` block in the response is the **upstream's own**. Normalising renames fields
+into the OpenAI shape and fills two gaps — a `total_tokens` of `0` is computed from the
+two parts, and DeepSeek's top-level `prompt_cache_hit_tokens` is folded into
+`cached_tokens` — but it validates nothing. A provider that reports something impossible,
+a negative count or a total that does not add up, reaches you that way.
+
+What Ragmux **records** is cleaned. The request log, the budget counters and the cost
+estimate floor every count at zero; a `prompt_tokens` or `completion_tokens` that arrived
+unusable is replaced with a character estimate and the row is flagged `estimated`; an
+unusable cache split drops to zero without that flag, because the flag speaks for those
+two counts and they were fine. So a request log row and the `usage` of the same request
+can differ when the upstream misreported. Trust the row for spend, and treat a mismatch
+as a signal about that provider.
+
+Response headers, only for limits that are set on the project or the key. Where both
+tiers have a limit, the header describes whichever has the smaller remaining allowance:
 
 | Header | Meaning |
 |---|---|
@@ -485,15 +768,24 @@ Response headers, only for limits the project has set:
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
+| `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
+
+Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
+`Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`) and
+accepts `X-Ragmux-Project` in `Access-Control-Allow-Headers`, but a cross-origin page
+sees no response header outside the CORS safelist unless the request went through CORS
+at all.
 
 Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, or a translation error such as tools on a Gemini connection |
-| `401` | missing or invalid project key |
+| `400` | malformed JSON, missing `messages`, a translation error such as tools on a Gemini connection, or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
+| `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
+| `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `413` | body larger than 4 MiB |
-| `429` | project rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly"}}` |
+| `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
+| `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
 | `4xx`/`5xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted) |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
 | `502` | transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
@@ -507,4 +799,7 @@ Return the project's single model in OpenAI's shape so SDK model listings work:
 {"object": "list", "data": [{"id": "claude-sonnet-4-5", "object": "model", "created": 1758190800, "owned_by": "anthropic"}]}
 ```
 
-`{id}` is ignored; both routes describe the project's connection.
+With one project resolved, `{id}` is ignored and both routes describe that project's
+connection. A `sk-user-…` key that grants several projects and names none lists one entry
+per granted project's connection instead, deduplicated by model name; `{id}` then has to
+match one of them (`404` otherwise). Both routes need the key's `models` scope.

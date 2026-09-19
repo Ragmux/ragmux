@@ -270,8 +270,10 @@ td.json{font-family:var(--mono);font-size:11.5px;color:var(--tx2);max-width:360p
       <button class="nav-item" data-tab="models" title="Models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg><span class="nav-text">Models</span><span class="nav-badge" data-badge="models"></span></button>
       <button class="nav-item" data-tab="rag" title="RAG stores"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nav-text">RAG stores</span><span class="nav-badge" data-badge="rag"></span></button>
       <button class="nav-item" data-tab="projects" title="Projects"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.9 12.1 20 3M15 8l2 2M18 5l2 2"/></svg><span class="nav-text">Projects</span><span class="nav-badge" data-badge="projects"></span></button>
+      <button class="nav-item" data-tab="keys" title="API keys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v4M15 12v3"/></svg><span class="nav-text">API keys</span><span class="nav-badge" data-badge="keys"></span></button>
       <button class="nav-item" data-tab="playground" title="Playground"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12 15h5"/></svg><span class="nav-text">Playground</span></button>
-      <div class="nav-label" data-role="admin">Administer</div>
+      <div class="nav-label" data-role="editor">Administer</div>
+      <button class="nav-item" data-tab="prices" data-role="editor" title="Prices"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v20"/><path d="M17 6.5c0-2-2.2-3-5-3s-5 1-5 3 2.2 2.8 5 3.5 5 1.5 5 3.5-2.2 3-5 3-5-1-5-3"/></svg><span class="nav-text">Prices</span></button>
       <button class="nav-item" data-tab="users" data-role="admin" title="Users"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><circle cx="17" cy="9" r="2.5"/><path d="M16 14.5c3 0 5.5 2 5.5 5.5"/></svg><span class="nav-text">Users</span><span class="nav-badge" data-badge="users"></span></button>
       <button class="nav-item" data-tab="audit" data-role="admin" title="Audit log"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg><span class="nav-text">Audit log</span></button>
     </nav>
@@ -307,6 +309,9 @@ const fmtTime = s => s ? new Date(s).toLocaleTimeString([], { hour: '2-digit', m
 const fmtDay = s => s ? new Date(s).toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
 const fmtMonthDay = s => new Date(s).toLocaleDateString([], { month: 'short', day: '2-digit' });
 const fmtMs = ms => `${fmtN(Math.round(ms || 0))} ms`;
+// Estimated spend. Sub-cent amounts keep four decimals so a single cheap
+// request does not read as $0.00; larger ones round to cents.
+const fmtUSD = v => { v = Number(v || 0); const d = v && Math.abs(v) < 0.01 ? 4 : 2; return '$' + v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); };
 // "34 s", "6h 12m", "3d 4h" for a duration in milliseconds.
 function fmtDur(ms) {
   if (ms <= 0) return 'now';
@@ -335,9 +340,35 @@ const ICON = {
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12m0 0 4-4m-4 4-4-4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>',
 };
 
-const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], users: [], system: null, sessionExp: null,
+const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], searchBackends: [], users: [], keys: [], system: null, sessionExp: null,
   overview: { window: '24h' }, openStore: null, openProject: null, users_filter: { q: '', role: 'all' },
+  keys_filter: { q: '', kind: 'all', mine: true },
   playground: { key: '', system: '', stream: true, sources: true, msgs: [], last: null } };
+// The first-run wizard spans three screens and one of them creates the
+// session, so "am I mid-wizard?" has to survive a reload. sessionStorage
+// keeps it to the tab that started it: an established install where someone
+// deleted every project never falls back into the wizard.
+// The stored value is the step to resume at, so the screen a reload lands on
+// needs no network call to decide: GET /setup stops answering anything but
+// needs_setup once the first administrator exists, and state.models is only as
+// good as the last loadAll(), which leaves it empty when any one of its calls
+// failed.
+const WIZARD_KEY = 'ragmux_wizard';
+const wizard = {
+  // A tab mid-wizard when a new version is deployed reloads into the new
+  // script and finds the old flag, which was a bare "1". Read it as step 2 so
+  // that tab resumes where it was instead of dropping to the dashboard with
+  // the key left behind.
+  get step() {
+    let raw = null;
+    try { raw = sessionStorage.getItem(WIZARD_KEY); } catch (e) { return 0; }
+    const step = Number(raw) || 0;
+    return step === 1 ? 2 : step;
+  },
+  get active() { return this.step >= 2; },
+  setStep(step) { try { sessionStorage.setItem(WIZARD_KEY, String(step)); } catch (e) { /* private mode: the wizard just does not resume */ } },
+  done() { try { sessionStorage.removeItem(WIZARD_KEY); } catch (e) { /* nothing to clean up */ } },
+};
 const ROLE_RANK = { viewer: 1, editor: 2, admin: 3 };
 // can('editor') is true for editors and admins; the API enforces the same matrix.
 const can = role => !!state.user && (ROLE_RANK[state.user.role] || 0) >= (ROLE_RANK[role] || 99);
@@ -347,12 +378,23 @@ const ragName = id => id ? ((state.rag.find(r => r.id === id) || {}).name || '#'
 const userName = id => (state.users.find(u => u.id === id) || {}).username || '#' + id;
 const projectName = id => (state.projects.find(p => p.id === id) || {}).name || '#' + id;
 const ptype = t => state.providerTypes.find(x => x.type === t) || {};
+// What an adapter can do with a provider type. cohere_rerank / voyage_rerank
+// can neither chat nor embed, so every connection picker filters on this
+// rather than listing state.models wholesale.
+const pcaps = t => ptype(t).capabilities || {};
+const chatModels = () => state.models.filter(m => pcaps(m.provider_type).chat);
+const rerankModels = () => state.models.filter(m => pcaps(m.provider_type).rerank);
+const connOpts = list => list.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` }));
 const PROVIDER_LETTER = { openai: 'O', anthropic: 'A', gemini: 'G', ollama: 'L', deepseek: 'D', custom_openai: 'C' };
 const providerBadge = (type, cls = '') => `<div class="provider p-${esc(type)} ${cls}" aria-hidden="true">${PROVIDER_LETTER[type] || (type || '?')[0].toUpperCase()}</div>`;
 // Compact "2 rpm · 10k tpm · 1M/day" summary of a project's non-zero limits.
 const limitSummary = p => [p.rate_limit_rpm ? `${fmtK(p.rate_limit_rpm)} rpm` : '', p.rate_limit_tpm ? `${fmtK(p.rate_limit_tpm)} tpm` : '', p.budget_daily_tokens ? `${fmtK(p.budget_daily_tokens)}/day` : '', p.budget_monthly_tokens ? `${fmtK(p.budget_monthly_tokens)}/month` : ''].filter(Boolean).join(' · ') || 'unlimited';
 // "hybrid (english) · rerank 15 · dist ≤ 0.6" summary of a store's retrieval settings.
-const retrievalSummary = r => [r.search_mode === 'vector' ? 'vector' : `hybrid (${r.fts_config || 'simple'})`, r.rerank ? `rerank ${r.rerank_candidates}` : '', r.max_distance ? `dist ≤ ${r.max_distance}` : ''].filter(Boolean).join(' · ');
+const retrievalSummary = r => [r.search_mode === 'vector' ? 'vector' : `hybrid (${r.search_backend === 'pg_search' ? 'bm25' : r.fts_config || 'simple'})`, r.rerank ? `rerank ${r.rerank_backend || 'llm'} ${r.rerank_candidates}` : '', r.max_distance ? `dist ≤ ${r.max_distance}` : ''].filter(Boolean).join(' · ');
+// Options for the search-backend picker; what this server cannot run is
+// listed but disabled, because saving it would be rejected with a 400.
+const backendOpts = () => (state.searchBackends.length ? state.searchBackends : [{ id: 'pgvector', available: true }])
+  .map(b => ({ value: b.id, label: b.id === 'pg_search' ? 'pg_search — ParadeDB BM25' : 'pgvector — PostgreSQL full-text', disabled: !b.available, hint: b.reason }));
 
 let toastTimer;
 function toast(msg, ms = 3500, cls = '') {
@@ -390,11 +432,11 @@ function field(name, label, inner, hint = '') {
 }
 const input = (name, val = '', attrs = '') => `<INPUT class="input" name="${name}" value="${esc(val)}" ${attrs}>`;
 const textarea = (name, val = '', attrs = '') => `<TEXTAREA class="input" name="${name}" ${attrs}>${esc(val)}</TEXTAREA>`;
-const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${name}" ${attrs}>${opts.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(val) ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</SELECT>`;
+const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${name}" ${attrs}>${opts.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(val) ? 'selected' : ''} ${o.disabled ? 'disabled' : ''} ${o.hint ? `title="${esc(o.hint)}"` : ''}>${esc(o.label)}${o.disabled ? ' (unavailable here)' : ''}</option>`).join('')}</SELECT>`;
 const toggle = (name, checked, label, hint = '') => `<label class="toggle"><span><span class="dim">${esc(label)}</span>${hint ? `<div class="hint">${hint}</div>` : ''}</span><input type="checkbox" name="${name}" ${checked ? 'checked' : ''}><span class="switch" aria-hidden="true"></span></label>`;
 const checklist = (name, opts, vals = [], empty = 'Nothing to choose from.') => `<div class="checklist">${opts.map(o => `<label class="check"><input type="checkbox" name="${name}" value="${esc(o.value)}" ${vals.map(String).includes(String(o.value)) ? 'checked' : ''}>${esc(o.label)}</label>`).join('') || `<div class="hint" style="padding:6px 10px">${esc(empty)}</div>`}</div>`;
 const twoCol = (a, b) => `<div class="row" style="align-items:flex-start"><div class="grow">${a}</div><div class="grow">${b}</div></div>`;
-const ROLES = [{ value: 'admin', label: 'admin', hint: 'Everything, including users and the audit log' }, { value: 'editor', label: 'editor', hint: 'Models, RAG stores and own projects' }, { value: 'viewer', label: 'viewer', hint: 'Read-only across member projects' }];
+const ROLES = [{ value: 'admin', label: 'admin', hint: 'Everything, including users and the audit log' }, { value: 'editor', label: 'editor', hint: 'Models, RAG stores and own projects' }, { value: 'viewer', label: 'viewer', hint: 'Read-only on these screens. Can still create its own gateway key, so a demotion does not stop API spend.' }];
 const roleCards = val => `<fieldset class="field" style="border:0;padding:0;margin:0;gap:8px"><legend>Role</legend>${ROLES.map(r => `<label class="radio-card"><input type="radio" name="role" value="${r.value}" ${r.value === val ? 'checked' : ''}><div><div style="font-weight:500">${r.label}</div><div class="hint">${r.hint}</div></div></label>`).join('')}</fieldset>`;
 // Client-side strength heuristic: length and character variety; the server only enforces length.
 function strengthScore(pw) {
@@ -415,6 +457,7 @@ function bindStrength(inputEl, id, min) {
 }
 const formData = form => { const d = Object.fromEntries(new FormData(form).entries()); for (const cb of $$('input[type=checkbox]', form)) d[cb.name] = cb.checked; return d; };
 const checkedValues = (form, name) => $$(`input[name="${name}"]:checked`, form).map(i => Number(i.value));
+const checkedStrings = (form, name) => $$(`input[name="${name}"]:checked`, form).map(i => i.value);
 
 // ---------------------------------------------------------------------------
 // drawer (forms) and modal (confirm / key reveal)
@@ -461,10 +504,12 @@ document.addEventListener('keydown', e => { if (e.key !== 'Escape') return; cons
 // ---------------------------------------------------------------------------
 // shell: sidebar, session, health line
 // ---------------------------------------------------------------------------
-function signedOut() { state.user = null; state.sessionExp = null; closeDrawer(); render(); }
+function signedOut() { state.user = null; state.sessionExp = null; wizard.done(); closeDrawer(); render(); }
 function render() {
   const shell = $('#shell'), auth = $('#auth');
   if (!state.user) { shell.classList.add('hidden'); auth.classList.remove('hidden'); if (state.needsSetup) renderSetup(); else renderLogin(); return; }
+  // Steps 2 and 3 of the wizard are signed in but still on the setup card.
+  if (wizard.active) { shell.classList.add('hidden'); auth.classList.remove('hidden'); renderSetup(); return; }
   auth.classList.add('hidden'); shell.classList.remove('hidden');
   $('#meName').textContent = state.user.username;
   $('#meAvatar').outerHTML = avatar(state.user.username).replace('class="avatar "', 'class="avatar" id="meAvatar"');
@@ -472,13 +517,14 @@ function render() {
   $$('[data-role]', $('#nav')).forEach(el => el.classList.toggle('hidden', !can(el.dataset.role)));
   $$('.nav-item').forEach(b => { const active = b.dataset.tab === state.tab; b.classList.toggle('active', active); if (active) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
   updateBadges();
-  const tabs = { overview: renderOverview, models: renderModels, rag: renderRAG, projects: renderProjects, playground: renderPlayground, users: renderUsers, audit: renderAudit };
-  if (!tabs[state.tab] || ($('.nav-item[data-tab=' + state.tab + ']').dataset.role && !can('admin'))) state.tab = 'overview';
+  const tabs = { overview: renderOverview, models: renderModels, rag: renderRAG, projects: renderProjects, keys: renderKeys, playground: renderPlayground, prices: renderPrices, users: renderUsers, audit: renderAudit };
+  const navItem = $('.nav-item[data-tab=' + state.tab + ']');
+  if (!tabs[state.tab] || (navItem && navItem.dataset.role && !can(navItem.dataset.role))) state.tab = 'overview';
   clearTimeout(pollTimer); clearInterval(ringTimer);
   tabs[state.tab]();
 }
 function updateBadges() {
-  const b = { models: state.models.length, rag: state.rag.length, projects: state.projects.length, users: state.users.length && can('admin') ? state.users.length : '' };
+  const b = { models: state.models.length, rag: state.rag.length, projects: state.projects.length, keys: state.keys.length, users: state.users.length && can('admin') ? state.users.length : '' };
   for (const [k, v] of Object.entries(b)) { const el = $(`[data-badge=${k}]`); if (el) el.textContent = v ? String(v) : ''; }
 }
 function updateSession() {
@@ -487,7 +533,8 @@ function updateSession() {
 }
 setInterval(() => { if (state.user) updateSession(); }, 30000);
 async function loadAll() {
-  [state.models, state.rag, state.projects, state.providerTypes] = await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types')]);
+  [state.models, state.rag, state.projects, state.providerTypes, state.searchBackends] =
+    await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types'), api('/search-backends').catch(() => [])]);
   // Admins get the full list (badge, actor filter); editors the active users for member pickers; viewers nothing.
   state.users = can('admin') ? await api('/users').catch(() => []) : can('editor') ? await api('/users/lite').catch(() => []) : [];
   loadSystem();
@@ -533,10 +580,10 @@ function renderLogin() {
     ${field('username', 'Username', input('username', '', 'required autocomplete=username autocapitalize=none spellcheck=false'))}
     ${field('password', 'Password', input('password', '', 'type=password required autocomplete=current-password'))}
     <div id="loginNote"></div>
-    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Sign in</button>
+    <button type="submit" class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Sign in</button>
     <div class="hint" style="text-align:center">Forgot your password? Ask an administrator to reset it.</div></form></section>`;
   heroVersion();
-  $('#loginForm').onsubmit = async e => { e.preventDefault(); const form = e.target; const d = formData(form); const btn = $('button', form); btn.disabled = true; const note = $('#loginNote');
+  $('#loginForm').onsubmit = async e => { e.preventDefault(); const form = e.target; const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true; const note = $('#loginNote');
     try {
       const r = await request('/login', { method: 'POST', body: { username: d.username, password: d.password } });
       if (r.ok) { state.user = r.data.user; state.needsSetup = false; await afterSignIn(); return; }
@@ -546,13 +593,109 @@ function renderLogin() {
       else note.innerHTML = `<div class="note err"><span class="hint">${esc(errMsg(r.data, r.statusText))}</span></div>`;
     } catch (err) { toast(err.message, 4000, 'err'); } finally { btn.disabled = false; } };
 }
-// Shown instead of the login form while the users table is empty (GET /setup
-// says needs_setup). The server refuses once any user exists, so a stale page
-// cannot create a second administrator.
+// The three-step first-run wizard. Only step 1 is unauthenticated: it posts
+// /setup exactly as before and gets the session cookie. Steps 2 and 3 are
+// ordinary authenticated calls to POST /api/models and POST /api/projects,
+// already role-gated and already audited, so the wizard adds no new
+// unauthenticated surface at all.
+// wizard.step survives the reload, so a resumed wizard lands on the screen it
+// left rather than on whatever the boot calls happened to return.
 function renderSetup() {
+  if (!state.user) { renderSetupAdmin(); return; }
+  if (wizard.step === 3) renderSetupProject();
+  else renderSetupModel();
+}
+// setupCard renders one wizard step into the auth screen.
+function setupCard(step, id, title, lede, body, submitLabel, extra = '') {
+  $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="${id}">
+    <div><div class="eyebrow">First run · step ${step} of 3</div><h2>${esc(title)}</h2><p class="lede" style="font-size:13.5px">${lede}</p></div>
+    ${body}
+    <button type="submit" class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">${esc(submitLabel)}</button>
+    ${extra}</form></section>`;
+  heroVersion();
+}
+// finishWizard leaves the setup screens for the dashboard.
+async function finishWizard() {
+  wizard.done();
+  try { await loadAll(); } catch (e) { toast(e.message, 4000, 'err'); }
+  state.tab = 'overview'; render();
+}
+// Step 2: a model connection, created through the ordinary editor endpoint.
+function renderSetupModel() {
+  // Chat-capable types only: the next wizard step creates a project, and a
+  // rerank-only connection cannot back one.
+  const types = state.providerTypes.filter(t => (t.capabilities || {}).chat).map(t => ({ value: t.type, label: t.label }));
+  setupCard(2, 'setupModelForm', 'Connect a model',
+    'Ragmux proxies to your provider with a credential sealed in the database. You can add more connections later under <strong>Models</strong>.', `
+    ${field('name', 'Name', input('name', 'default', 'required placeholder="e.g. openai-gpt4o"'))}
+    ${field('provider_type', 'Provider', select('provider_type', types, 'openai'))}
+    ${field('model_name', 'Model', input('model_name', '', 'required placeholder="gpt-4o, claude-sonnet-4-5, qwen2.5:7b …"'))}
+    ${field('api_key', 'API key', input('api_key', '', 'type=password autocomplete=off'), 'Encrypted at rest and bound to this connection; never returned by the API.')}
+    ${field('base_url', 'Base URL (optional)', input('base_url', '', 'placeholder="https://…"'), '<span id="setupUrlHint">Blank uses the provider default.</span>')}
+    <div id="setupTestOut"></div>`,
+    'Save connection & continue',
+    `<div class="row" style="gap:10px"><button type="button" class="btn grow" id="setupTest" style="justify-content:center">Test connection</button><button type="button" class="btn ghost grow" id="setupSkipModel" style="justify-content:center">Skip for now</button></div>`);
+  const form = $('#setupModelForm');
+  const hint = () => { const t = ptype($('[name=provider_type]', form).value);
+    $('#setupUrlHint').textContent = `Default: ${t.default_base_url || 'none'}${t.type === 'custom_openai' ? ' — required for custom_openai.' : '.'}`;
+    $('[name=base_url]', form).placeholder = t.default_base_url || 'https://…'; };
+  $('[name=provider_type]', form).onchange = hint; hint();
+  $('#setupTest').onclick = async () => {
+    const d = formData(form); const btn = $('#setupTest'); btn.disabled = true; const out = $('#setupTestOut');
+    out.innerHTML = '<div class="note"><span class="hint">Testing…</span></div>';
+    try { const r = await api('/models/test', { method: 'POST', body: { provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name, mode: 'chat' } });
+      out.innerHTML = `<div class="note ${r.ok ? 'ok' : 'err'}"><span class="pill ${r.ok ? 'ok' : 'err'}">${r.ok ? 'ok' : 'failed'} · ${fmtN(r.latency_ms)} ms</span><span class="hint" style="white-space:pre-wrap">${esc(r.ok ? (r.reply ? 'reply: ' + r.reply : 'reachable') : r.error)}</span></div>`; }
+    catch (e) { out.innerHTML = `<div class="note err"><span class="hint">${esc(e.message)}</span></div>`; } finally { btn.disabled = false; } };
+  // Skipping without a connection auto-skips step 3 too: a project needs one.
+  // Ask /models rather than trust state.models, which a partly failed loadAll()
+  // leaves empty; ending the wizard over an unrelated error would be wrong.
+  $('#setupSkipModel').onclick = async () => {
+    const btn = $('#setupSkipModel'); btn.disabled = true;
+    try { state.models = await api('/models'); }
+    catch (e) { toast(e.message, 5000, 'err'); btn.disabled = false; return; }
+    if (!state.models.length) { toast('Add a model connection first — a project needs one. You can do both from the Models tab.', 6000); await finishWizard(); return; }
+    wizard.setStep(3); renderSetup(); };
+  form.onsubmit = async e => { e.preventDefault(); const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true;
+    try { await api('/models', { method: 'POST', body: { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name } });
+      state.models = await api('/models'); wizard.setStep(3); renderSetup(); }
+    catch (err) { toast(err.message, 6000, 'err'); btn.disabled = false; } };
+}
+// Step 3: a project, which is what mints the first client key.
+function renderSetupProject() {
+  const models = connOpts(chatModels());
+  // A resumed step 3 draws the picker from what the boot calls returned, and
+  // that list is empty when either /models or /provider-types failed. Submitting
+  // then posts a null connection id and earns a validation error nobody can act
+  // on, so the form says what happened and offers the retry instead.
+  const stranded = !models.length;
+  setupCard(3, 'setupProjectForm', 'Create your first project',
+    'A project ties a client key to a model connection and, later, a RAG store. Its key is shown once — this is the credential your applications use.', `
+    ${field('name', 'Project name', input('name', 'default', 'required'))}
+    ${field('model_connection_id', 'Model connection', select('model_connection_id', models, models.length ? models[0].value : undefined))}
+    ${field('system_prompt', 'System prompt (optional)', textarea('system_prompt', '', 'placeholder="You are the company support assistant."'), 'Prepended to every request this project proxies.')}
+    ${stranded ? `<div class="note warn"><span class="hint">No model connections loaded, and a project needs one. If you just created one, this is a load error rather than a missing connection. <button type="button" class="btn ghost" id="setupRetryModels">Try again</button></span></div>` : ''}`,
+    'Create project & finish',
+    `<button type="button" class="btn ghost" id="setupSkipProject" style="justify-content:center">Skip for now</button>`);
+  if (stranded) {
+    $('button[type=submit]', $('#setupProjectForm')).disabled = true;
+    $('#setupRetryModels').onclick = async e => {
+      const btn = e.currentTarget; btn.disabled = true;
+      try { [state.models, state.providerTypes] = await Promise.all([api('/models'), api('/provider-types')]); renderSetup(); }
+      catch (err) { toast(err.message, 5000, 'err'); btn.disabled = false; } };
+  }
+  $('#setupSkipProject').onclick = finishWizard;
+  $('#setupProjectForm').onsubmit = async e => { e.preventDefault(); const d = formData(e.target); const btn = $('button[type=submit]', e.target); btn.disabled = true;
+    try { const r = await api('/projects', { method: 'POST', body: { name: d.name, model_connection_id: Number(d.model_connection_id), system_prompt: d.system_prompt } });
+      showKey(r.project, r.api_key); await finishWizard(); }
+    catch (err) { toast(err.message, 6000, 'err'); btn.disabled = false; } };
+}
+// Step 1, shown instead of the login form while the users table is empty (GET
+// /setup says needs_setup). The server refuses once any user exists, so a
+// stale page cannot create a second administrator.
+function renderSetupAdmin() {
   const s = state.setup || {};
   $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="setupForm">
-    <div><div class="eyebrow">First run · step 1 of 1</div><h2>Create the first administrator</h2><p class="lede" style="font-size:13.5px">No users exist yet. This form works only once and is rate limited per address; afterwards sign in normally.</p></div>
+    <div><div class="eyebrow">First run · step 1 of 3</div><h2>Create the first administrator</h2><p class="lede" style="font-size:13.5px">No users exist yet. This form works only once and is rate limited per address; afterwards sign in normally.</p></div>
     ${field('username', 'Username', input('username', '', 'required autocomplete=username autocapitalize=none spellcheck=false pattern="[a-z0-9._-]{3,64}" title="3-64 characters: a-z, 0-9, . _ -"'), '3–64 characters: lowercase letters, digits, dot, dash, underscore.')}
     ${field('password', 'Password', input('password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('spw'))}
     ${field('confirm', 'Confirm password', input('confirm', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'))}
@@ -560,14 +703,17 @@ function renderSetup() {
       ${s.migrations_version != null ? `<div class="row" style="gap:8px"><span class="dot"></span><span class="dim">PostgreSQL connected · migrations ${esc(s.migrations_version)}${s.database_role ? ` · role ${esc(s.database_role)}` : ''}</span></div>` : ''}
       ${s.secret_key_source ? `<div class="row" style="gap:8px"><span class="dot"></span><span class="dim">SECRET_KEY from ${s.secret_key_source === 'env' ? 'environment' : esc(s.secret_key_source)}</span></div>` : ''}
     </div>
-    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Create administrator &amp; sign in</button>
+    <button type="submit" class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Create administrator &amp; continue</button>
     <div class="hint" style="text-align:center">Prefer automation? Set <code>ADMIN_USER</code> and <code>ADMIN_PASSWORD</code> before first start instead.</div></form></section>`;
   heroVersion();
   bindStrength($('[name=password]', $('#setupForm')), 'spw', 12);
   $('#setupForm').onsubmit = async e => { e.preventDefault(); const d = formData(e.target);
     if (d.password !== d.confirm) { toast('Passwords do not match', 3500, 'err'); return; }
-    const btn = $('button', e.target); btn.disabled = true;
-    try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } }); state.needsSetup = false; state.user = r.user; await afterSignIn(); }
+    const btn = $('button[type=submit]', e.target); btn.disabled = true;
+    try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } });
+      // needsSetup drops before anything else can fail, so a reload can
+      // never land back on step 1 with the account already created.
+      state.needsSetup = false; state.user = r.user; wizard.setStep(2); await afterSignIn(); }
     catch (err) { toast(err.message, 5000, 'err'); if (/already completed/.test(err.message)) { state.needsSetup = false; render(); } }
     finally { btn.disabled = false; } };
 }
@@ -663,18 +809,19 @@ async function renderOverview() {
       <div class="stat"><div class="l">Completion tokens</div><div class="v">${fmtK(w.completion_tokens)}</div>${delta(w.completion_tokens, prev.completion_tokens, { suffix: vs }) || `<div class="d">≈ ${fmtN(Math.round(w.completion_tokens / (w.requests || 1)))} / request</div>`}</div>
       <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(w.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(w.p95_latency_ms)} ms${prev.avg_latency_ms ? ` · ${delta(w.avg_latency_ms, prev.avg_latency_ms, { invert: true }).replace(/<[^>]+>/g, '')}${vs}` : ''}</div></div>
       <div class="stat"><div class="l">Rate limited</div><div class="v">${fmtN(w.rate_limited)}</div><div class="d ${w.rate_limited ? 'down' : ''}">429 · ${w.requests ? (100 * w.rate_limited / w.requests).toFixed(1) : '0.0'}% of calls</div></div>
+      <div class="stat" title="Estimated from the price table; not a bill"><div class="l">Spend (est.)</div><div class="v">${fmtUSD(w.cost_usd)}</div>${delta(w.cost_usd, prev.cost_usd, { invert: true, suffix: vs }) || `<div class="d">all time ${fmtUSD(t.cost_usd)}</div>`}<div class="d">estimated · ${fmtUSD(t.cost_usd)} all time</div></div>
     </div>
     <div class="ov-grid">
       <section class="card"><div class="card-head"><div><h2>Requests per day</h2><div class="hint">${W.days} days · ${fmtN(w.rag_requests)} RAG-augmented in ${W.label} · all time ${fmtN(t.requests)} requests · ${fmtK(t.prompt_tokens + t.completion_tokens)} tokens</div></div>
         <div class="legend"><span><i style="background:var(--amber)"></i>requests</span><span><i style="background:var(--rose)"></i>errors</span></div></div>${areaChart(daily)}</section>
       <section class="card stack" style="gap:14px"><div class="card-head m0"><h2>Traffic by project</h2><span class="hint">${W.label}</span></div>
-        <div class="stack">${byProject.map((p, i) => `<div class="bar-row"><div class="row between"><span class="dim ellip">${esc(p.name)}</span><span class="mono muted nowrap">${fmtN(p.requests)} · ${pct(p.requests, w.requests)}%${p.errors ? ` · ${fmtN(p.errors)} err` : ''}</span></div><div class="meter ${COLORS[i % COLORS.length]}"><i style="width:${pct(p.requests, maxP)}%"></i></div></div>`).join('') || '<div class="hint">No traffic in this window.</div>'}</div>
+        <div class="stack">${byProject.map((p, i) => `<div class="bar-row"><div class="row between"><span class="dim ellip">${esc(p.name)}</span><span class="mono muted nowrap">${fmtN(p.requests)} · ${pct(p.requests, w.requests)}%${p.errors ? ` · ${fmtN(p.errors)} err` : ''} · <span title="estimated spend">${fmtUSD(p.cost_usd)}</span></span></div><div class="meter ${COLORS[i % COLORS.length]}"><i style="width:${pct(p.requests, maxP)}%"></i></div></div>`).join('') || '<div class="hint">No traffic in this window.</div>'}</div>
         <div class="stack" style="border-top:1px solid var(--line);padding-top:14px;gap:10px"><h3>Budget watch</h3>
           ${budgets.map(b => `<div class="row between"><span class="dim ellip">${esc(b.name)} · ${b.kind}</span>${pctPill(b.pct)}</div>${meter(b.pct)}${b.at ? `<div class="hint">at the current rate exhausted ${new Date(b.at) <= Date.now() ? 'now' : 'in ' + fmtDur(new Date(b.at) - Date.now())} · resets ${esc(fmtDay(b.resets))}</div>` : ''}`).join('') || '<div class="hint">No project has a token budget.</div>'}</div></section>
     </div>
     <section class="card"><div class="card-head"><h2>Recent requests</h2><div class="row"><span class="pill">last 50</span><button class="btn sm ghost" data-goto="projects">All projects →</button></div></div>
-      <div class="tbl"><table><thead><tr><th>Time</th><th>Project</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
-      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td>${esc(projectName(r.project_id))}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:280px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No requests yet.</td></tr>'}</tbody></table></div></section>`;
+      <div class="tbl"><table><thead><tr><th>Time</th><th>Project</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th title="Estimated from the price table">$ (est.)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
+      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td>${esc(projectName(r.project_id))}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}${r.cached_prompt_tokens ? ` <span class="pill info" title="prompt tokens served from the provider cache">cache ${fmtK(r.cached_prompt_tokens)}</span>` : ''}</td><td class="mono ${r.cost_source === 'none' ? 'muted' : ''}" title="${r.cost_source === 'none' ? 'no price for this model' : 'estimated · ' + esc(r.cost_source) + ' price'}">${r.cost_source === 'none' ? '—' : fmtUSD(r.cost_usd)}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:280px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="9" class="muted">No requests yet.</td></tr>'}</tbody></table></div></section>`;
   bindChart(daily);
   on(app, '[data-win]', 'click', b => { state.overview.window = b.dataset.win; renderOverview(); });
   on(app, '[data-goto]', 'click', b => { state.tab = b.dataset.goto; render(); });
@@ -683,7 +830,7 @@ async function renderOverview() {
 // ---------------------------------------------------------------------------
 // models
 // ---------------------------------------------------------------------------
-const capsLine = t => [t.supports_embeddings ? 'chat + embeddings' : 'chat', t.supports_tools ? 'tools' : ''].filter(Boolean).join(', ');
+const capsLine = t => { const c = t.capabilities || {}; return c.rerank && !c.chat ? 'reranking only' : [c.embeddings ? 'chat + embeddings' : 'chat', c.tools ? 'tools' : ''].filter(Boolean).join(', '); };
 const testPill = m => m.last_test_ok === true ? `<span class="pill ok" title="tested ${esc(fmtDate(m.last_test_at))}">ok · ${fmtN(m.last_test_latency_ms)} ms</span>` : m.last_test_ok === false ? `<span class="pill err" title="${esc(m.last_test_error)}">failed</span>` : '<span class="pill">untested</span>';
 const hostOf = (url, t) => { if (!url) return `${(t.default_base_url || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '') || 'provider default'} (default)`; return url; };
 function renderModels() {
@@ -694,7 +841,7 @@ function renderModels() {
       <div class="row" style="align-items:flex-start">${providerBadge(m.provider_type)}<div class="grow"><div style="font-weight:600;font-size:15px" class="ellip">${esc(m.name)}</div><div class="hint">${esc(t.label || m.provider_type)} · ${capsLine(t)}</div></div><div class="row wrap" style="gap:6px;justify-content:flex-end">${m.private_upstream ? '<span class="pill warn">private upstream</span>' : ''}${testPill(m)}</div></div>
       <div class="kv"><span class="k">model</span><span class="mono ellip">${esc(m.model_name)}</span><span class="k">base URL</span><span class="mono dim ellip" title="${esc(m.base_url || t.default_base_url)}">${esc(hostOf(m.base_url, t))}</span><span class="k">key</span><span class="mono dim">${esc(m.api_key_masked || '— none')}</span></div>
       ${m.last_test_ok === false && m.last_test_error ? `<div class="hint ellip" title="${esc(m.last_test_error)}">last test: ${esc(m.last_test_error)}</div>` : ''}
-      ${w ? `<div class="row wrap" style="gap:8px;margin-top:2px"><button class="btn sm" data-test="${m.id}">Test chat</button>${t.supports_embeddings ? `<button class="btn sm" data-testemb="${m.id}">Test embed</button>` : ''}<span class="grow"></span><button class="btn sm ghost" data-edit="${m.id}">Edit</button><button class="btn sm ghost danger" data-del="${m.id}">Delete</button></div>` : ''}</div>`; }).join('')}
+      ${w ? `<div class="row wrap" style="gap:8px;margin-top:2px">${(t.capabilities || {}).chat ? `<button class="btn sm" data-test="${m.id}">Test chat</button>` : ''}${t.supports_embeddings ? `<button class="btn sm" data-testemb="${m.id}">Test embed</button>` : ''}<span class="grow"></span><button class="btn sm ghost" data-edit="${m.id}">Edit</button><button class="btn sm ghost danger" data-del="${m.id}">Delete</button></div>` : ''}</div>`; }).join('')}
       ${w ? `<div class="empty stack" style="align-items:center;justify-content:center;gap:10px"><div class="dim" style="font-weight:500">Add DeepSeek, Mistral or any OpenAI-compatible endpoint</div><div class="hint">custom_openai connections run through the same SSRF guard and redaction layer</div><button class="btn sm" data-add>${ICON.plus} New connection</button></div>` : (state.models.length ? '' : '<div class="empty">No connections yet.</div>')}</div>`;
   if (w) { $('#addModel').onclick = () => modelForm(); on(app, '[data-add]', 'click', () => modelForm()); }
   on(app, '[data-edit]', 'click', b => modelForm(modelById(Number(b.dataset.edit))));
@@ -746,7 +893,7 @@ function renderRAG() {
     <div class="split"><section class="stack" style="gap:10px" id="storeList">
       ${state.rag.map(r => { const m = modelById(r.embedding_connection_id) || {}; const qp = quotaPct(r); return `<button class="card tight store-card ${r.id === state.openStore ? 'sel' : ''}" data-open="${r.id}" aria-pressed="${r.id === state.openStore}">
         <div class="row between"><div style="font-weight:600" class="ellip">${esc(r.name)}</div><span class="pill ${r.search_mode === 'vector' ? '' : 'ok'}">${r.search_mode === 'vector' ? 'vector' : 'hybrid'}</span></div>
-        <div class="hint" style="margin-top:4px">${esc(m.name || '#' + r.embedding_connection_id)}${r.dimensions ? ` · ${r.dimensions}d` : ''}${r.search_mode !== 'vector' ? ` · ${esc(r.fts_config || 'simple')}` : ''}</div>
+        <div class="hint" style="margin-top:4px">${esc(m.name || '#' + r.embedding_connection_id)}${r.dimensions ? ` · ${r.dimensions}d` : ''}${r.search_mode !== 'vector' ? ` · ${esc(r.search_backend === 'pg_search' ? 'bm25' : r.fts_config || 'simple')}` : ''}</div>
         <div class="row mono" style="margin-top:12px;gap:14px;font-size:12px"><span><span style="color:var(--tx)">${fmtN(r.document_count)}</span> <span class="muted">docs</span></span><span><span style="color:var(--tx)">${fmtN(r.chunk_count)}</span> <span class="muted">chunks</span></span>${r.rerank ? `<span class="muted">rerank ${r.rerank_candidates}</span>` : ''}${r.max_distance ? `<span class="muted">dist ≤ ${r.max_distance}</span>` : ''}</div>
         <div style="margin-top:10px">${meter(qp, r.max_documents || r.max_bytes ? '' : 'mint')}</div><div class="hint" style="margin-top:4px">${quotaLine(r)}</div></button>`; }).join('') || `<div class="empty">No RAG stores yet.${emb.length ? '' : ' Add an embedding-capable model connection first.'}</div>`}</section>
     <section class="stack" style="gap:16px" id="storePanel"></section></div>`;
@@ -761,14 +908,16 @@ function storeForm(r) {
     ${field('embedding_connection_id', 'Embedding model connection', select('embedding_connection_id', emb.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), r ? r.embedding_connection_id : undefined, r && r.chunk_count ? 'disabled' : ''), r && r.chunk_count ? 'Locked while the store has chunks.' : '')}
     ${twoCol(field('chunk_size', 'Chunk size (chars)', input('chunk_size', r ? r.chunk_size : 1000, 'type=number min=200 max=20000')), field('chunk_overlap', 'Chunk overlap', input('chunk_overlap', r ? r.chunk_overlap : 200, 'type=number min=0')))}
     ${twoCol(field('top_k', 'Top-k', input('top_k', r ? r.top_k : 5, 'type=number min=1 max=50')), field('search_mode', 'Search mode', select('search_mode', [{ value: 'hybrid', label: 'hybrid — vector + full-text (RRF)' }, { value: 'vector', label: 'vector only' }], r ? r.search_mode : 'hybrid')))}
+    ${field('search_backend', 'Search backend', select('search_backend', backendOpts(), r ? r.search_backend || 'pgvector' : 'pgvector'), 'Who answers the lexical half of a hybrid search. <code>pg_search</code> needs the ParadeDB extension; switching needs no reprocessing and ignores the full-text config below.')}
     ${toggle('contextual_chunks', r ? r.contextual_chunks : true, 'Contextual chunks', 'Embed filename and section with each chunk (changing this needs a reprocess).')}
     ${field('fts_config', 'Full-text query config', input('fts_config', r ? r.fts_config || 'simple' : 'simple', 'placeholder=simple'), 'Postgres text search configuration for hybrid queries: <code>simple</code> (no stemming), <code>english</code>, <code>turkish</code>, <code>german</code>… Chunks are always indexed with <code>simple</code>.')}
-    ${toggle('rerank', !!(r && r.rerank), 'Rerank with the project chat model', 'Sends the candidates to the chat model on every request (extra latency and tokens).')}
+    ${toggle('rerank', !!(r && r.rerank), 'Rerank the candidates', 'Reorders the candidates on every request (extra latency, and tokens or rerank-API calls).')}
+    ${twoCol(field('rerank_backend', 'Rerank backend', select('rerank_backend', [{ value: 'llm', label: 'llm — the project chat model' }, { value: 'cohere', label: 'cohere — Cohere Rerank API' }, { value: 'voyage', label: 'voyage — Voyage Rerank API' }], r ? r.rerank_backend || 'llm' : 'llm')), field('rerank_connection_id', 'Rerank connection', select('rerank_connection_id', [{ value: 0, label: '— none (llm backend) —' }, ...connOpts(rerankModels())], r ? r.rerank_connection_id || 0 : 0), rerankModels().length ? 'Required by the cohere and voyage backends.' : 'Add a <code>cohere_rerank</code> or <code>voyage_rerank</code> connection under Models first.'))}
     ${twoCol(field('rerank_candidates', 'Rerank candidates', input('rerank_candidates', r ? r.rerank_candidates : 15, 'type=number min=1 max=100')), field('max_distance', 'Max distance (0 = off)', input('max_distance', r ? r.max_distance : 0, 'type=number min=0 max=2 step=0.01')))}
     ${twoCol(field('max_documents', 'Max documents (0 = ∞)', input('max_documents', r ? r.max_documents : 0, 'type=number min=0 step=1')), field('max_mb', 'Max size MB (0 = ∞)', input('max_mb', r && r.max_bytes ? Math.ceil(r.max_bytes / 1048576) : 0, 'type=number min=0 step=1')))}
     <p class="hint">Upload quotas for this store; an instance-wide ceiling (MAX_DOCUMENTS_PER_STORE / MAX_BYTES_PER_STORE_MB) may apply on top. Max distance drops passages whose cosine distance to the query exceeds it.</p>`,
-    onSubmit: async d => { const body = { name: d.name, embedding_connection_id: Number(d.embedding_connection_id || (r && r.embedding_connection_id)), chunk_size: Number(d.chunk_size), chunk_overlap: Number(d.chunk_overlap), top_k: Number(d.top_k), search_mode: d.search_mode, fts_config: d.fts_config,
-        contextual_chunks: d.contextual_chunks, rerank: d.rerank, rerank_candidates: Number(d.rerank_candidates) || 15, max_distance: Number(d.max_distance) || 0, max_documents: Number(d.max_documents) || 0, max_bytes: (Number(d.max_mb) || 0) * 1048576 };
+    onSubmit: async d => { const body = { name: d.name, embedding_connection_id: Number(d.embedding_connection_id || (r && r.embedding_connection_id)), chunk_size: Number(d.chunk_size), chunk_overlap: Number(d.chunk_overlap), top_k: Number(d.top_k), search_mode: d.search_mode, search_backend: d.search_backend, fts_config: d.fts_config,
+        contextual_chunks: d.contextual_chunks, rerank: d.rerank, rerank_backend: d.rerank_backend, rerank_connection_id: Number(d.rerank_connection_id) || null, rerank_candidates: Number(d.rerank_candidates) || 15, max_distance: Number(d.max_distance) || 0, max_documents: Number(d.max_documents) || 0, max_bytes: (Number(d.max_mb) || 0) * 1048576 };
       const res = r ? await api('/rag-stores/' + r.id, { method: 'PUT', body }) : await api('/rag-stores', { method: 'POST', body });
       toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3000, 'ok');
       if (!r && res && res.id) state.openStore = res.id; await loadAll(); render(); } });
@@ -780,6 +929,7 @@ async function renderStorePanel() {
   let docs = []; try { docs = await api(`/rag-stores/${r.id}/documents`); } catch (e) { toast(e.message, 5000, 'err'); }
   if (state.openStore !== r.id) return;
   const rt = panel.dataset.mode || r.search_mode || 'hybrid'; const rr = panel.dataset.rerank ? panel.dataset.rerank === '1' : !!r.rerank;
+  const rb = panel.dataset.backend || r.search_backend || 'pgvector';
   const hitsHtml = panel.dataset.hits || '';
   panel.innerHTML = `<div class="card stack" style="gap:14px">
       <div class="card-head m0"><div><h2>${esc(r.name)} · documents</h2><div class="hint">chunk ${r.chunk_size} / overlap ${r.chunk_overlap} · contextual chunks ${r.contextual_chunks ? 'on' : 'off'} · top-k ${r.top_k} · ${esc(retrievalSummary(r))}</div></div>
@@ -787,8 +937,8 @@ async function renderStorePanel() {
       ${w ? `<button type="button" class="drop" id="dropzone">${ICON.upload}<span class="dim">Drop PDF, DOCX, HTML, Markdown or text here, or click to choose</span></button>` : ''}
       <div class="tbl"><table><thead><tr><th>Document</th><th>Size</th><th>Chunks</th><th>Status</th><th>Added</th>${w ? '<th></th>' : ''}</tr></thead><tbody>
       ${docs.map(d => `<tr><td><div class="ellip" style="font-weight:500;max-width:340px">${esc(d.filename)}</div><div class="hint mono">${esc(d.mime || '')}${d.page_count ? ` · ${fmtN(d.page_count)} page${d.page_count === 1 ? '' : 's'}` : ''}</div>${d.error ? `<div class="hint ellip" style="max-width:340px" title="${esc(d.error)}">${esc(d.error)}</div>` : ''}</td><td class="mono nowrap">${fmtBytes(d.size_bytes)}</td><td class="mono">${d.chunk_count ? fmtN(d.chunk_count) : '—'}</td><td>${docStatus(d)}</td><td class="mono muted nowrap" title="${esc(fmtDate(d.created_at))}">${fmtDay(d.created_at)}</td>${w ? `<td class="right nowrap"><button class="btn sm ghost" data-re="${d.id}">Reprocess</button> <button class="btn sm ghost danger" data-del="${d.id}">Delete</button></td>` : ''}</tr>`).join('') || `<tr><td colspan="6" class="muted">No documents yet.${w ? ' Upload PDF, DOCX, HTML, TXT or Markdown files.' : ''}</td></tr>`}</tbody></table></div></div>
-    <div class="card stack" style="gap:12px"><div class="card-head m0"><h2>Test retrieval</h2><div class="row"><div class="tabs" role="tablist" aria-label="Search mode"><button class="tab" role="tab" data-mode="hybrid" aria-selected="${rt === 'hybrid'}">hybrid</button><button class="tab" role="tab" data-mode="vector" aria-selected="${rt === 'vector'}">vector</button></div><button class="tab" id="rerankToggle" aria-pressed="${rr}" style="border:1px solid var(--line)">rerank</button></div></div>
-      <form class="row" id="srch"><div class="search grow">${ICON.search}<label for="q" class="sr">Query</label><input id="q" class="input" name="q" placeholder="Ask something that should be in the documents…" autocomplete="off"></div><button class="btn primary">Search</button></form>
+    <div class="card stack" style="gap:12px"><div class="card-head m0"><h2>Test retrieval</h2><div class="row"><div class="tabs" role="tablist" aria-label="Search mode"><button class="tab" role="tab" data-mode="hybrid" aria-selected="${rt === 'hybrid'}">hybrid</button><button class="tab" role="tab" data-mode="vector" aria-selected="${rt === 'vector'}">vector</button></div><label for="backendSel" class="sr">Search backend</label>${select('backend', backendOpts(), rb, 'id=backendSel style="width:auto;padding:6px 10px"')}<button class="tab" id="rerankToggle" aria-pressed="${rr}" style="border:1px solid var(--line)">rerank</button></div></div>
+      <form class="row" id="srch"><div class="search grow">${ICON.search}<label for="q" class="sr">Query</label><input id="q" class="input" name="q" placeholder="Ask something that should be in the documents…" autocomplete="off"></div><button type="submit" class="btn primary">Search</button></form>
       <div id="hits">${hitsHtml}</div></div>`;
   const refresh = async () => { await loadAll(); if (state.tab === 'rag') { render(); } };
   if (w) {
@@ -806,12 +956,13 @@ async function renderStorePanel() {
   }
   on(panel, '[data-mode]', 'click', b => { panel.dataset.mode = b.dataset.mode; $$('[data-mode]', panel).forEach(x => x.setAttribute('aria-selected', x === b)); });
   $('#rerankToggle').onclick = b => { const el = b.currentTarget; const v = el.getAttribute('aria-pressed') !== 'true'; el.setAttribute('aria-pressed', v); panel.dataset.rerank = v ? '1' : '0'; };
+  $('#backendSel').onchange = e => { panel.dataset.backend = e.target.value; };
   $('#srch').onsubmit = async e => { e.preventDefault(); const q = $('#q').value.trim(); if (!q) return; const hits = $('#hits'); hits.innerHTML = '<p class="hint">Searching…</p>';
-    try { const res = await api(`/rag-stores/${r.id}/search`, { method: 'POST', body: { query: q, mode: panel.dataset.mode || rt, rerank: panel.dataset.rerank ? panel.dataset.rerank === '1' : rr } });
+    try { const res = await api(`/rag-stores/${r.id}/search`, { method: 'POST', body: { query: q, mode: panel.dataset.mode || rt, backend: panel.dataset.backend || rb, rerank: panel.dataset.rerank ? panel.dataset.rerank === '1' : rr } });
       const maxS = Math.max(1e-9, ...res.hits.map(h => h.score)); const where = h => [h.section, h.page ? `p.${h.page}` : ''].filter(Boolean).join(' · ');
-      hits.innerHTML = `<div class="hint">${res.hits.length} hit${res.hits.length === 1 ? '' : 's'} in ${fmtN(res.latency_ms)} ms · ${esc(res.mode)}${res.retrieval_latency_ms != null ? ` · retrieval ${fmtN(res.retrieval_latency_ms)} ms` : ''}${res.reranked ? ` · rerank ${res.rerank_latency_ms != null ? fmtN(res.rerank_latency_ms) + ' ms' : 'on'}` : ''}</div>` +
+      hits.innerHTML = `<div class="hint">${res.hits.length} hit${res.hits.length === 1 ? '' : 's'} in ${fmtN(res.latency_ms)} ms · ${esc(res.mode)}${res.mode === 'vector' ? '' : ` · ${esc(res.backend || 'pgvector')}${res.backend === 'pg_search' ? ' (fts_config ignored)' : ''}`}${res.retrieval_latency_ms != null ? ` · retrieval ${fmtN(res.retrieval_latency_ms)} ms` : ''}${res.reranked ? ` · rerank ${esc(res.rerank_backend || 'llm')} ${res.rerank_latency_ms != null ? fmtN(res.rerank_latency_ms) + ' ms' : 'on'}` : res.rerank_fallback ? ` · rerank ${esc(res.rerank_backend || 'llm')} skipped` : ''}</div>` +
         res.hits.map((h, i) => `<div class="hit"><div class="n">[${i + 1}]</div><div><div class="row wrap" style="gap:8px;margin-bottom:4px"><span style="font-weight:500">${esc(h.filename)}</span>${where(h) ? `<span class="pill">${esc(where(h))}</span>` : ''}<span class="hint">chunk ${h.index}</span></div><pre>${esc(h.content)}</pre></div>
-          <div class="score"><div class="row between"><span>${res.mode === 'vector' ? 'score' : 'rrf'}</span><span style="color:var(--tx)">${Number(h.score).toFixed(4)}</span></div><div class="meter mint"><i style="width:${pct(h.score, maxS)}%"></i></div><div class="row between"><span>vec #${h.vector_rank || '—'} · fts #${h.fts_rank || '—'}</span><span>d ${Number(h.distance).toFixed(2)}</span></div></div></div>`).join('');
+          <div class="score"><div class="row between"><span>${res.mode === 'vector' ? 'score' : 'rrf'}</span><span style="color:var(--tx)">${Number(h.score).toFixed(4)}</span></div><div class="meter mint"><i style="width:${pct(h.score, maxS)}%"></i></div><div class="row between"><span>vec #${h.vector_rank || '—'} · fts #${h.fts_rank || '—'}${h.lex_score ? ` · bm25 ${Number(h.lex_score).toFixed(2)}` : ''}</span><span>d ${Number(h.distance).toFixed(2)}</span></div></div></div>`).join('');
       panel.dataset.hits = hits.innerHTML; }
     catch (err) { hits.innerHTML = `<p class="hint">Error: ${esc(err.message)}</p>`; } };
   clearTimeout(pollTimer);
@@ -842,7 +993,7 @@ function renderProjects() {
 function projectForm(p) {
   drawer({ eyebrow: p ? 'Edit' : 'New', title: 'Project', submitLabel: p ? 'Save project' : 'Create project', body: `
     ${field('name', 'Name', input('name', p ? p.name : '', 'required'))}
-    ${field('model_connection_id', 'Model connection', select('model_connection_id', state.models.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), p ? p.model_connection_id : undefined))}
+    ${field('model_connection_id', 'Model connection', select('model_connection_id', connOpts(chatModels()), p ? p.model_connection_id : undefined))}
     ${field('rag_store_id', 'RAG store (optional)', select('rag_store_id', [{ value: 0, label: '— none —' }, ...state.rag.map(r => ({ value: r.id, label: r.name }))], p ? p.rag_store_id || 0 : 0))}
     ${field('system_prompt', 'Project system prompt', textarea('system_prompt', p ? p.system_prompt : ''), 'Optional; prepended to every request.')}
     ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', p ? p.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', p ? p.rate_limit_tpm : 0, 'type=number min=0 step=1')))}
@@ -859,15 +1010,26 @@ function membersForm(p) {
   drawer({ eyebrow: 'Members', title: p.name, submitLabel: 'Save members', body: `${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p.member_ids || [])}<p class="hint">Members see the project, its metrics and usage; editors among them can change it. An editor cannot remove themselves.</p>`,
     onSubmit: async (d, form) => { await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: checkedValues(form, 'members') } }); toast('Members saved', 3000, 'ok'); await loadAll(); render(); } });
 }
-function showKey(p, key) {
+// showSecret is the reveal-once modal for every credential the API returns.
+// A gateway key that grants more than one project gets the routing header in
+// its snippet; a management key gets the header-only warning instead.
+function showSecret({ title, key, kind = 'gateway', projects = [] }) {
   const origin = location.origin;
-  modal(`API key for ${p.name}`, `<p class="dim">Copy this key now — it is not stored and cannot be shown again.</p><pre class="mono" style="font-size:13px;color:var(--amber)">${esc(key)}</pre>
-    <h3>Example</h3><pre>curl ${esc(origin)}/v1/chat/completions \\
-  -H "Authorization: Bearer ${esc(key)}" \\
+  const projHeader = projects.length > 1 ? `\n  -H "X-Ragmux-Project: ${esc(projects[0])}"` : '';
+  const gateway = `<h3>Example</h3><pre>curl ${esc(origin)}/v1/chat/completions \\
+  -H "Authorization: Bearer ${esc(key)}" \\${projHeader}
   -H "Content-Type: application/json" \\
   -d '{"model":"default","messages":[{"role":"user","content":"Hello"}]}'</pre>
-    <p class="hint">Python: <code>OpenAI(base_url="${esc(origin)}/v1", api_key="${esc(key)}")</code> · the Playground has this key pre-filled until you reload.</p>`, { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
-  state.playground.key = key;
+    <p class="hint">Python: <code>OpenAI(base_url="${esc(origin)}/v1", api_key="${esc(key)}")</code> · the Playground has this key pre-filled until you reload.${projects.length > 1 ? ` Without <code>X-Ragmux-Project</code> the call is refused with <code>400 project_required</code>; valid values: ${projects.map(esc).join(', ')}.` : ''}</p>`;
+  const management = `<h3>Example</h3><pre>curl ${esc(origin)}/admin/api/projects \\
+  -H "Authorization: Bearer ${esc(key)}"</pre>
+    <p class="hint">Management keys are only accepted in the <code>Authorization</code> header — never in the session cookie — and can do no more than the scopes above intersected with your role.</p>`;
+  modal(title, `<p class="dim">Copy this key now — it is not stored and cannot be shown again.</p><pre class="mono" style="font-size:13px;color:var(--amber)">${esc(key)}</pre>
+    ${kind === 'management' ? management : gateway}`, { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
+  if (kind !== 'management') state.playground.key = key;
+}
+function showKey(p, key) {
+  showSecret({ title: `API key for ${p.name}`, key, kind: 'gateway', projects: [p.name] });
 }
 async function projectPanel() {
   const id = state.openProject; const panel = $('#projPanel'); const p = state.projects.find(x => x.id === id); if (!p || !panel) return;
@@ -890,10 +1052,10 @@ async function projectPanel() {
       <div class="stat"><div class="l">Requests 24h</div><div class="v">${fmtN(win.requests)}</div><div class="d">${fmtN(win.errors)} errors · ${fmtN(win.rate_limited)} rate limited</div></div>
       <div class="stat"><div class="l">Tokens 24h · p / c</div><div class="v" style="font-size:22px">${fmtK(win.prompt_tokens)} / ${fmtK(win.completion_tokens)}</div><div class="d">${fmtN(win.rag_requests)} RAG-augmented</div></div>
       <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(win.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(win.p95_latency_ms)} ms</div></div>
-      <div class="stat"><div class="l">All time</div><div class="v">${fmtN(t.requests)}</div><div class="d">${fmtK(t.prompt_tokens + t.completion_tokens)} tokens</div></div></div>
+      <div class="stat" title="Estimated from the price table; not a bill"><div class="l">Spend 24h (est.)</div><div class="v">${fmtUSD(win.cost_usd)}</div><div class="d">${fmtUSD(t.cost_usd)} all time · ${fmtN(t.requests)} requests</div></div></div>
     <div class="card"><div class="card-head"><h2>Recent</h2><span class="hint">last 50 · newest first</span></div>
-      <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
-      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
+      <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th title="Estimated from the price table">$ (est.)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
+      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}${r.cached_prompt_tokens ? ` <span class="pill info" title="prompt tokens served from the provider cache">cache ${fmtK(r.cached_prompt_tokens)}</span>` : ''}</td><td class="mono ${r.cost_source === 'none' ? 'muted' : ''}" title="${r.cost_source === 'none' ? 'no price for this model' : 'estimated · ' + esc(r.cost_source) + ' price'}">${r.cost_source === 'none' ? '—' : fmtUSD(r.cost_usd)}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
   // Live countdown on the reset labels; the minute ring is refetched when its window rolls over.
   const resets = { minute: u.minute.resets_at, day: u.day.resets_at, month: u.month.resets_at };
   ringTimer = setInterval(() => { if (state.tab !== 'projects' || state.openProject !== id) { clearInterval(ringTimer); return; }
@@ -919,7 +1081,7 @@ function renderPlayground() {
     <div class="split pg"><section class="card chat-card"><div class="chat" id="chat">
         <div class="hint mono" style="text-align:center">${proj ? `${esc(proj.name)} · ${esc(model ? model.model_name : '')}${proj.rag_store_id ? ' · ' + esc(ragName(proj.rag_store_id)) : ''}` : 'enter a project key to start'}</div>
         ${pg.msgs.map(msg => msg.role === 'user' ? `<div class="bubble user">${esc(msg.content)}</div>` : `<div class="bubble asst">${providerBadge(model ? model.provider_type : '', 'sm')}<div class="body ${msg.error ? 'err' : ''}">${esc(msg.content)}${msg.pending ? '<span class="caret" aria-hidden="true"></span>' : ''}</div></div>${msgMeta(msg)}`).join('')}</div>
-      <form class="composer" id="pgForm"><label for="pg-text" class="sr">Message</label><textarea id="pg-text" class="input" name="text" placeholder="Message… Enter to send, Shift+Enter for a newline"></textarea><button class="btn primary" id="pgSend" style="min-height:56px;padding:0 20px">${ICON.send} Send</button></form></section>
+      <form class="composer" id="pgForm"><label for="pg-text" class="sr">Message</label><textarea id="pg-text" class="input" name="text" placeholder="Message… Enter to send, Shift+Enter for a newline"></textarea><button type="submit" class="btn primary" id="pgSend" style="min-height:56px;padding:0 20px">${ICON.send} Send</button></form></section>
     <aside class="stack" style="gap:14px"><div class="card stack" style="gap:14px"><h3>Session</h3>
         ${field('key', 'Project API key', input('key', pg.key, 'type=password placeholder="sk-proj-…" autocomplete=off spellcheck=false'), `<span id="keyHint">${keyHint(proj, model)}</span>`)}
         ${field('system', 'Extra system prompt', textarea('system', pg.system, 'style="min-height:72px" placeholder="Optional; sent as the first system message"'))}
@@ -947,6 +1109,10 @@ async function sendMessage(text) {
   const history = pg.msgs.filter(m => m.content && !m.error).map(m => ({ role: m.role, content: m.content }));
   const messages = pg.system.trim() ? [{ role: 'system', content: pg.system.trim() }, ...history] : history;
   const payload = { model: 'default', stream: pg.stream, messages }; if (pg.sources && !pg.stream) payload.ragmux = { include_context: true };
+  // The gateway only sends the usage-only trailer chunk to a client that asks
+  // for it, the way OpenAI does; without this the token badge and the "Last
+  // response" card would go blank on streamed replies.
+  if (pg.stream) payload.stream_options = { include_usage: true };
   try {
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + pg.key, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     status = r.status;
@@ -979,6 +1145,177 @@ async function sendMessage(text) {
 }
 
 // ---------------------------------------------------------------------------
+// api keys (every role: each user manages their own)
+// ---------------------------------------------------------------------------
+const KEY_EXPIRY_WARN_DAYS = 7;
+// "active" / "expires in 12 d" (amber under a week) / "expired" / "revoked".
+function keyStatus(k) {
+  if (k.revoked_at) return '<span class="pill err">revoked</span>';
+  if (!k.expires_at) return '<span class="pill ok">active</span>';
+  const left = new Date(k.expires_at) - Date.now();
+  if (left <= 0) return '<span class="pill err">expired</span>';
+  const days = Math.ceil(left / 86400e3);
+  return `<span class="pill ${days <= KEY_EXPIRY_WARN_DAYS ? 'warn' : 'ok'}">expires in ${days} d</span>`;
+}
+const keyLastUsed = k => k.last_used_at ? `${fmtDur(Date.now() - new Date(k.last_used_at))} ago` : 'never';
+const keyKindPill = k => `<span class="pill ${k.kind === 'management' ? 'violet' : 'info'}">${esc(k.kind)}</span>`;
+const SCOPE_HINTS = { chat: 'POST /v1/chat/completions', models: 'GET /v1/models', read: 'every listing', write: 'the editor routes', admin: 'users and the audit log', keys: 'minting api keys' };
+const scopesFor = kind => kind === 'management' ? ['read', 'write', 'admin', 'keys'] : ['chat', 'models'];
+const EXPIRY_CHOICES = [{ value: '', label: 'never expires' }, { value: '30', label: 'in 30 days' }, { value: '90', label: 'in 90 days' }, { value: '365', label: 'in a year' }];
+const expiryISO = days => days ? new Date(Date.now() + Number(days) * 86400e3).toISOString() : '';
+
+async function renderKeys() {
+  const app = $('#app'); app.innerHTML = '<div class="card">Loading…</div>';
+  const f = state.keys_filter;
+  const mine = !can('admin') || f.mine;
+  let keys;
+  try { keys = await api('/keys' + (mine ? `?user_id=${state.user.id}` : '')); } catch (e) { app.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  state.keys = keys; updateBadges();
+  const rows = keys.filter(k => (f.kind === 'all' || k.kind === f.kind) && (!f.q || k.name.toLowerCase().includes(f.q.toLowerCase()) || (k.username || '').toLowerCase().includes(f.q.toLowerCase())));
+  const live = keys.filter(k => !k.revoked_at && (!k.expires_at || new Date(k.expires_at) > Date.now()));
+  const soon = live.filter(k => k.expires_at && new Date(k.expires_at) - Date.now() <= KEY_EXPIRY_WARN_DAYS * 86400e3);
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">API keys · ${mine ? 'yours' : 'all users'} · ${keys.length} key${keys.length === 1 ? '' : 's'}</div><h1>API keys</h1>
+      <p class="lede">Your own credentials, separate from a project's default key: <code>sk-user-…</code> calls <code>/v1</code> on the projects you grant it, <code>sk-mgmt-…</code> calls <code>/admin/api</code> within its scopes. An <code>sk-mgmt-…</code> key never outranks your role, which is read on every request; an <code>sk-user-…</code> key is bounded by its grants and limits instead, since <code>/v1</code> checks only that your account is active. Revoking either takes effect on the next request.</p></div>
+    <div class="actions"><button class="btn primary" id="addKey">${ICON.plus} New key</button></div></div>
+    <div class="stats four">
+      <div class="stat"><div class="l">Active</div><div class="v">${fmtN(live.length)}</div><div class="d">${fmtN(keys.length - live.length)} revoked or expired</div></div>
+      <div class="stat"><div class="l">Gateway</div><div class="v">${fmtN(keys.filter(k => k.kind === 'gateway').length)}</div><div class="d">call <code>/v1</code></div></div>
+      <div class="stat"><div class="l">Management</div><div class="v">${fmtN(keys.filter(k => k.kind === 'management').length)}</div><div class="d">call <code>/admin/api</code></div></div>
+      <div class="stat"><div class="l">Expiring soon</div><div class="v ${soon.length ? '' : 'muted'}">${fmtN(soon.length)}</div><div class="d ${soon.length ? 'down' : ''}">within ${KEY_EXPIRY_WARN_DAYS} days</div></div></div>
+    <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:280px">${ICON.search}<label for="k-q" class="sr">Search keys</label><input id="k-q" class="input" placeholder="Search name" value="${esc(f.q)}" style="min-height:38px" autocomplete="off"></div>
+        <div class="tabs" role="tablist" aria-label="Kind">${['all', 'gateway', 'management'].map(k => `<button class="tab" role="tab" data-kind="${k}" aria-selected="${f.kind === k}">${k}</button>`).join('')}</div>
+        ${can('admin') ? `<div class="tabs" role="tablist" aria-label="Owner"><button class="tab" role="tab" data-mine="1" aria-selected="${f.mine}">mine</button><button class="tab" role="tab" data-mine="0" aria-selected="${!f.mine}">all users</button></div>` : ''}</div>
+      <span class="hint">${rows.length} of ${keys.length} keys</span></div>
+      <div class="tbl"><table><thead><tr><th>Key</th><th>Scopes</th><th>Projects</th><th>Limits</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>
+      ${rows.map(k => `<tr><td><div style="font-weight:500">${esc(k.name)} ${keyKindPill(k)}</div><div class="hint mono">${esc(k.key_prefix)}…${!mine && k.username ? ` · ${esc(k.username)}` : ''}</div></td>
+        <td class="mono muted">${(k.scopes || []).map(s => esc(s)).join(' ') || '—'}</td>
+        <td class="ellip" style="max-width:220px">${k.kind === 'management' ? '<span class="muted">—</span>' : ((k.project_ids || []).map(id => esc(projectName(id))).join(', ') || '<span class="pill err">no grants</span>')}${k.default_project_id ? `<div class="hint">default ${esc(projectName(k.default_project_id))}</div>` : ''}</td>
+        <td class="mono dim">${k.kind === 'management' ? '—' : esc(limitSummary(k))}</td><td>${keyStatus(k)}</td><td class="mono muted nowrap">${esc(keyLastUsed(k))}</td>
+        <td class="right nowrap"><button class="btn sm ghost" data-usage="${k.id}">Usage</button> <button class="btn sm ghost" data-edit="${k.id}">Edit</button> <button class="btn sm ghost" data-revoke="${k.id}" ${k.revoked_at ? 'disabled' : ''}>Revoke</button>${can('admin') ? ` <button class="btn sm ghost danger" data-del="${k.id}">Delete</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No keys yet. A new key is shown once and cannot be retrieved again.</td></tr>'}</tbody></table></div></section>`;
+  let qTimer; $('#k-q').oninput = e => { f.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(renderKeys, 200); };
+  on(app, '[data-kind]', 'click', b => { f.kind = b.dataset.kind; renderKeys(); });
+  on(app, '[data-mine]', 'click', b => { f.mine = b.dataset.mine === '1'; renderKeys(); });
+  $('#addKey').onclick = () => keyForm(null);
+  on(app, '[data-edit]', 'click', b => keyForm(keys.find(k => k.id == b.dataset.edit)));
+  on(app, '[data-usage]', 'click', b => keyUsageModal(keys.find(k => k.id == b.dataset.usage)));
+  on(app, '[data-revoke]', 'click', async b => { if (!await confirmDialog('Revoke this key? Requests with it stop working immediately; its usage history stays.', { label: 'Revoke key' })) return;
+    try { await api(`/keys/${b.dataset.revoke}/revoke`, { method: 'POST' }); toast('Key revoked', 3000, 'ok'); renderKeys(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this key for good? Revoking is usually enough; deleting is refused while request logs still attribute usage to it.', { label: 'Delete key' })) return;
+    try { await api('/keys/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); renderKeys(); } catch (e) { toast(e.message, 6000, 'err'); } });
+}
+async function keyUsageModal(k) {
+  if (!k) return;
+  let u; try { u = await api(`/keys/${k.id}/usage`); } catch (e) { toast(e.message, 5000, 'err'); return; }
+  const line = (label, w) => `<div class="row between"><span class="dim">${label}</span><span class="mono">${fmtK(w.tokens)}${w.token_limit ? ` / ${fmtK(w.token_limit)}` : ''} tokens · ${fmtN(w.requests)} req</span></div>${w.token_limit ? meter(w.token_percent) : ''}`;
+  modal(`Usage · ${k.name}`, `<div class="stack" style="gap:10px">${line('this minute', u.minute)}${line('today', u.day)}${line('this month', u.month)}</div>
+    <p class="hint">The key's own counters against its own limits. The project it routes to has a second, independent ceiling; whichever is tighter decides.</p>`,
+    { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
+}
+function keyForm(k) {
+  const editing = !!k;
+  const kind = k ? k.kind : 'gateway';
+  const projectOpts = state.projects.map(p => ({ value: p.id, label: p.name }));
+  const form = drawer({ eyebrow: editing ? 'Edit' : 'New', title: editing ? k.name : 'API key', submitLabel: editing ? 'Save key' : 'Create key', body: `
+    ${editing ? '' : field('kind', 'Kind', select('kind', [{ value: 'gateway', label: 'gateway — calls /v1 with a project key' }, { value: 'management', label: 'management — calls /admin/api' }], kind), 'A gateway key routes chat traffic; a management key drives the dashboard API. The kind cannot be changed later.')}
+    ${field('name', 'Name', input('name', k ? k.name : '', 'required maxlength=64 placeholder="e.g. ci-pipeline"'), 'Unique among your keys; it is how the key is identified once the secret is gone.')}
+    ${can('admin') && !editing ? field('user_id', 'Owner', select('user_id', [{ value: state.user.id, label: `${state.user.username} (you)` }, ...state.users.filter(u => u.id !== state.user.id).map(u => ({ value: u.id, label: `${u.username} (${u.role})` }))], state.user.id), 'Grants are held to what this account can reach right now. A management key stays bounded by its role afterwards; a gateway key keeps the grants it was given, so later changes to the account narrow it only by deactivation.') : ''}
+    <fieldset class="field" style="border:0;padding:0;margin:0;gap:4px" id="scopeBox"><legend>Scopes</legend><div id="scopeList"></div><div class="hint" id="scopeHint"></div></fieldset>
+    ${field('expires', 'Expiry', select('expires', editing && k.expires_at ? [{ value: 'keep', label: `keep ${fmtDate(k.expires_at)}` }, ...EXPIRY_CHOICES] : EXPIRY_CHOICES, editing && k.expires_at ? 'keep' : ''), 'An expired key stops resolving; the row is kept for 30 days so its usage history stays readable.')}
+    <div id="gatewayBox" class="stack" style="gap:16px">
+      <div class="field"><span class="field"><label>Projects this key may call</label></span>${checklist('project_ids', projectOpts, k ? k.project_ids || [] : [], 'You are not a member of any project yet.')}<div class="hint">Checked once, here: a later change to the project's member list never breaks the key. With more than one, callers pick with the <code>X-Ragmux-Project</code> header.</div></div>
+      ${field('default_project_id', 'Default project', select('default_project_id', [{ value: 0, label: '— none —' }, ...projectOpts], k ? k.default_project_id || 0 : 0), 'Used when a request names no project. Must be one of the checked projects.')}
+      ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', k ? k.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', k ? k.rate_limit_tpm : 0, 'type=number min=0 step=1')))}
+      ${twoCol(field('budget_daily_tokens', 'Daily token budget', input('budget_daily_tokens', k ? k.budget_daily_tokens : 0, 'type=number min=0 step=1')), field('budget_monthly_tokens', 'Monthly token budget', input('budget_monthly_tokens', k ? k.budget_monthly_tokens : 0, 'type=number min=0 step=1')))}
+      <p class="hint">0 = unlimited. These sit under the project's own limits, against separate counters: the tighter of the two decides and the <code>429</code> says which with <code>"scope"</code>.</p></div>`,
+    onSubmit: async (d, fm) => {
+      const kd = editing ? k.kind : d.kind;
+      const body = { kind: kd, name: d.name, scopes: checkedStrings(fm, 'scopes') };
+      if (!editing && can('admin') && Number(d.user_id) !== state.user.id) body.user_id = Number(d.user_id);
+      body.expires_at = d.expires === 'keep' ? (k.expires_at || '') : expiryISO(d.expires);
+      if (kd === 'gateway') {
+        body.project_ids = checkedValues(fm, 'project_ids');
+        body.default_project_id = Number(d.default_project_id) || null;
+        body.rate_limit_rpm = Number(d.rate_limit_rpm) || 0; body.rate_limit_tpm = Number(d.rate_limit_tpm) || 0;
+        body.budget_daily_tokens = Number(d.budget_daily_tokens) || 0; body.budget_monthly_tokens = Number(d.budget_monthly_tokens) || 0;
+      }
+      if (editing) { await api('/keys/' + k.id, { method: 'PUT', body }); toast('Saved', 3000, 'ok'); }
+      else { const r = await api('/keys', { method: 'POST', body });
+        showSecret({ title: `New ${kd} key · ${r.key.name}`, key: r.api_key, kind: kd, projects: (r.key.project_ids || []).map(projectName) }); }
+      renderKeys(); } });
+  // The scope list and the gateway-only block follow the chosen kind.
+  const paint = () => {
+    const kd = editing ? kind : $('[name=kind]', form).value;
+    const chosen = k ? k.scopes || [] : scopesFor(kd);
+    $('#scopeList').innerHTML = checklist('scopes', scopesFor(kd).map(s => ({ value: s, label: `${s} — ${SCOPE_HINTS[s]}` })), chosen);
+    $('#gatewayBox').classList.toggle('hidden', kd !== 'gateway');
+    // The owner is looked up on every request either way, but only /admin/api
+    // intersects the role. Saying "the role is checked as well" on a gateway
+    // key would promise that demoting the owner narrows it, and it does not.
+    $('#scopeHint').textContent = kd === 'gateway'
+      ? 'A scope only narrows. /v1 checks that the owner\'s account is active, not their role, so demoting the owner does not narrow this key — revoke it, give it a smaller sub-limit, or deactivate the account.'
+      : 'A scope only narrows. /admin/api intersects it with the owner\'s role, read on every request, so demoting the owner narrows this key at once.';
+  };
+  if (!editing) $('[name=kind]', form).onchange = paint;
+  paint();
+}
+
+// ---------------------------------------------------------------------------
+// prices (editor)
+// ---------------------------------------------------------------------------
+const priceState = { q: '', provider: 'all' };
+// A per-million-token rate. "—" means the row has no own cache price and
+// falls back to the input rate, which is what the API returns as null.
+const rate = v => v == null ? '<span class="muted" title="falls back to the input rate">—</span>' : `<span class="mono">${Number(v).toFixed(v && Math.abs(v) < 0.01 ? 4 : 2)}</span>`;
+const priceNum = (name, val, label, hint = '') => field(name, label, input(name, val == null ? '' : String(val), 'type=number min=0 max=100000 step=any inputmode=decimal'), hint);
+// An empty numeric field means "unset": null for the cache rates, which is
+// not the same as 0, and 0 for the two required ones.
+const numOrNull = v => String(v).trim() === '' ? null : Number(v);
+
+async function renderPrices() {
+  const app = $('#app'); app.innerHTML = '<div class="card">Loading…</div>';
+  let res;
+  try { res = await api('/prices'); } catch (e) { app.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  const all = res.prices || [], s = priceState, w = can('editor');
+  const providers = [...new Set(all.map(p => p.provider_type))].sort();
+  const rows = all.filter(p => (s.provider === 'all' || p.provider_type === s.provider) &&
+    (!s.q || (p.model_pattern + ' ' + p.provider_type).toLowerCase().includes(s.q.toLowerCase())));
+  const edited = all.filter(p => p.source === 'user').length;
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Prices · ${all.length} row${all.length === 1 ? '' : 's'} · built-in table v${fmtN(res.builtin_version)}</div><h1>Model prices</h1>
+      <p class="lede">What each model costs per <strong>million tokens</strong>, used to estimate the spend shown on request logs and the overview. <strong>Estimates only</strong> — providers round, discount and change prices without telling the gateway. A built-in row you edit becomes yours and upgrades stop touching it; built-in rows cannot be deleted, only edited or reset.</p></div>
+    <div class="actions">${w ? `<button class="btn primary" id="addPrice">${ICON.plus} Add price</button>` : ''}</div></div>
+    <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:280px">${ICON.search}<label for="p-q" class="sr">Search prices</label><input id="p-q" class="input" placeholder="Search model pattern" value="${esc(s.q)}" style="min-height:38px" autocomplete="off"></div>
+        <div class="tabs" role="tablist" aria-label="Provider">${['all', ...providers].map(t => `<button class="tab" role="tab" data-provider="${esc(t)}" aria-selected="${s.provider === t}">${esc(t)}</button>`).join('')}</div></div>
+        <span class="hint">${rows.length} of ${all.length} · ${edited} edited by hand</span></div>
+      <div class="tbl"><table><thead><tr><th>Provider</th><th>Model pattern</th><th class="right">Input</th><th class="right">Output</th><th class="right">Cache write</th><th class="right">Cache read</th><th>Source</th><th></th></tr></thead><tbody>
+      ${rows.map(p => `<tr><td><div class="row" style="gap:10px">${providerBadge(p.provider_type, 'sm')}<span class="dim">${esc(p.provider_type)}</span></div></td>
+        <td class="mono">${esc(p.model_pattern)}</td><td class="right">${rate(p.input_per_mtok)}</td><td class="right">${rate(p.output_per_mtok)}</td>
+        <td class="right">${rate(p.cache_write_per_mtok)}</td><td class="right">${rate(p.cache_read_per_mtok)}</td>
+        <td><span class="pill ${p.source === 'user' ? 'info' : ''}">${esc(p.source)}</span> <span class="muted mono">${esc(p.currency)}</span></td>
+        <td class="right nowrap">${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button> ${p.source === 'user' ? `<button class="btn sm ghost" data-reset="${p.id}">Reset</button> <button class="btn sm ghost danger" data-del="${p.id}">Delete</button>` : ''}` : ''}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No prices match.</td></tr>'}</tbody></table></div></section>`;
+  let qTimer; $('#p-q').oninput = e => { s.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(renderPrices, 200); };
+  on(app, '[data-provider]', 'click', b => { s.provider = b.dataset.provider; renderPrices(); });
+  if (!w) return;
+  const priceBody = p => `${twoCol(priceNum('input_per_mtok', p ? p.input_per_mtok : 0, 'Input / Mtok'), priceNum('output_per_mtok', p ? p.output_per_mtok : 0, 'Output / Mtok'))}
+    ${twoCol(priceNum('cache_write_per_mtok', p ? p.cache_write_per_mtok : null, 'Cache write / Mtok', 'Empty: charged at the input rate'), priceNum('cache_read_per_mtok', p ? p.cache_read_per_mtok : null, 'Cache read / Mtok', 'Empty: charged at the input rate'))}
+    ${field('currency', 'Currency', input('currency', p ? p.currency : 'USD', 'maxlength=3 autocapitalize=characters'), 'Three-letter code; the dashboard labels every figure as an estimate.')}`;
+  const payload = d => ({ input_per_mtok: Number(d.input_per_mtok || 0), output_per_mtok: Number(d.output_per_mtok || 0),
+    cache_write_per_mtok: numOrNull(d.cache_write_per_mtok), cache_read_per_mtok: numOrNull(d.cache_read_per_mtok), currency: d.currency });
+  $('#addPrice').onclick = () => drawer({ eyebrow: 'New', title: 'Model price', submitLabel: 'Add price', body: `
+      ${twoCol(field('provider_type', 'Provider type', select('provider_type', state.providerTypes.map(t => ({ value: t.type, label: t.label || t.type })), 'openai')),
+        field('model_pattern', 'Model pattern', input('model_pattern', '', 'required maxlength=128 autocomplete=off spellcheck=false'), 'An exact model name, or a prefix with <code>*</code> (e.g. <code>gpt-4o-mini*</code>). The longest literal prefix wins.'))}
+      ${priceBody(null)}`,
+    onSubmit: async d => { await api('/prices', { method: 'POST', body: { provider_type: d.provider_type, model_pattern: d.model_pattern, ...payload(d) } }); toast('Price added', 3000, 'ok'); renderPrices(); } });
+  on(app, '[data-edit]', 'click', b => { const p = all.find(x => x.id == b.dataset.edit);
+    drawer({ eyebrow: `${p.provider_type} · ${p.source}`, title: p.model_pattern, submitLabel: 'Save price',
+      body: `${priceBody(p)}${p.source === 'builtin' ? '<p class="hint">Saving turns this into your own row: later upgrades will not overwrite it again. Reset restores the shipped values.</p>' : ''}`,
+      onSubmit: async d => { await api('/prices/' + p.id, { method: 'PUT', body: payload(d) }); toast('Price saved', 3000, 'ok'); renderPrices(); } }); });
+  on(app, '[data-reset]', 'click', async b => { if (!await confirmDialog('Restore the shipped price for this model? Later upgrades will refresh it again.', { label: 'Reset price', danger: false })) return;
+    try { await api(`/prices/${b.dataset.reset}/reset`, { method: 'POST' }); toast('Price reset', 3000, 'ok'); renderPrices(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this price? Requests for models it matched are logged without a cost estimate.', { label: 'Delete price' })) return;
+    try { await api('/prices/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); renderPrices(); } catch (e) { toast(e.message, 5000, 'err'); } });
+}
+
+// ---------------------------------------------------------------------------
 // users (admin)
 // ---------------------------------------------------------------------------
 async function renderUsers() {
@@ -989,12 +1326,12 @@ async function renderUsers() {
   const f = state.users_filter; const count = r => users.filter(u => u.role === r).length; const inactive = users.filter(u => !u.is_active).length;
   const rows = users.filter(u => (f.role === 'all' || (f.role === 'inactive' ? !u.is_active : u.role === f.role)) && (!f.q || u.username.toLowerCase().includes(f.q.toLowerCase())));
   const lock = sec && sec.active_lockouts && sec.active_lockouts.length ? sec.active_lockouts : [];
-  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Users · admin only · ${users.length} account${users.length === 1 ? '' : 's'}</div><h1>Users</h1><p class="lede"><strong>admin</strong> manages everything including users, <strong>editor</strong> manages models, RAG stores and the projects it belongs to, <strong>viewer</strong> is read-only. Deactivated users cannot sign in and lose their sessions.</p></div>
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Users · admin only · ${users.length} account${users.length === 1 ? '' : 's'}</div><h1>Users</h1><p class="lede"><strong>admin</strong> manages everything including users, <strong>editor</strong> manages models, RAG stores and the projects it belongs to, <strong>viewer</strong> is read-only on these screens. A role bounds the dashboard, not API spend: every user can create its own <code>sk-user-…</code> gateway key, so demoting someone does not stop theirs — revoke the key or deactivate the account. Deactivated users cannot sign in, lose their sessions, and their keys stop resolving.</p></div>
     <div class="actions"><button class="btn primary" id="addUser">${ICON.plus} Add user</button></div></div>
     <div class="stats four">
       <div class="stat"><div class="l">Admins</div><div class="v">${count('admin')}</div><div class="d">last active admin is protected</div></div>
       <div class="stat"><div class="l">Editors</div><div class="v">${count('editor')}</div><div class="d">across ${state.projects.length} project${state.projects.length === 1 ? '' : 's'}</div></div>
-      <div class="stat"><div class="l">Viewers</div><div class="v">${count('viewer')}</div><div class="d">${inactive ? `${inactive} inactive account${inactive === 1 ? '' : 's'}` : 'read-only'}</div></div>
+      <div class="stat"><div class="l">Viewers</div><div class="v">${count('viewer')}</div><div class="d">${inactive ? `${inactive} inactive account${inactive === 1 ? '' : 's'}` : 'read-only screens'}</div></div>
       <div class="stat"><div class="l">Failed logins · 1h</div><div class="v">${sec ? fmtN(sec.failed_last_hour) : '—'}</div><div class="d ${lock.length ? 'down' : ''}">${sec ? (lock.length ? `${lock.length} lockout${lock.length === 1 ? '' : 's'} active · ${esc(lock[0].username)} @ ${esc(lock[0].ip)}` : `${fmtN(sec.failed_last_24h)} in 24h · no lockouts`) : 'unavailable'}</div></div></div>
     <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:300px">${ICON.search}<label for="u-q" class="sr">Search users</label><input id="u-q" class="input" placeholder="Search username" value="${esc(f.q)}" style="min-height:38px" autocomplete="off"></div>
         <div class="tabs" role="tablist" aria-label="Filter">${['all', 'admin', 'editor', 'viewer', 'inactive'].map(r => `<button class="tab" role="tab" data-role-filter="${r}" aria-selected="${f.role === r}">${r}</button>`).join('')}</div></div><span class="hint">${rows.length} of ${users.length} users</span></div>
@@ -1043,7 +1380,7 @@ async function renderAudit() {
       <form class="row wrap" id="auditFilter" style="gap:10px"><div class="search grow">${ICON.search}<label for="a-q" class="sr">Filter by action prefix</label><input id="a-q" class="input" name="action" placeholder="action prefix, e.g. login. or project.create" value="${esc(s.action)}" autocomplete="off"></div>
         <select class="input" name="actor" style="width:200px" aria-label="Actor"><option value="">any actor</option>${actors.map(u => `<option value="${u.id}" ${String(u.id) === String(s.actor) ? 'selected' : ''}>${esc(u.username)}</option>`).join('')}</select>
         <select class="input" name="range" style="width:180px" aria-label="Range"><option value="">all time</option>${[['24h', 'last 24 hours'], ['7d', 'last 7 days'], ['30d', 'last 30 days']].map(([v, l]) => `<option value="${v}" ${s.range === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
-        <button class="btn">Filter</button></form>
+        <button type="submit" class="btn">Filter</button></form>
       <div class="row wrap" style="gap:8px"><span class="hint">Quick:</span>${QUICK.map(a => `<button type="button" class="chip ${s.action === a ? 'on' : ''}" data-quick="${a}">${a}</button>`).join('')}</div>
       <div class="tbl"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th><th>Details</th></tr></thead><tbody id="auditRows"></tbody></table></div>
       <div class="row between" style="border-top:1px solid var(--line);padding-top:12px"><span class="hint mono" id="auditInfo"></span><button class="btn sm" id="auditMore">Load 100 more</button></div></section>`;
@@ -1069,8 +1406,12 @@ async function renderAudit() {
 // ---------------------------------------------------------------------------
 (async function init() {
   try { const me = await api('/me'); state.user = me; state.sessionExp = me.session_expires_at || null; } catch (e) { state.user = null; if (e.message !== 'session expired') toast('Could not load session: ' + e.message, 5000, 'err'); }
+  // /setup is unauthenticated and cheap; it is read on every boot to decide
+  // between the login form and step 1 of the wizard. Once a user exists it
+  // answers needs_setup alone, so the database facts in state.setup are only
+  // ever there while step 1 is the screen that shows them.
+  try { const s = await api('/setup'); state.setup = s; state.needsSetup = !state.user && !!s.needs_setup; } catch (e) { state.setup = {}; state.needsSetup = false; }
   if (state.user) { try { await loadAll(); } catch (e) { toast(e.message, 5000, 'err'); } }
-  else { try { const s = await api('/setup'); state.setup = s; state.needsSetup = !!s.needs_setup; } catch (e) { state.needsSetup = false; } }
   render();
 })();
 </script>

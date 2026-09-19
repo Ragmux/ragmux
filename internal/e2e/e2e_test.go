@@ -18,16 +18,18 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ragmux/ragmux/internal/admin"
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/gateway"
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/metrics"
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/testdb"
+	"github.com/ragmux/ragmux/internal/tracing"
 )
 
 // mockUpstream is an OpenAI-compatible server that embeds by keyword and
@@ -115,6 +117,19 @@ type env struct {
 	session string
 	store   *store.Store
 	usage   *limits.Limiter
+	// registry is the metric set this stack records into, so a test can
+	// scrape it after driving real traffic through the server.
+	registry *metrics.Registry
+}
+
+// envOpts tunes a stack. The zero value bootstraps no admin and traces
+// nothing, which is what the first-run tests want.
+type envOpts struct {
+	bootstrap bool
+	tune      func(*admin.Admin)
+	// tracer, when set, is wired through every span site the way main.go
+	// wires it.
+	tracer *tracing.Tracer
 }
 
 // newEnv wires the whole application against the schema described by cfg.
@@ -131,6 +146,12 @@ func newEnv(t *testing.T, cfg store.OpenConfig) *env {
 // tune, when set, adjusts the admin before it is served (settings main.go
 // takes from the configuration).
 func newEnvWith(t *testing.T, cfg store.OpenConfig, bootstrap bool, tune func(*admin.Admin)) *env {
+	return newEnvOpts(t, cfg, envOpts{bootstrap: bootstrap, tune: tune})
+}
+
+// newEnvOpts is newEnvWith with the full option set.
+func newEnvOpts(t *testing.T, cfg store.OpenConfig, opts envOpts) *env {
+	bootstrap, tune := opts.bootstrap, opts.tune
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	st := testdb.OpenWith(t, cfg)
@@ -140,18 +161,28 @@ func newEnvWith(t *testing.T, cfg store.OpenConfig, bootstrap bool, tune func(*a
 			t.Fatal(err)
 		}
 	}
+	reg := metrics.New(metrics.Options{})
+	met := obs.New(reg)
+	met.RegisterStore(st)
+	tracer := opts.tracer
 	provCfg := func(c *store.ModelConnection) provider.Config {
-		return provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.ModelName}
+		return provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey,
+			Model: c.ModelName, Tracer: tracer}
 	}
 	providers := func(c *store.ModelConnection) (provider.Provider, error) { return provider.New(provCfg(c)) }
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) { return provider.NewEmbedder(provCfg(c)) }
-	ing := rag.NewIngester(ctx, st, embedders, 1, log)
+	// A short poll keeps the tests quick: uploads kick the dispatcher, but
+	// a document another stack queued is only found by the next poll.
+	ing := rag.NewIngester(ctx, st, embedders, 1, log, rag.Settings{PollInterval: 100 * time.Millisecond,
+		Metrics: met, Tracer: tracer})
 	t.Cleanup(ing.Stop)
-	ing.Resume(ctx)
+	ing.Kick()
 	ret := rag.NewRetriever(st, embedders)
+	ret.Metrics, ret.Tracer = met, tracer
 	authSvc := &auth.Service{Store: st, TTL: time.Hour}
 	usage := &limits.Limiter{Store: st}
-	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log, Limiter: usage}
+	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log, Limiter: usage,
+		Metrics: met, Tracer: tracer}
 	// The mock upstreams listen on loopback, which the save-time base_url
 	// check would otherwise reject.
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
@@ -160,12 +191,16 @@ func newEnvWith(t *testing.T, cfg store.OpenConfig, bootstrap bool, tune func(*a
 		tune(adm)
 	}
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
+	// The same middleware main.go uses, so the tests exercise the real
+	// request id path rather than chi's header-echoing one.
+	r.Use(obs.RequestID)
+	r.Use(obs.HTTPMetrics(met))
+	r.Use(obs.HTTPTracing(tracer))
 	r.Route("/v1", gw.Routes)
 	r.Route("/admin", adm.Routes)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
-	e := &env{t: t, srv: srv, store: st, usage: usage}
+	e := &env{t: t, srv: srv, store: st, usage: usage, registry: reg}
 	if !bootstrap {
 		return e
 	}
@@ -394,7 +429,8 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(9) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(store.LatestMigration()) ||
+		sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
@@ -1251,7 +1287,7 @@ func TestMetricsExportAndSummaryOptions(t *testing.T) {
 		t.Fatalf("csv: %d %v", code, h)
 	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error" {
+	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error,cached_prompt_tokens,cache_write_tokens,cost_usd,cost_source,api_key_id,user_id" {
 		t.Fatalf("csv lines: %q", lines)
 	}
 	if !strings.Contains(lines[1], fmt.Sprintf(",%d,alpha,x,200,10,3,false,40,true,true,2,", idA)) {

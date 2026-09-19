@@ -1,0 +1,60 @@
+# Minimal OpenTelemetry Collector configuration for Ragmux, used by
+# docker-compose.otel.yml. See docs/observability.md.
+#
+# Ragmux exports OTLP/HTTP with the JSON encoding on /v1/traces, which the
+# http receiver below accepts with no extra settings. Only traces are sent:
+# metrics go to Prometheus at /metrics and logs to stdout as JSON.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batching is done here rather than in the gateway's exporter, which sends
+  # small uncompressed batches on purpose.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+  # A ceiling so a span flood cannot take the Collector down with the
+  # gateway it is meant to observe.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+exporters:
+  # Prints every span it receives. Replace this with one of the blocks below
+  # once the wiring is confirmed.
+  debug:
+    verbosity: detailed
+
+  # --- Jaeger (all-in-one exposes OTLP on 4317) ---
+  # otlp/jaeger:
+  #   endpoint: jaeger:4317
+  #   tls:
+  #     insecure: true
+
+  # --- Grafana Tempo ---
+  # otlp/tempo:
+  #   endpoint: tempo:4317
+  #   tls:
+  #     insecure: true
+
+  # --- A vendor's OTLP endpoint ---
+  # otlphttp/vendor:
+  #   endpoint: https://otlp.example-vendor.com
+  #   headers:
+  #     authorization: "Bearer ${env:VENDOR_API_KEY}"
+  #   compression: gzip
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+  telemetry:
+    logs:
+      level: info

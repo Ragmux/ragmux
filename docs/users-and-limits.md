@@ -10,15 +10,60 @@ retention that apply to the client API. Endpoint details are in the
 The first-run account (`ADMIN_USER`) is an `admin`. Admins create further users in the
 dashboard (**Users** tab) or via `POST /admin/api/users`. Every user has exactly one role:
 
-| Role     | Model connections, RAG stores, documents | Projects | Users, audit log |
-|----------|------------------------------------------|----------|------------------|
-| `admin`  | full access | all projects, all metrics | full access |
-| `editor` | create, edit, delete, upload, test, search | create (becomes a member); read, edit, delete, rotate key, metrics and members only for projects it belongs to | list active users (`/users/lite`) |
-| `viewer` | read and search only | read and metrics only for projects it belongs to | — |
+| Role     | Model connections, RAG stores, documents | Projects | API keys | Users, audit log |
+|----------|------------------------------------------|----------|----------|------------------|
+| `admin`  | full access | all projects, all metrics | own and everyone's; only role that may delete one | full access |
+| `editor` | create, edit, delete, upload, test, search | create (becomes a member); read, edit, delete, rotate key, metrics and members only for projects it belongs to | own; may create `management` keys | list active users (`/users/lite`) |
+| `viewer` | read and search only | read and metrics only for projects it belongs to | own `gateway` (`sk-user-…`) keys for member projects — **which means a viewer can spend**, see below; no `management` keys | — |
 
 Writes the role does not allow answer `403 {"error":{"type":"forbidden"}}`. Everyone can
-change their own password (`POST /admin/api/me/password`) and read `/admin/api/system`
-(the PostgreSQL and pgvector versions in it are shown to admins only).
+change their own password (`POST /admin/api/me/password`), manage their own API keys and
+read `/admin/api/system` (the PostgreSQL and pgvector versions in it are shown to admins
+only).
+
+### A role bounds the admin surface, not spend
+
+The table above is about `/admin/api` and the dashboard. It is not a spending limit, and
+`viewer` is not a read-only *account* — only a read-only *administrator*. The key routes
+are deliberately role-free, because every account manages its own credentials, so a
+`viewer` can mint itself an `sk-user-…` gateway key granting the projects it is a member
+of, and send traffic through `/v1`. That spend is charged to those projects' budgets and
+attributed to the key in the usage records, exactly as an editor's or an admin's would
+be.
+
+What bounds that spend is never a role. It is:
+
+- the per-project rate limits and token budgets the key runs under (below), and
+- the optional per-key sub-limits set when the key is created ([Key sub-limits](#key-sub-limits)).
+
+A user carries no limit of its own; limits live on the project and on the key.
+
+**To cap one user**, give their key a sub-limit. Note that `0` there means *unlimited*,
+not *nothing*, so capping means setting a small ceiling — setting it to zero removes the
+ceiling instead of applying one.
+
+**To stop them outright**, revoke the key (`POST /admin/api/keys/{id}/revoke`), or
+deactivate the account (`PUT /admin/api/users/{id}` with `is_active: false`).
+Deactivation stops every key the user holds at once, at `/v1` with
+`401 key_owner_inactive`.
+
+**Two things that look like they would stop a key and do not:**
+
+- **Dropping the user's project membership.** A gateway key carries its own grants,
+  validated once when the key was created; `/v1` consults only those and never rechecks
+  `project_members` ([API keys](#api-keys) below). The user loses the project in the
+  dashboard while the key keeps spending against it.
+- **Setting a limit to `0`.** That is the unlimited value, as above.
+
+**Demoting the user to `viewer`** takes away the admin surface and nothing else on the
+gateway side. Role is intersected with a key's scopes on `/admin/api` only, where it is
+read live on every request, so a demotion narrows the `sk-mgmt-…` keys the user holds
+immediately. It changes nothing about an `sk-user-…` key: `/v1` does not consult roles,
+and `chat` and `models` are scopes every role including `viewer` already covers.
+
+Roles do still bind where they are the control: a `viewer` cannot put a `write`, `admin`
+or `keys` scope on any key it mints, and a `management` key needs at least `editor` plus
+an interactive session. Recorded as ADR-003.
 
 ## Project membership
 
@@ -46,6 +91,92 @@ replace the member set freely.
 - `GET /admin/api/users` reports `project_count` and `active_sessions` per user;
   `GET /admin/api/me` reports `session_expires_at` and whether the session is a bearer
   token (`session_bearer`).
+
+## API keys
+
+Besides the one key a project carries (`sk-proj-…`, rotated from the project page and
+labelled *the project's default key* in the dashboard), every user can mint their own
+credentials in the **API keys** tab or through `/admin/api/keys`. They come in two kinds:
+
+| Kind | Prefix | Calls | Carries |
+|---|---|---|---|
+| `gateway` | `sk-user-…` | `/v1` | a set of granted projects, its own rate limits and budgets, scopes `chat` and `models` |
+| `management` | `sk-mgmt-…` | `/admin/api` | scopes `read`, `write`, `admin`, `keys`; no projects and no limits |
+
+All three prefixes keep the `sk-` head so secret scanners that watch for OpenAI-shaped
+keys keep firing on a leak. The key is shown once at creation and only its first 15
+characters (`key_prefix`) are stored for identification, next to a SHA-256 hash.
+
+**A key is never issued beyond its owner.** Scopes only ever narrow, grants are held at
+creation to what the owner can reach, and the owner is looked up on *every* request rather
+than copied onto the key. What that lookup can still take away, though, depends on the
+surface — a grant, once given, is not rechecked.
+
+What that lookup enforces differs by surface. On `/admin/api` the effective permission is
+the key's scopes intersected with the owner's role, so demoting a user narrows every
+`sk-mgmt-…` key they hold at once. `/v1` does not read the role at all — it checks only
+that the account is active — so a demotion changes nothing about an `sk-user-…` key:
+`chat` and `models` are scopes every role including `viewer` already covers. See
+[A role bounds the admin surface, not spend](#a-role-bounds-the-admin-surface-not-spend).
+
+**Deactivating** an account stops both kinds at once: the key stops resolving entirely
+(`401 key_owner_inactive` at `/v1`).
+
+| Kind | Scope | Allows |
+|---|---|---|
+| gateway | `chat` | `POST /v1/chat/completions` |
+| gateway | `models` | `GET /v1/models`, `GET /v1/models/{id}` |
+| management | `read` | every listing and metrics route (the `viewer` set) |
+| management | `write` | the routes that need `editor` |
+| management | `admin` | the routes that need `admin` (users, audit log, login security) |
+| management | `keys` | `/admin/api/keys*`, separate from `write` so a leaked write key cannot mint more keys |
+
+Both gateway scopes are granted by default. A management key needs at least one scope and
+the `editor` role; the `admin` scope needs the `admin` role.
+
+Three actions refuse an api-key principal outright and answer
+`403 {"error":{"code":"session_required"}}`: changing your own password, resetting
+someone else's, and creating a `management` key. A leaked key must not be able to lock
+its owner out of the account or mint a successor.
+
+**Projects a gateway key may call** are the grants listed on the key, not the owner's
+project memberships. Membership is a dashboard-visibility concept; requiring both would
+mean an admin editing a member list silently breaks a production key. The grants are
+validated once, when the key is created or updated (you can only grant projects the
+*owner* can access), and from then on `/v1` consults only them. A key whose last grant
+was deleted routes nowhere and fails closed. How a request picks one is described in the
+[API reference](api.md#choosing-a-project).
+
+**Expiry and revocation.** `expires_at` is optional; `POST /admin/api/keys/{id}/revoke`
+sets `revoked_at`. Both are part of the single lookup that resolves a key, so there is no
+cache to invalidate and a revocation takes effect on the very next request. A key that no
+longer resolves answers `401`; the body carries `code` `key_revoked`, `key_expired` or
+`key_owner_inactive` — an unknown key keeps the plain `invalid project api key` body, so
+the extra detail only ever reaches someone who already holds the key bytes. The hourly
+retention job deletes revoked or expired rows after 30 days, but never one that request
+logs still attribute usage to; that is what keeps billing history intact.
+
+Prefer **revoke** over **delete**: `DELETE /admin/api/keys/{id}` is admin-only and
+answers `409 key_in_use` while any request log references the key.
+
+### Key sub-limits
+
+A gateway key carries the same four limits as a project (`rate_limit_rpm`,
+`rate_limit_tpm`, `budget_daily_tokens`, `budget_monthly_tokens`, `0` = unlimited), kept
+in `key_usage` exactly the way `project_usage` holds the project's. They are a second,
+independent ceiling under the project's, not a replacement: the two tiers count against
+different rows, so each is evaluated against its own counters in the order monthly →
+daily → TPM (project before key) and the **first violation wins**. The `429` body gains
+`"scope"`, either `"project"` or `"key"`; `code` and `type` are unchanged.
+
+The `x-ratelimit-*` and `x-ragmux-budget-*` headers report whichever tier has the smaller
+remaining allowance, so a client always sees the bound it will hit first. For the
+requests-per-minute limit both minute slots are reserved atomically, project first; if
+the key's slot overflows, both are released again so neither tier keeps a phantom
+request.
+
+`GET /admin/api/keys/{id}/usage` returns the key's own counters in the same shape as
+`GET /admin/api/projects/{id}/usage`, with `api_key_id` in place of `project_id`.
 
 ## Case-insensitive usernames
 
@@ -123,9 +254,19 @@ small JSON `details` object that never contains credentials. Action names are
 `document.upload`, `document.delete`, `document.reprocess`, `project.create`,
 `project.update`, `project.delete`, `project.rotate_key`, `project.members_update`,
 `user.create`, `user.update`, `user.delete`, `user.reset_password`,
-`user.revoke_sessions`, `password.change`, `logout`, `setup.complete` for the first
+`user.revoke_sessions`, `apikey.create`, `apikey.update`, `apikey.revoke`,
+`apikey.delete`, `password.change`, `logout`, `setup.complete` for the first
 administrator created through the first-run form, and `audit.exported` for every
-export of the log (its `details` hold the filters used).
+export of the log (its `details` hold the filters used). The `apikey.*` entries record
+the key's name, kind, owner, scopes, grants, limits and 15-character display prefix —
+never the credential or its hash.
+
+Most entries have a signed-in actor, but two kinds do not. Failed logins record
+`actor_username` without an id, and `ragmux reset-password` (see
+[Configuration](configuration.md#reset-password)) records the fixed actor `cli` with a
+null `actor_user_id` and `ip` `cli`; its `details` carry `via`, `host`, `os_user`,
+`revoked_sessions` and `revoked_keys`. That is the one action with no account behind it,
+so an emergency reset is still visible in the trail.
 
 Admins read the log with
 `GET /admin/api/audit?limit=100&action=project.&actor_user_id=1&since=…&until=…&before=…`
@@ -196,7 +337,24 @@ usage fall back to the same character estimate.
 ```
 
 Minute rows are purged after two hours, day rows after 400 days and month rows after
-three years by the hourly retention job.
+three years by the hourly retention job, in `key_usage` as well as `project_usage`.
+
+A user-owned gateway key adds a second ceiling under the project's; see
+[Key sub-limits](#key-sub-limits) for how the two interact and which one the response
+headers describe.
+
+### Budgets are counted in tokens, not money
+
+Ragmux 0.4 estimates what each request cost and shows it on the dashboard, but **cost is
+informational: no limit is enforced in money.** A project cannot be given a dollar
+budget, a request is never refused because a spend figure was reached, and the estimate
+never feeds `rate_limit_tpm`, `budget_daily_tokens` or `budget_monthly_tokens` — those
+stay token counters. To cap spend, cap tokens.
+
+The estimate comes from the [price table](api.md#model-prices), which ships current
+public list prices and is editable per model. It is not a bill: providers round,
+discount and change prices without telling the gateway, and a model with no matching
+price row is logged with `cost_source: "none"` and a cost of zero rather than a guess.
 
 ## Metrics and retention
 
@@ -216,13 +374,26 @@ response was streamed and whether RAG context was injected. Prompts and completi
 not stored. Upstream error messages are stored and logged with anything that looks like
 an API key (`sk-…`, `sk-ant-…`, `AIza…`, `Bearer …`) replaced by `[redacted]`.
 
+Since 0.4 a row also carries `cached_prompt_tokens` and `cache_write_tokens` (the parts
+of `prompt_tokens` a provider cache served and wrote, see
+[Prompt caching](providers.md#prompt-caching)) plus the estimated `cost_micros` and the
+`cost_source` it came from. A `429` row costs nothing — nothing was sent upstream — and
+a `499` row keeps the cost of whatever the provider had already reported.
+
 `GET /admin/api/metrics/summary?window=24h` and `GET /admin/api/projects/{id}/metrics`
 return the window summary (requests, errors, tokens, average and p95 latency, RAG
-requests, `rate_limited`), the all-time summary, a 14-day daily series and the 50 most
-recent requests; the dashboard's overview and project pages are built on them.
+requests, `rate_limited`, estimated cost), the all-time summary, a 14-day daily series
+and the 50 most recent requests; the dashboard's overview and project pages are built on
+them.
+
+Each row also records which user-owned key made the request (`api_key_id`) and who owns
+it (`user_id`); both are `null` for a project's default key. The owner is denormalised so
+deleting a key never destroys the history: `api_key_id` becomes `null` and `user_id`
+stays. The CSV export does not carry the two columns yet.
 
 A retention job (the janitor in `internal/maintenance`) runs one minute after start and
 then hourly: request logs older than `LOG_RETENTION_DAYS` (default 90) and audit entries
 older than `AUDIT_RETENTION_DAYS` (default 365) are deleted, `0` keeps a table forever.
-The same pass removes login attempts older than 24 hours, expired dashboard sessions and
-stale usage counters.
+The same pass removes login attempts older than 24 hours, expired dashboard sessions,
+stale usage counters on both tiers, and api keys revoked or expired more than 30 days ago
+that no request log still references.

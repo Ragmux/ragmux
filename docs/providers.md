@@ -17,6 +17,8 @@ gateway. Connections are managed with `POST /admin/api/models` (see the
 | `deepseek` | `https://api.deepseek.com/v1` | `POST {base}/chat/completions` | reported as unsupported (`supports_embeddings: false`) | `Authorization: Bearer <api_key>` |
 | `ollama` | `http://localhost:11434` | `POST {base}/api/chat` (native API) | yes — `POST {base}/api/embed` | none; an `api_key` is sent as `Authorization: Bearer` for a proxy in front of Ollama |
 | `custom_openai` | *(required; dashboard suggests `http://localhost:8000/v1`)* | `POST {base}/chat/completions` | yes — `POST {base}/embeddings` | `Authorization: Bearer <api_key>` (optional) |
+| `cohere_rerank` | `https://api.cohere.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
+| `voyage_rerank` | `https://api.voyageai.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
 
 Base URL handling: a trailing `/` is trimmed. For `openai` and `deepseek` a `/v1` suffix
 is appended when the URL does not already end in one. For `custom_openai` the URL is used
@@ -42,9 +44,73 @@ whose stored key is reused. Each connection also reports `private_upstream`: whe
 `base_url` pointed at a loopback, private or link-local address when it was saved. See
 [REST API reference](api.md#model-connections).
 
-`GET /admin/api/provider-types` lists the types with their capabilities:
-`supports_embeddings`, `requires_api_key`, `supports_streaming` (every adapter) and
-`supports_tools` (every adapter except `gemini`, see below).
+## Capabilities
+
+What each adapter can do with a provider type. These describe the **adapter**, not the
+upstream model: a model that cannot see images still shows `vision` for its provider
+type, because the translation exists — the model's own refusal is relayed as it comes.
+
+| | `openai` | `anthropic` | `gemini` | `deepseek` | `ollama` | `custom_openai` |
+|---|---|---|---|---|---|---|
+| `streaming` | yes | yes | yes | yes | yes | yes |
+| `embeddings` | yes | no | yes | no | yes | yes |
+| `tools` | yes | yes | yes | yes | yes | yes |
+| `tool_streaming` | yes | yes | no ¹ | yes | no ¹ | yes |
+| `vision` | yes | yes | yes | no | yes | yes |
+| `remote_images` | yes | yes | no ² | no | no ² | yes |
+| `prompt_caching` | no ³ | yes | no | no | no | no |
+| `cached_token_usage` | yes | yes | yes | yes | no | no |
+| `rerank` | no | no | no | no | no | no |
+
+`cohere_rerank` and `voyage_rerank` sit outside that table: `rerank` is the only
+capability they have, and `chat` and `embeddings` are both `no`.
+
+¹ Tool calls still work in streams; they arrive as one complete delta per call instead of
+argument fragments, because that is how the upstream sends them — see
+[Ollama](#ollama-native-api) and [Gemini](#gemini).
+² The upstream cannot fetch an image URL, so the gateway downloads it and sends the bytes;
+see [Images](#images).
+³ OpenAI caches prompts automatically, so there is no marker to send.
+
+The table gates nothing: an adapter answers for itself with a typed error when a request
+asks for something it cannot do, and a second copy of those rules in front of it would
+only drift. It is a description, for the dashboard and for this page.
+
+`GET /admin/api/provider-types` reports it per type: the flat `supports_embeddings`,
+`requires_api_key`, `supports_streaming` and `supports_tools` fields, plus a
+`capabilities` object with the full table above.
+
+## Rerank providers (`cohere_rerank`, `voyage_rerank`)
+
+These two types are connections that can do exactly one thing: reorder retrieved
+passages by relevance to a query. **They cannot back a project and they cannot back a
+RAG store's embeddings.** `provider.New` and `NewEmbedder` reject them, the dashboard's
+model and embedding pickers filter them out, and saving a project or a store that names
+one is refused with `400` (`provider "cohere_rerank" cannot be used for chat`,
+`... cannot be used for embeddings`). The only place a connection of these types belongs
+is a RAG store's `rerank_connection_id` — see [Reranking](rag.md#reranking).
+
+| | `cohere_rerank` | `voyage_rerank` |
+|---|---|---|
+| Endpoint | `POST {base}/v2/rerank` | `POST {base}/v1/rerank` |
+| Request | `{"model","query","documents","top_n"}` | `{"model","query","documents","top_k","truncation":true}` |
+| Response | `{"results":[{"index","relevance_score"}]}` | `{"data":[{"index","relevance_score"}]}` |
+| `model_name` | e.g. `rerank-v3.5` | e.g. `rerank-2.5` |
+
+They are ordinary model connections in every other respect: the API key is AES-256-GCM
+encrypted at rest with the connection id as additional authenticated data, it is covered
+by `ragmux rotate-key`, it is masked in the API, the `base_url` goes through the same
+SSRF guard when it is saved, and the call itself travels the gateway's one hardened
+outbound path — the netguard dialer, the redirect cap, the fixed transport-error
+messages, redaction and the response body cap. `POST /admin/api/models/{id}/test` does
+not apply to them: they answer neither a chat nor an embedding ping. Test them from the
+RAG store's search panel instead, which shows whether reranking ran or was skipped.
+
+Each passage is cut to 4000 characters before it is sent. Indexes the API answers with
+are validated against the list that was sent: anything out of range or repeated is
+dropped, and a reply with nothing usable left is a `502`. Every failure — a timeout, a
+`429`, a malformed body — leaves the fused retrieval order in place; the request is
+answered without reranking and the reason is logged.
 
 ## OpenAI-compatible (`openai`, `deepseek`, `custom_openai`)
 
@@ -53,8 +119,18 @@ model name), `stream` (set by the gateway) and `stream_options` (set to
 `{"include_usage": true}` on streams so token counts are recorded; removed on
 non-streaming calls). Responses and SSE chunks are relayed in the OpenAI schema.
 
+What the gateway asks the upstream for is not what it passes on: the usage-only trailer
+chunk reaches the client only when the client itself sent
+`stream_options: {"include_usage": true}`. The same rule covers `anthropic`, `gemini`
+and `ollama`, whose adapters all emit that trailer so token counts are recorded — see
+[the streaming contract](api.md#post-v1chatcompletions).
+
 `custom_openai` covers vLLM, LM Studio, LiteLLM, text-generation-inference's OpenAI
 route, Ollama's `/v1` shim and any other server speaking the Chat Completions format.
+
+Prompt caching on these providers is automatic and server-side: nothing is sent for it,
+and `prompt_tokens_details.cached_tokens` (DeepSeek's `prompt_cache_hit_tokens`) is
+surfaced back to the client. See [Prompt caching](#prompt-caching).
 
 ### Request field passthrough (`Extra`)
 
@@ -72,7 +148,8 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
 
 - `system` and `developer` messages are removed from the message list, joined with blank
   lines and sent as the top-level `system` field (this is where the project system prompt
-  and RAG context end up).
+  and RAG context end up). With a `cache_control` on one of them the field becomes an
+  array of blocks instead — see [Prompt caching](#prompt-caching).
 - `max_tokens` is required by Anthropic; when the client sends neither `max_tokens` nor
   `max_completion_tokens` the gateway uses **4096**.
 - `temperature`, `top_p` and `stop` are mapped; `n`, `response_format`, `user` and unknown
@@ -85,10 +162,14 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   `tool_use` blocks, `tool` messages become `tool_result` blocks, and `tool_use` in the
   reply becomes OpenAI `tool_calls` (also in streams, via `input_json_delta`).
 - Image parts: `image_url` with a `data:` URL is sent as a base64 image block, any other
-  URL as a URL image block.
+  URL as a URL image block — Anthropic fetches it itself, which is cheaper than relaying
+  the bytes through the gateway. A Bedrock-style gateway in front of Anthropic that has no
+  `source.type: url` needs the images inlined instead; that is the one constant
+  `anthropicInlineImages` in `internal/provider/images.go`.
 - Finish reasons: `end_turn`/`stop_sequence` → `stop`, `max_tokens` → `length`,
-  `tool_use` → `tool_calls`. Usage (`input_tokens`, `output_tokens`) is mapped to
-  `prompt_tokens`/`completion_tokens`, including on streams.
+  `tool_use` → `tool_calls`. Usage is mapped to `prompt_tokens`/`completion_tokens`,
+  including on streams; see [Prompt caching](#prompt-caching) for how the cache
+  counters are folded in.
 
 Anthropic has no embeddings API; choose another connection for RAG stores.
 
@@ -97,18 +178,123 @@ Anthropic has no embeddings API; choose another connection for RAG stores.
 Requests are translated to `generateContent` / `streamGenerateContent`:
 
 - `system`/`developer` messages become `systemInstruction`; `assistant` turns are sent
-  with role `model`; `tool` messages are sent as user text.
+  with role `model`.
 - `temperature`, `top_p`, `max_tokens`/`max_completion_tokens` and `stop` map to
   `generationConfig` (`topP`, `maxOutputTokens`, `stopSequences`); a `response_format`
   whose `type` starts with `json` sets `responseMimeType: application/json`.
-- Image parts: `image_url` with a `data:` URL becomes `inlineData` (MIME type taken from
-  the data URL), any other URL becomes `fileData.fileUri`.
-- **Tool calling is not supported yet**: a request with `tools` answers
-  `400 {"error":{"type":"invalid_request_error","message":"tool calling is not supported for gemini connections in this gateway version"}}`.
+- Image parts: a `data:` URL becomes `inlineData`. `fileData.fileUri` carries only what
+  Gemini can resolve itself — a Files API object
+  (`https://generativelanguage.googleapis.com/v1beta/files/…`) or a `gs://` path. Every
+  other image URL is downloaded by the gateway and sent as `inlineData`; with
+  `IMAGE_FETCH=false` such a request is refused with `400`. See [Images](#images).
 - Finish reasons: `STOP` → `stop`, `MAX_TOKENS` → `length`, safety-related reasons
   (`SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`) → `content_filter`.
-  `usageMetadata` is mapped to OpenAI usage.
+  A turn that called tools reports `tool_calls` whatever Gemini said, because Gemini has
+  no distinct reason for it. `usageMetadata` is mapped to OpenAI usage, including
+  `cachedContentTokenCount` — see [Prompt caching](#prompt-caching). Explicit caching
+  (`cachedContents`) is not supported.
 - Embeddings use `batchEmbedContents`; the model name gets a `models/` prefix if missing.
+
+### Tool calling
+
+Gemini has function calling but neither call ids nor JSON Schema, so the translation does
+more work than elsewhere:
+
+- `tools[].function` definitions become one `functionDeclarations` list;
+  `tool_choice` maps to `toolConfig.functionCallingConfig`: `"auto"` → `AUTO`,
+  `"required"` → `ANY`, `"none"` → `NONE`, a named function → `ANY` with
+  `allowedFunctionNames`. Unlike the Anthropic path, `"none"` keeps the declarations —
+  Gemini has an exact equivalent, so the model still knows the tools exist.
+- Assistant `tool_calls` become `functionCall` parts; arguments that are not a JSON object
+  are sent as `{}`.
+- **Results are correlated by function name**, not by id. A `tool` message's
+  `tool_call_id` is looked up in the assistant `tool_calls` that preceded it and the
+  recovered name is sent as a `functionResponse` with role `user` (`Content.role` only
+  takes `user` or `model`; consecutive ones merge, which is what parallel results need).
+  A result whose call is not in the message history is dropped, with a debug log line,
+  rather than turned into an upstream `400`. `response` must be a JSON object: the content
+  is used as-is when it parses as one, otherwise wrapped as `{"result": "<text>"}`.
+- In streams a `functionCall` always arrives complete inside one chunk, so each call is
+  emitted as one `tool_calls` delta carrying the index, id, name and arguments together.
+  No argument fragments are invented.
+
+**Known limit — tool-use tokens.** On a tool round Gemini also reports
+`usageMetadata.toolUsePromptTokenCount`, which Ragmux neither reads nor maps. Gemini's
+`totalTokenCount` is relayed as `total_tokens` as it arrives, so on those requests
+`prompt_tokens + completion_tokens` can be **less than** `total_tokens`, and whatever the
+difference covers is not priced: the cost estimate is built from the prompt and
+completion counts alone. Google's own references disagree on what `totalTokenCount`
+sums — the REST reference says prompt + thoughts + candidates, the published
+`generativelanguage` protobuf says prompt + candidates — and neither states whether
+tool-use tokens are inside it, so Ragmux does not guess. Every other provider keeps
+`prompt_tokens + completion_tokens == total_tokens`. Read a Gemini tool-round bill from
+Google's console, not from here.
+
+### Tool schema sanitising
+
+Gemini's `parameters` take an OpenAPI 3.0 subset and **reject** keywords they do not know,
+rather than ignoring them. Every OpenAI strict-mode tool carries
+`"additionalProperties": false` and most non-trivial ones carry `$defs`/`$ref`, so a
+schema forwarded unchanged fails with `Invalid JSON payload received. Unknown name
+"additionalProperties"` — an error that names something the caller never wrote by hand.
+Each schema is therefore rewritten before it is sent.
+
+Kept: `type`, `description`, `enum`, `items`, `properties`, `required`, `nullable`,
+`anyOf`, `minimum`, `maximum`, `minItems`, `maxItems`, `minLength`, `maxLength`,
+`pattern`, and `format` only for `enum`/`date-time` on strings and
+`float`/`double`/`int32`/`int64` on numbers.
+
+Kept means kept as the type Gemini's `Schema` declares, not kept as written: `description`
+and `pattern` must be strings, `nullable` a boolean, `minimum`/`maximum` doubles,
+`minItems`/`maxItems`/`minLength`/`maxLength` **non-negative whole numbers** (they are
+`int64` there, so `{"minItems":1.5}` and `{"maxLength":1e30}` are dropped), and `enum` an
+array of strings, because `Schema.enum` is `repeated string`. A value of any other shape
+is dropped like an unknown keyword — `{"type":"integer","enum":[1,2,3]}` loses its `enum`,
+and so does an `enum` on a node that is not a string, or on an `anyOf` node, rather than
+travelling to Gemini as something it rejects.
+
+Rewritten:
+
+| From | To |
+|---|---|
+| `const: "x"` | `enum: ["x"]` |
+| `const: 7`, `const: true`, `const: {…}` | `type: "integer"` / `"boolean"` / `"object"` — the value cannot be carried, but it still pins the type; dropped if the node already has one |
+| `oneOf`, `allOf` | `anyOf` — an `allOf` whose branches are all objects is shallow-merged into the node instead |
+| `type: ["string","null"]` | `type: "string"` + `nullable: true`; a wider union keeps its first non-`null` member |
+| `exclusiveMinimum: N`, `exclusiveMaximum: N` | `minimum: N`, `maximum: N` |
+| `$ref` | the definition from `$defs`/`definitions`, inlined |
+
+A `$ref` is matched on its full JSON Pointer, so `#/$defs/Foo`, `#/definitions/Foo` and a
+`Foo` nested under another node are three different definitions, and an external
+`https://…#/definitions/Foo` resolves to none of them (it is elided, since that document
+is never fetched). Properties and keywords are walked in sorted order, so the same schema
+always sanitises to the same bytes.
+
+Dropped: `$schema`, `additionalProperties`, `title`, `default`, `examples`, `$comment`,
+`patternProperties`, `not`, `if`/`then`/`else`, `unevaluated*`, other `format` values and
+any keyword not listed above. The dropped names are logged once per tool at `debug` with
+`provider=gemini`.
+
+`$ref` inlining is depth-capped at 8 and cycle-aware; a recursive or unresolvable
+reference becomes `{"type":"string","description":"(recursive schema elided)"}` for a
+cycle and `"(unresolved schema reference elided)"` for a definition this document does not
+contain, which since references are matched on their full pointer is every external one. A
+node that is not an object, or one nothing survived in, becomes `{"type":"object"}`, a node
+that carried no `type` takes the one its surviving keywords imply (an `anyOf` node stays
+untyped, because its branches carry the types) — that inference is a guess, and a lossy
+one: a node carrying only `minimum`/`maximum` becomes `number`, so a field the caller
+meant as an integer can come back with a fractional value, and one carrying only
+`minItems` becomes `string`, keeping an array keyword on a scalar. Gemini rejects an
+untyped node outright, so a guess beats the alternative; give a `type` to anything whose
+shape matters. A declaration whose sanitised
+schema has no properties left is sent **without** `parameters` — several model versions
+reject `{"type":"object","properties":{}}`. Sanitising never fails; anything Gemini still
+objects to comes back relayed verbatim.
+
+This is lossy on purpose. A tool that relies on `oneOf` to discriminate between argument
+shapes, on `additionalProperties: false` to forbid extra keys, or on a recursive `$ref`
+behaves differently on Gemini than on OpenAI. If a tool depends on those, keep it on a
+provider whose schema support is wider.
 
 ## Ollama (native API)
 
@@ -125,11 +311,19 @@ gives access to Ollama-only options:
   `format`.
 - Tools use OpenAI's `{type:"function", function:{…}}` shape natively, so `tools` are
   forwarded; assistant `tool_calls` and `tool` messages (with `tool_name`) are translated
-  both ways.
-- Images must be inline base64 `data:` URLs; other `image_url` values are rejected with
-  `400`.
+  both ways. Ollama sends no call ids, so the gateway generates them (`call_…`).
+- In streams each tool call arrives **whole** inside one NDJSON line, so it is relayed as
+  one `tool_calls` delta carrying the index, id, name and arguments together. This is a
+  property of the protocol, not a gap: Ollama genuinely produces the arguments atomically,
+  splitting them into fragments would invent framing that carries no information, and
+  every OpenAI-shaped client accumulates `arguments` by string concatenation. Calls spread
+  over several lines keep distinct indexes.
+- Images are sent to Ollama as inline base64. An `image_url` that is not a `data:` URL is
+  downloaded by the gateway first (see [Images](#images)); with `IMAGE_FETCH=false` it is
+  rejected with `400`.
 - Finish reasons: `stop` → `stop`, `length` → `length`; usage is built from
-  `prompt_eval_count` / `eval_count`.
+  `prompt_eval_count` / `eval_count`. Ollama has no prompt cache, so no cache fields are
+  reported and the shipped price table charges `ollama` models nothing.
 
 Ollama itself is unauthenticated; if you set an `api_key` it is sent as
 `Authorization: Bearer …`, which is useful behind an authenticating reverse proxy.
@@ -149,6 +343,177 @@ allows every private host instead; see
 To use Ollama's OpenAI-compatible endpoint instead, create a `custom_openai` connection
 with `base_url` ending in `/v1` (for example `http://host.docker.internal:11434/v1`).
 The native type is preferable for `keep_alive`, `num_ctx` and batch embeddings.
+
+## Images
+
+A user message may carry OpenAI image parts:
+`{"type":"image_url","image_url":{"url":"…"}}`, either an inline
+`data:image/png;base64,…` URL or a remote one. Inline images are checked and then passed
+to every vision-capable provider as they are. Remote ones depend on the provider:
+
+| Provider | Remote `image_url` |
+|---|---|
+| `openai`, `custom_openai` | forwarded unchanged; the upstream fetches it |
+| `anthropic` | forwarded as a `source.type: url` image block; Anthropic fetches it |
+| `gemini` | Files API and `gs://` URIs are forwarded as `fileData`; anything else is fetched by the gateway and inlined |
+| `ollama` | fetched by the gateway and inlined — Ollama accepts nothing else |
+
+An inline `data:` URL is held to the same whitelist a downloaded image is, and refused
+with the gateway's own `400` when it does not meet it — before anything is sent upstream:
+
+- the URL must carry `;base64`, so `data:image/png,%89PNG…` is refused rather than
+  forwarded as if it were encoded (the `data:` scheme itself is matched case-insensitively);
+- the media type must be one **this** provider accepts (see the table below), so
+  `data:text/html;base64,…` no longer travels as an image;
+- the payload must decode as standard base64, **padding included**, and must not be
+  empty — an empty one used to vanish silently, leaving the client a `200` for a message
+  the model never saw an image in.
+
+These used to pass through untouched and came back as a provider `400` that named nothing
+the caller could act on. The check belongs to the translating adapters (`gemini`,
+`ollama`, `anthropic`); the OpenAI-compatible types relay the request body verbatim by
+design, so there the upstream is still the one that reads the part.
+
+The accepted formats are the ones each upstream documents, and they are not the same set:
+
+| Provider | Accepted image media types |
+|---|---|
+| `gemini` | `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif` |
+| `anthropic` | `image/png`, `image/jpeg`, `image/gif`, `image/webp` |
+| `ollama` | `image/png`, `image/jpeg`, `image/gif`, `image/webp` |
+
+One shared list would be wrong in both directions — it would refuse the HEIC Gemini takes
+and promise Anthropic a format its API rejects — so each connection is held to its own,
+inline and downloaded alike.
+
+The gateway's own fetch (`IMAGE_FETCH`, on by default) goes out over the same hardened
+transport as provider calls but under a **stricter** policy: an image URL that resolves to
+a loopback, link-local or private address is refused, and a redirect to another host — or
+one that drops from `https` to `http` on the same host — is not followed.
+
+The difference matters. `ALLOW_PRIVATE_UPSTREAMS` and `PRIVATE_UPSTREAM_ALLOWLIST` lift
+the private-address check for provider calls — allowlisting a host is the documented way
+to reach a local Ollama — but they **do not apply to image fetching**. A `base_url` is
+typed by an editor; an image URL arrives from whoever holds an API key, so letting it
+inherit that exemption would turn every allowlisted deployment into a way for a key holder
+to probe the internal network. On top of that:
+
+- `GET` only, with `Accept: image/*`, and only `http`/`https` URLs.
+- The response's own `Content-Type` decides, against the same per-provider list an inline
+  image is held to. The URL's extension is never consulted. The cache is keyed on the URL
+  alone, so a hit is re-checked against the asking provider's list rather than trusted.
+- `IMAGE_FETCH_MAX_MB` is enforced on `Content-Length` and again while reading, so a
+  response that declares nothing (or lies) cannot exceed it.
+- Images are fetched one at a time, at most `IMAGE_FETCH_MAX_PER_REQUEST` per chat
+  request, each within `IMAGE_FETCH_TIMEOUT`.
+- Across requests, `IMAGE_FETCH_MAX_CONCURRENT` caps the fetches the whole process runs
+  at once and the connections it will hold to one host. A per-request limit bounds one
+  request and nothing at all when many arrive together, which is what would make the
+  gateway a useful amplifier for a target an API key chose. **While another project is
+  queueing, no single project takes more than half those slots**: capping the process
+  alone closed the outward problem and opened an inward one, where a few requests aimed at
+  a slow image host filled every slot and an unrelated project waited out its whole
+  timeout.
+- **Takes, not holds.** A slot already taken is never reclaimed. A project that filled the
+  gateway while nobody was waiting keeps those downloads running and can sit above its
+  half until they finish; what changes the moment somebody else queues is that it takes
+  nothing further until it is back inside the share. Cutting a running download short to
+  rebalance would throw away a fetch that is already part paid for, which is not what this
+  ceiling is for. So the share is a floor under everybody else rather than a ceiling on
+  one tenant: with nobody else waiting, a single project reaches the whole of
+  `IMAGE_FETCH_MAX_CONCURRENT`, which is what the setting says it is.
+- A fetch that cannot get a slot within two seconds (or `IMAGE_FETCH_TIMEOUT`, if that is
+  shorter — the wait is not separately configurable) is answered `429` with `Retry-After`
+  and `code: "image_fetch_saturated"`. The gateway ran out, which is a resource limit
+  rather than the client getting anything wrong, and deliberately not a `5xx`, which would
+  report a fault and count against availability when nothing is broken. `Retry-After`
+  names `IMAGE_FETCH_TIMEOUT`, not the queue wait: a slot frees when a **download**
+  finishes, so naming the wait sent clients that honour the header — the official SDKs do,
+  for a `429` as much as for a `5xx` — straight back into the same full queue. The queue
+  wait is its own budget, separate from `IMAGE_FETCH_TIMEOUT`, which starts once a slot is
+  in hand; otherwise the same saturation came back sometimes as a `429` and sometimes as a
+  download timeout blaming the image host.
+
+Anything the client got wrong — a bad scheme, a non-image response, an oversized image,
+a non-2xx from the image host, too many images — is a `400 invalid_request_error` naming
+only the **host** of the offending URL, never the full URL (which may carry a signed query
+string). A non-2xx is deliberately a `400` and not a `502`: the client chose the host.
+
+Fetched images are cached in memory (`IMAGE_CACHE_ENTRIES`, `IMAGE_CACHE_MAX_MB`,
+`IMAGE_CACHE_TTL`) because a
+multi-turn conversation resends the same image part on every turn. The cache is keyed on
+the URL alone and is not written to disk, so an image whose content changes within the TTL
+keeps serving the old bytes until it expires; a response carrying `Cache-Control: no-store`
+is never cached.
+
+## Prompt caching
+
+Providers cache a repeated prompt prefix and charge less for the cached part. Ragmux
+passes a client's caching intent through where the provider has a field for it, and
+always reports back what the provider said it cached. Both sides feed the
+[cost estimate](api.md#model-prices) shown on request logs.
+
+### Response side: one accounting for every provider
+
+`usage` gains OpenAI's breakdown objects, so the same fields mean the same thing on
+every connection:
+
+```json
+"usage": {"prompt_tokens": 250, "completion_tokens": 500, "total_tokens": 750,
+          "prompt_tokens_details": {"cached_tokens": 200, "cache_creation_tokens": 40},
+          "completion_tokens_details": {"reasoning_tokens": 30}}
+```
+
+`prompt_tokens` **always includes** the cached and freshly written parts: the mapping
+guarantees that. `prompt_tokens + completion_tokens == total_tokens` is weaker — it is
+how each adapter assembles the block from an upstream that reports consistently, and it
+is not checked, so a Gemini tool round (see [Tool calling](#tool-calling)) or any
+upstream reporting a total that does not add up breaks it; the block is relayed as it
+came. `cache_creation_tokens` has no OpenAI equivalent — OpenAI does not bill cache
+writes, Anthropic does.
+
+| Provider | What it reports | How it is mapped |
+|---|---|---|
+| `openai` | `prompt_tokens_details.cached_tokens` (already inside `prompt_tokens`) | passed through unchanged |
+| `deepseek` | `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` at the top level (their sum is `prompt_tokens`) | the hit count is folded into `cached_tokens`; the top-level fields are still relayed |
+| `anthropic` | `input_tokens` **excluding** `cache_creation_input_tokens` and `cache_read_input_tokens` | all three are added up into `prompt_tokens`; reads become `cached_tokens`, writes `cache_creation_tokens` |
+| `gemini` | `usageMetadata.cachedContentTokenCount` (already inside `promptTokenCount`) | becomes `cached_tokens`; `thoughtsTokenCount` keeps counting as completion tokens and is also reported as `reasoning_tokens` |
+| `ollama` | nothing; Ollama has no prompt cache | no cache fields |
+
+> **Change from 0.3.x:** for a cached Anthropic request, `prompt_tokens` is now larger.
+> Earlier releases reported Anthropic's `input_tokens` verbatim and so under-reported a
+> cached prompt by the size of its cached prefix. Recorded token budgets and metrics for
+> such requests move up accordingly.
+
+### Request side: `cache_control`
+
+**Anthropic** takes a `cache_control` marker in three places, and Ragmux relays each of
+them verbatim (the gateway never inspects or invents one):
+
+| Where the client puts it | What is sent upstream |
+|---|---|
+| on a content part: `{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}` | copied onto the matching Anthropic content block |
+| on a tool, at the top level *or* inside `function` | copied onto the Anthropic tool object |
+| on a `system`/`developer` message's content part | the `system` field becomes an array of blocks, one per system message, carrying the marker |
+
+With no `cache_control` anywhere, `system` stays the plain joined string it has always
+been — a request that does not ask for caching is byte-identical to a 0.3.x one. When a
+message has several marked parts the last marker wins, since Anthropic caches the prefix
+up to and including the marked block.
+
+**OpenAI, DeepSeek and `custom_openai`: nothing is sent.** Their caching is automatic and
+server-side; there is no request field to emit, so Ragmux emits none. A `cache_control` a
+client embeds rides along untouched (message content is relayed raw) and OpenAI ignores
+it. Only the response side matters here — this is not a gap.
+
+**Gemini and Ollama: response side only.** Gemini's explicit caching needs a stateful
+`cachedContents` resource created and referenced across requests, which does not fit a
+stateless passthrough; its implicit caching happens automatically and is reported in
+`cachedContentTokenCount`. Ollama has no prompt cache at all.
+
+The project system prompt and the RAG context block the gateway injects are the stable
+prefix most worth a breakpoint, but the gateway does not mark one: a project-level
+`cache_prompt` switch needs a column and dashboard work of its own and is not in 0.4.
 
 ## Model field echo
 

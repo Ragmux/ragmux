@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"math"
 	"testing"
 	"time"
@@ -57,8 +59,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.MigrationsVersion != 9 {
-		t.Errorf("migrations version = %d, want 9", info.MigrationsVersion)
+	if want := store.LatestMigration(); info.MigrationsVersion != want {
+		t.Errorf("migrations version = %d, want %d", info.MigrationsVersion, want)
 	}
 }
 
@@ -111,12 +113,41 @@ func TestCredentialsRoundTripAcrossReopen(t *testing.T) {
 		t.Errorf("api key after reopen = %q", got.APIKey)
 	}
 
-	// A different SECRET_KEY cannot decrypt what was stored.
+	// A different SECRET_KEY no longer gets as far as reading a
+	// credential: the canary stops the store from opening at all.
 	other := cfg
 	other.SecretKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-	s3 := testdb.OpenWith(t, other)
-	if _, err := s3.GetConnection(ctx, c.ID); err == nil {
-		t.Error("expected decryption failure with a different key")
+	_, err = store.Open(ctx, other, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("opening with a different key should fail the canary, got %v", err)
+	}
+}
+
+// TestRotateKeyReSealsCanary is the hard dependency between rotate-key and
+// the boot check: a rotation that left the canary sealed with the old key
+// would make every later start fail.
+func TestRotateKeyReSealsCanary(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	s := testdb.OpenWith(t, cfg)
+	if _, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "o", ProviderType: "openai", APIKey: "sk-secret-123456", ModelName: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	newKey := "aabbccddeeff00112233445566778899aabbccddeeff001122334455667788990"[:64]
+	if _, err := s.ReencryptConnections(ctx, newKey); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	old := cfg
+	cfg.SecretKeyHex = newKey
+	s2 := testdb.OpenWith(t, cfg) // fatals here if the canary was not re-sealed
+	if list, err := s2.ListConnections(ctx); err != nil || len(list) != 1 {
+		t.Fatalf("connections after rotation: %v %d", err, len(list))
+	}
+	// And the key the database moved away from is refused.
+	if _, err := store.Open(ctx, old, slog.New(slog.NewTextHandler(io.Discard, nil))); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("the pre-rotation key should be refused, got %v", err)
 	}
 }
 
@@ -149,7 +180,7 @@ func TestVectorSearchOrderingAndDistances(t *testing.T) {
 		{Index: 2, Content: "near x", Embedding: []float32{0.9, 0.1, 0, 0}},
 		{Index: 3, Content: "z axis", Embedding: []float32{0, 0, 1, 0}},
 	}
-	if err := s.ReplaceDocumentChunks(ctx, doc, chunks); err != nil {
+	if err := s.ReplaceDocumentChunks(ctx, doc, chunks, ""); err != nil {
 		t.Fatalf("replace chunks: %v", err)
 	}
 	rr, err := s.GetRAGStore(ctx, r.ID)
@@ -183,7 +214,7 @@ func TestVectorSearchOrderingAndDistances(t *testing.T) {
 	}
 
 	// Re-ingesting replaces rather than duplicates.
-	if err := s.ReplaceDocumentChunks(ctx, doc, chunks[:2]); err != nil {
+	if err := s.ReplaceDocumentChunks(ctx, doc, chunks[:2], ""); err != nil {
 		t.Fatal(err)
 	}
 	if rr, _ = s.GetRAGStore(ctx, r.ID); rr.ChunkCount != 2 {
@@ -453,7 +484,7 @@ func TestBackupInfoCountsVectorTablesAndDocumentBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReplaceDocumentChunks(ctx, doc, []*store.Chunk{{Index: 0, Content: "hello", Embedding: []float32{1, 0, 0}}}); err != nil {
+	if err := s.ReplaceDocumentChunks(ctx, doc, []*store.Chunk{{Index: 0, Content: "hello", Embedding: []float32{1, 0, 0}}}, ""); err != nil {
 		t.Fatal(err)
 	}
 	info, err := s.BackupInfo(ctx)
@@ -649,5 +680,167 @@ func TestStoreUsageAndQuotaFields(t *testing.T) {
 	r.MaxBytes = -1
 	if _, err := s.UpdateRAGStore(ctx, r); err == nil {
 		t.Error("negative max_bytes should violate the check constraint")
+	}
+}
+
+// A database written before instance_settings existed has credentials but no
+// canary. Opening it once with the wrong key must not record that key as the
+// database's: doing so inverts the check for good, because the correct key is
+// then refused and rotate-key opens the store too, so it is refused with it.
+func TestCanaryIsNotSealedByAKeyThatCannotOpenExistingCredentials(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	s := testdb.OpenWith(t, cfg)
+	if _, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "o", ProviderType: "openai",
+		APIKey: "sk-secret-123456", ModelName: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	// Roll the database back to what an upgrade finds: credentials, no canary.
+	if _, err := s.DB().Exec(ctx, "DELETE FROM instance_settings WHERE key = 'secret_key_canary'"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	wrong := cfg
+	wrong.SecretKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := store.Open(ctx, wrong, quiet); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Fatalf("the wrong key should be refused, got %v", err)
+	}
+
+	// The refusal must have left nothing behind: the real key still opens it.
+	s2, err := store.Open(ctx, cfg, quiet)
+	if err != nil {
+		t.Fatalf("the original key was locked out by the refused attempt: %v", err)
+	}
+	defer s2.Close()
+	list, err := s2.ListConnections(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("connections: %v %d", err, len(list))
+	}
+	// ... and it is the one now recorded, so the wrong key is refused from here on.
+	if _, err := store.Open(ctx, wrong, quiet); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("after a good open the wrong key should still be refused, got %v", err)
+	}
+}
+
+// A database with nothing encrypted yet cannot contradict any key, so the
+// first one to arrive is adopted -- that is what makes a fresh install work
+// without SECRET_KEY set.
+func TestCanaryAdoptsTheFirstKeyOnAnEmptyDatabase(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	s := testdb.OpenWith(t, cfg)
+	if _, err := s.DB().Exec(ctx, "DELETE FROM instance_settings WHERE key = 'secret_key_canary'"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	other := cfg
+	other.SecretKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s2, err := store.Open(ctx, other, quiet)
+	if err != nil {
+		t.Fatalf("an empty database should adopt the key it is opened with: %v", err)
+	}
+	s2.Close()
+	if _, err := store.Open(ctx, cfg, quiet); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("once adopted, a different key must be refused, got %v", err)
+	}
+}
+
+// TestMetricsIgnoreNegativeRows pins the read side of the token clamp. The
+// gateway keeps negative counts out of new rows, but a row written by an
+// older build, restored from a dump or put there by anything else must not
+// subtract from totals the dashboard presents as usage and spend: one such
+// row used to turn a real day's traffic into a negative completion count and
+// a negative cost.
+func TestMetricsIgnoreNegativeRows(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "m", ProviderType: "custom_openai",
+		ModelName: "gpt-4o", BaseURL: "https://api.example.com/v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := s.CreateProject(ctx, &store.Project{Name: "p", ModelConnectionID: conn.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, l := range []store.RequestLog{
+		{StatusCode: 200, PromptTokens: 10, CompletionTokens: 22, CostMicros: 1500},
+		{StatusCode: 200, PromptTokens: -100, CompletionTokens: -100, CostMicros: -1500},
+	} {
+		l.ProjectID = p.ID
+		if err := s.InsertRequestLog(ctx, &l); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	since := time.Now().Add(-time.Hour)
+	m, err := s.Summarize(ctx, store.MetricsFilter{ProjectID: &p.ID}, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.PromptTokens != 10 || m.CompletionTokens != 22 || m.CostMicros != 1500 || m.CostUSD != 0.0015 {
+		t.Errorf("summary = %+v, want the negative row read as zero", m)
+	}
+	if m.Requests != 2 {
+		t.Errorf("summary counted %d requests, want both rows", m.Requests)
+	}
+	by, err := s.SummarizeByProject(ctx, store.MetricsFilter{}, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(by) != 1 || by[0].PromptTokens != 10 || by[0].CompletionTokens != 22 || by[0].CostMicros != 1500 {
+		t.Errorf("per-project = %+v", by)
+	}
+	series, err := s.DailySeries(ctx, store.MetricsFilter{ProjectID: &p.ID}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 1 || series[0].PromptTokens != 10 || series[0].CompletionTokens != 22 || series[0].CostMicros != 1500 {
+		t.Errorf("daily series = %+v", series)
+	}
+
+	// The row surfaces floor the same way. A summary of 22 completion tokens
+	// beside a CSV of -78 for the same window would leave the operator with
+	// no way to tell which figure to believe.
+	recent, err := s.RecentRequests(ctx, store.MetricsFilter{ProjectID: &p.ID}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent) != 2 {
+		t.Fatalf("recent returned %d rows", len(recent))
+	}
+	for _, l := range recent {
+		if l.PromptTokens < 0 || l.CompletionTokens < 0 || l.CachedPromptTokens < 0 ||
+			l.CacheWriteTokens < 0 || l.CostMicros < 0 || l.CostUSD < 0 {
+			t.Errorf("recent row kept a negative figure: %+v", l)
+		}
+	}
+	var exported []*store.RequestExportRow
+	if err := s.ExportRequests(ctx, store.MetricsFilter{ProjectID: &p.ID}, since, func(r *store.RequestExportRow) error {
+		exported = append(exported, r)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(exported) != 2 {
+		t.Fatalf("export returned %d rows", len(exported))
+	}
+	var exportPrompt, exportCompletion int
+	var exportCost int64
+	for _, r := range exported {
+		if r.PromptTokens < 0 || r.CompletionTokens < 0 || r.CostMicros < 0 || r.CostUSD < 0 {
+			t.Errorf("exported row kept a negative figure: %+v", r)
+		}
+		exportPrompt += r.PromptTokens
+		exportCompletion += r.CompletionTokens
+		exportCost += r.CostMicros
+	}
+	// Summing the export reproduces the summary, which is the whole point.
+	if int64(exportPrompt) != m.PromptTokens || int64(exportCompletion) != m.CompletionTokens || exportCost != m.CostMicros {
+		t.Errorf("export sums to %d/%d/%d, summary says %d/%d/%d", exportPrompt, exportCompletion, exportCost,
+			m.PromptTokens, m.CompletionTokens, m.CostMicros)
 	}
 }

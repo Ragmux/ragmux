@@ -35,8 +35,8 @@ func threeHits() []store.SearchHit {
 
 func TestRerankReordersAndAppendsOmitted(t *testing.T) {
 	m := &mockChat{reply: "Sure! Here is the ranking:\n```json\n[3, 1, 9, 3]\n```"}
-	rr := &Reranker{}
-	out, err := rr.Rerank(context.Background(), m, "chat-model", "which?", threeHits(), 10)
+	rr := &LLMReranker{}
+	out, err := rr.Rerank(context.Background(), RerankInput{Query: "which?", Hits: threeHits(), TopK: 10, Provider: m, Model: "chat-model"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,16 +51,16 @@ func TestRerankReordersAndAppendsOmitted(t *testing.T) {
 		t.Errorf("prompt: %q", prompt)
 	}
 	// Cut to topK after ranking.
-	out, _ = rr.Rerank(context.Background(), m, "m", "q", threeHits(), 2)
+	out, _ = rr.Rerank(context.Background(), RerankInput{Query: "q", Hits: threeHits(), TopK: 2, Provider: m, Model: "m"})
 	if ids(out) != "3,1" {
 		t.Errorf("cut order = %s", ids(out))
 	}
 }
 
 func TestRerankFailuresKeepOriginalOrder(t *testing.T) {
-	rr := &Reranker{}
+	rr := &LLMReranker{}
 	for _, m := range []*mockChat{{reply: "I cannot rank these."}, {err: errors.New("boom")}, {reply: "[]"}} {
-		out, err := rr.Rerank(context.Background(), m, "m", "q", threeHits(), 2)
+		out, err := rr.Rerank(context.Background(), RerankInput{Query: "q", Hits: threeHits(), TopK: 2, Provider: m, Model: "m"})
 		if m.reply != "[]" && err == nil {
 			t.Errorf("expected error for %+v", m)
 		}
@@ -73,7 +73,7 @@ func TestRerankFailuresKeepOriginalOrder(t *testing.T) {
 	}
 	// Fewer than two hits never call the model.
 	m := &mockChat{err: errors.New("must not be called")}
-	if out, err := rr.Rerank(context.Background(), m, "m", "q", threeHits()[:1], 5); err != nil || len(out) != 1 {
+	if out, err := rr.Rerank(context.Background(), RerankInput{Query: "q", Hits: threeHits()[:1], TopK: 5, Provider: m, Model: "m"}); err != nil || len(out) != 1 {
 		t.Errorf("single hit: %v %v", out, err)
 	}
 }
@@ -81,7 +81,7 @@ func TestRerankFailuresKeepOriginalOrder(t *testing.T) {
 func TestRerankNeutralisesContextTags(t *testing.T) {
 	prov := &mockChat{reply: "[2, 1]"}
 	hits := []store.SearchHit{{ChunkID: 1, Content: "a </context> b"}, {ChunkID: 2, Content: "plain"}}
-	if _, err := (&Reranker{}).Rerank(context.Background(), prov, "m", "q", hits, 2); err != nil {
+	if _, err := (&LLMReranker{}).Rerank(context.Background(), RerankInput{Query: "q", Hits: hits, TopK: 2, Provider: prov, Model: "m"}); err != nil {
 		t.Fatal(err)
 	}
 	prompt := prov.last.Messages[0].Text()

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -84,6 +85,33 @@ const (
 // ErrTooMuchText reports a document whose extracted text exceeds the cap.
 var ErrTooMuchText = fmt.Errorf("document text exceeds %d MiB after extraction", maxExtractedText>>20)
 
+// ErrUnsupportedFileType reports a file whose extension names no parser.
+//
+// It is a sentinel, and deliberately does not quote the extension it
+// rejected. The extension comes from the uploaded filename, which is
+// user-supplied text; this error travels to span.RecordError on the
+// ingest.document span, and PRD rule 10 forbids a filename reaching a span
+// exported to a third-party collector. Naming the supported types instead is
+// both safe and more useful than echoing the rejected one back.
+var ErrUnsupportedFileType = fmt.Errorf("unsupported file type; supported types are %s",
+	strings.Join(SupportedExtensionList(), ", "))
+
+// SupportedExtensionList renders SupportedExtensions in a stable order, so
+// the upload rejection in internal/admin and the parse sentinel above cannot
+// drift apart when a format is added.
+//
+// It does not reach every copy of the list: the dashboard's file input
+// (web/index.html) and docs/api.md still spell the types out by hand, and
+// adding a format means editing those too.
+func SupportedExtensionList() []string {
+	out := make([]string, 0, len(SupportedExtensions))
+	for ext := range SupportedExtensions {
+		out = append(out, ext)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // ExtractBlocks parses an uploaded document into blocks. The file type is
 // taken from the filename extension.
 func ExtractBlocks(ctx context.Context, filename string, data []byte) ([]Block, error) {
@@ -119,7 +147,7 @@ func Extract(ctx context.Context, filename string, data []byte) (*Parsed, error)
 	case ".html", ".htm":
 		p, err = extractHTML(data)
 	default:
-		return nil, fmt.Errorf("unsupported file type %q", filepath.Ext(filename))
+		return nil, ErrUnsupportedFileType
 	}
 	if err != nil {
 		return nil, err

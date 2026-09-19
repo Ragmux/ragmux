@@ -175,19 +175,51 @@ func TestPrivateUpstreamFlag(t *testing.T) {
 func TestProviderTypeCapabilities(t *testing.T) {
 	e := newEnv(t, testdb.Config(t))
 	list := e.call("GET", "/admin/api/provider-types", nil, "")["_list"].([]any)
-	wantTools := map[string]bool{"openai": true, "anthropic": true, "gemini": false, "deepseek": true, "ollama": true, "custom_openai": true}
+	// Every chat adapter now translates tools, Gemini included.
+	wantTools := map[string]bool{"openai": true, "anthropic": true, "gemini": true, "deepseek": true, "ollama": true, "custom_openai": true}
+	// Gemini sends a function call whole inside one chunk rather than as
+	// argument deltas, which is the one capability that separates it here.
+	wantToolStreaming := map[string]bool{"openai": true, "anthropic": true, "gemini": false, "deepseek": true, "ollama": false, "custom_openai": true}
+	// The rerank-only types sit outside those tables: they neither chat nor
+	// embed, so the dashboard's chat and embedding pickers must skip them.
+	wantRerankOnly := map[string]bool{"cohere_rerank": true, "voyage_rerank": true}
 	seen := 0
 	for _, it := range list {
 		m := it.(map[string]any)
 		typ := m["type"].(string)
+		if wantRerankOnly[typ] {
+			caps, _ := m["capabilities"].(map[string]any)
+			if caps == nil || caps["rerank"] != true || caps["chat"] != false ||
+				caps["embeddings"] != false || m["supports_embeddings"] != false {
+				t.Errorf("%s should be rerank-only: %v", typ, m)
+			}
+			continue
+		}
 		want, ok := wantTools[typ]
 		if !ok {
 			t.Errorf("unexpected type %q", typ)
 			continue
 		}
+		if caps, _ := m["capabilities"].(map[string]any); caps != nil && caps["chat"] != true {
+			t.Errorf("%s: chat capability = %v, want true", typ, caps["chat"])
+		}
 		seen++
 		if m["supports_tools"] != want || m["supports_streaming"] != true {
 			t.Errorf("%s: %v", typ, m)
+		}
+		// The flat fields are kept for older clients, so they must keep
+		// agreeing with the capabilities object they are taken from.
+		caps, _ := m["capabilities"].(map[string]any)
+		if caps == nil {
+			t.Errorf("%s: no capabilities object", typ)
+			continue
+		}
+		if caps["tools"] != want || caps["streaming"] != true ||
+			caps["embeddings"] != m["supports_embeddings"] {
+			t.Errorf("%s: capabilities disagree with the flat fields: %v", typ, m)
+		}
+		if caps["tool_streaming"] != wantToolStreaming[typ] {
+			t.Errorf("%s: tool_streaming = %v, want %v", typ, caps["tool_streaming"], wantToolStreaming[typ])
 		}
 	}
 	if seen != len(wantTools) {

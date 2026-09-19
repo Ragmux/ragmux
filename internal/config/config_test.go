@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/ragmux/ragmux/internal/bm25"
 )
 
 func TestLoadReadsSecretsFromFiles(t *testing.T) {
@@ -49,5 +52,204 @@ func TestLoadReadsSecretsFromFiles(t *testing.T) {
 	t.Setenv("TRUSTED_PROXY_CIDRS", "not-a-network")
 	if _, err := Load(); err == nil {
 		t.Error("bad CIDR should fail")
+	}
+}
+
+func TestLoadImageSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ImageFetch || c.ImageFetchMaxBytes != 8<<20 || c.ImageFetchTimeout != 10*time.Second ||
+		c.ImageFetchMaxPerRequest != 8 || c.ImageFetchMaxConcurrent != 16 ||
+		c.ImageCacheEntries != 64 || c.ImageCacheMaxBytes != 64<<20 || c.ImageCacheTTL != 10*time.Minute {
+		t.Errorf("defaults = %+v", c)
+	}
+
+	t.Setenv("IMAGE_FETCH", "false")
+	t.Setenv("IMAGE_FETCH_MAX_MB", "2")
+	t.Setenv("IMAGE_FETCH_TIMEOUT", "3s")
+	t.Setenv("IMAGE_FETCH_MAX_PER_REQUEST", "1")
+	t.Setenv("IMAGE_FETCH_MAX_CONCURRENT", "2")
+	// 0 entries is the documented way to turn caching off, not an error.
+	t.Setenv("IMAGE_CACHE_ENTRIES", "0")
+	t.Setenv("IMAGE_CACHE_MAX_MB", "16")
+	t.Setenv("IMAGE_CACHE_TTL", "45s")
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ImageFetch || c.ImageFetchMaxBytes != 2<<20 || c.ImageFetchTimeout != 3*time.Second ||
+		c.ImageFetchMaxPerRequest != 1 || c.ImageFetchMaxConcurrent != 2 ||
+		c.ImageCacheEntries != 0 || c.ImageCacheMaxBytes != 16<<20 || c.ImageCacheTTL != 45*time.Second {
+		t.Errorf("overrides = %+v", c)
+	}
+
+	for _, bad := range []struct{ key, value string }{
+		{"IMAGE_FETCH_MAX_MB", "0"},
+		{"IMAGE_FETCH_MAX_MB", "huge"},
+		{"IMAGE_FETCH_TIMEOUT", "-1s"},
+		{"IMAGE_FETCH_TIMEOUT", "soon"},
+		{"IMAGE_FETCH_MAX_PER_REQUEST", "0"},
+		{"IMAGE_FETCH_MAX_CONCURRENT", "0"},
+		{"IMAGE_FETCH_MAX_CONCURRENT", "many"},
+		{"IMAGE_CACHE_ENTRIES", "-1"},
+		{"IMAGE_CACHE_MAX_MB", "0"},
+		{"IMAGE_CACHE_MAX_MB", "lots"},
+		{"IMAGE_CACHE_TTL", "0"},
+	} {
+		t.Run(bad.key+"="+bad.value, func(t *testing.T) {
+			t.Setenv(bad.key, bad.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), bad.key) {
+				t.Errorf("err = %v", err)
+			}
+		})
+	}
+}
+
+// The fetched-image cache stores base64, a third larger than the bytes
+// IMAGE_FETCH_MAX_MB caps, and its ceiling used to be a fixed 64 MiB: an
+// operator who raised the per-image limit past that got a cache that silently
+// stored nothing at all, because every entry was too large to put.
+func TestImageCacheCeilingFollowsTheImageLimit(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+	t.Setenv("IMAGE_FETCH_MAX_MB", "64")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one := Base64Len(c.ImageFetchMaxBytes); c.ImageCacheMaxBytes < 2*one {
+		t.Errorf("a %d MiB ceiling cannot hold two %d MiB entries", c.ImageCacheMaxBytes>>20, one>>20)
+	}
+	// A small per-image limit keeps the default rather than shrinking to it.
+	t.Setenv("IMAGE_FETCH_MAX_MB", "1")
+	if c, err = Load(); err != nil || c.ImageCacheMaxBytes != 64<<20 {
+		t.Errorf("ceiling = %d, err = %v", c.ImageCacheMaxBytes, err)
+	}
+	// And the derivation stops somewhere: following a 512 MiB per-image limit
+	// would hand a memory-limited container a 1.3 GiB cache nobody asked for.
+	t.Setenv("IMAGE_FETCH_MAX_MB", "512")
+	if c, err = Load(); err != nil || c.ImageCacheMaxBytes != 256<<20 {
+		t.Errorf("ceiling = %d MiB, err = %v; want the derivation capped", c.ImageCacheMaxBytes>>20, err)
+	}
+	// An explicit ceiling too small for one image is that same silent no-op,
+	// so it is refused at startup instead of discovered as a cache that never
+	// hits.
+	t.Setenv("IMAGE_FETCH_MAX_MB", "32")
+	t.Setenv("IMAGE_CACHE_MAX_MB", "32")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "IMAGE_CACHE_MAX_MB") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// The tokenizer is the one part of the BM25 index DDL that is interpolated
+// rather than bound, so a value that is not a plain identifier must be
+// refused at boot. Falling back to the default instead would leave an
+// operator who typed "en-stem" silently running an unstemmed index.
+func TestPgSearchTokenizerRejectsInjection(t *testing.T) {
+	base := func() { t.Setenv("DATABASE_URL", "postgres://x/y"); t.Setenv("SECRET_KEY", strings.Repeat("a", 64)) }
+	for _, bad := range []string{"default'} , x => '", "DROP TABLE", "en stem", "en-stem", "En_Stem", "1stem"} {
+		base()
+		t.Setenv("PG_SEARCH_TOKENIZER", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("PG_SEARCH_TOKENIZER %q was accepted", bad)
+		}
+	}
+	base()
+	t.Setenv("PG_SEARCH_TOKENIZER", "en_stem")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("en_stem rejected: %v", err)
+	}
+	if c.PgSearchTokenizer != "en_stem" {
+		t.Errorf("tokenizer = %q", c.PgSearchTokenizer)
+	}
+}
+
+// A "<code>_stem" name is translated to a Snowball language from a table in
+// the bm25 package. A code missing from it can only produce a DDL pg_search
+// refuses, which costs a warning per search and a store stuck on the pgvector
+// fallback for the life of the process -- invisible from the outside. It is
+// refused at startup instead, where an operator sees it.
+func TestPgSearchTokenizerRejectsUnsupportedStemmer(t *testing.T) {
+	base := func() { t.Setenv("DATABASE_URL", "postgres://x/y"); t.Setenv("SECRET_KEY", strings.Repeat("a", 64)) }
+	for _, bad := range []string{"hi_stem", "sr_stem", "ca_stem", "uk_stem"} {
+		base()
+		t.Setenv("PG_SEARCH_TOKENIZER", bad)
+		_, err := Load()
+		if err == nil {
+			t.Errorf("PG_SEARCH_TOKENIZER %q was accepted", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "PG_SEARCH_TOKENIZER") || !strings.Contains(err.Error(), bad) {
+			t.Errorf("%q error should name the variable and the value: %v", bad, err)
+		}
+	}
+	// Every supported code loads, including the two a first version of the
+	// table left out.
+	for _, code := range bm25.StemmerCodes() {
+		base()
+		t.Setenv("PG_SEARCH_TOKENIZER", code+"_stem")
+		if _, err := Load(); err != nil {
+			t.Errorf("%s_stem rejected: %v", code, err)
+		}
+	}
+	// A plain tokenizer type is not a stemmer and is left to pg_search.
+	base()
+	t.Setenv("PG_SEARCH_TOKENIZER", "whitespace")
+	if _, err := Load(); err != nil {
+		t.Errorf("whitespace rejected: %v", err)
+	}
+}
+
+func TestRerankTimeoutMustParse(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x/y")
+	t.Setenv("SECRET_KEY", strings.Repeat("a", 64))
+	for _, bad := range []string{"5", "-1s", "soon"} {
+		t.Setenv("RERANK_TIMEOUT", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("RERANK_TIMEOUT %q was accepted", bad)
+		}
+	}
+	t.Setenv("RERANK_TIMEOUT", "8s")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("8s rejected: %v", err)
+	}
+	if c.RerankTimeout != 8*time.Second {
+		t.Errorf("timeout = %v", c.RerankTimeout)
+	}
+}
+
+// METRICS_ENABLED used to accept exactly "true" and treat every other value
+// as off, so METRICS_ENABLED=1 or =yes was a silent no that only showed up as
+// an empty dashboard. TRACING_ENABLED in the same file already refused what
+// it did not understand; this holds metrics to the same contract.
+func TestMetricsEnabledRefusesUnknownValues(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x/y")
+	t.Setenv("SECRET_KEY", strings.Repeat("a", 64))
+	t.Setenv("METRICS_TOKEN", "t")
+	for _, bad := range []string{"1", "0", "yes", "no", "TRUE", "False", "on", "off"} {
+		t.Setenv("METRICS_ENABLED", bad)
+		_, err := Load()
+		if err == nil {
+			t.Errorf("METRICS_ENABLED %q was accepted", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "METRICS_ENABLED") {
+			t.Errorf("METRICS_ENABLED %q: the error must name the variable, got %q", bad, err)
+		}
+	}
+	for _, good := range []string{"true", "false", "", " true "} {
+		t.Setenv("METRICS_ENABLED", good)
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("METRICS_ENABLED %q rejected: %v", good, err)
+		}
+		if want := strings.TrimSpace(good) == "true"; c.MetricsEnabled != want {
+			t.Errorf("METRICS_ENABLED %q: enabled = %v, want %v", good, c.MetricsEnabled, want)
+		}
 	}
 }

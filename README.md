@@ -27,17 +27,28 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
   and `custom_openai` for vLLM, LM Studio, LiteLLM or any OpenAI-compatible server.
 - **OpenAI-compatible proxy:** `/v1/chat/completions` (JSON + SSE streaming) and
   `/v1/models`; works with the official SDKs by changing `base_url` and `api_key`.
-  Anthropic and Gemini requests and streams are translated, including tool calls for Anthropic.
+  Anthropic and Gemini requests and streams are translated, tool calls included, and remote
+  images are fetched for the providers that cannot follow a URL themselves.
 - **RAG stores:** PDF / DOCX / HTML / TXT / Markdown, section-aware chunking with contextual
-  embeddings, hybrid vector + full-text search (RRF), optional LLM reranking, distance threshold.
+  embeddings, hybrid search fusing pgvector with either Postgres full-text ranking or
+  ParadeDB BM25, reranking by your own model or the Cohere / Voyage APIs, distance threshold.
 - **Projects:** one `sk-proj-…` key per project mapped to a model connection, a system prompt
   and an optional RAG store; provider credentials are encrypted at rest and never exposed.
+- **API keys:** per-user `sk-user-…` keys for `/v1` scoped to the projects you grant them and
+  `sk-mgmt-…` keys for the management API, both with scopes, expiry, revocation and optional
+  limits under the project's.
 - **Users and roles:** `admin`, `editor`, `viewer`, project membership, login rate limiting
-  with lockout, audit log of every management action.
+  with lockout, audit log of every management action, and `ragmux reset-password` when the
+  last administrator is locked out.
+- **Cost:** prompt-caching passthrough, cache-aware token accounting and an editable price
+  table that estimates what each request cost.
 - **Rate limits and budgets:** per-project requests / tokens per minute and daily / monthly
   token budgets shared across replicas, OpenAI-style `429` and `x-ratelimit-*` headers.
-- **Observability:** per-request logs (tokens, latency, status, streaming, RAG use),
-  summaries, daily series, configurable retention.
+- **Observability:** per-request logs (tokens, latency, status, streaming, RAG use, cost),
+  summaries, daily series, configurable retention, an authenticated Prometheus `/metrics`
+  endpoint and OpenTelemetry traces over OTLP.
+- **Scale:** run several replicas against one PostgreSQL — ingestion is claimed under a
+  lease, the retention pass elects a leader, and streaming needs no session affinity.
 - **Dashboard:** embedded UI at `/admin/` for models, RAG stores, documents, projects,
   metrics, users, audit log and a playground; everything is also a REST API.
 
@@ -147,7 +158,11 @@ client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-proj-...")
 resp = client.chat.completions.create(model="default", stream=True,
     messages=[{"role": "user", "content": "How many vacation days do I get?"}])
 for chunk in resp:
-    print(chunk.choices[0].delta.content or "", end="")
+    # Guard the array: an upstream may send a frame of its own with no
+    # choices (a content filter result, a proxy keep-alive), and asking for
+    # usage adds a final chunk that carries only the token counts.
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="")
 ```
 
 ## Dashboard
@@ -184,6 +199,8 @@ IBM Plex Sans, JetBrains Mono, all SIL OFL, `web/fonts/`) and runs under a stric
 | [Users, roles and limits](docs/users-and-limits.md) | roles matrix, project membership, login protection, audit log, rate limits and budgets, metrics and retention |
 | [Providers](docs/providers.md) | provider types and endpoints, Anthropic / Gemini / Ollama translation details, request passthrough, model echo |
 | [Backup and restore](docs/backup-restore.md) | what to back up, `scripts/backup.sh` and `scripts/restore.sh`, scheduled backups, PITR, restore runbook |
+| [Scaling](docs/scaling.md) | running several replicas, what state is already shared, SECRET_KEY and connection pooling, leased ingestion, rolling restarts, Kubernetes notes |
+| [Observability](docs/observability.md) | `/metrics` and why it is authenticated, the metric table, the cardinality checklist, `/readyz` vs `/healthz`, tracing spans and sampling, running a Collector |
 | [Changelog](CHANGELOG.md) | release notes |
 
 ## Security
@@ -227,6 +244,9 @@ internal/gateway/     /v1 proxy, RAG injection, metrics
 internal/limits/      per-project rate limits, token budgets, usage counters
 internal/maintenance/ hourly retention job
 internal/admin/       /admin REST API + dashboard hosting
+internal/metrics/     dependency-free Prometheus registry and text exposition
+internal/tracing/     OTLP/HTTP span exporter over the standard library
+internal/obs/         the metric set, its labels and the HTTP middlewares
 web/                  dashboard (index.html, vanilla JS) and its fonts, embedded in the binary
 docker/aio/           entrypoint of the all-in-one image (Postgres + gateway supervision)
 docker/postgres-init/ ragmux_app role and vector extension SQL shared by both layouts
@@ -234,9 +254,9 @@ docker/postgres-init/ ragmux_app role and vector extension SQL shared by both la
 
 ## Roadmap
 
-Not in this release: an import tool for 0.1 (pre-PostgreSQL) databases, Gemini tool calling,
-OCR for scanned PDFs, a Prometheus metrics endpoint, SSO / OIDC login, prompt caching
-passthrough.
+Not in this release: an import tool for 0.1 (pre-PostgreSQL) databases, OCR for scanned
+PDFs, SSO / OIDC login, cost-denominated budgets, and a cache breakpoint on the gateway's
+own system prompt and RAG context block.
 
 ## License
 

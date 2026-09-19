@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -32,7 +33,11 @@ var ErrNotFound = errors.New("not found")
 // replicas can start (or create a new embedding table) at the same time.
 const (
 	lockMigrations int64 = 0x7261676d75780001 // "ragmux" + 1
-	lockVecTables  int32 = 0x72616701
+	// LockJanitor is the leader lock the hourly retention pass takes so only
+	// one replica does the work. Exported: internal/maintenance takes it.
+	LockJanitor   int64 = 0x7261676d75780002 // "ragmux" + 2
+	lockVecTables int32 = 0x72616701
+	lockBM25Index int32 = 0x72616702
 )
 
 // OpenConfig carries everything Open needs.
@@ -46,6 +51,9 @@ type OpenConfig struct {
 	SecretKeyHex string
 	// DataDir is only used for the secret.key fallback.
 	DataDir string
+	// PgSearchTokenizer names the ParadeDB analyser for the BM25 index;
+	// empty selects "default". config.Load validates it.
+	PgSearchTokenizer string
 }
 
 // Store wraps the connection pool and the credential cipher.
@@ -59,6 +67,12 @@ type Store struct {
 	log             *slog.Logger
 	// vecTables remembers which chunk_embeddings_<dims> tables exist.
 	vecTables sync.Map
+	// caps are the optional server features detected once at Open.
+	caps Capabilities
+	// pgSearchTok is the analyser the BM25 index is built with.
+	pgSearchTok string
+	// bm25Ready remembers that the ParadeDB index has been created.
+	bm25Ready atomic.Bool
 }
 
 // Open connects to PostgreSQL, ensures the vector extension exists, runs
@@ -95,6 +109,7 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		_ = conn.Close(ctx)
 		return nil, err
 	}
+	caps := detectCapabilities(ctx, conn, log)
 	if err := conn.Close(ctx); err != nil {
 		return nil, err
 	}
@@ -118,7 +133,15 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log}, nil
+	s := &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log, caps: caps, pgSearchTok: cfg.PgSearchTokenizer}
+	// Before any stored credential is read (UpgradeConnectionKeys is the
+	// first caller and would fail with a raw decrypt error): prove this
+	// process holds the key the database was written with.
+	if err := s.verifySecretKey(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 // Close releases the connection pool.
@@ -134,6 +157,7 @@ func (s *Store) DB() *pgxpool.Pool { return s.pool }
 type DatabaseInfo struct {
 	PostgresVersion   string `json:"postgres_version"`
 	PgvectorVersion   string `json:"pgvector_version"`
+	PgSearchVersion   string `json:"pg_search_version"`
 	MigrationsVersion int    `json:"migrations_version"`
 	SizeBytes         int64  `json:"size_bytes"`
 }
@@ -147,9 +171,30 @@ type BackupInfo struct {
 	LastMigrationAt *time.Time `json:"last_migration_at"`
 }
 
+// LatestMigration is the highest migration version this binary carries. A
+// freshly opened database reports exactly this as its MigrationsVersion, so
+// the two together say whether a schema is fully migrated without anyone
+// having to hard-code the number.
+var LatestMigration = sync.OnceValue(func() int {
+	entries, err := fs.ReadDir(migrationFS, "migrations")
+	if err != nil {
+		// The directory is embedded in the binary; a read failure here is
+		// a broken build, not a runtime condition.
+		panic("read embedded migrations: " + err.Error())
+	}
+	highest := 0
+	for _, e := range entries {
+		var version int
+		if _, err := fmt.Sscanf(e.Name(), "%d_", &version); err == nil && version > highest {
+			highest = version
+		}
+	}
+	return highest
+})
+
 // DatabaseInfo reports server, extension and migration versions plus size.
 func (s *Store) DatabaseInfo(ctx context.Context) (*DatabaseInfo, error) {
-	info := &DatabaseInfo{PostgresVersion: s.ServerVersion}
+	info := &DatabaseInfo{PostgresVersion: s.ServerVersion, PgSearchVersion: s.caps.PgSearchVersion}
 	err := s.pool.QueryRow(ctx, `SELECT
 		COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'vector'), ''),
 		COALESCE((SELECT MAX(version) FROM schema_migrations), 0),
@@ -313,6 +358,16 @@ func pgCode(err error) string {
 type SetupInfo struct {
 	MigrationsVersion int
 	DatabaseRole      string
+}
+
+// SetupProgress reports whether any model connection and any project exist,
+// so the first-run wizard can resume at the step it left off. Both are EXISTS
+// probes rather than counts: the page only needs the booleans, and this stays
+// cheap on an unauthenticated route.
+func (s *Store) SetupProgress(ctx context.Context) (hasConnections, hasProjects bool, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM model_connections), EXISTS (SELECT 1 FROM projects)`).
+		Scan(&hasConnections, &hasProjects)
+	return hasConnections, hasProjects, err
 }
 
 // SetupInfo reads the migration version and the connected role in one

@@ -18,8 +18,16 @@ func TestFirstRunSetup(t *testing.T) {
 	e := newEnvWith(t, testdb.Config(t), false, nil)
 	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
 
-	if r := e.call("GET", "/admin/api/setup", nil, "x"); r["needs_setup"] != true {
+	r := e.call("GET", "/admin/api/setup", nil, "x")
+	if r["needs_setup"] != true {
 		t.Fatalf("fresh schema should need setup: %v", r)
+	}
+	// While setup is pending the wizard gets the facts its first screen shows.
+	for _, k := range []string{"migrations_version", "secret_key_source", "database_role",
+		"has_connections", "has_projects"} {
+		if _, ok := r[k]; !ok {
+			t.Errorf("setup status is missing %s while setup is pending: %v", k, r)
+		}
 	}
 	if r := e.call("POST", "/admin/api/login", map[string]any{"username": "admin", "password": "password123"}, "x"); status(r) != 401 {
 		t.Errorf("login before setup: %v", r)
@@ -116,8 +124,10 @@ func TestFirstRunSetup(t *testing.T) {
 	if r := e2.call("POST", "/admin/api/setup", map[string]any{"username": "another", "password": "correct-horse-battery"}, "x"); status(r) != 409 {
 		t.Errorf("second setup: %v", r)
 	}
-	if r := e2.call("GET", "/admin/api/setup", nil, "x"); r["needs_setup"] != false {
-		t.Errorf("needs_setup after setup: %v", r)
+	// Setup is done, so the unauthenticated endpoint stops publishing the rest:
+	// only needs_setup survives (_status is the harness's own field).
+	if done := e2.call("GET", "/admin/api/setup", nil, "x"); done["needs_setup"] != false || len(done) != 2 {
+		t.Errorf("setup status after setup should be needs_setup alone: %v", done)
 	}
 	if n, _ := e2.store.CountUsers(context.Background()); n != 1 {
 		t.Errorf("users after second setup: %d", n)

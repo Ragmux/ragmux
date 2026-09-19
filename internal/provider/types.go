@@ -140,6 +140,25 @@ func (r ChatRequest) MaxOutputTokens() int {
 	return 0
 }
 
+// IncludeUsage reports whether the client asked for the usage-only trailer
+// chunk with stream_options.include_usage. OpenAI sends no such chunk
+// without it, and a client that reaches for chunk.choices[0] on every chunk
+// breaks on one that carries an empty choices array, so the gateway holds
+// the trailer back unless it was asked for. A malformed stream_options is
+// read as "not asked for": the upstream would reject it anyway.
+func (r ChatRequest) IncludeUsage() bool {
+	if len(r.StreamOptions) == 0 {
+		return false
+	}
+	var o struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
+	if json.Unmarshal(r.StreamOptions, &o) != nil {
+		return false
+	}
+	return o.IncludeUsage
+}
+
 // StopSequences normalises the stop field into a slice.
 func (r ChatRequest) StopSequences() []string {
 	if len(r.Stop) == 0 {
@@ -156,11 +175,81 @@ func (r ChatRequest) StopSequences() []string {
 	return nil
 }
 
-// Usage mirrors OpenAI's usage block.
+// Usage mirrors OpenAI's usage block. PromptTokens always includes the
+// cached part of the prompt, whichever provider answered, so the number
+// means the same thing on every connection and prompt + completion == total.
+//
+// One known exception: a Gemini request that called tools. Its
+// usageMetadata.toolUsePromptTokenCount is not read, and TotalTokens is
+// copied from Gemini's own totalTokenCount, so the total can exceed the two
+// parts. Google's REST reference and its published protobuf disagree on what
+// that total sums and neither says whether tool-use tokens are inside it, so
+// nothing is derived from a guess. docs/providers.md carries the limit.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// PromptTokensDetails and CompletionTokensDetails are OpenAI's
+	// breakdowns; each adapter fills in what its own provider reports.
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+	// PromptCacheHitTokens and PromptCacheMissTokens are DeepSeek's
+	// top-level spelling of the same split; normalize folds them in.
+	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens,omitempty"`
+}
+
+// PromptTokensDetails breaks the prompt down by how it was billed.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+	// CacheWriteTokens has no OpenAI equivalent: OpenAI does not bill cache
+	// writes, Anthropic does.
+	CacheWriteTokens int `json:"cache_creation_tokens,omitempty"`
+	AudioTokens      int `json:"audio_tokens,omitempty"`
+}
+
+// CompletionTokensDetails carries the reasoning share of the completion.
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// normalize folds provider-specific spellings into the OpenAI shape and
+// computes a total the upstream left out. It is safe on a nil receiver so
+// callers can apply it to an optional usage block unconditionally.
+func (u *Usage) normalize() {
+	if u == nil {
+		return
+	}
+	if u.PromptCacheHitTokens > 0 && u.CachedTokens() == 0 {
+		u.promptDetails().CachedTokens = u.PromptCacheHitTokens
+	}
+	if u.TotalTokens == 0 {
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	}
+}
+
+// promptDetails returns the prompt breakdown, creating it on first use.
+func (u *Usage) promptDetails() *PromptTokensDetails {
+	if u.PromptTokensDetails == nil {
+		u.PromptTokensDetails = &PromptTokensDetails{}
+	}
+	return u.PromptTokensDetails
+}
+
+// CachedTokens is the part of the prompt a provider cache served.
+func (u *Usage) CachedTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
+}
+
+// CacheWriteTokens is the part of the prompt written into a provider cache.
+func (u *Usage) CacheWriteTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CacheWriteTokens
 }
 
 // Choice is one non-streaming completion choice.
@@ -231,6 +320,11 @@ type Error struct {
 	Type    string
 	Code    string
 	Message string
+	// RetryAfter is seconds for the Retry-After header, set only where the
+	// gateway can say when the thing that was full will have room. It is a
+	// header rather than a body field because that is what an HTTP client
+	// already knows how to honour.
+	RetryAfter int
 }
 
 func (e *Error) Error() string {

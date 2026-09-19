@@ -37,6 +37,34 @@ func TestChatRequestExtraRoundTrip(t *testing.T) {
 	}
 }
 
+// TestIncludeUsage: the gateway holds the usage-only trailer back unless the
+// client asked for it, so "asked for it" has to be read the way OpenAI reads
+// it — and anything unreadable has to mean no.
+func TestIncludeUsage(t *testing.T) {
+	cases := []struct {
+		streamOptions string
+		want          bool
+	}{
+		{``, false},
+		{`null`, false},
+		{`{}`, false},
+		{`{"include_usage":true}`, true},
+		{`{"include_usage":false}`, false},
+		{`{"include_usage":true,"something_else":1}`, true},
+		// Neither a wrong type nor a broken object is a yes.
+		{`{"include_usage":"yes"}`, false},
+		{`{"include_usage":1}`, false},
+		{`["include_usage"]`, false},
+		{`not json`, false},
+	}
+	for _, c := range cases {
+		r := ChatRequest{StreamOptions: json.RawMessage(c.streamOptions)}
+		if got := r.IncludeUsage(); got != c.want {
+			t.Errorf("IncludeUsage(%q) = %v, want %v", c.streamOptions, got, c.want)
+		}
+	}
+}
+
 func TestTranslateAnthropic(t *testing.T) {
 	var r ChatRequest
 	json.Unmarshal([]byte(`{"model":"x","messages":[
@@ -46,11 +74,12 @@ func TestTranslateAnthropic(t *testing.T) {
 		{"role":"user","content":[{"type":"text","text":"b"}]},
 		{"role":"assistant","content":"c"},
 		{"role":"user","content":"d"}],"max_tokens":10,"stop":"END"}`), &r)
-	ar, err := translateAnthropic(r, "claude-x")
+	ar, err := translateAnthropic(context.Background(), Config{Model: "claude-x"}, r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ar.System != "be terse\n\nreally" || ar.MaxTokens != 10 || ar.Model != "claude-x" {
+	// Without a cache_control the system field stays a plain JSON string.
+	if string(ar.System) != `"be terse\n\nreally"` || ar.MaxTokens != 10 || ar.Model != "claude-x" {
 		t.Errorf("bad translation: %+v", ar)
 	}
 	if len(ar.Messages) != 3 || len(ar.Messages[0].Content) != 2 || ar.Messages[1].Role != "assistant" {
@@ -64,7 +93,7 @@ func TestTranslateAnthropic(t *testing.T) {
 func TestTranslateGemini(t *testing.T) {
 	var r ChatRequest
 	json.Unmarshal([]byte(`{"model":"x","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"},{"role":"assistant","content":"a"},{"role":"user","content":"u2"}],"temperature":0.2}`), &r)
-	g, err := translateGemini(r)
+	g, err := translateGemini(context.Background(), Config{ProviderType: "gemini"}, r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,5 +228,70 @@ func TestAnthropicStreamNormalisation(t *testing.T) {
 	}
 	if text != "Hi there" || finish != "stop" || usage == nil || usage.PromptTokens != 7 || usage.CompletionTokens != 2 {
 		t.Errorf("text=%q finish=%q usage=%+v", text, finish, usage)
+	}
+}
+
+// TestAnthropicStreamToolCallBytes pins the exact tool_calls deltas the
+// Anthropic adapter emits, down to the key order json.Marshal gives a map.
+// OpenAI clients accumulate these deltas by index, so the sequence is a wire
+// contract: the shared normaliser must reproduce it byte for byte.
+func TestAnthropicStreamToolCallBytes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, ev := range []string{
+			`data: {"type":"message_start","message":{"id":"msg_2","usage":{"input_tokens":4}}}`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one sec"}}`,
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}`,
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}`,
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"Ankara\"}"}}`,
+			`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_2","name":"get_time"}}`,
+			`data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+			// An argument delta for a block that never opened is ignored.
+			`data: {"type":"content_block_delta","index":7,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}`,
+			`data: {"type":"message_stop"}`,
+		} {
+			_, _ = w.Write([]byte(ev + "\n\n"))
+		}
+	}))
+	defer srv.Close()
+	p, _ := New(Config{ProviderType: "anthropic", BaseURL: srv.URL, APIKey: "ak", Model: "claude"})
+	var req ChatRequest
+	_ = json.Unmarshal([]byte(`{"model":"client","messages":[{"role":"user","content":"hi"}]}`), &req)
+	out := make(chan StreamChunk, 32)
+	if err := p.ChatStream(context.Background(), req, out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+	var got []string
+	var finish string
+	for c := range out {
+		for _, ch := range c.Choices {
+			if len(ch.Delta.ToolCalls) > 0 {
+				got = append(got, string(ch.Delta.ToolCalls))
+			}
+			if ch.FinishReason != nil {
+				finish = *ch.FinishReason
+			}
+		}
+	}
+	want := []string{
+		`[{"function":{"arguments":"","name":"get_weather"},"id":"toolu_1","index":0,"type":"function"}]`,
+		`[{"function":{"arguments":"{\"city\":"},"index":0}]`,
+		`[{"function":{"arguments":"\"Ankara\"}"},"index":0}]`,
+		`[{"function":{"arguments":"","name":"get_time"},"id":"toolu_2","index":1,"type":"function"}]`,
+		`[{"function":{"arguments":"{}"},"index":1}]`,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d tool deltas: %v", len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("delta %d:\n got %s\nwant %s", i, got[i], want[i])
+		}
+	}
+	if finish != "tool_calls" {
+		t.Errorf("finish = %q", finish)
 	}
 }

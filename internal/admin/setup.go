@@ -32,14 +32,27 @@ const setupMinPasswordLen = 12
 // without touching any real account's counters.
 const setupLimiterUser = ""
 
-// setupStatus reports whether setup is pending plus three facts the setup
-// page shows so an operator can confirm which database the gateway is on:
-// the migration version, where SECRET_KEY came from and the database role.
-// Nothing here identifies users or hosts.
+// setupStatus reports whether setup is pending. While it is, the answer also
+// carries three facts the setup page shows so an operator can confirm which
+// database the gateway is on -- the migration version, where SECRET_KEY came
+// from and the database role -- plus has_connections and has_projects, which
+// let the wizard resume at the right step after a reload. Nothing there
+// identifies users or hosts: all five are booleans or instance-wide facts.
+//
+// Once a user exists the answer shrinks to needs_setup alone. The endpoint is
+// unauthenticated by design, and after setup nobody needs the rest: an
+// internet-facing install should not hand an anonymous curl the migration
+// version, the database role, where the key came from and how far the
+// install got. None of that is an opening on its own; together it is
+// reconnaissance, and it costs nothing to stop publishing it.
 func (a *Admin) setupStatus(w http.ResponseWriter, r *http.Request) {
 	n, err := a.Store.CountUsers(r.Context())
 	if err != nil {
 		a.fail(w, err)
+		return
+	}
+	if n != 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"needs_setup": false})
 		return
 	}
 	info, err := a.Store.SetupInfo(r.Context())
@@ -47,11 +60,18 @@ func (a *Admin) setupStatus(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	conns, projects, err := a.Store.SetupProgress(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"needs_setup":        n == 0,
+		"needs_setup":        true,
 		"migrations_version": info.MigrationsVersion,
 		"secret_key_source":  a.Store.SecretKeySource,
 		"database_role":      info.DatabaseRole,
+		"has_connections":    conns,
+		"has_projects":       projects,
 	})
 }
 

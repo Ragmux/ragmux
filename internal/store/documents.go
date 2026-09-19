@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -28,19 +30,27 @@ type Document struct {
 	PageCount *int `json:"page_count"`
 	// ProgressPercent moves 0 -> 100 while the document is ingested and
 	// keeps its last value when ingestion fails.
-	ProgressPercent int    `json:"progress_percent"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
+	ProgressPercent int `json:"progress_percent"`
+	// Attempts counts how often a replica has claimed this document since
+	// it was last queued. A document past the attempt cap is skipped by the
+	// claim query, so one poisonous file cannot walk the cluster.
+	Attempts  int    `json:"attempts"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
-const docCols = "id, rag_store_id, filename, mime, size_bytes, status, error, chunk_count, page_count, progress_percent, created_at, updated_at"
+const docCols = "id, rag_store_id, filename, mime, size_bytes, status, error, chunk_count, page_count, progress_percent, attempts, created_at, updated_at"
+
+// docColsD is docCols qualified for statements that join another relation
+// and would otherwise read ambiguously.
+var docColsD = "d." + strings.ReplaceAll(docCols, ", ", ", d.")
 
 func scanDoc(row interface{ Scan(...any) error }) (*Document, error) {
 	d := &Document{}
 	var created, updated time.Time
 	var progress int16
 	err := row.Scan(&d.ID, &d.RAGStoreID, &d.Filename, &d.Mime, &d.SizeBytes, &d.Status, &d.Error,
-		&d.ChunkCount, &d.PageCount, &progress, &created, &updated)
+		&d.ChunkCount, &d.PageCount, &progress, &d.Attempts, &created, &updated)
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -112,31 +122,148 @@ func collectDocs(rows interface {
 	return out, rows.Err()
 }
 
-// SetDocumentStatus updates processing state.
+// SetDocumentStatus updates processing state. Moving a document back to
+// pending is an explicit retry (an upload, a reprocess), so it also drops
+// any stale claim and resets the attempt counter: the cap is meant to stop
+// a crash loop, not to run out over a document's lifetime.
 func (s *Store) SetDocumentStatus(ctx context.Context, id int64, status, errMsg string) error {
-	_, err := s.pool.Exec(ctx, "UPDATE documents SET status=$1, error=$2, updated_at=now() WHERE id=$3",
-		status, errMsg, id)
+	_, err := s.pool.Exec(ctx, `UPDATE documents SET status=$1, error=$2, updated_at=now(),
+		attempts    = CASE WHEN $1 = 'pending' THEN 0 ELSE attempts END,
+		claimed_by  = CASE WHEN $1 = 'pending' THEN NULL ELSE claimed_by END,
+		lease_until = CASE WHEN $1 = 'pending' THEN NULL ELSE lease_until END
+		WHERE id=$3`, status, errMsg, id)
 	return err
 }
 
-// StartDocumentProcessing marks a document processing and resets the
-// progress fields of a previous run in the same write.
-func (s *Store) StartDocumentProcessing(ctx context.Context, id int64) error {
-	_, err := s.pool.Exec(ctx, `UPDATE documents SET status=$1, error='', progress_percent=0, page_count=NULL,
-		updated_at=now() WHERE id=$2`, DocProcessing, id)
+// claimWhere is the eligibility test of the ingestion queue: a document
+// waiting to be picked up, or one whose owner stopped renewing its lease
+// (it crashed, was killed, or lost the database). A lease_until of NULL is
+// a row written before this schema existed.
+const claimWhere = `(status='pending' OR (status='processing' AND (lease_until IS NULL OR lease_until < now())))
+	AND attempts < $3`
+
+// claimSet is the write a claim performs: take ownership, start the lease,
+// count the attempt and clear the leftovers of any previous run.
+const claimSet = `status='processing', claimed_by=$1, claimed_at=now(),
+	lease_until=now()+make_interval(secs => $2), attempts=d.attempts+1,
+	error='', progress_percent=0, page_count=NULL, updated_at=now()`
+
+// ClaimDocument takes the next claimable document for owner and leases it
+// for lease. FOR UPDATE SKIP LOCKED is what makes this safe to run from
+// every replica at once: each poller locks a different row instead of
+// queueing behind the same one. It returns ErrNotFound when the queue is
+// empty, which is the dispatcher's signal to stop polling.
+//
+// A document that has been claimed maxAttempts times is skipped: without
+// that cap a file that reliably kills the process becomes a cluster-wide
+// crash loop as replicas take turns on it. The janitor fails those rows.
+func (s *Store) ClaimDocument(ctx context.Context, owner string, lease time.Duration, maxAttempts int) (*Document, error) {
+	return scanDoc(s.pool.QueryRow(ctx, `WITH next AS (
+			SELECT id FROM documents
+			 WHERE `+claimWhere+`
+			 ORDER BY id
+			 FOR UPDATE SKIP LOCKED
+			 LIMIT 1)
+		UPDATE documents d SET `+claimSet+`
+		  FROM next WHERE d.id = next.id
+		RETURNING `+docColsD, owner, lease.Seconds(), maxAttempts))
+}
+
+// ExtendDocumentLease pushes the lease of a document owner still holds out
+// by lease. ErrNotFound means the claim is gone: the lease expired and
+// another replica took the document over, so the caller must stop working
+// on it and must not write a status.
+func (s *Store) ExtendDocumentLease(ctx context.Context, id int64, owner string, lease time.Duration) error {
+	res, err := s.pool.Exec(ctx, `UPDATE documents SET lease_until=now()+make_interval(secs => $3)
+		WHERE id=$1 AND claimed_by=$2 AND status=$4`, id, owner, lease.Seconds(), DocProcessing)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearDocumentClaim releases the lease a finished ingestion held and
+// resets the attempt counter so a later reprocess starts from zero. The
+// status is left alone: ReplaceDocumentChunks already wrote it.
+func (s *Store) ClearDocumentClaim(ctx context.Context, id int64, owner string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE documents SET claimed_by=NULL, lease_until=NULL, attempts=0
+		WHERE id=$1 AND claimed_by=$2`, id, owner)
 	return err
+}
+
+// ReleaseDocuments puts every document owner is still processing back into
+// the queue and reports how many. A replica calls it on a clean shutdown so
+// the work is picked up immediately instead of after the lease expires.
+//
+// The attempt is given back: it was cancelled by an orderly restart, not
+// spent on a document that took the process down, and a rolling deploy
+// during a long ingest would otherwise eat the whole attempt budget.
+func (s *Store) ReleaseDocuments(ctx context.Context, owner string) (int64, error) {
+	res, err := s.pool.Exec(ctx, `UPDATE documents
+		SET status=$2, claimed_by=NULL, lease_until=NULL, attempts=GREATEST(attempts-1, 0), updated_at=now()
+		WHERE claimed_by=$1 AND status=$3`, owner, DocPending, DocProcessing)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected(), nil
+}
+
+// CountPendingDocuments is the cluster-wide ingestion backlog: what every
+// replica together still has to pick up. Enqueue checks it against
+// MAX_PENDING_DOCUMENTS.
+func (s *Store) CountPendingDocuments(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, "SELECT count(*) FROM documents WHERE status=$1", DocPending).Scan(&n)
+	return n, err
+}
+
+// FailExhaustedDocuments marks documents that ran out of claim attempts as
+// failed, keeping the error of the last try. They are invisible to the
+// claim query at that point, so without this they would sit in
+// "processing" forever.
+func (s *Store) FailExhaustedDocuments(ctx context.Context, maxAttempts int) (int64, error) {
+	res, err := s.pool.Exec(ctx, `UPDATE documents
+		SET status=$1, claimed_by=NULL, lease_until=NULL, updated_at=now(),
+		    error = CASE WHEN error = '' THEN $3 ELSE error || ' (' || $3 || ')' END
+		WHERE status=$2 AND attempts >= $4 AND (lease_until IS NULL OR lease_until < now())`,
+		DocFailed, DocProcessing, "ingestion gave up after the maximum number of attempts (INGEST_MAX_ATTEMPTS)", maxAttempts)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected(), nil
 }
 
 // SetDocumentProgress records ingestion progress (clamped to 0..100). With
 // pageCount set the page count is stored as well.
-func (s *Store) SetDocumentProgress(ctx context.Context, id int64, percent int, pageCount *int) error {
+// owner, when set, restricts the write to the replica still holding the
+// claim: a worker whose lease expired must not keep writing to a row another
+// replica has taken over. ErrNotFound reports exactly that. An empty owner
+// skips the check, for callers that never claimed the row.
+func (s *Store) SetDocumentProgress(ctx context.Context, id int64, percent int, pageCount *int, owner string) error {
 	percent = max(0, min(100, percent))
+	q := "UPDATE documents SET progress_percent=$1"
+	args := []any{int16(percent)}
 	if pageCount != nil {
-		_, err := s.pool.Exec(ctx, "UPDATE documents SET progress_percent=$1, page_count=$2 WHERE id=$3", int16(percent), *pageCount, id)
+		q += ", page_count=$2"
+		args = append(args, *pageCount)
+	}
+	args = append(args, id)
+	q += fmt.Sprintf(" WHERE id=$%d", len(args))
+	if owner != "" {
+		args = append(args, owner)
+		q += fmt.Sprintf(" AND claimed_by=$%d AND status='processing'", len(args))
+	}
+	tag, err := s.pool.Exec(ctx, q, args...)
+	if err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, "UPDATE documents SET progress_percent=$1 WHERE id=$2", int16(percent), id)
-	return err
+	if tag.RowsAffected() == 0 && owner != "" {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DeleteDocument removes the document; chunks and embeddings cascade.

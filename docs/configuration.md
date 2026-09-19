@@ -21,7 +21,11 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `CORS_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call the API (`*` allows all). Unset means no CORS headers at all. |
 | `SESSION_TTL` | `24h` | Dashboard session lifetime (Go duration such as `12h`, `30m`). |
 | `UPSTREAM_TIMEOUT` | `5m` | Timeout for a non-streaming provider call. Streaming calls use it for the connect and response-header phase only. |
-| `INGEST_WORKERS` | `2` | Parallel document ingestion jobs (`>= 1`). |
+| `INGEST_WORKERS` | `2` | Parallel document ingestion jobs on this replica (`>= 1`). |
+| `INGEST_LEASE` | `2m` | How long this replica owns a document it claimed without renewing the claim (Go duration, minimum `3s`). The worker renews it every third of this while the job runs, so it bounds how long a crashed replica's document stays untouchable, not how long a job may take. See [Ingestion across replicas](scaling.md#ingestion-across-replicas). |
+| `INGEST_POLL_INTERVAL` | `5s` | How often the ingestion dispatcher looks for claimable documents when nothing wakes it (Go duration, minimum `100ms`). An upload on this replica kicks it immediately; the poll is what finds work another replica queued. |
+| `INGEST_MAX_ATTEMPTS` | `5` | How many times one document may be claimed before the retention job marks it `failed` (`>= 1`). It stops a document that kills the process from becoming a cluster-wide crash loop. A successful ingest, an upload and a reprocess each reset the counter. |
+| `MAX_PENDING_DOCUMENTS` | `1024` | Cluster-wide ingestion backlog an upload is still accepted into (`>= 1`). Beyond it the upload gets `503`; the count is `documents` in status `pending` across every replica, cached for about a second. |
 | `MAX_UPLOAD_MB` | `50` | Maximum size of one document upload request in MiB (`>= 1`). |
 | `MAX_CHUNKS_PER_DOCUMENT` | `20000` | A document that splits into more chunks than this is marked `failed` before anything is embedded (`>= 1`). Bounds the memory and embedding cost of one document. |
 | `MAX_DOCUMENTS_PER_STORE` | `0` | Instance-wide ceiling on the documents one RAG store may hold (`0` = unlimited). A store's own `max_documents` can only lower it; uploads over the limit get `422 store_quota`. See [Quotas](rag.md#quotas). |
@@ -30,6 +34,16 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `PRIVATE_UPSTREAM_ALLOWLIST` | *(empty)* | Comma-separated hostnames (case-insensitive) that may resolve to private addresses while `ALLOW_PRIVATE_UPSTREAMS` stays `false`, e.g. `host.docker.internal,ollama`. |
 | `STREAM_MAX_DURATION` | `30m` | Wall-time limit for one streaming provider response (Go duration). The stream ends with a `504 timeout` error when it is reached. |
 | `STREAM_MAX_BYTES_MB` | `256` | Maximum bytes read from one streaming provider response in MiB (`>= 1`). |
+| `RERANK_TIMEOUT` | — | Bounds one rerank call whichever backend a store uses. Empty gives the `llm` backend 10 s (a full chat completion) and `cohere`/`voyage` 5 s (a single scoring call). A timeout is not an error: retrieval falls back to the fused order. See [Reranking](rag.md#reranking). |
+| `PG_SEARCH_TOKENIZER` | `default` | ParadeDB analyser for the BM25 index, used only by stores whose `search_backend` is `pg_search`. `default` splits on unicode word boundaries and lowercases, matching the tsvector backend, so a store can move between the two without changing which words match. `<iso-639-1>_stem` adds stemming for one of twenty languages (`ar cs da de el en es fi fr hu it nl no pl pt ro ru sv ta tr`); a stemmer code outside that set is refused at startup, because it could only ever be rejected by `pg_search` and leave the store on the `pgvector` fallback. Instance-wide, because the index is global — changing it needs `DROP INDEX IF EXISTS idx_chunks_bm25;`, and no restart: the next hybrid search notices the index is gone, answers from `pgvector` for that one query, and rebuilds with the new analyser. Do it when traffic is low — the rebuild runs on the request that triggers it and blocks ingestion writes while it scans `chunks`; see [Search backends](rag.md#search-backends). Until the drop, the running index keeps its own analyser and the value here is only logged as a mismatch. A value that is not a plain lowercase identifier is refused at startup: it is interpolated into the index DDL. |
+| `IMAGE_FETCH` | `true` | Download the `image_url` parts of a chat request for providers whose upstream cannot fetch a URL itself (`gemini`, `ollama`) and send the bytes inline. `false` refuses such a request with `400` instead; a valid inline `data:` image is unaffected either way, and `anthropic`/`openai` forward a remote URL either way. Inline images are validated whatever this is set to, on every translating connection (`gemini`, `ollama` **and** `anthropic`): the URL must carry `;base64`, its payload must decode as standard base64 and not be empty, and its media type must be one **that** provider accepts — the lists differ, and are in [Images](providers.md#images). Downloads go out over the same hardened transport as provider calls but always with the private-address filter on: `ALLOW_PRIVATE_UPSTREAMS` and `PRIVATE_UPSTREAM_ALLOWLIST` lift it for a `base_url` an editor typed, never for an image URL an API key chose. |
+| `IMAGE_FETCH_MAX_MB` | `8` | Maximum size of one fetched image in MiB (`>= 1`). Enforced on `Content-Length` and again while reading, so a response that declares nothing cannot exceed it. |
+| `IMAGE_FETCH_TIMEOUT` | `10s` | Timeout for one image fetch (Go duration, `> 0`). |
+| `IMAGE_FETCH_MAX_PER_REQUEST` | `8` | Maximum images one chat request may fetch (`>= 1`); they are fetched one at a time. Over the limit the request gets `400`. |
+| `IMAGE_FETCH_MAX_CONCURRENT` | `16` | Image fetches the whole process runs at once (`>= 1`), and the most connections the image transport will hold to one host. `IMAGE_FETCH_MAX_PER_REQUEST` bounds a single request and nothing across them; this is what bounds the fan-out when many arrive together, so a key holder cannot turn the gateway into an amplifier pointed at a host of their choosing. **While another project (or, for a key that named none, key) is queueing, no single one takes more than half of these slots**, so one tenant aimed at a slow image host cannot starve another. Takes, not holds: a slot already taken is not reclaimed, so a tenant that filled the gateway while nobody was waiting can sit above half until those downloads finish — it simply takes nothing further. With nobody else waiting a single project reaches the full value, so the setting means what it says on a one-project install; see [Images](providers.md#images). A fetch that cannot get a slot within two seconds — or `IMAGE_FETCH_TIMEOUT`, if that is shorter; the wait is not separately configurable — gets `429` with `Retry-After` and `code: "image_fetch_saturated"`: a resource limit, not a fault, and deliberately not a `5xx`, which would report the gateway as unwell when it is merely full. `Retry-After` names `IMAGE_FETCH_TIMEOUT` rather than the queue wait, because a slot frees when a download finishes. The queue wait is its own budget; `IMAGE_FETCH_TIMEOUT` starts only once a slot is in hand. |
+| `IMAGE_CACHE_ENTRIES` | `64` | Size of the in-memory fetched-image cache (`0` disables it). Keyed on the URL alone, so an image whose content changes within the TTL is served stale. |
+| `IMAGE_CACHE_TTL` | `10m` | How long a fetched image may be reused (Go duration, `> 0`). |
+| `IMAGE_CACHE_MAX_MB` | derived | Byte ceiling for that cache (`>= 1`). Unset it is 64 MiB, or enough to hold two images of the largest size `IMAGE_FETCH_MAX_MB` accepts, whichever is larger, and never more than 256 MiB — the derivation follows the per-image limit but does not follow it into a gigabyte. The cache stores base64, a third larger than the image itself, so a ceiling below one encoded image makes every `put` a no-op and the cache silently holds nothing: an explicit value like that is refused at startup, and a derived one that lands there is warned about in the `image policy` line. |
 | `SECURE_COOKIES` | `false` | `true` marks the `ragmux_session` cookie `Secure` unconditionally. The flag is set anyway when the request arrived over TLS, or when `TRUST_PROXY_HEADERS` is on and the proxy sends `X-Forwarded-Proto: https`. |
 | `TRUST_PROXY_HEADERS` | `false` | `true` takes the client address from the **last** `X-Forwarded-For` entry (the one appended by the nearest proxy), or from `X-Real-IP` when there is no `X-Forwarded-For`. Used by login limits, the audit log and the `Secure` cookie flag. Enable only behind a reverse proxy; see [Behind a reverse proxy](#behind-a-reverse-proxy). |
 | `TRUSTED_PROXY_CIDRS` | *(none)* | Comma-separated networks (`10.0.0.0/8,172.16.0.0/12`, single addresses allowed). When set, proxy headers are honoured only for connections from these networks, and `X-Forwarded-For` is walked from the right past addresses inside them, so the first hop that is not one of your proxies wins. |
@@ -39,6 +53,19 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `LOGIN_LOCKOUT_MINUTES` | `15` | Lockout window in minutes. |
 | `LOG_RETENTION_DAYS` | `90` | Request logs older than this many days are deleted by the hourly retention job (`0` keeps them forever). |
 | `AUDIT_RETENTION_DAYS` | `365` | Audit entries older than this many days are deleted (`0` keeps them forever). |
+| `METRICS_ENABLED` | `false` | `true` serves the Prometheus text exposition at `/metrics`. Off, the route does not exist and returns `404`. Only `true` and `false` are accepted; anything else (`1`, `yes`, `TRUE`) is a start-up error rather than a silent off. See [Observability](observability.md). |
+| `METRICS_TOKEN` | *(none)* | Bearer token `/metrics` requires, compared in constant time. Required whenever `METRICS_LISTEN` is unset or binds a non-loopback address; see [Why the endpoint is authenticated](observability.md#why-the-endpoint-is-authenticated). |
+| `METRICS_TOKEN_FILE` | *(none)* | Path of a file whose trimmed content is used when `METRICS_TOKEN` is unset (Docker/Compose secrets). |
+| `METRICS_LISTEN` | *(none)* | `host:port` (e.g. `127.0.0.1:9090`). When set, `/metrics` is served by a **second** `http.Server` on that address and is **not mounted on the main router at all**, so no reverse-proxy rule can expose it. A loopback host (`127.0.0.1`, `::1`, `localhost`) is accepted without a token; any other host still needs one. Setting it without `METRICS_ENABLED=true` is a configuration error. |
+| `METRICS_MAX_SERIES` | `5000` | Ceiling on the registry's label combinations (`>= 1`). New combinations beyond it are dropped, counted in `ragmux_metrics_series_dropped_total` and logged at `error` (at most once a minute). There is no eviction: once the cap is full, every new series is lost until it is raised or the cardinality comes down, so treat a non-zero drop count as an incident. |
+| `TRACING_ENABLED` | *(endpoint set)* | Defaults to `true` when an OTLP endpoint is configured and `false` otherwise; an explicit `false` always wins. `true` without an endpoint is a configuration error. |
+| `TRACING_TRUST_INCOMING` | `false` | `true` continues a trace a client started from its `traceparent` header. Off by default: a client could otherwise pin every request into one trace and force the sampled flag on all of it. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(none)* | Base URL of an OpenTelemetry Collector's OTLP/HTTP receiver, e.g. `http://otel-collector:4318`. `/v1/traces` is appended unless the URL already ends in it. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | *(none)* | Traces-signal URL; takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | *(none)* | `k=v,k2=v2` headers sent with every export request (a vendor's auth header). A value may contain `=`; only the first one separates. |
+| `OTEL_SERVICE_NAME` | `ragmux` | `service.name` resource attribute. |
+| `OTEL_RESOURCE_ATTRIBUTES` | *(none)* | Extra resource attributes in the same `k=v,k2=v2` form, e.g. `deployment.environment=prod`. |
+| `OTEL_TRACES_SAMPLER_ARG` | `0.05` | Head sampling probability for new traces, `0` to `1`. |
 
 The integer variables from `LOGIN_RATE_LIMIT_PER_MIN` down accept `0` or any positive
 number; a negative or non-numeric value is a configuration error.
@@ -82,8 +109,63 @@ The same policy applies to the `POST /admin/api/models/{id}/test` ping.
 
 Without flags the binary loads the configuration, connects to the database, applies
 pending migrations under an advisory lock (several replicas may start against the same
-database), creates the first admin if needed, resumes unfinished document ingestion and
-starts listening.
+database), checks that `SECRET_KEY` is the one the database was written with (see
+[SECRET_KEY](scaling.md#secret-key)), creates the first admin if needed, starts working
+the document ingestion queue and starts listening.
+
+## Subcommands
+
+Both open the database directly and need `DATABASE_URL` plus the current `SECRET_KEY`
+(or `SECRET_KEY_FILE` / the `secret.key` fallback); neither needs a running gateway.
+
+| Subcommand | Purpose |
+|---|---|
+| `ragmux rotate-key --new <hex>` | Re-encrypt the stored provider credentials with a new `SECRET_KEY`. Stop the gateway first; see [Rotating SECRET_KEY](backup-restore.md#rotating-secret_key). |
+| `ragmux reset-password <username> …` | Set a dashboard password from the command line, for when every administrator is locked out. |
+
+### reset-password
+
+```
+ragmux reset-password <username> [--generate|--stdin] [--force] [--no-revoke] [--revoke-keys]
+```
+
+| Flag | Effect |
+|---|---|
+| `--generate` | Generate a 24-character password and print it after the reset. |
+| `--stdin` | Read the new password from the first line of standard input. |
+| `--force` | Skip the confirmation prompt. |
+| `--no-revoke` | Keep the user's dashboard sessions; by default they are all revoked. |
+| `--revoke-keys` | Also set `revoked_at` on every API key the account owns. |
+
+Exactly one of `--generate` and `--stdin` is required. There is deliberately **no
+`--password` flag and no interactive prompt**: a flag value lands in `ps` output and the
+shell history, and a no-echo prompt would need `golang.org/x/term`, which is not a
+dependency of this project and is not worth adding for one emergency command. The
+minimum length is 12 characters (the first-run setup's floor, not the dashboard's 8 — an
+emergency admin reset should not create a weak credential) and the maximum is bcrypt's
+72 bytes.
+
+```bash
+# print a fresh password
+DATABASE_URL=… SECRET_KEY=… ragmux reset-password admin --generate
+# or pipe one in, without a confirmation prompt
+printf '%s\n' "$NEW_PASSWORD" | ragmux reset-password admin --stdin
+# in the all-in-one container
+docker compose run --rm ragmux reset-password admin --generate
+```
+
+An unknown username exits `1` with a clear message; the command **never creates an
+account**, so a typo cannot quietly add an administrator. Usernames are matched
+case-insensitively. A deactivated account is reported as such: the password is set but
+the user still cannot sign in until an admin reactivates it. When standard input is a
+terminal and neither `--stdin` nor `--force` is given, the reset is confirmed
+interactively first.
+
+This grants no new privilege. Anyone holding `DATABASE_URL` and `SECRET_KEY` can already
+rewrite any row, provider credentials included; the subcommand only makes the recovery
+path an obvious, audited one instead of hand-written SQL. The run is recorded in the
+audit log as the actor `cli` with a null `actor_user_id` and `details` carrying `via`,
+`host`, `os_user`, `revoked_sessions` and `revoked_keys`.
 
 ## Fixed server limits
 
@@ -99,14 +181,15 @@ These are not configurable:
   an `X-Request-Id`; the dashboard pages carry a `Content-Security-Policy` that pins the
   embedded script by hash (`script-src 'sha256-…'`, `frame-ancestors 'none'`).
 - Upstream connections: dial timeout 15 s, TLS handshake 15 s, up to 100 idle connections
-  (20 per host), idle timeout 90 s, at most 3 same-host redirects.
+  (20 per host), idle timeout 90 s, at most 3 redirects, each to the same host and never
+  from `https` down to `http`.
 - Document parsing: PDFs are read for at most 60 s and 2000 pages; a DOCX
   `word/document.xml` may be at most 32 MiB (and at most 100× its compressed size); the
   extracted text of any document is capped at 20 MiB; one ingestion job may run 15 min.
-- The ingestion queue holds 1024 documents; uploads beyond that get `503`.
 - Graceful shutdown on `SIGINT`/`SIGTERM`: in-flight HTTP requests get 15 s, running
-  ingestion jobs 30 s, then the retention job and the pool stop. Documents whose
-  ingestion was cut short resume on the next start.
+  ingestion jobs 30 s, then the documents this process still owned go back into the
+  queue and the retention job and the pool stop. See
+  [Rolling restarts and shutdown](scaling.md#rolling-restarts-and-shutdown).
 - `GET /` redirects to `/admin/`.
 
 ## Deployment layouts
@@ -123,6 +206,7 @@ least-privilege database role `ragmux_app`; they differ in where PostgreSQL runs
 | Required `.env` | nothing (`SECRET_KEY` recommended) | `SECRET_KEY`, `POSTGRES_PASSWORD`, `RAGMUX_DB_PASSWORD` |
 | Database access | unix socket inside the container, no TCP listener | TCP inside the Compose network, password authentication |
 | Use it for | single-host installs, evaluation, small teams | an existing or managed PostgreSQL, a database you operate separately, scaling the gateway independently |
+| More than one gateway replica | **no** - the container bundles PostgreSQL | yes, with `docker-compose.scale.yml` on top; see [Running more than one replica](scaling.md) |
 
 **All-in-one.** `docker compose up -d` starts one container. Its entrypoint runs as
 root only long enough to prepare the volume, then starts `postgres` as the `postgres`
@@ -283,13 +367,20 @@ From v0.3.1 on both are signed with cosign; see
   `Connection: keep-alive`, which nginx honours for `proxy_pass` upstreams. On other
   proxies disable response buffering for `/v1/` explicitly and make sure the proxy
   read timeout is longer than your longest completion (the gateway itself does not
-  time out an established stream).
+  time out an established stream). Streams keep no server-side state, so a fleet of
+  replicas needs plain round robin and **no** session affinity; see
+  [Streaming](scaling.md#streaming).
 - **Upload size.** Raise the proxy's body limit to at least `MAX_UPLOAD_MB` for
   `/admin/api/rag-stores/*/documents`.
 - **CORS.** If browsers call the API from another origin, set `CORS_ORIGINS`; the
   gateway answers preflight `OPTIONS` requests itself with
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS` and
-  `Access-Control-Allow-Headers: Authorization, Content-Type`.
+  `Access-Control-Allow-Headers: Authorization, Content-Type, X-Ragmux-Project`. The
+  rate-limit, budget, RAG and `Retry-After` headers are listed in
+  `Access-Control-Expose-Headers`, without which browser JavaScript cannot read any of
+  them. With `CORS_ORIGINS` empty (the default) no preflight is ever answered, which is
+  also what keeps a management key in an `Authorization` header unforgeable from a
+  foreign page.
 
 ## Database privileges
 

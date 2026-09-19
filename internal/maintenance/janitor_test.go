@@ -165,6 +165,105 @@ func TestCutoffIsRelativeToClock(t *testing.T) {
 	}
 }
 
+// Retired keys go once they are past APIKeyRetention, but only when no
+// request log still attributes spend to them: that NOT EXISTS is what makes
+// request_logs.api_key_id's ON DELETE SET NULL safe.
+func TestAPIKeyPurgeKeepsAttributedKeys(t *testing.T) {
+	f := seed(t)
+	u, err := f.st.CreateUser(f.ctx, "owner", "h", "editor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name string, revokedAgo time.Duration, withLog bool) int64 {
+		t.Helper()
+		k, _, err := f.st.CreateAPIKey(f.ctx, &store.APIKey{Kind: store.KindGateway, Name: name,
+			UserID: u.ID, ProjectIDs: []int64{f.proj}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if revokedAgo > 0 {
+			if _, err := f.st.DB().Exec(f.ctx, "UPDATE api_keys SET revoked_at = $1 WHERE id = $2",
+				f.now.Add(-revokedAgo), k.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if withLog {
+			if err := f.st.InsertRequestLog(f.ctx, &store.RequestLog{ProjectID: f.proj, ModelName: "m",
+				StatusCode: 200, APIKeyID: &k.ID, UserID: &u.ID}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return k.ID
+	}
+	live := mk("live", 0, false)
+	recent := mk("recent", time.Hour, false)
+	old := mk("old", 60*24*time.Hour, false)
+	billed := mk("billed", 60*24*time.Hour, true)
+
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+	rep, err := j.RunOnce(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.APIKeys != 1 {
+		t.Errorf("purged %d key(s), want 1", rep.APIKeys)
+	}
+	for _, c := range []struct {
+		name string
+		id   int64
+		want bool
+	}{{"live", live, true}, {"recently revoked", recent, true}, {"long revoked", old, false},
+		{"revoked but billed", billed, true}} {
+		_, err := f.st.GetAPIKey(f.ctx, c.id)
+		if (err == nil) != c.want {
+			t.Errorf("%s key present = %v, want %v (%v)", c.name, err == nil, c.want, err)
+		}
+	}
+	// The billed key's request log keeps its attribution.
+	rows, err := f.st.RecentRequests(f.ctx, store.MetricsFilter{ProjectID: &f.proj}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributed := 0
+	for _, r := range rows {
+		if r.APIKeyID != nil {
+			attributed++
+		}
+	}
+	if attributed != 1 {
+		t.Errorf("%d attributed request log(s), want 1", attributed)
+	}
+}
+
+// TestRetentionPassRunsOnLeaderOnly: every replica schedules the retention
+// job, and the advisory lock is what keeps them from all deleting the same
+// rows at the same time.
+func TestRetentionPassRunsOnLeaderOnly(t *testing.T) {
+	f := seed(t)
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+
+	// Another replica is mid-pass: this one skips its turn entirely.
+	release, ok, err := f.st.TryAdvisoryLock(f.ctx, store.LockJanitor)
+	if err != nil || !ok {
+		t.Fatalf("take the leader lock: ok=%v err=%v", ok, err)
+	}
+	if j.runLeader(f.ctx) {
+		t.Error("a replica without the leader lock must not run the pass")
+	}
+	if n := f.count("request_logs"); n != 2 {
+		t.Errorf("a follower deleted rows: %d left, want 2", n)
+	}
+	release()
+
+	// The leader is gone; the next pass runs here.
+	if !j.runLeader(f.ctx) {
+		t.Fatal("the pass should run once the lock is free")
+	}
+	if n := f.count("request_logs"); n != 1 {
+		t.Errorf("request_logs after the leader pass = %d, want 1", n)
+	}
+}
+
 func TestRunStopsOnCancel(t *testing.T) {
 	f := seed(t)
 	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}

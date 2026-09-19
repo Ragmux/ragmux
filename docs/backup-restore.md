@@ -10,29 +10,38 @@ and how to rehearse a disaster.
 | Where | What |
 |---|---|
 | PostgreSQL (`ragmux-data` volume, `/data/pg`, with the default all-in-one file; `pgdata` volume with `docker-compose.split.yml`) | users and sessions, model connections (provider API keys, AES-256-GCM encrypted), RAG stores, documents (the uploaded files as `bytea`), chunks, one `chunk_embeddings_<dims>` table per embedding width (HNSW vector indexes), projects and their hashed `sk-proj-…` keys, request logs, usage counters, login attempts, audit log, `schema_migrations` |
-| `SECRET_KEY` | the 32-byte key (64 hex characters) that decrypts the provider API keys stored in the database |
+| `SECRET_KEY` | the 32-byte key (64 hex characters) that decrypts the provider API keys stored in the database. The database records which key that is (`instance_settings`), and a restore with the wrong one fails at start rather than silently |
 | `/data/ragmux/secret.key` (all-in-one, only when `SECRET_KEY` is unset) | the generated fallback key; it lives in the same volume as the database, so a volume backup covers it, a `pg_dump` does not |
 
 With the split layout the gateway container itself is stateless: it can be deleted and
 recreated at any time. With the all-in-one layout the container is disposable too, as
 long as the `ragmux-data` volume stays.
 
-**Without `SECRET_KEY` a restored database is still usable** — users, projects, documents
-and vectors all come back — but every model connection fails with
-`decrypt api key for connection N: cipher: message authentication failed` until you
-re-enter its provider API key in the dashboard (Models -> Edit). Keep the key in a
+**Since 0.4 a wrong key stops the start instead of every provider call.** The database
+holds a canary in `instance_settings` that only the key it was written with can open, so
+a dump restored onto a host with a different `SECRET_KEY` fails at boot with
+`SECRET_KEY does not match the one this database was written with (key source: …)`
+rather than looking healthy until the first chat request. Put the matching key back — see
+[SECRET_KEY](scaling.md#secret-key).
+
+**Without the key at all**, the fastest way back is a database whose canary you own:
+restore the dump, drop the canary row (`DELETE FROM instance_settings WHERE key =
+'secret_key_canary'`) so the next start seals a new one, and then re-enter every provider
+API key in the dashboard (Models -> Edit) — users, projects, documents and vectors all
+come back, only the encrypted credentials are lost. Keep the key in a
 secret manager (or your deployment's env store) *and* in the backup bundle, encrypted
 at rest or in a separate location from the dumps. `scripts/backup.sh` can write it next
 to the dump with `INCLUDE_SECRET_KEY=1` (see below).
 
-`GET /admin/api/system` reports what a backup will contain:
+`GET /admin/api/system` reports what a backup will contain, with sample values —
+`migrations_version` and `version` are whatever the running build reports:
 
 ```json
 {
   "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
-  "database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": 4, "size_bytes": 8787635},
+  "database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
   "secret_key_source": "env",
-  "version": "0.2.0"
+  "version": "0.4.0"
 }
 ```
 
@@ -68,10 +77,74 @@ Notes:
   available (`pgvector/pgvector:pg17` does; on managed Postgres enable it first).
 - `pg_dump` runs in a consistent snapshot, so you can take it while the gateway is
   running. Documents that are being ingested at that moment are restored in their
-  `pending`/`processing` state and the gateway resumes them after restart.
+  `pending`/`processing` state; the gateway claims them again after a restart, once any
+  lease recorded in the dump has expired.
 - Use the same major version of `pg_dump`/`pg_restore` as the server (17). Running the
   tools *inside* the container that holds Postgres (`ragmux` in the all-in-one layout,
   `postgres` in the split one) guarantees that.
+
+### Restoring a ParadeDB dump onto a plain pgvector server
+
+A dump taken from one of the [ParadeDB variants](rag.md#search-backends) carries
+`pg_search` objects that a `pgvector/pgvector:pg17` target cannot create. `pg_restore`
+reports each one and **exits 1**, even though every ragmux table restores:
+
+```
+ERROR:  extension "pg_search" is not available
+ERROR:  relation "paradedb._typmod_cache" does not exist
+ERROR:  access method "bm25" does not exist
+```
+
+Note what that list means: dropping `idx_chunks_bm25` before the dump is **not enough on
+its own**. The BM25 index is only one of the entries — the `paradedb` schema, the
+`CREATE EXTENSION pg_search`, its comment and the extension's own `_typmod_cache` table
+are dumped too, and a restore that only lost the index still fails.
+
+The recipe that works is a TOC filter. `pg_dump` has no `--exclude-index`, so list the
+archive, drop the entries the target cannot create, and restore through the edited list.
+
+**First find them.** Do not assume the list is the ParadeDB ones: every extension present
+in the source database is in the dump, and the split ParadeDB image
+(`docker-compose.paradedb.yml`) ships more than `pg_search` — `postgis`,
+`postgis_topology`, `postgis_tiger_geocoder`, `pg_ivm`, `pg_stat_statements` and
+`fuzzystrmatch` are all installed in its default database, none of which a
+`pgvector/pgvector:pg17` target has. The all-in-one `:<version>-paradedb` image installs
+only `vector` and `pg_search`, so there the ParadeDB filter alone is complete.
+
+```bash
+pg_restore -l ragmux.dump | grep 'EXTENSION -'
+```
+
+Compare that against the target (`SELECT name FROM pg_available_extensions;`) and filter
+on what is missing. For an all-in-one ParadeDB dump that is:
+
+```bash
+pg_restore -l ragmux.dump > full.list
+grep -viE 'pg_search|paradedb|bm25' full.list > filtered.list
+pg_restore -U ragmux -d ragmux --no-owner -L filtered.list ragmux.dump
+```
+
+For a split ParadeDB dump, add the rest (`postgis|pg_ivm|pg_stat_statements|fuzzystrmatch|
+tiger|topology|spatial_ref_sys`). Check the filter before running it: `grep` matches
+anywhere in the TOC line, so a pattern like `bm25` or `paradedb` would also drop a table
+or index of your own whose name contains it, silently. `diff full.list filtered.list`
+shows exactly what is being dropped.
+
+A filtered restore finishes with no errors and exit 0. The database is complete:
+`chunks.content` and `chunks.tsv` are what the lexical half reads, and `idx_chunks_bm25`
+is a derived object that ragmux rebuilds lazily — on a ParadeDB server, on the first
+hybrid search of a store using the `pg_search` backend.
+
+Nothing else needs changing. A `rag_stores` row keeps `search_backend = "pg_search"`
+through the restore and the gateway falls back to `pgvector` for it — hits still come
+back, the search response names the backend that really ran, and one warning per store
+is logged (see [Search backends](rag.md#search-backends)). Restoring the same dump back
+onto a ParadeDB server later finds the setting still there and rebuilds the index; on a
+large corpus that first search is the one that pays for the build, so consider building
+it ahead of time (see the upgrade notes in [CHANGELOG.md](../CHANGELOG.md)).
+
+Roles are cluster-global and are never in a database dump, so create `ragmux_app` on the
+target before restoring a split-layout dump, whichever recipe you use.
 
 ## Scripts
 
@@ -393,12 +466,14 @@ the number of rows changed. It needs the **current** key in the environment
 4. Put the new key into `.env` (or the secret file) and start the gateway:
    `docker compose up -d ragmux`.
 5. Verify: **Test chat** on a model connection succeeds. If the gateway was started with
-   the wrong key, connections fail with `cipher: message authentication failed`; put the
-   right key back, nothing was lost.
+   the wrong key it refuses to start at all (`SECRET_KEY does not match the one this
+   database was written with`); put the right key back, nothing was lost.
 
 Rows are only rewritten when every one of them decrypts with the current key and
 re-decrypts with the new one; otherwise the command exits `1` and the database is
-unchanged. Dumps taken before the rotation still need the old key.
+unchanged. The same transaction re-seals the `instance_settings` canary, so the first
+start after a rotation accepts the new key and refuses the old one. Dumps taken before
+the rotation still need the old key.
 
 Since 0.2.3 each stored key is also bound to its connection id (`key_version = 1` in
 `model_connections`), so a ciphertext moved to another row does not decrypt. Dumps taken

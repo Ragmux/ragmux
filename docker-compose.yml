@@ -2,6 +2,11 @@
 # pgvector server (Dockerfile.aio). All state lives in the ragmux-data volume.
 # For a separate or external database use docker-compose.split.yml instead;
 # see docs/configuration.md#deployment-layouts.
+#
+# This layout CANNOT be scaled: the container bundles PostgreSQL, so a second
+# replica would start a second database on its own volume rather than share
+# the first one. To run more than one gateway, use the split layout with
+# docker-compose.scale.yml on top; see docs/scaling.md.
 services:
   ragmux:
     build:

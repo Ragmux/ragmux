@@ -131,6 +131,28 @@ func TestCheckRedirect(t *testing.T) {
 	if err := check(mk("ftp://api.example.com/"), []*http.Request{first}); !errors.As(err, &re) {
 		t.Errorf("scheme: %v", err)
 	}
+	// Same host, one scheme down: the host check alone used to allow this,
+	// which put the Authorization header on the wire in the clear.
+	if err := check(mk("http://api.example.com/v2"), []*http.Request{first}); !errors.As(err, &re) {
+		t.Errorf("https to http downgrade: %v", err)
+	}
+	// An upgrade the other way is fine, and so is a plain-http hop that never
+	// had a secure connection to lose.
+	plain, _ := http.NewRequest(http.MethodGet, "http://api.example.com/v1", nil)
+	if err := check(mk("https://api.example.com/v2"), []*http.Request{plain}); err != nil {
+		t.Errorf("http to https upgrade: %v", err)
+	}
+	if err := check(mk("http://api.example.com/v2"), []*http.Request{plain}); err != nil {
+		t.Errorf("http to http: %v", err)
+	}
+	// The scheme belongs to the connection being left, so it is compared
+	// against the hop just taken. Against the first request instead, an
+	// http -> https -> http chain passed on the grounds that it started in
+	// the clear, after the credentials had already crossed TLS once.
+	secured, _ := http.NewRequest(http.MethodGet, "https://api.example.com/v2", nil)
+	if err := check(mk("http://api.example.com/v3"), []*http.Request{plain, secured}); !errors.As(err, &re) {
+		t.Errorf("downgrade after an upgrade: %v", err)
+	}
 	via := []*http.Request{first, first, first, first}
 	if err := check(mk("https://api.example.com/"), via); !errors.As(err, &re) {
 		t.Errorf("hops: %v", err)

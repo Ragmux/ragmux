@@ -2,8 +2,8 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
@@ -39,15 +39,27 @@ type SearchHit struct {
 	Distance   float64 `json:"distance"`
 	Score      float64 `json:"score"`
 	VectorRank int     `json:"vector_rank"`
-	FTSRank    int     `json:"fts_rank"`
+	// FTSRank keeps its JSON name across backends: it is the rank on the
+	// lexical side whatever produced that side.
+	FTSRank int `json:"fts_rank"`
+	// LexScore is the raw lexical relevance of the hit: a BM25 score under
+	// the pg_search backend, 0 under pgvector, where ts_rank_cd is neither
+	// comparable across queries nor a BM25 score and is therefore not
+	// exposed at all.
+	LexScore float64 `json:"lex_score,omitempty"`
 }
 
 // SearchOptions tunes Search.
 type SearchOptions struct {
 	// Mode is SearchVector or SearchHybrid (default hybrid).
 	Mode string
+	// Backend selects the lexical backend of a hybrid search
+	// (BackendPgvector or BackendPgSearch; default pgvector). It is ignored
+	// in vector mode, which never touches a lexical index.
+	Backend string
 	// FTSConfig is the text search configuration for parsing the query
-	// (default "simple"); indexing always uses "simple".
+	// (default "simple"); indexing always uses "simple". Only the pgvector
+	// backend reads it.
 	FTSConfig string
 	// MaxDistance drops candidates with a cosine distance above it; 0 = off.
 	MaxDistance float64
@@ -106,7 +118,7 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 
 // ReplaceDocumentChunks atomically swaps a document's chunks and embeddings
 // and marks it ready. All chunks must share the store's embedding width.
-func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks []*Chunk) error {
+func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks []*Chunk, owner string) error {
 	if len(chunks) == 0 {
 		return fmt.Errorf("no chunks to store")
 	}
@@ -184,9 +196,22 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, "UPDATE documents SET status=$1, error='', chunk_count=$2, progress_percent=100, updated_at=now() WHERE id=$3",
-		DocReady, len(chunks), doc.ID); err != nil {
+	// The same ownership check the progress write makes, and here it also
+	// protects the chunk rewrite above: this runs in the transaction that
+	// deleted the old chunks, so a worker whose lease expired mid-job rolls
+	// its own work back instead of replacing what the new owner wrote.
+	q := "UPDATE documents SET status=$1, error='', chunk_count=$2, progress_percent=100, updated_at=now() WHERE id=$3"
+	args := []any{DocReady, len(chunks), doc.ID}
+	if owner != "" {
+		args = append(args, owner)
+		q += fmt.Sprintf(" AND claimed_by=$%d AND status='processing'", len(args))
+	}
+	tag, err := tx.Exec(ctx, q, args...)
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 0 && owner != "" {
+		return ErrNotFound
 	}
 	return tx.Commit(ctx)
 }
@@ -198,10 +223,21 @@ func (s *Store) SearchTopK(ctx context.Context, storeID int64, query []float32, 
 }
 
 // Search runs vector or hybrid retrieval. In hybrid mode the vector top-N
-// and the full-text top-N are fused with reciprocal rank fusion
+// and the lexical top-N are fused with reciprocal rank fusion
 // (score = 1/(60+rank) summed over both lists); every candidate also gets
 // its cosine distance so MaxDistance applies uniformly.
 func (s *Store) Search(ctx context.Context, storeID int64, query string, queryVec []float32, opts SearchOptions) ([]SearchHit, error) {
+	hits, _, err := s.SearchWithBackend(ctx, storeID, query, queryVec, opts)
+	return hits, err
+}
+
+// SearchWithBackend is Search plus the backend that actually answered the
+// lexical half. It differs from opts.Backend when the configured backend is
+// not available on this server, when its index could not be prepared, or
+// when its query failed; in each case the search degrades to pgvector and
+// logs rather than failing, because a retrieval problem must not take the
+// request down with it (PRD behaviour rule 8).
+func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query string, queryVec []float32, opts SearchOptions) ([]SearchHit, string, error) {
 	if opts.Candidates <= 0 {
 		opts.Candidates = 5
 	}
@@ -211,17 +247,87 @@ func (s *Store) Search(ctx context.Context, storeID int64, query string, queryVe
 	if opts.FTSConfig == "" {
 		opts.FTSConfig = "simple"
 	}
+	if opts.Mode != SearchVector && opts.Mode != SearchHybrid {
+		return nil, "", fmt.Errorf("unknown search mode %q", opts.Mode)
+	}
+	// Resolved even in vector mode: it costs one map lookup, and a store
+	// left pointing at a backend this server cannot run should say so on
+	// every search rather than only on the hybrid ones.
+	backend := s.resolveBackend(opts.Backend, storeID)
 	r, err := s.GetRAGStore(ctx, storeID)
 	if err != nil {
-		return nil, err
+		return nil, backend.Name(), err
 	}
 	if r.Dimensions == 0 || r.ChunkCount == 0 {
-		return []SearchHit{}, nil
+		return []SearchHit{}, backend.Name(), nil
 	}
 	if len(queryVec) != r.Dimensions {
-		return nil, fmt.Errorf("query vector has %d dimensions, store expects %d", len(queryVec), r.Dimensions)
+		return nil, backend.Name(), fmt.Errorf("query vector has %d dimensions, store expects %d", len(queryVec), r.Dimensions)
+	}
+	if opts.Mode == SearchHybrid {
+		if err := backend.Prepare(ctx, s); err != nil {
+			// A backend that cannot prepare its index is as unusable as one
+			// the server does not carry; degrade rather than fail the search.
+			s.warnBackendOnce(storeID, warnPrepare,
+				"search backend could not be prepared; falling back to pgvector",
+				"rag_store", storeID, "backend", backend.Name(), "err", err)
+			backend = searchBackends[BackendPgvector]
+		} else {
+			s.clearBackendWarning(storeID, warnPrepare)
+		}
 	}
 
+	hits, err := s.runSearch(ctx, backend, r, query, queryVec, opts)
+	if err == nil {
+		if backend.Name() != BackendPgvector {
+			s.clearBackendWarning(storeID, warnQuery)
+		}
+		return hits, backend.Name(), nil
+	}
+	// Retry only what the lexical backend is actually to blame for. A
+	// vector-only search never reads a lexical index; a cancelled context
+	// would fail the retry too; and an error from Begin, SET LOCAL, Scan or
+	// Commit is the database or the pool, not the backend -- retrying those
+	// would double the load on a server that is already struggling, clear a
+	// perfectly good index flag into an extra DDL transaction per search,
+	// and name the wrong culprit in the log.
+	if opts.Mode != SearchHybrid || ctx.Err() != nil || backend.Name() == BackendPgvector ||
+		!errors.Is(err, errLexicalQuery) {
+		return hits, backend.Name(), err
+	}
+	// What is left is the statement the backend built, rejected by the
+	// server. The case this exists for is an index dropped under a running
+	// process -- exactly what docs/configuration.md tells an operator to do
+	// to change PG_SEARCH_TOKENIZER: Prepare returns from this process's
+	// memory, the query sends @@@ at a table that no longer has a BM25
+	// index, and every hybrid search on this replica would fail until it was
+	// restarted. Retrieval degrades instead (PRD behaviour rule 8), and
+	// Invalidate is what makes the next search rebuild rather than repeat
+	// this.
+	backend.Invalidate(s)
+	s.warnBackendOnce(storeID, warnQuery,
+		"hybrid search failed on its lexical backend; falling back to pgvector and rebuilding on the next search",
+		"rag_store", storeID, "backend", backend.Name(), "err", err)
+	backend = searchBackends[BackendPgvector]
+	hits, err = s.runSearch(ctx, backend, r, query, queryVec, opts)
+	return hits, backend.Name(), err
+}
+
+// errLexicalQuery marks the one failure the fallback may act on: the fused
+// statement a backend built was rejected by the server. Everything else
+// runSearch can return -- a transaction that would not begin, a session
+// setting that would not apply, a row that would not scan, a commit that
+// would not land -- is the database or the pool, and answers the same way on
+// pgvector.
+var errLexicalQuery = errors.New("search statement rejected")
+
+// runSearch executes one search with one backend. It is the whole database
+// half of SearchWithBackend, split out so a hybrid search whose lexical
+// backend fails can be retried on pgvector: the first attempt's transaction
+// is aborted by the failed query, so the retry needs a transaction of its
+// own rather than another statement on this one.
+func (s *Store) runSearch(ctx context.Context, backend SearchBackend, r *RAGStore,
+	query string, queryVec []float32, opts SearchOptions) ([]SearchHit, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -237,10 +343,16 @@ func (s *Store) Search(ctx context.Context, storeID int64, query string, queryVe
 	}
 	table := vecTable(r.Dimensions)
 	vec := pgvector.NewVector(queryVec)
-	var rows pgx.Rows
-	switch opts.Mode {
-	case SearchVector:
-		rows, err = tx.Query(ctx, fmt.Sprintf(`
+	var (
+		rows pgx.Rows
+		sql  string
+		args []any
+	)
+	if opts.Mode == SearchVector {
+		// Vector-only retrieval is identical under every backend: it never
+		// reads a lexical index. The twelfth column is the constant lex
+		// score, so one scan loop serves both modes.
+		sql = fmt.Sprintf(`
 			WITH v AS (
 				SELECT e.chunk_id, e.embedding <=> $1::vector AS distance,
 				       ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
@@ -250,82 +362,37 @@ func (s *Store) Search(ctx context.Context, storeID int64, query string, queryVe
 				LIMIT $3)
 			SELECT v.chunk_id, c.document_id, c.idx, c.content, d.filename,
 			       COALESCE(c.metadata->>'section', ''), COALESCE((c.metadata->>'page')::int, 0),
-			       v.distance, 1.0/(60+v.rank), v.rank, 0
+			       v.distance, 1.0/(%d+v.rank), v.rank, 0, 0::float8
 			FROM v
 			JOIN chunks c ON c.id = v.chunk_id
 			JOIN documents d ON d.id = c.document_id
 			WHERE ($4::float8 = 0 OR v.distance <= $4::float8)
-			ORDER BY v.distance, v.chunk_id`, table), vec, r.ID, opts.Candidates, opts.MaxDistance)
-	case SearchHybrid:
-		// An empty or stop-word-only query yields a tsquery with numnode = 0;
-		// the full-text side is then simply empty instead of an error.
-		rows, err = tx.Query(ctx, fmt.Sprintf(`
-			WITH q AS (SELECT websearch_to_tsquery($5::text::regconfig, $6::text) AS query),
-			v AS (
-				SELECT e.chunk_id, ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
-				FROM %[1]s e
-				WHERE e.rag_store_id = $2
-				ORDER BY e.embedding <=> $1::vector
-				LIMIT $3),
-			f AS (
-				SELECT c.id AS chunk_id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id) AS rank
-				FROM chunks c, q
-				WHERE c.rag_store_id = $2 AND numnode(q.query) > 0 AND c.tsv @@ q.query
-				ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id
-				LIMIT $3),
-			m AS (
-				SELECT COALESCE(v.chunk_id, f.chunk_id) AS chunk_id,
-				       COALESCE(v.rank, 0) AS vrank, COALESCE(f.rank, 0) AS frank,
-				       COALESCE(1.0/(60+v.rank), 0) + COALESCE(1.0/(60+f.rank), 0) AS score
-				FROM v FULL OUTER JOIN f ON v.chunk_id = f.chunk_id)
-			SELECT m.chunk_id, c.document_id, c.idx, c.content, d.filename,
-			       COALESCE(c.metadata->>'section', ''), COALESCE((c.metadata->>'page')::int, 0),
-			       e.embedding <=> $1::vector AS distance, m.score, m.vrank, m.frank
-			FROM m
-			JOIN chunks c ON c.id = m.chunk_id
-			JOIN documents d ON d.id = c.document_id
-			JOIN %[1]s e ON e.chunk_id = m.chunk_id
-			WHERE ($4::float8 = 0 OR (e.embedding <=> $1::vector) <= $4::float8)
-			ORDER BY m.score DESC, distance, m.chunk_id
-			LIMIT $3`, table), vec, r.ID, opts.Candidates, opts.MaxDistance, opts.FTSConfig, ftsQuery(query))
-	default:
-		return nil, fmt.Errorf("unknown search mode %q", opts.Mode)
+			ORDER BY v.distance, v.chunk_id`, table, rrfK)
+		args = []any{vec, r.ID, opts.Candidates, opts.MaxDistance}
+	} else {
+		sql, args = backend.HybridQuery(SearchParams{VecTable: table, Vector: vec, StoreID: r.ID,
+			Candidates: opts.Candidates, MaxDistance: opts.MaxDistance, FTSConfig: opts.FTSConfig, Query: query})
 	}
+	// Query and rows.Err are the two places the server can reject the
+	// statement itself -- pgx reports a plan failure from either, depending
+	// on how far the protocol got -- so both carry errLexicalQuery and
+	// nothing else does.
+	rows, err = tx.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("%s search: %w", opts.Mode, err)
+		return nil, fmt.Errorf("%s search: %w: %w", opts.Mode, errLexicalQuery, err)
 	}
 	defer rows.Close()
 	hits := []SearchHit{}
 	for rows.Next() {
 		var h SearchHit
 		if err := rows.Scan(&h.ChunkID, &h.DocumentID, &h.Index, &h.Content, &h.Filename, &h.Section, &h.Page,
-			&h.Distance, &h.Score, &h.VectorRank, &h.FTSRank); err != nil {
+			&h.Distance, &h.Score, &h.VectorRank, &h.FTSRank, &h.LexScore); err != nil {
 			return nil, err
 		}
 		hits = append(hits, h)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s search: %w: %w", opts.Mode, errLexicalQuery, err)
 	}
 	return hits, tx.Commit(ctx)
-}
-
-// ftsQuery prepares free text for websearch_to_tsquery. That function ANDs
-// all words, which makes natural-language questions ("what is the zyxquux
-// protocol") match only chunks containing every word. Plain queries are
-// therefore OR-ed; ts_rank_cd still ranks chunks matching more terms higher.
-// Queries using websearch syntax (quotes, "or", a leading "-") are passed
-// through unchanged.
-func ftsQuery(q string) string {
-	q = strings.TrimSpace(q)
-	if q == "" || strings.Contains(q, `"`) {
-		return q
-	}
-	words := strings.Fields(q)
-	for _, w := range words {
-		if strings.EqualFold(w, "or") || strings.HasPrefix(w, "-") {
-			return q
-		}
-	}
-	return strings.Join(words, " or ")
 }

@@ -99,6 +99,17 @@ func OpenWith(t *testing.T, cfg store.OpenConfig) *store.Store {
 	return s
 }
 
+// RequirePgSearch skips the test unless the server behind s carries a usable
+// ParadeDB pg_search. CI runs the suite against a plain pgvector image on
+// purpose -- that job is what proves the fallback path -- so everything that
+// needs BM25 is capability-gated rather than assumed.
+func RequirePgSearch(t *testing.T, s *store.Store) {
+	t.Helper()
+	if !s.Caps().PgSearch {
+		t.Skipf("pg_search is not available on this server; start a ParadeDB Postgres (make dev-db-paradedb) to run this test")
+	}
+}
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

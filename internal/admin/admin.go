@@ -27,6 +27,7 @@ import (
 	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/netguard"
+	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -46,6 +47,9 @@ type Admin struct {
 	Limiter *auth.LoginLimiter
 	// Usage reads project rate-limit counters; nil builds one on the Store.
 	Usage *limits.Limiter
+	// Prices is the gateway's cached price table; price mutations
+	// invalidate it so the next request is costed with the new numbers.
+	Prices *pricing.Cache
 	// ProviderConfig builds the provider configuration for a connection the
 	// same way the gateway does (hardened HTTP client, limits); nil falls
 	// back to a bare configuration.
@@ -92,8 +96,9 @@ func (a *Admin) Routes(r chi.Router) {
 	}
 }
 
-// requestIDHeader echoes chi's request id so error responses and logs can
-// be matched; fail reads it back from the header.
+// requestIDHeader returns the id obs.RequestID generated for this request so
+// error responses and logs can be matched; fail reads it back from the
+// header. It is never the client's X-Request-Id: that header is not read.
 func requestIDHeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if id := middleware.GetReqID(r.Context()); id != "" {
@@ -104,59 +109,89 @@ func requestIDHeader(next http.Handler) http.Handler {
 }
 
 // authenticated mounts every route behind the session middleware.
+//
+// A management key's scopes map onto the same three groups as the roles:
+// "read" for the listings, "write" for the editor routes, "admin" for the
+// admin-only ones, and "keys" for /api/keys* so a leaked write key cannot
+// mint more keys. RequireScope only narrows key principals and always runs
+// alongside RequireRole, so a key can never exceed its owner's live role.
 func (a *Admin) authenticated(r chi.Router) {
 	r.Use(a.Auth.Middleware)
-	editor := r.With(auth.RequireRole(auth.RoleEditor))
-	adminOnly := r.With(auth.RequireRole(auth.RoleAdmin))
+	read := r.With(auth.RequireScope(store.ScopeRead))
+	editor := r.With(auth.RequireRole(auth.RoleEditor), auth.RequireScope(store.ScopeWrite))
+	adminOnly := r.With(auth.RequireRole(auth.RoleAdmin), auth.RequireScope(store.ScopeAdmin))
+	keys := r.With(auth.RequireScope(store.ScopeKeys))
 
+	// Identity routes carry no scope: /api/me is how a key holder finds out
+	// what it is, and a logout is a no-op without a session to end.
 	r.Post("/api/logout", a.logout)
 	r.Get("/api/me", a.me)
 	r.Post("/api/me/password", a.changePassword)
 
-	r.Get("/api/provider-types", a.providerTypes)
+	read.Get("/api/provider-types", a.providerTypes)
+	read.Get("/api/search-backends", a.searchBackends)
 
 	// Model connections: viewers may read, editors mutate and test (a
 	// test spends provider quota and is audited as a write).
-	r.Get("/api/models", a.listConnections)
+	read.Get("/api/models", a.listConnections)
 	editor.Post("/api/models", a.createConnection)
-	r.Get("/api/models/{id}", a.getConnection)
+	read.Get("/api/models/{id}", a.getConnection)
 	editor.Put("/api/models/{id}", a.updateConnection)
 	editor.Delete("/api/models/{id}", a.deleteConnection)
 	editor.Post("/api/models/{id}/test", a.testConnection)
 	editor.Post("/api/models/test", a.testUnsavedConnection)
 
 	// RAG stores and documents: same split; search is a read.
-	r.Get("/api/rag-stores", a.listRAGStores)
+	read.Get("/api/rag-stores", a.listRAGStores)
 	editor.Post("/api/rag-stores", a.createRAGStore)
-	r.Get("/api/rag-stores/{id}", a.getRAGStore)
+	read.Get("/api/rag-stores/{id}", a.getRAGStore)
 	editor.Put("/api/rag-stores/{id}", a.updateRAGStore)
 	editor.Delete("/api/rag-stores/{id}", a.deleteRAGStore)
-	r.Get("/api/rag-stores/{id}/documents", a.listDocuments)
+	read.Get("/api/rag-stores/{id}/documents", a.listDocuments)
 	editor.With(httpx.ReadDeadline(uploadReadDeadline)).Post("/api/rag-stores/{id}/documents", a.uploadDocument)
-	r.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
+	read.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
 	editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
-	r.Get("/api/documents/{id}", a.getDocument)
+	read.Get("/api/documents/{id}", a.getDocument)
 	editor.Delete("/api/documents/{id}", a.deleteDocument)
 	editor.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
 
 	// Projects: membership is checked inside the handlers (404 for
 	// non-members); mutation additionally needs the editor role.
-	r.Get("/api/projects", a.listProjects)
+	read.Get("/api/projects", a.listProjects)
 	editor.Post("/api/projects", a.createProject)
-	r.Get("/api/projects/{id}", a.getProject)
+	read.Get("/api/projects/{id}", a.getProject)
 	editor.Put("/api/projects/{id}", a.updateProject)
 	editor.Delete("/api/projects/{id}", a.deleteProject)
 	editor.Post("/api/projects/{id}/rotate-key", a.rotateKey)
-	r.Get("/api/projects/{id}/metrics", a.projectMetrics)
-	r.Get("/api/projects/{id}/metrics.csv", a.projectMetricsCSV)
-	r.Get("/api/projects/{id}/usage", a.projectUsage)
-	r.Get("/api/projects/{id}/members", a.listMembers)
+	read.Get("/api/projects/{id}/metrics", a.projectMetrics)
+	read.Get("/api/projects/{id}/metrics.csv", a.projectMetricsCSV)
+	read.Get("/api/projects/{id}/usage", a.projectUsage)
+	read.Get("/api/projects/{id}/members", a.listMembers)
 	editor.Put("/api/projects/{id}/members", a.setMembers)
 
-	r.Get("/api/metrics/summary", a.metricsSummary)
-	r.Get("/api/metrics/requests", a.recentRequests)
-	r.Get("/api/metrics/requests.csv", a.requestsCSV)
-	r.Get("/api/system", a.systemInfo)
+	// API keys: ownership is checked inside the handlers (404 for someone
+	// else's key). Deleting one is admin-only; everyone else revokes.
+	keys.Get("/api/keys", a.listKeys)
+	keys.Post("/api/keys", a.createKey)
+	keys.Get("/api/keys/{id}", a.getKey)
+	keys.Put("/api/keys/{id}", a.updateKey)
+	keys.Post("/api/keys/{id}/revoke", a.revokeKey)
+	keys.Get("/api/keys/{id}/usage", a.keyUsage)
+	keys.With(auth.RequireRole(auth.RoleAdmin)).Delete("/api/keys/{id}", a.deleteKey)
+
+	// Model prices: viewers read the table that costs their requests,
+	// editors maintain it. A built-in row can be edited or reset but never
+	// deleted, so an upgrade cannot resurrect it.
+	read.Get("/api/prices", a.listPrices)
+	editor.Post("/api/prices", a.createPrice)
+	editor.Put("/api/prices/{id}", a.updatePrice)
+	editor.Delete("/api/prices/{id}", a.deletePrice)
+	editor.Post("/api/prices/{id}/reset", a.resetPrice)
+
+	read.Get("/api/metrics/summary", a.metricsSummary)
+	read.Get("/api/metrics/requests", a.recentRequests)
+	read.Get("/api/metrics/requests.csv", a.requestsCSV)
+	read.Get("/api/system", a.systemInfo)
 
 	// User management and the audit trail are admin-only; the lite user
 	// list lets editors pick project members.
@@ -171,6 +206,19 @@ func (a *Admin) authenticated(r chi.Router) {
 	adminOnly.Get("/api/audit", a.listAudit)
 	adminOnly.Get("/api/audit/export", a.exportAudit)
 	adminOnly.Get("/api/security/logins", a.loginSecurity)
+}
+
+// sessionOnly refuses an api-key principal. It guards the three actions that
+// could take an account over — changing a password, resetting one and minting
+// a management key — so a leaked key cannot lock its owner out or extend its
+// own reach beyond the key that leaked.
+func sessionOnly(w http.ResponseWriter, r *http.Request) bool {
+	if auth.SessionFrom(r.Context()).IsKey() {
+		writeErrCode(w, http.StatusForbidden, "session_required",
+			"this action requires a signed-in dashboard session, not an api key")
+		return false
+	}
+	return true
 }
 
 // ---- helpers ----
@@ -401,22 +449,30 @@ func (a *Admin) auditAs(r *http.Request, actor *store.User, action, targetType s
 
 func ptr(id int64) *int64 { return &id }
 
-// me returns the caller's account plus the session it is using: when it
-// expires and whether it arrived as a bearer token.
+// me returns the caller's account plus the credential it is using: when it
+// expires, whether it arrived as a bearer token, and whether it is a
+// dashboard session or a management key (with that key's scopes).
 func (a *Admin) me(w http.ResponseWriter, r *http.Request) {
 	out := struct {
 		*store.User
-		SessionExpiresAt string `json:"session_expires_at"`
-		SessionBearer    bool   `json:"session_bearer"`
-	}{User: auth.UserFrom(r.Context())}
+		SessionExpiresAt string   `json:"session_expires_at"`
+		SessionBearer    bool     `json:"session_bearer"`
+		SessionKind      string   `json:"session_kind"`
+		Scopes           []string `json:"scopes,omitempty"`
+	}{User: auth.UserFrom(r.Context()), SessionKind: "session"}
 	if se := auth.SessionFrom(r.Context()); se != nil {
-		out.SessionExpiresAt = se.ExpiresAt.UTC().Format(time.RFC3339)
-		out.SessionBearer = se.Bearer
+		if !se.ExpiresAt.IsZero() {
+			out.SessionExpiresAt = se.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		out.SessionBearer, out.SessionKind, out.Scopes = se.Bearer, se.Kind(), se.Scopes
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
+	if !sessionOnly(w, r) {
+		return
+	}
 	var in struct {
 		Current string `json:"current_password"`
 		New     string `json:"new_password"`
@@ -449,8 +505,15 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "password.change", "user", ptr(u.ID), nil)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// ... and so do the management keys, which outlive a session and can act
+	// on the account just as well. Gateway keys are left running.
+	revoked, err := a.Store.RevokeUserManagementKeys(r.Context(), u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.audit(r, "password.change", "user", ptr(u.ID), map[string]any{"revoked_management_keys": revoked})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "revoked_management_keys": revoked})
 }
 
 func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
@@ -460,18 +523,49 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 		DefaultURL string `json:"default_base_url"`
 		Embeddings bool   `json:"supports_embeddings"`
 		NeedsKey   bool   `json:"requires_api_key"`
-		// Tools and Streaming mirror the adapter capabilities: every adapter
-		// streams; Gemini refuses requests with tools.
-		Tools     bool `json:"supports_tools"`
-		Streaming bool `json:"supports_streaming"`
+		// The flat supports_* fields stay for older clients; Capabilities is
+		// the full picture. Both are read from the provider package so this
+		// list cannot drift from what the adapters actually do.
+		Tools        bool                  `json:"supports_tools"`
+		Streaming    bool                  `json:"supports_streaming"`
+		Capabilities provider.Capabilities `json:"capabilities"`
 	}
-	out := []pt{
-		{"openai", "OpenAI", "https://api.openai.com/v1", true, true, true, true},
-		{"anthropic", "Anthropic", "https://api.anthropic.com", false, true, true, true},
-		{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", true, true, false, true},
-		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", false, true, true, true},
-		{"ollama", "Ollama", "http://localhost:11434", true, false, true, true},
-		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", true, false, true, true},
+	types := []struct {
+		typ, label, url string
+		needsKey        bool
+	}{
+		{"openai", "OpenAI", "https://api.openai.com/v1", true},
+		{"anthropic", "Anthropic", "https://api.anthropic.com", true},
+		{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", true},
+		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", true},
+		{"ollama", "Ollama", "http://localhost:11434", false},
+		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", false},
+		{"cohere_rerank", "Cohere Rerank (reranking only)", "https://api.cohere.com", true},
+		{"voyage_rerank", "Voyage Rerank (reranking only)", "https://api.voyageai.com", true},
+	}
+	out := make([]pt, 0, len(types))
+	for _, t := range types {
+		caps := provider.CapabilitiesFor(t.typ)
+		out = append(out, pt{Type: t.typ, Label: t.label, DefaultURL: t.url,
+			Embeddings: caps.Embeddings, NeedsKey: t.needsKey,
+			Tools: caps.Tools, Streaming: caps.Streaming, Capabilities: caps})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// searchBackends reports which lexical search backends this server can run,
+// so the dashboard can disable what a save would reject instead of offering
+// it and failing on submit.
+func (a *Admin) searchBackends(w http.ResponseWriter, r *http.Request) {
+	type backend struct {
+		ID        string `json:"id"`
+		Available bool   `json:"available"`
+		Reason    string `json:"reason"`
+	}
+	out := make([]backend, 0, len(store.SearchBackendNames))
+	for _, id := range store.SearchBackendNames {
+		out = append(out, backend{ID: id, Available: a.Store.SearchBackendAvailable(id),
+			Reason: a.Store.SearchBackendReason(id)})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -770,9 +864,12 @@ type ragInput struct {
 	ChunkOverlap          int      `json:"chunk_overlap"`
 	TopK                  int      `json:"top_k"`
 	SearchMode            string   `json:"search_mode"`
+	SearchBackend         string   `json:"search_backend"`
 	FTSConfig             string   `json:"fts_config"`
 	Rerank                bool     `json:"rerank"`
 	RerankCandidates      int      `json:"rerank_candidates"`
+	RerankBackend         string   `json:"rerank_backend"`
+	RerankConnectionID    *int64   `json:"rerank_connection_id"`
 	MaxDistance           *float64 `json:"max_distance"`
 	// ContextualChunks defaults to true when omitted.
 	ContextualChunks *bool `json:"contextual_chunks"`
@@ -806,6 +903,19 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	if in.SearchMode != store.SearchVector && in.SearchMode != store.SearchHybrid {
 		return errors.New("search_mode must be \"vector\" or \"hybrid\"")
 	}
+	if in.SearchBackend == "" {
+		in.SearchBackend = store.BackendPgvector
+	}
+	if !store.IsValidSearchBackend(in.SearchBackend) {
+		return fmt.Errorf("search_backend must be one of %s", strings.Join(store.SearchBackendNames, ", "))
+	}
+	// Rejected on write, tolerated on read: a store saved here can always
+	// run, while a row that arrived another way (a dump restored onto a
+	// plain PostgreSQL) degrades to pgvector instead of failing searches.
+	if !a.Store.SearchBackendAvailable(in.SearchBackend) {
+		return fmt.Errorf("search_backend %q cannot be used here: %s (see docs/rag.md#search-backends)",
+			in.SearchBackend, a.Store.SearchBackendReason(in.SearchBackend))
+	}
 	in.FTSConfig = strings.ToLower(strings.TrimSpace(in.FTSConfig))
 	if in.FTSConfig == "" {
 		in.FTSConfig = "simple"
@@ -820,6 +930,9 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	}
 	if in.RerankCandidates > 100 {
 		return errors.New("rerank_candidates must be between 1 and 100")
+	}
+	if err := a.validateRerank(r, in); err != nil {
+		return err
 	}
 	if in.MaxDistance == nil {
 		in.MaxDistance = new(float64)
@@ -847,10 +960,43 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	return nil
 }
 
+// validateRerank checks the rerank backend and the connection it needs.
+//
+// The pairing is enforced here rather than by a CHECK constraint: the column
+// is ON DELETE SET NULL so deleting a rerank connection does not cascade
+// into the store, and a CHECK would turn that SET NULL into a foreign-key
+// failure on the operator's DELETE. See migration 0012.
+func (a *Admin) validateRerank(r *http.Request, in *ragInput) error {
+	if in.RerankBackend == "" {
+		in.RerankBackend = store.RerankLLM
+	}
+	if !store.IsValidRerankBackend(in.RerankBackend) {
+		return fmt.Errorf("rerank_backend must be one of %s", strings.Join(store.RerankBackends, ", "))
+	}
+	want := store.RerankConnectionType(in.RerankBackend)
+	if want == "" {
+		in.RerankConnectionID = nil
+		return nil
+	}
+	if in.RerankConnectionID == nil || *in.RerankConnectionID == 0 {
+		return fmt.Errorf("rerank_backend %q needs a rerank_connection_id pointing at a %s connection", in.RerankBackend, want)
+	}
+	conn, err := a.Store.GetConnection(r.Context(), *in.RerankConnectionID)
+	if err != nil {
+		return errors.New("rerank_connection_id does not reference an existing model connection")
+	}
+	if conn.ProviderType != want {
+		return fmt.Errorf("cannot use connection %q for reranking: it is a %s connection", conn.Name, conn.ProviderType)
+	}
+	return nil
+}
+
 func (in *ragInput) toStore(id int64) *store.RAGStore {
 	return &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
 		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK,
-		SearchMode: in.SearchMode, FTSConfig: in.FTSConfig, Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
+		SearchMode: in.SearchMode, SearchBackend: in.SearchBackend, FTSConfig: in.FTSConfig,
+		Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
+		RerankBackend: in.RerankBackend, RerankConnectionID: in.RerankConnectionID,
 		MaxDistance: *in.MaxDistance, ContextualChunks: *in.ContextualChunks,
 		MaxDocuments: in.MaxDocuments, MaxBytes: in.MaxBytes}
 }
@@ -973,6 +1119,11 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	}
 	// Chunking and embedding-text settings only take effect when documents
 	// are processed again; tell the caller when that is worth doing.
+	//
+	// search_backend is deliberately absent: both backends derive the
+	// lexical side from chunks.content, so switching costs an index build
+	// at most, never a re-embed. Listing it here would send operators
+	// through hours of embedding calls for nothing.
 	reprocess := rs.ChunkCount > 0 && (before.ChunkSize != rs.ChunkSize || before.ChunkOverlap != rs.ChunkOverlap ||
 		before.ContextualChunks != rs.ContextualChunks)
 	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess})
@@ -1033,11 +1184,14 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 	}
 	// Overrides let the dashboard try settings before saving them.
 	var in struct {
-		Query       string   `json:"query"`
-		TopK        int      `json:"top_k"`
-		Mode        string   `json:"mode"`
-		Rerank      *bool    `json:"rerank"`
-		MaxDistance *float64 `json:"max_distance"`
+		Query              string   `json:"query"`
+		TopK               int      `json:"top_k"`
+		Mode               string   `json:"mode"`
+		Backend            string   `json:"backend"`
+		Rerank             *bool    `json:"rerank"`
+		RerankBackend      string   `json:"rerank_backend"`
+		RerankConnectionID *int64   `json:"rerank_connection_id"`
+		MaxDistance        *float64 `json:"max_distance"`
 	}
 	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Query) == "" {
 		writeErr(w, http.StatusBadRequest, "query is required")
@@ -1050,8 +1204,32 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		}
 		rs.SearchMode = in.Mode
 	}
+	// The overrides cover every retrieval setting the store carries so two
+	// configurations can be compared on the same query before either is
+	// saved; that comparison is what makes these settings usable at all.
+	if in.Backend != "" {
+		if !store.IsValidSearchBackend(in.Backend) {
+			writeErr(w, http.StatusBadRequest, "backend must be one of "+strings.Join(store.SearchBackendNames, ", "))
+			return
+		}
+		rs.SearchBackend = in.Backend
+	}
 	if in.Rerank != nil {
 		rs.Rerank = *in.Rerank
+	}
+	if in.RerankBackend != "" {
+		if !store.IsValidRerankBackend(in.RerankBackend) {
+			writeErr(w, http.StatusBadRequest, "rerank_backend must be one of "+strings.Join(store.RerankBackends, ", "))
+			return
+		}
+		rs.RerankBackend = in.RerankBackend
+	}
+	if in.RerankConnectionID != nil {
+		if *in.RerankConnectionID == 0 {
+			rs.RerankConnectionID = nil
+		} else {
+			rs.RerankConnectionID = in.RerankConnectionID
+		}
 	}
 	// top_k is clamped to the store's own bounds; 0 means "use the store's
 	// top_k", which validateRAG already keeps within 1..50.
@@ -1068,11 +1246,12 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		}
 		rs.MaxDistance = *in.MaxDistance
 	}
-	// Reranking uses the chat model of a project linked to this store; the
-	// embedding connection cannot chat.
+	// The llm rerank backend uses the chat model of a project linked to this
+	// store; the embedding connection cannot chat. The API backends carry
+	// their own connection and need none of this.
 	var prov provider.Provider
 	model := ""
-	if rs.Rerank {
+	if rs.Rerank && rs.RerankBackend != store.RerankCohere && rs.RerankBackend != store.RerankVoyage {
 		if conn, err := a.rerankConnection(r, rs.ID); err == nil {
 			if p, err := a.Providers(conn); err == nil {
 				prov, model = p, conn.ModelName
@@ -1085,8 +1264,13 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "reranked": res.Reranked,
-		"latency_ms": time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
+	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "backend": res.Backend,
+		// fts_config is echoed because the pg_search backend ignores it: the
+		// index is global and tokenised once, so the setting is inert there.
+		// Returning it makes that visible instead of surprising.
+		"fts_config": rs.FTSConfig, "reranked": res.Reranked, "rerank_backend": res.RerankBackend,
+		"rerank_fallback": res.RerankFallback,
+		"latency_ms":      time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
 		"rerank_latency_ms": res.RerankLatencyMS})
 }
 
@@ -1154,7 +1338,8 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	for _, fh := range files {
 		name := filepath.Base(fh.Filename)
 		if !rag.IsSupported(name) {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported file type for %q (pdf, docx, html, txt, md)", name))
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported file type for %q (supported types are %s)",
+				name, strings.Join(rag.SupportedExtensionList(), ", ")))
 			return
 		}
 		src, err := fh.Open()
@@ -1295,8 +1480,15 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	if strings.TrimSpace(in.Name) == "" {
 		return errors.New("name is required")
 	}
-	if _, err := a.Store.GetConnection(r.Context(), in.ModelConnectionID); err != nil {
+	conn, err := a.Store.GetConnection(r.Context(), in.ModelConnectionID)
+	if err != nil {
 		return errors.New("model_connection_id does not reference an existing model connection")
+	}
+	// Rerank-only connection types exist since 0.4 and cannot chat. Caught
+	// here so the mistake is a 400 when the project is saved rather than a
+	// 502 on the first request that uses it.
+	if !provider.SupportsChat(conn.ProviderType) {
+		return fmt.Errorf("provider %q cannot be used for chat", conn.ProviderType)
 	}
 	if in.RAGStoreID != nil {
 		if *in.RAGStoreID == 0 {
@@ -1653,8 +1845,11 @@ func (a *Admin) requestsCSV(w http.ResponseWriter, r *http.Request) {
 	a.exportCSV(w, r, f, "ragmux-requests")
 }
 
+// csvHeader keeps its original columns in their original order and grows
+// only at the end, so an importer that reads by position keeps working.
 var csvHeader = []string{"created_at", "project_id", "project_name", "model_name", "status_code", "prompt_tokens",
-	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error"}
+	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error",
+	"cached_prompt_tokens", "cache_write_tokens", "cost_usd", "cost_source", "api_key_id", "user_id"}
 
 // exportCSV streams the window's request logs (oldest first, at most
 // store.MaxExportRows) as a CSV download. Errors after the first row can
@@ -1676,11 +1871,25 @@ func (a *Admin) exportCSV(w http.ResponseWriter, r *http.Request, f store.Metric
 	}
 }
 
+// optInt64 renders a nullable id, empty when it is nil.
+func optInt64(v *int64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatInt(*v, 10)
+}
+
 func csvRecord(row *store.RequestExportRow) []string {
 	rec := []string{row.CreatedAt, strconv.FormatInt(row.ProjectID, 10), row.ProjectName, row.ModelName,
 		strconv.Itoa(row.StatusCode), strconv.Itoa(row.PromptTokens), strconv.Itoa(row.CompletionTokens),
 		strconv.FormatBool(row.Estimated), strconv.FormatInt(row.LatencyMs, 10), strconv.FormatBool(row.Streamed),
-		strconv.FormatBool(row.RAGUsed), strconv.Itoa(row.RAGHits), row.Error}
+		strconv.FormatBool(row.RAGUsed), strconv.Itoa(row.RAGHits), row.Error,
+		strconv.Itoa(row.CachedPromptTokens), strconv.Itoa(row.CacheWriteTokens),
+		// Six decimals is the full precision of cost_micros; anything
+		// shorter would round a cheap request to zero.
+		strconv.FormatFloat(row.CostUSD, 'f', 6, 64), row.CostSource,
+		// Empty rather than 0 for a project's default key, which has no owner.
+		optInt64(row.APIKeyID), optInt64(row.UserID)}
 	for i, c := range rec {
 		rec[i] = csvCell(c)
 	}

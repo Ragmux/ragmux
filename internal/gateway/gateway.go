@@ -18,9 +18,12 @@ import (
 
 	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/obs"
+	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/tracing"
 )
 
 // ProviderFactory builds a chat adapter for a model connection.
@@ -36,9 +39,81 @@ type Gateway struct {
 	MaxBodyBytes int64
 	// Limiter enforces per-project rate limits and budgets; nil disables them.
 	Limiter *limits.Limiter
+	// Prices estimates the cost of a completed request; nil records none.
+	Prices *pricing.Cache
+	// Metrics records the gateway counters at the deferred chokepoint of a
+	// finished request; nil records nothing.
+	Metrics *obs.Metrics
+	// Tracer opens the gateway.chat_completion span every downstream span
+	// hangs beneath; nil is a disabled tracer.
+	Tracer *tracing.Tracer
+}
+
+// requestObs collects the facts about one chat completion that the request
+// log does not carry: the provider's error type, which is a bounded label
+// set where the message is not, and the streaming timings. It is filled on
+// the way through and read once at the deferred chokepoint.
+type requestObs struct {
+	// errType is provider.Error.Type; empty when nothing failed.
+	errType string
+	// upstream is the time inside the provider call. For a stream it covers
+	// the whole stream, not just the header phase.
+	upstream time.Duration
+	// ttft is the wait for a stream's first chunk; zero when none arrived.
+	ttft time.Duration
 }
 
 type ctxKey struct{}
+type principalKey struct{}
+
+// principal is the identity behind a /v1 request. A project key resolves to
+// nothing but its project; a user key adds the key row, its owner and the
+// projects it grants. project is nil only when a multi-grant key named no
+// project, which chat refuses and the model listings answer across grants.
+type principal struct {
+	project *store.Project
+	key     *store.APIKey
+	user    *store.User
+	grants  []*store.Project
+}
+
+// subject builds the limit subject: the project tier always applies, the key
+// tier only for user keys.
+func (pr *principal) subject() limits.Subject {
+	s := limits.Subject{Project: pr.project}
+	if pr.key != nil {
+		s.KeyID = &pr.key.ID
+		s.Key = limits.Caps{RPM: pr.key.RateLimitRPM, TPM: pr.key.RateLimitTPM,
+			DailyTokens: pr.key.BudgetDailyTokens, MonthlyTokens: pr.key.BudgetMonthlyTokens}
+	}
+	return s
+}
+
+// imageTenant is the identity the image fetch ceiling shares its slots
+// between. The project is the tenant boundary everywhere else here -- limits,
+// budgets, request logs -- so it is the one that must not be starved by
+// another; a multi-grant key that named no project falls back to the key,
+// which is as far as its identity goes.
+func (pr *principal) imageTenant() string {
+	switch {
+	case pr == nil:
+		return ""
+	case pr.project != nil:
+		return "project:" + strconv.FormatInt(pr.project.ID, 10)
+	case pr.key != nil:
+		return "key:" + strconv.FormatInt(pr.key.ID, 10)
+	}
+	return ""
+}
+
+// attribute stamps the request log with the key and owner that paid for the
+// request; a project's default key leaves both nil.
+func (pr *principal) attribute(rec *store.RequestLog) {
+	if pr == nil || pr.key == nil {
+		return
+	}
+	rec.APIKeyID, rec.UserID = &pr.key.ID, &pr.key.UserID
+}
 
 // statusClientClosed is recorded in the request log when the client
 // disconnected before the completion finished (nginx's 499 convention). It is
@@ -52,18 +127,52 @@ const (
 // body is in memory so streaming responses are never cut short by it.
 const bodyReadDeadline = 60 * time.Second
 
-// Routes mounts /v1 handlers on the router.
+// projectHeader lets a key that grants several projects name the one a
+// request is for, by name or by id.
+const projectHeader = "X-Ragmux-Project"
+
+// projectsHeader lists the valid values of projectHeader when a request left
+// the choice open and the key grants more than one project.
+const projectsHeader = "X-Ragmux-Projects"
+
+// Routes mounts /v1 handlers on the router. Scopes are enforced per route so
+// a key can be issued for model listings without chat, and requireProject
+// only guards chat: the listings answer across every granted project.
 func (g *Gateway) Routes(r chi.Router) {
 	r.Use(g.authenticate)
-	r.Post("/chat/completions", g.chatCompletions)
-	r.Get("/models", g.listModels)
-	r.Get("/models/{id}", g.getModel)
+	r.With(g.requireScope(store.ScopeChat, "chat completions"), g.requireProject).
+		Post("/chat/completions", g.chatCompletions)
+	models := r.With(g.requireScope(store.ScopeModels, "model listings"))
+	models.Get("/models", g.listModels)
+	models.Get("/models/{id}", g.getModel)
 }
 
 func writeError(w http.ResponseWriter, status int, typ, msg string) {
+	writeErrorCode(w, status, typ, "", msg)
+}
+
+// writeErrorCode is writeError with a machine-readable code; an empty code
+// renders as null, which is the shape every pre-0.4 client already sees.
+func writeErrorCode(w http.ResponseWriter, status int, typ, code, msg string) {
+	var c any
+	if code != "" {
+		c = code
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": nil}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": c}})
+}
+
+// invalidKey is the answer to any credential that does not resolve. Unknown
+// keys keep exactly this body, so existing client handling is untouched; a
+// retired key gets a code on top, which only ever reaches someone who
+// already holds the key bytes.
+func invalidKey(w http.ResponseWriter, code, msg string) {
+	if code == "" {
+		writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid project api key")
+		return
+	}
+	writeErrorCode(w, http.StatusUnauthorized, "invalid_api_key", code, msg)
 }
 
 func (g *Gateway) authenticate(next http.Handler) http.Handler {
@@ -74,22 +183,144 @@ func (g *Gateway) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		key := strings.TrimSpace(h[7:])
-		if !strings.HasPrefix(key, "sk-proj-") {
-			writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid project api key")
+		if !strings.HasPrefix(key, store.ProjectKeyPrefix) && !strings.HasPrefix(key, store.GatewayKeyPrefix) {
+			invalidKey(w, "", "")
 			return
 		}
-		p, err := g.Store.GetProjectByKey(r.Context(), key)
+		ctx := r.Context()
+		gk, err := g.Store.ResolveGatewayKey(ctx, key)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid project api key")
+				g.explainMiss(w, r, key)
 				return
 			}
 			g.Log.Error("project lookup", "err", err)
 			writeError(w, http.StatusInternalServerError, "server_error", "project lookup failed")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, p)))
+		pr := &principal{project: gk.Project, key: gk.Key, user: gk.Owner}
+		if pr.key != nil {
+			grants, err := g.Store.ListProjectsByIDs(ctx, pr.key.ProjectIDs)
+			if err != nil {
+				g.Log.Error("key grants", "key", pr.key.ID, "err", err)
+				writeError(w, http.StatusInternalServerError, "server_error", "project lookup failed")
+				return
+			}
+			pr.grants = grants
+			if !g.selectProject(w, r, pr) {
+				return
+			}
+		}
+		ctx = context.WithValue(ctx, principalKey{}, pr)
+		ctx = provider.WithImageTenant(ctx, pr.imageTenant())
+		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, ctxKey{}, pr.project)))
 	})
+}
+
+// explainMiss answers a credential that did not resolve. The extra lookup
+// runs only on a miss, so the hot path stays a single query.
+func (g *Gateway) explainMiss(w http.ResponseWriter, r *http.Request, key string) {
+	if !strings.HasPrefix(key, store.GatewayKeyPrefix) {
+		invalidKey(w, "", "")
+		return
+	}
+	state, err := g.Store.GetAPIKeyState(r.Context(), key)
+	if err != nil {
+		g.Log.Error("api key state", "err", err)
+		invalidKey(w, "", "")
+		return
+	}
+	switch state {
+	case store.KeyStateRevoked:
+		invalidKey(w, "key_revoked", "this api key has been revoked")
+	case store.KeyStateExpired:
+		invalidKey(w, "key_expired", "this api key has expired")
+	case store.KeyStateOwnerInactive:
+		invalidKey(w, "key_owner_inactive", "the account owning this api key is deactivated")
+	default:
+		invalidKey(w, "", "")
+	}
+}
+
+// selectProject resolves which granted project a user key's request is for:
+// the X-Ragmux-Project header (a name, or an id when numeric) wins, then the
+// key's default project, then a single grant. A key that grants several and
+// names none leaves pr.project nil, which only chat refuses.
+//
+// Grants, not project_members, decide here. Membership is a dashboard
+// visibility concept; requiring both would let an admin editing a member
+// list silently break a production key. Membership is checked once, when the
+// grant is created.
+func (g *Gateway) selectProject(w http.ResponseWriter, r *http.Request, pr *principal) bool {
+	want := strings.TrimSpace(r.Header.Get(projectHeader))
+	if want != "" {
+		for _, p := range pr.grants {
+			// A numeric value is an id; the name match stays exact so a
+			// project called "12" is still reachable by name.
+			if p.Name == want || strconv.FormatInt(p.ID, 10) == want {
+				pr.project = p
+				return true
+			}
+		}
+		// One fixed message for "no such project" and "not granted" alike, so
+		// a key holder cannot probe for project names.
+		writeErrorCode(w, http.StatusForbidden, "invalid_request_error", "project_not_granted",
+			"this api key is not authorised for the requested project")
+		return false
+	}
+	if pr.key.DefaultProjectID != nil {
+		for _, p := range pr.grants {
+			if p.ID == *pr.key.DefaultProjectID {
+				pr.project = p
+				return true
+			}
+		}
+	}
+	if len(pr.grants) == 1 {
+		pr.project = pr.grants[0]
+	}
+	return true
+}
+
+// requireProject refuses a request that could not be routed: either the key
+// grants several projects and named none, or its last grant was removed, in
+// which case it fails closed rather than falling back to anything.
+func (g *Gateway) requireProject(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pr := principalFrom(r.Context())
+		if pr != nil && pr.project == nil {
+			if len(pr.grants) == 0 {
+				writeErrorCode(w, http.StatusForbidden, "invalid_request_error", "project_not_granted",
+					"this api key is not authorised for the requested project")
+				return
+			}
+			names := make([]string, len(pr.grants))
+			for i, p := range pr.grants {
+				names[i] = p.Name
+			}
+			w.Header().Set(projectsHeader, strings.Join(names, ","))
+			writeErrorCode(w, http.StatusBadRequest, "invalid_request_error", "project_required",
+				"this api key grants several projects; name one in the "+projectHeader+" header")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireScope enforces one gateway scope. It is a no-op for a project's
+// default key, which has no scopes and is not narrowed by any.
+func (g *Gateway) requireScope(scope, what string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			pr := principalFrom(r.Context())
+			if pr != nil && pr.key != nil && !pr.key.HasScope(scope) {
+				writeErrorCode(w, http.StatusForbidden, "insufficient_scope", "insufficient_scope",
+					"api key is not authorised for "+what)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func projectFrom(ctx context.Context) *store.Project {
@@ -97,29 +328,69 @@ func projectFrom(ctx context.Context) *store.Project {
 	return p
 }
 
+func principalFrom(ctx context.Context) *principal {
+	pr, _ := ctx.Value(principalKey{}).(*principal)
+	return pr
+}
+
 func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
-	p := projectFrom(r.Context())
-	conn, err := g.Store.GetConnection(r.Context(), p.ModelConnectionID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+	models, ok := g.visibleModels(w, r)
+	if !ok {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"object": "list",
-		"data":   []map[string]any{modelObject(conn)},
-	})
+	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
 }
 
 func (g *Gateway) getModel(w http.ResponseWriter, r *http.Request) {
-	p := projectFrom(r.Context())
-	conn, err := g.Store.GetConnection(r.Context(), p.ModelConnectionID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+	models, ok := g.visibleModels(w, r)
+	if !ok {
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(modelObject(conn))
+	// A single-project credential keeps answering for any {id}, the way it
+	// always has; across several grants the id has to name one of them.
+	if len(models) == 1 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(models[0])
+		return
+	}
+	id := chi.URLParam(r, "id")
+	for _, m := range models {
+		if m["id"] == id {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(m)
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "invalid_request_error", "no such model")
+}
+
+// visibleModels lists the models the credential can reach: the selected
+// project's connection, or — for a key that grants several and named none —
+// one entry per granted project's connection, deduplicated by model name.
+func (g *Gateway) visibleModels(w http.ResponseWriter, r *http.Request) ([]map[string]any, bool) {
+	ctx := r.Context()
+	projects := []*store.Project{}
+	if p := projectFrom(ctx); p != nil {
+		projects = append(projects, p)
+	} else if pr := principalFrom(ctx); pr != nil {
+		projects = pr.grants
+	}
+	out := []map[string]any{}
+	seen := map[string]bool{}
+	for _, p := range projects {
+		conn, err := g.Store.GetConnection(ctx, p.ModelConnectionID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+			return nil, false
+		}
+		if seen[conn.ModelName] {
+			continue
+		}
+		seen[conn.ModelName] = true
+		out = append(out, modelObject(conn))
+	}
+	return out, true
 }
 
 func modelObject(conn *store.ModelConnection) map[string]any {
@@ -132,9 +403,16 @@ func modelObject(conn *store.ModelConnection) map[string]any {
 
 func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ctx := r.Context()
+	// Every span below -- rag.retrieve, rag.embed_query, rag.rerank and the
+	// provider client spans -- hangs beneath this one, so the traced context
+	// replaces the request's.
+	ctx, span := g.Tracer.Start(r.Context(), "gateway.chat_completion", tracing.KindInternal)
+	defer span.End()
+	r = r.WithContext(ctx)
 	p := projectFrom(ctx)
 	log := g.Log.With("project", p.ID)
+	projectID := strconv.FormatInt(p.ID, 10)
+	obsv := &requestObs{}
 
 	max := g.MaxBodyBytes
 	if max <= 0 {
@@ -179,19 +457,29 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Limits are checked before RAG retrieval so throttled clients do not
 	// cost an embedding call. The token estimate covers the client's
 	// messages and the project prompt; retrieved context is not included.
+	pr := principalFrom(ctx)
+	subject := limits.Subject{Project: p}
+	if pr != nil {
+		subject = pr.subject()
+	}
 	var decision limits.Decision
 	if g.Limiter != nil {
 		est := (len(p.SystemPrompt) + messageChars(req.Messages) + 3) / 4
-		decision, err = g.Limiter.Check(ctx, p, est)
+		decision, err = g.Limiter.CheckSubject(ctx, subject, est)
 		if err != nil {
 			log.Error("limit check", "err", err)
 			writeError(w, http.StatusInternalServerError, "server_error", "limit check failed")
 			return
 		}
-		setLimitHeaders(w.Header(), p, decision)
+		setLimitHeaders(w.Header(), decision)
 		if !decision.Allowed {
+			// Reason is one of the limits.Reason* constants, a closed set.
+			g.Metrics.RecordLimitDenied(projectID, decision.Reason)
+			// Nothing was sent upstream, so the row costs nothing.
 			rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, Streamed: req.Stream,
-				StatusCode: http.StatusTooManyRequests, Error: decision.Reason, LatencyMs: time.Since(start).Milliseconds()}
+				StatusCode: http.StatusTooManyRequests, Error: decision.Reason, CostSource: store.CostSourceNone,
+				LatencyMs: time.Since(start).Milliseconds()}
+			pr.attribute(rec)
 			if err := g.Store.InsertRequestLog(ctx, rec); err != nil {
 				log.Error("write request log", "err", err)
 			}
@@ -201,6 +489,12 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Project-level system prompt, if configured, goes first.
+	//
+	// The prompt injected here and the RAG context block injected below are
+	// the stable prefix most worth an Anthropic cache breakpoint, but the
+	// gateway does not mark one: a project-level cache_prompt flag needs a
+	// column, a migration and dashboard work of its own. Clients that mark
+	// their own content parts are relayed unchanged in the meantime.
 	if p.SystemPrompt != "" {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
@@ -238,27 +532,64 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, RAGUsed: ragUsed, RAGHits: ragHits, Streamed: req.Stream}
+	pr.attribute(rec)
 	promptChars := messageChars(req.Messages)
 	defer func() {
 		rec.LatencyMs = time.Since(start).Milliseconds()
+		// This is the one place the success, error, mid-stream-failure and
+		// 499 paths all pass with final token counts, so cost is priced
+		// here rather than in fillUsage, which stays a pure function.
+		g.priceRequest(conn, rec)
 		if err := g.Store.InsertRequestLog(context.Background(), rec); err != nil {
 			log.Error("write request log", "err", err)
 		}
 		if g.Limiter != nil {
 			// The minute request slot was already reserved by Check when an
 			// RPM limit is set; otherwise count the request here.
-			if err := g.Limiter.Record(context.Background(), p.ID, rec.PromptTokens, rec.CompletionTokens, !decision.Reserved); err != nil {
+			if err := g.Limiter.RecordSubject(context.Background(), subject, rec.PromptTokens, rec.CompletionTokens, !decision.Reserved); err != nil {
 				log.Error("record usage", "err", err)
+			}
+		}
+		if pr != nil && pr.key != nil {
+			// At most one write per key per minute; the statement itself
+			// throttles, so a busy key does not rewrite its row per request.
+			if err := g.Store.TouchAPIKeyUsed(context.Background(), pr.key.ID); err != nil {
+				log.Error("touch api key", "key", pr.key.ID, "err", err)
+			}
+		}
+		// The model label is conn.ModelName, never the model string the
+		// client sent: that value is attacker-controlled and would make the
+		// label unbounded. The project label is the numeric id.
+		g.Metrics.RecordGateway(obs.GatewayRequest{
+			Project: projectID, Model: conn.ModelName, Provider: conn.ProviderType,
+			Status: rec.StatusCode, Streamed: rec.Streamed,
+			Duration: time.Since(start), Upstream: obsv.upstream, TimeToFirstToken: obsv.ttft,
+			PromptTokens: rec.PromptTokens, CompletionTokens: rec.CompletionTokens,
+			Estimated: rec.Estimated, CostUSD: rec.CostUSD, ErrorType: obsv.errType,
+			ClientDisconnected: rec.StatusCode == statusClientClosed,
+		})
+		if span.IsRecording() {
+			span.SetAttributes(
+				tracing.Int64("ragmux.project.id", p.ID),
+				tracing.String("gen_ai.request.model", conn.ModelName),
+				tracing.Bool("ragmux.stream", rec.Streamed),
+				tracing.Int("gen_ai.usage.input_tokens", rec.PromptTokens),
+				tracing.Int("gen_ai.usage.output_tokens", rec.CompletionTokens),
+			)
+			if rec.StatusCode < 500 {
+				span.SetStatusOK()
 			}
 		}
 	}()
 
 	if req.Stream {
-		g.stream(w, r, prov, req, rec, promptChars)
+		g.stream(w, r, prov, conn, req, rec, obsv, promptChars)
 		return
 	}
 
+	upstreamStart := time.Now()
 	resp, err := prov.Chat(ctx, req)
+	obsv.upstream = time.Since(upstreamStart)
 	if err != nil {
 		if ctx.Err() != nil {
 			// The client went away while the upstream call was running; the
@@ -267,9 +598,12 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		status, pe := providerError(err)
-		rec.StatusCode, rec.Error = status, pe.Message
+		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		log.Warn("upstream error", "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
+		if pe.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
+		}
 		w.WriteHeader(status)
 		_, _ = w.Write(pe.ErrorJSON())
 		return
@@ -386,7 +720,8 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 	return append(b, '\n'), nil
 }
 
-func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, req provider.ChatRequest, rec *store.RequestLog, promptChars int) {
+func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, conn *store.ModelConnection,
+	req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by server")
@@ -394,6 +729,13 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+
+	// The chunk counter is resolved once, here: the registry's With costs an
+	// allocation, and a per-chunk lookup in a streaming handler is exactly
+	// the mistake its allocation note exists to prevent.
+	sm := g.Metrics.StreamStarted(conn.ProviderType)
+	defer sm.Ended()
+	upstreamStart := time.Now()
 
 	out := make(chan provider.StreamChunk, 16)
 	errc := make(chan error, 1)
@@ -426,10 +768,22 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		w.WriteHeader(http.StatusOK)
 	}
 
+	// Every adapter emits a usage-only trailer, and the OpenAI-compatible
+	// one always asks its upstream for one, because the token counts are
+	// what the request log, the budgets and the cost are built from. The
+	// client only sees that trailer when it asked for it: OpenAI sends none
+	// without stream_options.include_usage, and a chunk with an empty
+	// choices array is exactly what breaks a client indexing choices[0].
+	wantUsage := req.IncludeUsage()
+
 	var usage *provider.Usage
 	compChars := 0
 	clientGone := false
 	for chunk := range out {
+		sm.Chunk()
+		if obsv.ttft == 0 {
+			obsv.ttft = time.Since(upstreamStart)
+		}
 		if clientGone {
 			continue // drain until the provider notices the cancellation
 		}
@@ -437,6 +791,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		chunk.Model = req.Model
 		if chunk.Usage != nil {
 			usage = chunk.Usage
+			if !wantUsage {
+				chunk.Usage = nil
+				if len(chunk.Choices) == 0 {
+					continue // a trailer the client never asked for
+				}
+			}
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != nil {
@@ -454,6 +814,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		flusher.Flush()
 	}
 	err := <-errc
+	obsv.upstream = time.Since(upstreamStart)
 	if clientGone || r.Context().Err() != nil {
 		// The client disconnected before the completion finished. cancel()
 		// (deferred, or called above) has already torn down the upstream
@@ -464,9 +825,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	}
 	if err != nil && !headersSent {
 		status, pe := providerError(err)
-		rec.StatusCode, rec.Error = status, pe.Message
+		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
+		if pe.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
+		}
 		w.WriteHeader(status)
 		_, _ = w.Write(pe.ErrorJSON())
 		return
@@ -475,7 +839,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	if err != nil {
 		// Mid-stream failure: surface it as an SSE error event then end.
 		_, pe := providerError(err)
-		rec.StatusCode, rec.Error = http.StatusBadGateway, pe.Message
+		rec.StatusCode, rec.Error, obsv.errType = http.StatusBadGateway, pe.Message, pe.Type
 		g.Log.Warn("upstream stream failed", "project", rec.ProjectID, "msg", pe.Message)
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", pe.ErrorJSON())
 	} else {
@@ -496,17 +860,18 @@ func messageChars(msgs []provider.Message) int {
 
 // setLimitHeaders exposes the request budget the way OpenAI does (reset as
 // integer seconds) plus Ragmux-specific remaining token budgets. Only limits
-// that are configured produce headers.
-func setLimitHeaders(h http.Header, p *store.Project, d limits.Decision) {
-	if p.RateLimitRPM > 0 {
+// that are configured produce headers; the Decision already carries whichever
+// of the project and key tiers has less headroom.
+func setLimitHeaders(h http.Header, d limits.Decision) {
+	if d.LimitRequests > 0 {
 		h.Set("x-ratelimit-limit-requests", strconv.Itoa(d.LimitRequests))
 		h.Set("x-ratelimit-remaining-requests", strconv.Itoa(d.RemainingRequests))
 		h.Set("x-ratelimit-reset-requests", strconv.Itoa(ceilSeconds(d.ResetRequests)))
 	}
-	if p.BudgetDailyTokens > 0 {
+	if d.DailyLimit > 0 {
 		h.Set("x-ragmux-budget-daily-remaining", strconv.FormatInt(max(d.DailyLimit-d.DailyUsed, 0), 10))
 	}
-	if p.BudgetMonthlyTokens > 0 {
+	if d.MonthlyLimit > 0 {
 		h.Set("x-ragmux-budget-monthly-remaining", strconv.FormatInt(max(d.MonthlyLimit-d.MonthlyUsed, 0), 10))
 	}
 }
@@ -515,14 +880,20 @@ func ceilSeconds(d time.Duration) int {
 	return int((d + time.Second - 1) / time.Second)
 }
 
-// writeLimitError answers a denied request with an OpenAI-style 429.
+// writeLimitError answers a denied request with an OpenAI-style 429. "scope"
+// says which tier denied; the wording stays "for this project" so existing
+// messages are unchanged for the tier that always existed.
 func writeLimitError(w http.ResponseWriter, d limits.Decision) {
+	subject := "this project"
+	if d.Scope == limits.ScopeKey {
+		subject = "this api key"
+	}
 	typ, msg := "rate_limit_exceeded", ""
 	switch d.Reason {
 	case limits.ReasonRPM:
-		msg = fmt.Sprintf("Rate limit reached: %d requests per minute for this project.", d.LimitRequests)
+		msg = fmt.Sprintf("Rate limit reached: %d requests per minute for %s.", d.LimitRequests, subject)
 	case limits.ReasonTPM:
-		msg = "Rate limit reached: tokens per minute for this project."
+		msg = "Rate limit reached: tokens per minute for " + subject + "."
 	case limits.ReasonBudgetDaily:
 		typ = "insufficient_quota"
 		msg = fmt.Sprintf("Daily token budget exhausted (%d of %d tokens used).", d.DailyUsed, d.DailyLimit)
@@ -530,14 +901,15 @@ func writeLimitError(w http.ResponseWriter, d limits.Decision) {
 		typ = "insufficient_quota"
 		msg = fmt.Sprintf("Monthly token budget exhausted (%d of %d tokens used).", d.MonthlyUsed, d.MonthlyLimit)
 	default:
-		msg = "Rate limit reached for this project."
+		msg = "Rate limit reached for " + subject + "."
 	}
 	retry := ceilSeconds(d.RetryAfter)
 	msg += fmt.Sprintf(" Retry after %d seconds.", retry)
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusTooManyRequests)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": typ, "code": d.Reason}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"message": msg, "type": typ, "code": d.Reason, "scope": d.Scope}})
 }
 
 func providerError(err error) (int, *provider.Error) {
@@ -554,14 +926,81 @@ func providerError(err error) (int, *provider.Error) {
 	return http.StatusBadGateway, &provider.Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: provider.Redact(err.Error())}
 }
 
+// priceRequest fills the cost fields of a finished request from the price
+// table. A model nobody priced, or a table that cannot be read, leaves the
+// cost at zero with cost_source "none" — a missing price is reported as
+// missing, never guessed.
+func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLog) {
+	rec.CostSource = store.CostSourceNone
+	if g.Prices == nil || conn == nil {
+		return
+	}
+	// The request context may already be cancelled (a client disconnect is
+	// exactly when this runs), and the cache usually answers without the
+	// database anyway, so the lookup gets a background context.
+	p, ok := g.Prices.Lookup(context.Background(), conn.ProviderType, conn.ModelName)
+	if !ok {
+		return
+	}
+	rec.CostMicros = p.CostMicros(rec.PromptTokens, rec.CachedPromptTokens, rec.CacheWriteTokens, rec.CompletionTokens)
+	rec.CostSource = p.Source
+	// The row stores micros (exact in BIGINT); CostUSD is the same figure in
+	// dollars, which is what the cost counter adds up.
+	rec.CostUSD = float64(rec.CostMicros) / 1e6
+}
+
+// fillUsage copies the upstream's token counts onto the log row, falling
+// back to a character estimate when it reported none. It is the one place
+// tokens enter request_logs, so it is also where a broken or hostile
+// upstream is stopped: a negative count never reaches the cost, the budget
+// counters or the metrics, where it would subtract from spend that really
+// happened.
+//
+// A negative count is replaced half by half rather than zeroed. A request
+// that produced text and came back with completion_tokens: -78 really did
+// spend output tokens, and logging it as 0 would under-charge the budget
+// and leave the row looking exact; the character estimate is the same
+// answer as for an upstream that reported nothing, and rec.Estimated says
+// so on every surface that shows the row.
 func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {
+	promptEstimate := (nonNegative(promptChars) + 3) / 4
+	compEstimate := (nonNegative(compChars) + 3) / 4
 	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
 		rec.PromptTokens, rec.CompletionTokens = u.PromptTokens, u.CompletionTokens
+		rec.CachedPromptTokens, rec.CacheWriteTokens = u.CachedTokens(), u.CacheWriteTokens()
+		if rec.PromptTokens < 0 {
+			rec.PromptTokens, rec.Estimated = promptEstimate, true
+		}
+		if rec.CompletionTokens < 0 {
+			rec.CompletionTokens, rec.Estimated = compEstimate, true
+		}
+		// The cache split has no characters to estimate from, so an unusable
+		// one drops to zero. It does not set Estimated: that flag renders as
+		// "~" beside the prompt and completion counts and says those two are
+		// guesses, which would be a lie about numbers the upstream reported
+		// exactly. The row also shows no cache pill, which is the honest
+		// reading of a split that arrived unusable.
+		//
+		// Zero is a defined reading, not a conservative one. CostMicros bills
+		// prompt - cached - written at the input rate, so zeroing moves those
+		// tokens into that share: the estimate lands low wherever cache_write
+		// is dearer than input, which is every Anthropic row in prices.json,
+		// and high wherever cache_read is cheaper, which is every row that
+		// sets one. Either way it stays what cost_micros always is, an
+		// estimate rather than a bill; what it must not be is negative.
+		rec.CachedPromptTokens = nonNegative(rec.CachedPromptTokens)
+		rec.CacheWriteTokens = nonNegative(rec.CacheWriteTokens)
 		return
 	}
 	rec.Estimated = true
-	rec.PromptTokens = (promptChars + 3) / 4
-	rec.CompletionTokens = (compChars + 3) / 4
+	rec.PromptTokens, rec.CompletionTokens = promptEstimate, compEstimate
+}
+
+func nonNegative(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func completionChars(resp *provider.ChatResponse) int {

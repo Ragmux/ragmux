@@ -32,7 +32,7 @@ func TestHybridSearchFusesVectorAndFullText(t *testing.T) {
 		{Index: 1, Content: "bananas are yellow", Embedding: []float32{0.7, 0.7, 0, 0}},
 		{Index: 2, Content: "the zyxquux protocol is obscure", Embedding: []float32{0, 0, 0, 1}},
 	}
-	if err := s.ReplaceDocumentChunks(ctx, doc, chunks); err != nil {
+	if err := s.ReplaceDocumentChunks(ctx, doc, chunks, ""); err != nil {
 		t.Fatalf("replace chunks: %v", err)
 	}
 	q := []float32{1, 0, 0, 0}
