@@ -36,6 +36,12 @@ type Settings struct {
 	MaxAttempts int
 	// MaxPending is the cluster-wide backlog ceiling Enqueue enforces.
 	MaxPending int
+	// MaxChunksPerDocument fails a document that splits into more chunks
+	// than this before anything is embedded; 0 means DefaultMaxChunks.
+	MaxChunksPerDocument int
+	// EmbedBatchSize is how many chunks go to the embedder in one call;
+	// 0 means defaultEmbedBatch.
+	EmbedBatchSize int
 	// Metrics counts claims, jobs and chunks; nil records nothing.
 	Metrics *obs.Metrics
 	// Tracer opens the ingest.document span; nil is a disabled tracer.
@@ -77,18 +83,22 @@ type Ingester struct {
 	backlogMu sync.Mutex
 	backlogAt time.Time
 	backlogN  int
-	// MaxChunksPerDocument fails a document that splits into more chunks
-	// than this before anything is embedded; 0 means DefaultMaxChunks.
-	MaxChunksPerDocument int
-	// metrics and tracer come in through Settings rather than as exported
-	// fields: the dispatcher polls from the moment NewIngester returns, so
-	// anything assigned afterwards would be a data race with it.
-	metrics *obs.Metrics
-	tracer  *tracing.Tracer
+	// maxChunks, metrics and tracer all come in through Settings rather
+	// than as exported fields: the dispatcher polls from the moment
+	// NewIngester returns, so anything assigned afterwards would be a data
+	// race with the worker that is already reading it.
+	maxChunks int
+	metrics   *obs.Metrics
+	tracer    *tracing.Tracer
 }
 
-// DefaultMaxChunks is the chunk cap used when MaxChunksPerDocument is 0.
+// DefaultMaxChunks is the chunk cap used when Settings.MaxChunksPerDocument
+// is 0.
 const DefaultMaxChunks = 20000
+
+// defaultEmbedBatch is how many chunks go to the embedder in one call when
+// Settings.EmbedBatchSize is 0.
+const defaultEmbedBatch = 32
 
 // processTimeout bounds one document's parse, embed and store cycle.
 const processTimeout = 15 * time.Minute
@@ -139,8 +149,10 @@ func NewIngester(ctx context.Context, st *store.Store, factory EmbedderFactory, 
 		lease: or(s.Lease, DefaultLease), poll: or(s.PollInterval, DefaultPollInterval),
 		maxAttempts: orInt(s.MaxAttempts, DefaultMaxAttempts), maxPending: orInt(s.MaxPending, DefaultMaxPending),
 		workers: workers, jobs: make(chan *store.Document), notify: make(chan struct{}, 1),
-		cancel: cancel, stopping: make(chan struct{}), batchSize: 32,
-		metrics: s.Metrics, tracer: s.Tracer,
+		cancel: cancel, stopping: make(chan struct{}),
+		batchSize: orInt(s.EmbedBatchSize, defaultEmbedBatch),
+		maxChunks: orInt(s.MaxChunksPerDocument, DefaultMaxChunks),
+		metrics:   s.Metrics, tracer: s.Tracer,
 	}
 	for i := 0; i < workers; i++ {
 		ing.wg.Add(1)
@@ -369,18 +381,6 @@ func (ing *Ingester) runJob(ctx context.Context, doc *store.Document) {
 	}
 }
 
-// Process claims one named document for this ingester and runs the full
-// pipeline synchronously. It is the on-demand path; the queue goes through
-// the dispatcher.
-func (ing *Ingester) Process(ctx context.Context, docID int64) error {
-	doc, err := ing.store.ClaimDocumentByID(ctx, docID, ing.owner, ing.lease, ing.maxAttempts)
-	if err != nil {
-		return err
-	}
-	_, err = ing.process(ctx, doc)
-	return err
-}
-
 // process runs the pipeline for a document this ingester holds the lease
 // on, renewing that lease while it works. It is bounded by processTimeout.
 //
@@ -495,10 +495,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 	}
 	// The cap bounds the memory held by the chunk slice and the single
 	// ReplaceDocumentChunks write below, and the embedding calls it takes.
-	maxChunks := ing.MaxChunksPerDocument
-	if maxChunks <= 0 {
-		maxChunks = DefaultMaxChunks
-	}
+	maxChunks := ing.maxChunks
 	if len(pieces) > maxChunks {
 		return 0, fmt.Errorf("document splits into %d chunks, more than the limit of %d (MAX_CHUNKS_PER_DOCUMENT); raise the store's chunk_size or the limit", len(pieces), maxChunks)
 	}

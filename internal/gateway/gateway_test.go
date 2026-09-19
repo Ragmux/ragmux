@@ -206,10 +206,27 @@ func (e *env) attachRAG() {
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) {
 		return provider.NewEmbedder(provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.ModelName})
 	}
-	ing := rag.NewIngester(ctx, e.st, embedders, 1, e.gw.Log)
+	ing := rag.NewIngester(ctx, e.st, embedders, 1, e.gw.Log,
+		rag.Settings{PollInterval: 20 * time.Millisecond})
 	defer ing.Stop()
-	if err := ing.Process(ctx, doc.ID); err != nil {
+	// Ingestion is the dispatcher's job; there is no synchronous path, so
+	// the fixture queues the document and waits for the row to say ready.
+	if err := ing.Enqueue(doc.ID); err != nil {
 		e.t.Fatal(err)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		d, err := e.st.GetDocument(ctx, doc.ID)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if d.Status == store.DocReady {
+			break
+		}
+		if d.Status == store.DocFailed || time.Now().After(deadline) {
+			e.t.Fatalf("fixture document is %q: %s", d.Status, d.Error)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	e.proj.RAGStoreID = &rs.ID
 	if _, err := e.st.UpdateProject(ctx, e.proj); err != nil {

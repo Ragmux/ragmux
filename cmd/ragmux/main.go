@@ -232,8 +232,8 @@ func run(cfg config.Config) error {
 	ingester := rag.NewIngester(bgCtx, st, embedders, cfg.IngestWorkers, log, rag.Settings{
 		Lease: cfg.IngestLease, PollInterval: cfg.IngestPollInterval,
 		MaxAttempts: cfg.IngestMaxAttempts, MaxPending: cfg.MaxPendingDocuments,
-		Metrics: met, Tracer: tracer})
-	ingester.MaxChunksPerDocument = cfg.MaxChunksPerDocument
+		MaxChunksPerDocument: cfg.MaxChunksPerDocument,
+		Metrics:              met, Tracer: tracer})
 	defer ingester.Stop()
 	// Nothing to resume: the dispatcher's first poll claims every pending
 	// document and every processing one whose lease expired, here and on
