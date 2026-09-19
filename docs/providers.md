@@ -274,8 +274,12 @@ any keyword not listed above. The dropped names are logged once per tool at `deb
 `provider=gemini`.
 
 `$ref` inlining is depth-capped at 8 and cycle-aware; a recursive or unresolvable
-reference becomes `{"type":"string","description":"(recursive schema elided)"}`. A node
-that is not an object, or one nothing survived in, becomes `{"type":"object"}`, and a declaration whose sanitised
+reference becomes `{"type":"string","description":"(recursive schema elided)"}` for a
+cycle and `"(unresolved schema reference elided)"` for a definition this document does not
+contain, which since references are matched on their full pointer is every external one. A
+node that is not an object, or one nothing survived in, becomes `{"type":"object"}`, a node
+that carried no `type` takes the one its surviving keywords imply (an `anyOf` node stays
+untyped, because its branches carry the types), and a declaration whose sanitised
 schema has no properties left is sent **without** `parameters` — several model versions
 reject `{"type":"object","properties":{}}`. Sanitising never fails; anything Gemini still
 objects to comes back relayed verbatim.
@@ -351,15 +355,29 @@ An inline `data:` URL is held to the same whitelist a downloaded image is, and r
 with the gateway's own `400` when it does not meet it — before anything is sent upstream:
 
 - the URL must carry `;base64`, so `data:image/png,%89PNG…` is refused rather than
-  forwarded as if it were encoded;
-- the media type must be `image/png`, `image/jpeg`, `image/gif` or `image/webp`, so
+  forwarded as if it were encoded (the `data:` scheme itself is matched case-insensitively);
+- the media type must be one **this** provider accepts (see the table below), so
   `data:text/html;base64,…` no longer travels as an image;
-- the payload must decode as standard base64.
+- the payload must decode as standard base64, **padding included**, and must not be
+  empty — an empty one used to vanish silently, leaving the client a `200` for a message
+  the model never saw an image in.
 
 These used to pass through untouched and came back as a provider `400` that named nothing
 the caller could act on. The check belongs to the translating adapters (`gemini`,
 `ollama`, `anthropic`); the OpenAI-compatible types relay the request body verbatim by
 design, so there the upstream is still the one that reads the part.
+
+The accepted formats are the ones each upstream documents, and they are not the same set:
+
+| Provider | Accepted image media types |
+|---|---|
+| `gemini` | `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif` |
+| `anthropic` | `image/png`, `image/jpeg`, `image/gif`, `image/webp` |
+| `ollama` | `image/png`, `image/jpeg`, `image/gif`, `image/webp` |
+
+One shared list would be wrong in both directions — it would refuse the HEIC Gemini takes
+and promise Anthropic a format its API rejects — so each connection is held to its own,
+inline and downloaded alike.
 
 The gateway's own fetch (`IMAGE_FETCH`, on by default) goes out over the same hardened
 transport as provider calls but under a **stricter** policy: an image URL that resolves to
@@ -374,8 +392,9 @@ inherit that exemption would turn every allowlisted deployment into a way for a 
 to probe the internal network. On top of that:
 
 - `GET` only, with `Accept: image/*`, and only `http`/`https` URLs.
-- The response's own `Content-Type` decides — `image/png`, `image/jpeg`, `image/gif` or
-  `image/webp`. The URL's extension is never consulted.
+- The response's own `Content-Type` decides, against the same per-provider list an inline
+  image is held to. The URL's extension is never consulted. The cache is keyed on the URL
+  alone, so a hit is re-checked against the asking provider's list rather than trusted.
 - `IMAGE_FETCH_MAX_MB` is enforced on `Content-Length` and again while reading, so a
   response that declares nothing (or lies) cannot exceed it.
 - Images are fetched one at a time, at most `IMAGE_FETCH_MAX_PER_REQUEST` per chat
@@ -383,9 +402,18 @@ to probe the internal network. On top of that:
 - Across requests, `IMAGE_FETCH_MAX_CONCURRENT` caps the fetches the whole process runs
   at once and the connections it will hold to one host. A per-request limit bounds one
   request and nothing at all when many arrive together, which is what would make the
-  gateway a useful amplifier for a target an API key chose. A fetch that cannot get a
-  slot within `IMAGE_FETCH_TIMEOUT` is answered `503` rather than `400`: that one is the
-  gateway running out, not the client getting anything wrong.
+  gateway a useful amplifier for a target an API key chose. **No single project may hold
+  more than half those slots**: capping the process alone closed the outward problem and
+  opened an inward one, where a few requests aimed at a slow image host filled every slot
+  and an unrelated project waited out its whole timeout.
+- A fetch that cannot get a slot within two seconds is answered `429` with `Retry-After`
+  and `code: "image_fetch_saturated"` — the gateway ran out, which is a resource limit
+  rather than the client getting anything wrong and rather than a fault. It is
+  deliberately not a `5xx`: the official SDKs retry those automatically with backoff, so
+  every client would spend its retries queueing again while the ceiling is still full.
+  The queue wait is its own budget, separate from `IMAGE_FETCH_TIMEOUT`, which starts
+  once a slot is in hand — otherwise the same saturation came back sometimes as a `429`
+  and sometimes as a download timeout blaming the image host.
 
 Anything the client got wrong — a bad scheme, a non-image response, an oversized image,
 a non-2xx from the image host, too many images — is a `400 invalid_request_error` naming

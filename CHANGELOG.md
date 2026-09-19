@@ -6,6 +6,19 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`IMAGE_FETCH_MAX_CONCURRENT`** (default `16`): image fetches the process runs at once,
+  and the image transport's per-host connection ceiling.
+  `IMAGE_FETCH_MAX_PER_REQUEST` bounds one request and nothing across them, so without
+  this a key holder could aim the gateway's own address at a host of their choosing. No
+  single project or key may hold more than half the slots, so one tenant pointed at a slow
+  image host cannot starve the rest.
+- **`IMAGE_CACHE_MAX_MB`**: byte ceiling for the fetched-image cache. Unset, it follows
+  `IMAGE_FETCH_MAX_MB` — 64 MiB, or enough for two images of the largest size accepted,
+  capped at 256 MiB. A value too small to hold one encoded image is refused at startup,
+  and a derived ceiling that ends up below one is warned about, because such a cache
+  silently stores nothing.
+
 ### Changed
 - **The request id is generated, never taken from `X-Request-Id`.** Ragmux previously used
   chi's `middleware.RequestID`, which starts from the client's `X-Request-Id` header and
@@ -65,6 +78,29 @@ All notable changes to Ragmux are documented here. The format follows
   `true`, `false` or nothing will fail to start until the value is corrected — the error
   names the variable and the two values it accepts. Metrics were already off in every such
   installation, so fixing the value is a no-op unless `true` was what was meant.
+- **Inline `data:` images are validated** before anything is sent upstream, for the
+  `gemini`, `anthropic` and `ollama` connections. The URL must carry `;base64`, its media
+  type must be one the connection's upstream accepts, and the payload must decode as
+  standard base64 (padding included) and not be empty. Each failure is the gateway's own
+  `400` naming what is wrong; these used to travel to the provider and come back as an
+  upstream `400` that named nothing. The OpenAI-compatible types relay the body verbatim,
+  as before, so their images are still read by the upstream.
+- **Image media types are per connection.** `gemini` accepts png, jpeg, webp, **heic** and
+  **heif**; `anthropic` and `ollama` accept png, jpeg, gif and webp. One shared list was
+  wrong in both directions.
+- **A saturated image fetch queue answers `429`** with `Retry-After` and
+  `code: "image_fetch_saturated"`, rather than holding the request for the whole fetch
+  timeout. Queueing now has its own budget, so a wait is never charged to the image host
+  as a download timeout.
+- **A redirect that drops from `https` to `http` is refused**, on the same host as well as
+  across hosts: same host is not the same connection, and the retry would put the
+  `Authorization` header on the wire in the clear.
+- **Gemini tool schemas are validated, not just filtered.** A keyword is kept only with
+  the type Gemini's `Schema` declares for it, so `{"type":"integer","enum":[1,2,3]}`,
+  `{"description":{...}}` and an out-of-range bound lose that keyword instead of
+  travelling to a rejection. `$ref` is matched on its full JSON Pointer, so two
+  same-named definitions no longer collide and an external reference resolves to none of
+  them; the same schema now sanitises to the same bytes every time.
 
 ### Fixed
 - A document whose file type is unsupported no longer quotes the rejected extension into
