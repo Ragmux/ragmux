@@ -63,7 +63,8 @@ func TestLoadImageSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !c.ImageFetch || c.ImageFetchMaxBytes != 8<<20 || c.ImageFetchTimeout != 10*time.Second ||
-		c.ImageFetchMaxPerRequest != 8 || c.ImageCacheEntries != 64 || c.ImageCacheTTL != 10*time.Minute {
+		c.ImageFetchMaxPerRequest != 8 || c.ImageFetchMaxConcurrent != 4 ||
+		c.ImageCacheEntries != 64 || c.ImageCacheMaxBytes != 64<<20 || c.ImageCacheTTL != 10*time.Minute {
 		t.Errorf("defaults = %+v", c)
 	}
 
@@ -71,15 +72,18 @@ func TestLoadImageSettings(t *testing.T) {
 	t.Setenv("IMAGE_FETCH_MAX_MB", "2")
 	t.Setenv("IMAGE_FETCH_TIMEOUT", "3s")
 	t.Setenv("IMAGE_FETCH_MAX_PER_REQUEST", "1")
+	t.Setenv("IMAGE_FETCH_MAX_CONCURRENT", "2")
 	// 0 entries is the documented way to turn caching off, not an error.
 	t.Setenv("IMAGE_CACHE_ENTRIES", "0")
+	t.Setenv("IMAGE_CACHE_MAX_MB", "16")
 	t.Setenv("IMAGE_CACHE_TTL", "45s")
 	c, err = Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.ImageFetch || c.ImageFetchMaxBytes != 2<<20 || c.ImageFetchTimeout != 3*time.Second ||
-		c.ImageFetchMaxPerRequest != 1 || c.ImageCacheEntries != 0 || c.ImageCacheTTL != 45*time.Second {
+		c.ImageFetchMaxPerRequest != 1 || c.ImageFetchMaxConcurrent != 2 ||
+		c.ImageCacheEntries != 0 || c.ImageCacheMaxBytes != 16<<20 || c.ImageCacheTTL != 45*time.Second {
 		t.Errorf("overrides = %+v", c)
 	}
 
@@ -89,7 +93,11 @@ func TestLoadImageSettings(t *testing.T) {
 		{"IMAGE_FETCH_TIMEOUT", "-1s"},
 		{"IMAGE_FETCH_TIMEOUT", "soon"},
 		{"IMAGE_FETCH_MAX_PER_REQUEST", "0"},
+		{"IMAGE_FETCH_MAX_CONCURRENT", "0"},
+		{"IMAGE_FETCH_MAX_CONCURRENT", "many"},
 		{"IMAGE_CACHE_ENTRIES", "-1"},
+		{"IMAGE_CACHE_MAX_MB", "0"},
+		{"IMAGE_CACHE_MAX_MB", "lots"},
 		{"IMAGE_CACHE_TTL", "0"},
 	} {
 		t.Run(bad.key+"="+bad.value, func(t *testing.T) {
@@ -98,6 +106,35 @@ func TestLoadImageSettings(t *testing.T) {
 				t.Errorf("err = %v", err)
 			}
 		})
+	}
+}
+
+// The fetched-image cache stores base64, a third larger than the bytes
+// IMAGE_FETCH_MAX_MB caps, and its ceiling used to be a fixed 64 MiB: an
+// operator who raised the per-image limit past that got a cache that silently
+// stored nothing at all, because every entry was too large to put.
+func TestImageCacheCeilingFollowsTheImageLimit(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+	t.Setenv("IMAGE_FETCH_MAX_MB", "64")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one := base64Len(c.ImageFetchMaxBytes); c.ImageCacheMaxBytes < 2*one {
+		t.Errorf("a %d MiB ceiling cannot hold two %d MiB entries", c.ImageCacheMaxBytes>>20, one>>20)
+	}
+	// A small per-image limit keeps the default rather than shrinking to it.
+	t.Setenv("IMAGE_FETCH_MAX_MB", "1")
+	if c, err = Load(); err != nil || c.ImageCacheMaxBytes != 64<<20 {
+		t.Errorf("ceiling = %d, err = %v", c.ImageCacheMaxBytes, err)
+	}
+	// An explicit ceiling too small for one image is that same silent no-op,
+	// so it is refused at startup instead of discovered as a cache that never
+	// hits.
+	t.Setenv("IMAGE_FETCH_MAX_MB", "32")
+	t.Setenv("IMAGE_CACHE_MAX_MB", "32")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "IMAGE_CACHE_MAX_MB") {
+		t.Errorf("err = %v", err)
 	}
 }
 

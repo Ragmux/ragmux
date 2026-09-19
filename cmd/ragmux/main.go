@@ -199,6 +199,10 @@ func run(cfg config.Config) error {
 	imageTransport := transport.Clone()
 	imageTransport.Proxy = nil
 	imageTransport.DialContext = netguard.SafeDialContext(dialer, false, nil)
+	// The fetcher's semaphore caps image fetches process-wide; this caps the
+	// sockets one host may hold at the same number, so the pool cannot keep
+	// more connections to a target than the gateway allows fetches in total.
+	imageTransport.MaxConnsPerHost = cfg.ImageFetchMaxConcurrent
 	imageClient := &http.Client{Transport: imageTransport, CheckRedirect: netguard.CheckRedirect(3)}
 	var images *provider.ImageFetcher
 	if cfg.ImageFetch {
@@ -207,10 +211,11 @@ func run(cfg config.Config) error {
 			MaxBytes:      cfg.ImageFetchMaxBytes,
 			Timeout:       cfg.ImageFetchTimeout,
 			MaxPerRequest: cfg.ImageFetchMaxPerRequest,
+			MaxConcurrent: cfg.ImageFetchMaxConcurrent,
 			Logger:        log,
 		}
 		if cfg.ImageCacheEntries > 0 {
-			images.Cache = provider.NewImageCache(cfg.ImageCacheEntries, cfg.ImageCacheTTL)
+			images.Cache = provider.NewImageCache(cfg.ImageCacheEntries, cfg.ImageCacheMaxBytes, cfg.ImageCacheTTL)
 		}
 	}
 	log.Info("image policy", "fetch", cfg.ImageFetch, "max_mb", cfg.ImageFetchMaxBytes>>20,

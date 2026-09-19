@@ -10,6 +10,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -62,9 +63,14 @@ func parseContent(raw json.RawMessage) ([]contentPart, error) {
 		case "text", "":
 			out = append(out, contentPart{Type: "text", Text: p.Text, CacheControl: p.CacheControl})
 		case "image_url":
-			ref, ok := parseImageURL(p.ImageURL.URL)
-			if !ok {
+			if p.ImageURL.URL == "" {
+				// Nothing to send and nothing to complain about, the way a
+				// part of a type no adapter can carry is dropped.
 				continue
+			}
+			ref, err := parseImageURL(p.ImageURL.URL)
+			if err != nil {
+				return nil, err
 			}
 			out = append(out, contentPart{Type: "image_url", Image: ref, CacheControl: p.CacheControl})
 		}
@@ -86,10 +92,15 @@ const (
 	ollamaInlineImages    = true
 )
 
-// imageMediaTypes is what the gateway will inline. The URL's extension is
-// never consulted; the response's own content type decides, because a URL can
-// be spelled to claim anything.
+// imageMediaTypes is what the gateway will carry, for a fetched image and an
+// inline data: one alike. For a fetched one the URL's extension is never
+// consulted; the response's own content type decides, because a URL can be
+// spelled to claim anything.
 var imageMediaTypes = map[string]bool{"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true}
+
+// defaultImageMaxConcurrent is how many image fetches the process runs at
+// once when nothing says otherwise.
+const defaultImageMaxConcurrent = 4
 
 // ImageFetcher resolves remote image URLs into base64 for adapters whose
 // upstream cannot fetch a URL itself.
@@ -107,9 +118,45 @@ type ImageFetcher struct {
 	Timeout time.Duration
 	// MaxPerRequest caps the images one chat request may pull (default 8).
 	MaxPerRequest int
+	// MaxConcurrent caps the image fetches in flight across the whole
+	// process (default 4).
+	//
+	// MaxPerRequest bounds one chat request and bounds nothing at all when a
+	// key holder sends many at once: every one of them turns into GETs
+	// against whatever host it names, from the gateway's own address. This is
+	// the ceiling that makes the gateway a poor amplifier — and the reason
+	// the image transport also carries MaxConnsPerHost.
+	MaxConcurrent int
 	// Cache is optional; nil fetches every time.
 	Cache  *imageCache
 	Logger *slog.Logger
+
+	semOnce sync.Once
+	sem     chan struct{}
+}
+
+// acquire takes one of the process-wide fetch slots and returns the release.
+// The context it waits on already carries the per-fetch timeout, so a
+// saturated gateway queues for at most as long as one fetch may take rather
+// than until the client gives up.
+func (f *ImageFetcher) acquire(ctx context.Context) (func(), error) {
+	f.semOnce.Do(func() {
+		n := f.MaxConcurrent
+		if n <= 0 {
+			n = defaultImageMaxConcurrent
+		}
+		f.sem = make(chan struct{}, n)
+	})
+	select {
+	case f.sem <- struct{}{}:
+		return func() { <-f.sem }, nil
+	case <-ctx.Done():
+		// Not the client's mistake and not the image host's, so neither a 400
+		// nor a relayed upstream failure: the gateway is the thing that ran
+		// out, and a 503 is what tells a client to come back.
+		return nil, &Error{Status: http.StatusServiceUnavailable, Type: "overloaded",
+			Message: "the gateway is already fetching as many images as it may at once; retry shortly"}
+	}
 }
 
 // Fetch downloads one image and returns its media type and base64 payload.
@@ -138,6 +185,11 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL string) (string, string
 	cfg := Config{ProviderType: "image", Logger: f.Logger}
 	ctx, cancel := context.WithTimeout(ctx, f.timeout())
 	defer cancel()
+	release, err := f.acquire(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	defer release()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", "", imageError("image URL is not a valid request target")
@@ -203,6 +255,13 @@ func (f *ImageFetcher) maxPerRequest() int {
 	return 8
 }
 
+func (f *ImageFetcher) maxConcurrent() int {
+	if f.MaxConcurrent > 0 {
+		return f.MaxConcurrent
+	}
+	return defaultImageMaxConcurrent
+}
+
 // imageBudget is one chat request's share of the fetcher: images are pulled
 // one at a time and only so many of them, so a single client request cannot
 // fan out into a burst of outbound connections.
@@ -240,16 +299,58 @@ func imageError(msg string) *Error {
 
 // parseImageURL splits a data: URL into its media type and payload, and keeps
 // anything else as a URL for the adapter's own policy to resolve.
-func parseImageURL(u string) (imageRef, bool) {
+//
+// A data: URL is held to the same whitelist a fetched image is, and for the
+// same reason: it is the client's own string. Passing it through unchecked
+// sent "data:text/html;base64,…" upstream as an image, and a "data:,payload"
+// with neither a type nor base64 encoding as well, each coming back as a
+// provider 400 that named nothing the caller could act on. The message never
+// echoes the payload.
+func parseImageURL(u string) (imageRef, error) {
 	if !strings.HasPrefix(u, "data:") {
-		if u == "" {
-			return imageRef{}, false
-		}
-		return imageRef{URL: u}, true
+		return imageRef{URL: u}, nil
 	}
-	meta, data, ok := strings.Cut(strings.TrimPrefix(u, "data:"), ",")
+	meta, payload, ok := strings.Cut(strings.TrimPrefix(u, "data:"), ",")
+	if !ok || !imageDataIsBase64(meta) {
+		return imageRef{}, imageError(
+			"an inline image must be a base64 data: URL, as in data:image/png;base64,<payload>")
+	}
+	mediaType, _, _ := strings.Cut(meta, ";")
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if !imageMediaTypes[mediaType] {
+		return imageRef{}, imageError(fmt.Sprintf(
+			"inline image media type %q is not supported; png, jpeg, gif and webp are accepted",
+			imageTypeInMessage(mediaType)))
+	}
+	if _, err := base64.StdEncoding.DecodeString(payload); err != nil {
+		return imageRef{}, imageError("inline image payload is not valid base64")
+	}
+	return imageRef{MediaType: mediaType, Base64: payload}, nil
+}
+
+// imageDataIsBase64 reports the ";base64" RFC 2397 puts last among a data:
+// URL's parameters. Anything else is a percent-encoded payload, which is not
+// what any adapter forwards.
+func imageDataIsBase64(meta string) bool {
+	_, params, ok := strings.Cut(meta, ";")
 	if !ok {
-		return imageRef{}, false
+		return false
 	}
-	return imageRef{MediaType: strings.TrimSuffix(meta, ";base64"), Base64: data}, true
+	for _, p := range strings.Split(params, ";") {
+		if strings.EqualFold(strings.TrimSpace(p), "base64") {
+			return true
+		}
+	}
+	return false
+}
+
+// imageTypeInMessage bounds a client-supplied media type before it goes into
+// an error message: nothing about a data: URL limits how long the part before
+// the comma is.
+func imageTypeInMessage(s string) string {
+	const max = 64
+	if r := []rune(s); len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
 }

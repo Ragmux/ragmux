@@ -102,8 +102,15 @@ type Config struct {
 	// ImageFetchMaxPerRequest caps how many images one chat request may pull,
 	// so a single request cannot fan out.
 	ImageFetchMaxPerRequest int
+	// ImageFetchMaxConcurrent caps the image fetches the whole process runs
+	// at once, which is what bounds the fan-out across requests; it is also
+	// the image transport's per-host connection ceiling.
+	ImageFetchMaxConcurrent int
 	// ImageCacheEntries is the size of the fetched-image cache; 0 disables it.
 	ImageCacheEntries int
+	// ImageCacheMaxBytes is the fetched-image cache's byte ceiling. It is
+	// derived from ImageFetchMaxBytes unless IMAGE_CACHE_MAX_MB sets it.
+	ImageCacheMaxBytes int64
 	// ImageCacheTTL is how long a fetched image may be reused.
 	ImageCacheTTL time.Duration
 	// MaxChunksPerDocument fails ingestion of documents that split into more
@@ -397,6 +404,17 @@ func Load() (Config, error) {
 		}
 		c.ImageFetchMaxPerRequest = n
 	}
+	// IMAGE_FETCH_MAX_PER_REQUEST bounds one request and nothing across
+	// them: this is the process-wide ceiling, and the image transport's
+	// per-host connection limit is set from it too.
+	c.ImageFetchMaxConcurrent = 4
+	if v := os.Getenv("IMAGE_FETCH_MAX_CONCURRENT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("invalid IMAGE_FETCH_MAX_CONCURRENT %q", v)
+		}
+		c.ImageFetchMaxConcurrent = n
+	}
 	c.ImageCacheEntries = 64
 	if v := os.Getenv("IMAGE_CACHE_ENTRIES"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -404,6 +422,29 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid IMAGE_CACHE_ENTRIES %q (0 disables)", v)
 		}
 		c.ImageCacheEntries = n
+	}
+	// The cache holds base64, which is a third larger than the bytes
+	// IMAGE_FETCH_MAX_MB caps. A fixed 64 MiB ceiling therefore turned the
+	// cache off silently the moment an operator raised the per-image limit
+	// past it: every entry was too large to store, so nothing ever was. The
+	// default now holds at least two images of the largest size the fetcher
+	// will accept, and a ceiling too small to hold even one is refused at
+	// startup rather than discovered as a cache that never hits.
+	oneImage := base64Len(c.ImageFetchMaxBytes)
+	c.ImageCacheMaxBytes = 64 << 20
+	if floor := 2 * oneImage; floor > c.ImageCacheMaxBytes {
+		c.ImageCacheMaxBytes = floor
+	}
+	if v := os.Getenv("IMAGE_CACHE_MAX_MB"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("invalid IMAGE_CACHE_MAX_MB %q", v)
+		}
+		if int64(n)<<20 < oneImage {
+			return c, fmt.Errorf("IMAGE_CACHE_MAX_MB %q cannot hold one IMAGE_FETCH_MAX_MB image "+
+				"(%d MiB of base64), so nothing would ever be cached", v, (oneImage+(1<<20)-1)>>20)
+		}
+		c.ImageCacheMaxBytes = int64(n) << 20
 	}
 	c.ImageCacheTTL = 10 * time.Minute
 	if v := os.Getenv("IMAGE_CACHE_TTL"); v != "" {
@@ -506,6 +547,10 @@ func isLoopbackHost(host string) bool {
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
 }
+
+// base64Len is what n bytes take once base64-encoded, which is the form the
+// image cache actually stores and measures.
+func base64Len(n int64) int64 { return (n + 2) / 3 * 4 }
 
 // loadTracing reads the OTLP settings. The OTEL_* names are the ones the
 // OpenTelemetry specification defines, so a collector sidecar that already

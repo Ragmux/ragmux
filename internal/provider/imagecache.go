@@ -35,10 +35,15 @@ type imageEntry struct {
 
 // NewImageCache builds the cache an ImageFetcher stores fetched images in.
 // The type stays unexported because nothing outside the package has any use
-// for it beyond assigning it to ImageFetcher.Cache; the byte ceiling is not a
-// setting, only the entry count and the TTL are.
-func NewImageCache(maxEntries int, ttl time.Duration) *imageCache {
-	return newImageCache(maxEntries, 0, ttl)
+// for it beyond assigning it to ImageFetcher.Cache.
+//
+// maxBytes is a caller's decision rather than a constant because the cache
+// stores base64, which is a third larger than the raw image, and the fetcher's
+// own per-image cap is configurable: a fixed ceiling below one image's encoded
+// size makes put a no-op for every entry, so the cache quietly holds nothing
+// at all.
+func NewImageCache(maxEntries int, maxBytes int64, ttl time.Duration) *imageCache {
+	return newImageCache(maxEntries, maxBytes, ttl)
 }
 
 // newImageCache builds a cache; a non-positive argument takes the default
