@@ -21,18 +21,41 @@ type RequestLog struct {
 	Streamed         bool   `json:"streamed"`
 	RAGUsed          bool   `json:"rag_used"`
 	// RAGHits is the number of retrieved chunks injected into the prompt.
-	RAGHits   int    `json:"rag_hits"`
-	Error     string `json:"error"`
-	CreatedAt string `json:"created_at"`
+	RAGHits int `json:"rag_hits"`
+	// CachedPromptTokens and CacheWriteTokens are the parts of the prompt a
+	// provider cache served and wrote; both are included in PromptTokens.
+	CachedPromptTokens int `json:"cached_prompt_tokens"`
+	CacheWriteTokens   int `json:"cache_write_tokens"`
+	// CostMicros is the estimated cost in USD millionths (exact in BIGINT,
+	// which is why it is summed rather than a float); CostUSD is the same
+	// figure in dollars, computed in Go. CostSource is "builtin", "user" or
+	// "none" when no price matched the model.
+	CostMicros int64   `json:"cost_micros"`
+	CostUSD    float64 `json:"cost_usd"`
+	CostSource string  `json:"cost_source"`
+	Error      string  `json:"error"`
+	CreatedAt  string  `json:"created_at"`
 }
+
+// CostSourceNone marks a request whose model matched no price row.
+const CostSourceNone = "none"
+
+// usd converts a micro-dollar total to dollars for the JSON API.
+func usd(micros int64) float64 { return float64(micros) / 1e6 }
 
 // InsertRequestLog persists a metric row.
 func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
+	source := l.CostSource
+	if source == "" {
+		source = CostSourceNone
+	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO request_logs
-		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed, rag_used, rag_hits, error)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed,
+		 rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens, cost_micros, cost_source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
-		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error)
+		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error,
+		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source)
 	return err
 }
 
@@ -58,6 +81,10 @@ type MetricsSummary struct {
 	RAGRequests      int     `json:"rag_requests"`
 	// RateLimited counts requests answered 429 by the gateway's limiter.
 	RateLimited int `json:"rate_limited"`
+	// CostMicros/CostUSD are the estimated spend of the window; cost is
+	// informational and never enforced.
+	CostMicros int64   `json:"cost_micros"`
+	CostUSD    float64 `json:"cost_usd"`
 }
 
 // MetricsFilter narrows metric queries. A nil ProjectID means every project;
@@ -102,7 +129,8 @@ func (s *Store) SummarizeBetween(ctx context.Context, f MetricsFilter, since, un
 		COALESCE(AVG(latency_ms), 0)::float8,
 		COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::float8,
 		COALESCE(SUM(CASE WHEN rag_used THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status_code = 429 THEN 1 ELSE 0 END), 0)
+		COALESCE(SUM(CASE WHEN status_code = 429 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(cost_micros), 0)
 		FROM request_logs WHERE created_at >= $1`
 	base := []any{since.UTC()}
 	if !until.IsZero() {
@@ -114,10 +142,11 @@ func (s *Store) SummarizeBetween(ctx context.Context, f MetricsFilter, since, un
 	m := &MetricsSummary{ProjectID: f.ProjectID}
 	var p95 float64
 	if err := s.pool.QueryRow(ctx, q, args...).Scan(&m.Requests, &m.Errors, &m.PromptTokens,
-		&m.CompletionTokens, &m.AvgLatencyMs, &p95, &m.RAGRequests, &m.RateLimited); err != nil {
+		&m.CompletionTokens, &m.AvgLatencyMs, &p95, &m.RAGRequests, &m.RateLimited, &m.CostMicros); err != nil {
 		return nil, err
 	}
 	m.P95LatencyMs = int64(math.Round(p95))
+	m.CostUSD = usd(m.CostMicros)
 	return m, nil
 }
 
@@ -127,7 +156,8 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 		limit = 100
 	}
 	q := `SELECT id, project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated,
-		latency_ms, streamed, rag_used, rag_hits, error, created_at FROM request_logs WHERE true`
+		latency_ms, streamed, rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens,
+		cost_micros, cost_source, created_at FROM request_logs WHERE true`
 	cond, args := f.where(nil)
 	args = append(args, limit)
 	q += cond + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
@@ -141,10 +171,12 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 		l := &RequestLog{}
 		var created time.Time
 		if err := rows.Scan(&l.ID, &l.ProjectID, &l.ModelName, &l.StatusCode, &l.PromptTokens, &l.CompletionTokens,
-			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.RAGHits, &l.Error, &created); err != nil {
+			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.RAGHits, &l.Error,
+			&l.CachedPromptTokens, &l.CacheWriteTokens, &l.CostMicros, &l.CostSource, &created); err != nil {
 			return nil, err
 		}
 		l.CreatedAt = ts(created)
+		l.CostUSD = usd(l.CostMicros)
 		out = append(out, l)
 	}
 	return out, rows.Err()
@@ -152,11 +184,13 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 
 // DailyBucket is request volume for one UTC day.
 type DailyBucket struct {
-	Day              string `json:"day"`
-	Requests         int    `json:"requests"`
-	Errors           int    `json:"errors"`
-	PromptTokens     int64  `json:"prompt_tokens"`
-	CompletionTokens int64  `json:"completion_tokens"`
+	Day              string  `json:"day"`
+	Requests         int     `json:"requests"`
+	Errors           int     `json:"errors"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	CostMicros       int64   `json:"cost_micros"`
+	CostUSD          float64 `json:"cost_usd"`
 }
 
 // MaxSeriesDays caps DailySeries; longer ranges belong in the CSV export.
@@ -174,7 +208,8 @@ func (s *Store) DailySeries(ctx context.Context, f MetricsFilter, days int) ([]D
 	since := time.Now().UTC().AddDate(0, 0, -days+1).Truncate(24 * time.Hour)
 	q := `SELECT date_trunc('day', created_at AT TIME ZONE 'UTC') AS day, COUNT(*),
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
+		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
+		COALESCE(SUM(cost_micros), 0)
 		FROM request_logs WHERE created_at >= $1`
 	cond, args := f.where([]any{since})
 	q += cond + " GROUP BY day ORDER BY day"
@@ -187,10 +222,11 @@ func (s *Store) DailySeries(ctx context.Context, f MetricsFilter, days int) ([]D
 	for rows.Next() {
 		var b DailyBucket
 		var day time.Time
-		if err := rows.Scan(&day, &b.Requests, &b.Errors, &b.PromptTokens, &b.CompletionTokens); err != nil {
+		if err := rows.Scan(&day, &b.Requests, &b.Errors, &b.PromptTokens, &b.CompletionTokens, &b.CostMicros); err != nil {
 			return nil, err
 		}
 		b.Day = day.Format("2006-01-02")
+		b.CostUSD = usd(b.CostMicros)
 		out = append(out, b)
 	}
 	return out, rows.Err()
@@ -198,14 +234,16 @@ func (s *Store) DailySeries(ctx context.Context, f MetricsFilter, days int) ([]D
 
 // ProjectMetrics is one project's totals inside a window.
 type ProjectMetrics struct {
-	ProjectID        int64  `json:"project_id"`
-	Name             string `json:"name"`
-	Requests         int    `json:"requests"`
-	Errors           int    `json:"errors"`
-	PromptTokens     int64  `json:"prompt_tokens"`
-	CompletionTokens int64  `json:"completion_tokens"`
-	RateLimited      int    `json:"rate_limited"`
-	RAGRequests      int    `json:"rag_requests"`
+	ProjectID        int64   `json:"project_id"`
+	Name             string  `json:"name"`
+	Requests         int     `json:"requests"`
+	Errors           int     `json:"errors"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	RateLimited      int     `json:"rate_limited"`
+	RAGRequests      int     `json:"rag_requests"`
+	CostMicros       int64   `json:"cost_micros"`
+	CostUSD          float64 `json:"cost_usd"`
 }
 
 // SummarizeByProject breaks the window down per project, busiest first.
@@ -215,7 +253,8 @@ func (s *Store) SummarizeByProject(ctx context.Context, f MetricsFilter, since t
 		COALESCE(SUM(CASE WHEN l.status_code >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(l.prompt_tokens), 0), COALESCE(SUM(l.completion_tokens), 0),
 		COALESCE(SUM(CASE WHEN l.status_code = 429 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN l.rag_used THEN 1 ELSE 0 END), 0)
+		COALESCE(SUM(CASE WHEN l.rag_used THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(l.cost_micros), 0)
 		FROM request_logs l LEFT JOIN projects p ON p.id = l.project_id WHERE l.created_at >= $1`
 	cond, args := f.whereCol("l.project_id", []any{since.UTC()})
 	q += cond + " GROUP BY l.project_id, p.name ORDER BY COUNT(*) DESC, l.project_id"
@@ -228,9 +267,10 @@ func (s *Store) SummarizeByProject(ctx context.Context, f MetricsFilter, since t
 	for rows.Next() {
 		var m ProjectMetrics
 		if err := rows.Scan(&m.ProjectID, &m.Name, &m.Requests, &m.Errors, &m.PromptTokens, &m.CompletionTokens,
-			&m.RateLimited, &m.RAGRequests); err != nil {
+			&m.RateLimited, &m.RAGRequests, &m.CostMicros); err != nil {
 			return nil, err
 		}
+		m.CostUSD = usd(m.CostMicros)
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -249,7 +289,8 @@ const MaxExportRows = 50000
 // to fn until MaxExportRows have been delivered or fn returns an error.
 func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.Time, fn func(*RequestExportRow) error) error {
 	q := `SELECT l.id, l.project_id, COALESCE(p.name, ''), l.model_name, l.status_code, l.prompt_tokens, l.completion_tokens,
-		l.estimated, l.latency_ms, l.streamed, l.rag_used, l.rag_hits, l.error, l.created_at
+		l.estimated, l.latency_ms, l.streamed, l.rag_used, l.rag_hits, l.error,
+		l.cached_prompt_tokens, l.cache_write_tokens, l.cost_micros, l.cost_source, l.created_at
 		FROM request_logs l LEFT JOIN projects p ON p.id = l.project_id WHERE l.created_at >= $1`
 	cond, args := f.whereCol("l.project_id", []any{since.UTC()})
 	args = append(args, MaxExportRows)
@@ -263,10 +304,12 @@ func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.
 		var r RequestExportRow
 		var created time.Time
 		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.ModelName, &r.StatusCode, &r.PromptTokens, &r.CompletionTokens,
-			&r.Estimated, &r.LatencyMs, &r.Streamed, &r.RAGUsed, &r.RAGHits, &r.Error, &created); err != nil {
+			&r.Estimated, &r.LatencyMs, &r.Streamed, &r.RAGUsed, &r.RAGHits, &r.Error,
+			&r.CachedPromptTokens, &r.CacheWriteTokens, &r.CostMicros, &r.CostSource, &created); err != nil {
 			return err
 		}
 		r.CreatedAt = ts(created)
+		r.CostUSD = usd(r.CostMicros)
 		if err := fn(&r); err != nil {
 			return err
 		}

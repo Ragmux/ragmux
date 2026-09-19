@@ -18,6 +18,7 @@ import (
 
 	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -36,6 +37,8 @@ type Gateway struct {
 	MaxBodyBytes int64
 	// Limiter enforces per-project rate limits and budgets; nil disables them.
 	Limiter *limits.Limiter
+	// Prices estimates the cost of a completed request; nil records none.
+	Prices *pricing.Cache
 }
 
 type ctxKey struct{}
@@ -190,8 +193,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		setLimitHeaders(w.Header(), p, decision)
 		if !decision.Allowed {
+			// Nothing was sent upstream, so the row costs nothing.
 			rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, Streamed: req.Stream,
-				StatusCode: http.StatusTooManyRequests, Error: decision.Reason, LatencyMs: time.Since(start).Milliseconds()}
+				StatusCode: http.StatusTooManyRequests, Error: decision.Reason, CostSource: store.CostSourceNone,
+				LatencyMs: time.Since(start).Milliseconds()}
 			if err := g.Store.InsertRequestLog(ctx, rec); err != nil {
 				log.Error("write request log", "err", err)
 			}
@@ -201,6 +206,12 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Project-level system prompt, if configured, goes first.
+	//
+	// The prompt injected here and the RAG context block injected below are
+	// the stable prefix most worth an Anthropic cache breakpoint, but the
+	// gateway does not mark one: a project-level cache_prompt flag needs a
+	// column, a migration and dashboard work of its own. Clients that mark
+	// their own content parts are relayed unchanged in the meantime.
 	if p.SystemPrompt != "" {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
@@ -241,6 +252,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	promptChars := messageChars(req.Messages)
 	defer func() {
 		rec.LatencyMs = time.Since(start).Milliseconds()
+		// This is the one place the success, error, mid-stream-failure and
+		// 499 paths all pass with final token counts, so cost is priced
+		// here rather than in fillUsage, which stays a pure function.
+		g.priceRequest(conn, rec)
 		if err := g.Store.InsertRequestLog(context.Background(), rec); err != nil {
 			log.Error("write request log", "err", err)
 		}
@@ -554,9 +569,30 @@ func providerError(err error) (int, *provider.Error) {
 	return http.StatusBadGateway, &provider.Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: provider.Redact(err.Error())}
 }
 
+// priceRequest fills the cost fields of a finished request from the price
+// table. A model nobody priced, or a table that cannot be read, leaves the
+// cost at zero with cost_source "none" — a missing price is reported as
+// missing, never guessed.
+func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLog) {
+	rec.CostSource = store.CostSourceNone
+	if g.Prices == nil || conn == nil {
+		return
+	}
+	// The request context may already be cancelled (a client disconnect is
+	// exactly when this runs), and the cache usually answers without the
+	// database anyway, so the lookup gets a background context.
+	p, ok := g.Prices.Lookup(context.Background(), conn.ProviderType, conn.ModelName)
+	if !ok {
+		return
+	}
+	rec.CostMicros = p.CostMicros(rec.PromptTokens, rec.CachedPromptTokens, rec.CacheWriteTokens, rec.CompletionTokens)
+	rec.CostSource = p.Source
+}
+
 func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {
 	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
 		rec.PromptTokens, rec.CompletionTokens = u.PromptTokens, u.CompletionTokens
+		rec.CachedPromptTokens, rec.CacheWriteTokens = u.CachedTokens(), u.CacheWriteTokens()
 		return
 	}
 	rec.Estimated = true
