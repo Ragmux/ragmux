@@ -142,11 +142,14 @@ All notable changes to Ragmux are documented here. The format follows
   it is granted; a **management** key (`sk-mgmt-…`) calls `/admin/api` within its scopes,
   replacing the 24-hour session token scripts had to borrow. Both carry an optional
   `expires_at`, can be revoked, record `last_used_at`, and may set their own rate limits
-  and budgets **under** the project's. A key never outranks its owner: its effective
-  permission is its scopes intersected with the owner's live role, so demoting or
-  deactivating a user immediately narrows every key they hold. A project's own
-  `sk-proj-…` key is unchanged and keeps working exactly as before. Managed from the new
-  **Keys** tab and `/admin/api/keys`, documented in
+  and budgets **under** the project's. A key never outranks its owner: on `/admin/api` its
+  effective permission is its scopes intersected with the owner's live role, so demoting a
+  user narrows every `sk-mgmt-…` key they hold at once. A demotion changes nothing about
+  an `sk-user-…` key — `/v1` does not consult roles, and `chat` and `models` are covered
+  by every role including `viewer` — so what stops one of those is revoking it, giving it
+  a smaller sub-limit, or deactivating the owner, which stops every key they hold. A
+  project's own `sk-proj-…` key is unchanged and keeps working exactly as before. Managed
+  from the new **Keys** tab and `/admin/api/keys`, documented in
   [Users, roles and limits](docs/users-and-limits.md#api-keys).
 - **`X-Ragmux-Project`**: a gateway key granting several projects selects one per request
   with this header, falling back to the key's default project and then to its single
