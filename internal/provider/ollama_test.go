@@ -180,6 +180,55 @@ func TestOllamaStreamNDJSON(t *testing.T) {
 	}
 }
 
+// Ollama can spread tool calls over several NDJSON lines. Each line used to
+// index its calls from zero, so a client accumulating by index merged them
+// into one call with concatenated arguments.
+func TestOllamaStreamToolCallIndexes(t *testing.T) {
+	srv, _ := ollamaServer(t, func(w http.ResponseWriter, _ ollamaRequest, _ map[string]json.RawMessage) {
+		for _, line := range []string{
+			`{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Ankara"}}}]},"done":false}`,
+			`{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_time","arguments":{"tz":"UTC"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":6}`,
+		} {
+			_, _ = fmt.Fprintln(w, line)
+		}
+	})
+	p, _ := New(Config{ProviderType: "ollama", BaseURL: srv.URL, Model: "llama3"})
+	out := make(chan StreamChunk, 16)
+	if err := p.ChatStream(context.Background(), parseReq(t, `{"messages":[{"role":"user","content":"hi"}]}`), out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+	var deltas []string
+	var finish string
+	for c := range out {
+		for _, ch := range c.Choices {
+			if len(ch.Delta.ToolCalls) > 0 {
+				deltas = append(deltas, string(ch.Delta.ToolCalls))
+			}
+			if ch.FinishReason != nil {
+				finish = *ch.FinishReason
+			}
+		}
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("got %d tool deltas: %v", len(deltas), deltas)
+	}
+	for i, want := range []string{
+		`"index":0`, `"index":1`,
+	} {
+		if !strings.Contains(deltas[i], want) {
+			t.Errorf("delta %d = %s, want %s", i, deltas[i], want)
+		}
+	}
+	if !strings.Contains(deltas[0], `"name":"get_weather"`) || !strings.Contains(deltas[1], `"name":"get_time"`) ||
+		!strings.Contains(deltas[1], `{\"tz\":\"UTC\"}`) {
+		t.Errorf("deltas = %v", deltas)
+	}
+	if finish != "tool_calls" {
+		t.Errorf("finish = %q", finish)
+	}
+}
+
 func TestOllamaErrors(t *testing.T) {
 	t.Run("http error body", func(t *testing.T) {
 		srv, _ := ollamaServer(t, func(w http.ResponseWriter, _ ollamaRequest, _ map[string]json.RawMessage) {

@@ -219,28 +219,14 @@ func openAIPartsToOllama(raw json.RawMessage) (string, []string, error) {
 	return text.String(), images, nil
 }
 
-// ollamaToolCallsJSON renders native tool calls in OpenAI's shape.
-func ollamaToolCallsJSON(calls []ollamaToolCall, withIndex bool) json.RawMessage {
-	if len(calls) == 0 {
-		return nil
-	}
-	out := make([]map[string]any, len(calls))
+// ollamaToolCallsJSON renders native tool calls in OpenAI's shape. Ollama
+// sends no call ids, so the normaliser generates them.
+func ollamaToolCallsJSON(calls []ollamaToolCall) json.RawMessage {
+	out := make([]toolCall, len(calls))
 	for i, c := range calls {
-		args := string(c.Function.Arguments)
-		if args == "" {
-			args = "{}"
-		}
-		tc := map[string]any{
-			"id": "call_" + randomID(24), "type": "function",
-			"function": map[string]string{"name": c.Function.Name, "arguments": args},
-		}
-		if withIndex {
-			tc["index"] = i
-		}
-		out[i] = tc
+		out[i] = toolCall{Name: c.Function.Name, Arguments: string(c.Function.Arguments)}
 	}
-	b, _ := json.Marshal(out)
-	return b
+	return toolCallsJSON(out)
 }
 
 func ollamaFinish(r ollamaResponse) *string {
@@ -273,7 +259,7 @@ func (p *ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: RedactWith(or.Error, p.cfg.APIKey)}
 	}
 	msg := ResponseMessage{Role: "assistant", Content: strPtr(or.Message.Content)}
-	msg.ToolCalls = ollamaToolCallsJSON(or.Message.ToolCalls, false)
+	msg.ToolCalls = ollamaToolCallsJSON(or.Message.ToolCalls)
 	return &ChatResponse{
 		ID: chatID(), Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
 		Choices: []Choice{{Index: 0, Message: msg, FinishReason: ollamaFinish(or)}},
@@ -305,6 +291,10 @@ func (p *ollama) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 		}
 	}
 	sentRole := false
+	// Scoped to the whole stream, not to one NDJSON line: newer builds spread
+	// tool calls over several lines, and a per-line index would number every
+	// one of them 0 so clients would merge them into a single corrupt call.
+	var tools toolCallStream
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for sc.Scan() {
@@ -327,14 +317,36 @@ func (p *ollama) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 		if or.Message.Content != "" || !or.Done {
 			delta.Content = strPtr(or.Message.Content)
 		}
-		delta.ToolCalls = ollamaToolCallsJSON(or.Message.ToolCalls, true)
-		if !or.Done {
+		// Ollama delivers arguments atomically, so each call is one whole
+		// delta. On the final line the last call rides along with the finish
+		// reason, keeping the shape Ollama itself sends.
+		calls := or.Message.ToolCalls
+		last := len(calls)
+		if or.Done && last > 0 {
+			last--
+		}
+		sent := false
+		for _, c := range calls[:last] {
+			delta.ToolCalls = tools.Whole("", c.Function.Name, string(c.Function.Arguments))
 			if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}}) {
+				return ctx.Err()
+			}
+			delta, sent = Delta{}, true
+		}
+		if !or.Done {
+			if !sent && !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}}) {
 				return ctx.Err()
 			}
 			continue
 		}
-		if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta, FinishReason: ollamaFinish(or)}}}) {
+		if len(calls) > 0 {
+			delta.ToolCalls = tools.Whole("", calls[last].Function.Name, string(calls[last].Function.Arguments))
+		}
+		finish := ollamaFinish(or)
+		if tools.Len() > 0 {
+			finish = strPtr("tool_calls")
+		}
+		if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta, FinishReason: finish}}}) {
 			return ctx.Err()
 		}
 		// Usage-only trailer, mirroring OpenAI's include_usage behaviour.

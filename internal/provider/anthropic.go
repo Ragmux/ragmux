@@ -267,26 +267,16 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		return nil, err
 	}
 	var text strings.Builder
-	var toolCalls []map[string]any
+	var calls []toolCall
 	for _, c := range ar.Content {
 		switch c.Type {
 		case "text":
 			text.WriteString(c.Text)
 		case "tool_use":
-			args := string(c.Input)
-			if args == "" {
-				args = "{}"
-			}
-			toolCalls = append(toolCalls, map[string]any{
-				"id": c.ID, "type": "function",
-				"function": map[string]string{"name": c.Name, "arguments": args},
-			})
+			calls = append(calls, toolCall{ID: c.ID, Name: c.Name, Arguments: string(c.Input)})
 		}
 	}
-	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String())}
-	if len(toolCalls) > 0 {
-		msg.ToolCalls, _ = json.Marshal(toolCalls)
-	}
+	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String()), ToolCalls: toolCallsJSON(calls)}
 	id := ar.ID
 	if id == "" {
 		id = chatID()
@@ -323,10 +313,9 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 			return false
 		}
 	}
-	// Track tool_use blocks by content index so argument deltas map to the
-	// right OpenAI tool_calls index.
-	toolIndex := map[int]int{}
-	nextTool := 0
+	// Tool_use blocks are tracked by content index so argument deltas map to
+	// the right OpenAI tool_calls index.
+	var tools toolCallStream
 	var streamErr error
 	sentRole := false
 
@@ -365,12 +354,7 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				} `json:"content_block"`
 			}
 			if json.Unmarshal([]byte(ev.Data), &cb) == nil && cb.ContentBlock.Type == "tool_use" {
-				toolIndex[cb.Index] = nextTool
-				tc, _ := json.Marshal([]map[string]any{{
-					"index": nextTool, "id": cb.ContentBlock.ID, "type": "function",
-					"function": map[string]string{"name": cb.ContentBlock.Name, "arguments": ""},
-				}})
-				nextTool++
+				tc := tools.Open(cb.Index, cb.ContentBlock.ID, cb.ContentBlock.Name)
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
 			}
 			return true
@@ -395,13 +379,10 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				}
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}})
 			case "input_json_delta":
-				ti, ok := toolIndex[d.Index]
-				if !ok {
+				tc := tools.Args(d.Index, d.Delta.PartialJSON)
+				if tc == nil {
 					return true
 				}
-				tc, _ := json.Marshal([]map[string]any{{
-					"index": ti, "function": map[string]string{"arguments": d.Delta.PartialJSON},
-				}})
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
 			}
 			return true
