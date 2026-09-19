@@ -214,8 +214,15 @@ isteği 10 sn asılı kalıp hata alıyor.
 Doygunlukta **429** dönülür, `Retry-After` başlığıyla ve
 `image_fetch_saturated` koduyla. Tavan varsayılanı **16**'dır ve tek bir
 key ya da proje, **başka bir kiracı beklerken** slotların yarısından
-fazlasını tutamaz. Pay yumuşaktır: kimse beklemiyorsa bir kiracı tavanın
+fazlasını **almaz**. Pay yumuşaktır: kimse beklemiyorsa bir kiracı tavanın
 tamamını kullanabilir.
+
+"Almaz", "tutmaz" değil — ve fark ölçülmüştür. Kimse beklemezken meşru
+olarak alınmış slotlar geri çağrılmaz; yeni bir kiracı geldiğinde mevcut
+kiracı payının üstünde **kalabilir**, ama o andan sonra pay dolana kadar
+yeni slot almaz. Yumuşak payın doğası bu: kararın hedefi boştaki
+kapasitenin israf edilmemesiydi, çalışan indirmelerin yarıda kesilmesi
+değil.
 
 Pay 2026-09-19'da sert (koşulsuz) olarak uygulanmıştı; ölçüm sert payın
 tek projeli kurulumda — en yaygın hâl — tavanın yarısını kalıcı olarak
