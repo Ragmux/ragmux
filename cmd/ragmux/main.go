@@ -302,20 +302,8 @@ func run(cfg config.Config) error {
 	r.Route("/v1", gw.Routes)
 	r.Route("/admin", adm.Routes)
 
-	// /metrics is either mounted here or served by a second listener, never
-	// both: with METRICS_LISTEN set it stays off the main router entirely,
-	// so no reverse-proxy rule can expose it by accident.
-	var metricsSrv *http.Server
+	metricsSrv := mountMetrics(r, cfg, registry)
 	if registry != nil {
-		h := registry.Handler(cfg.MetricsToken)
-		if cfg.MetricsListen != "" {
-			mux := http.NewServeMux()
-			mux.Handle("/metrics", h)
-			metricsSrv = &http.Server{Addr: cfg.MetricsListen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-		} else {
-			r.Method(http.MethodGet, "/metrics", h)
-			r.Method(http.MethodHead, "/metrics", h)
-		}
 		log.Info("metrics enabled", "listen", or(cfg.MetricsListen, "main listener"),
 			"authenticated", cfg.MetricsToken != "", "max_series", cfg.MetricsMaxSeries)
 	}
@@ -463,6 +451,28 @@ func buildMetrics(cfg config.Config, st *store.Store, log *slog.Logger) (*metric
 	m := obs.New(reg)
 	m.RegisterStore(st)
 	return reg, m
+}
+
+// mountMetrics attaches the scrape endpoint.
+//
+// It is either mounted on the main router or served by a second listener,
+// never both: with METRICS_LISTEN set /metrics stays off the main router
+// entirely, so no reverse-proxy rule and no path-prefix mistake can expose
+// per-project usage and spend to the internet. The returned server is nil
+// when there is nothing extra to run.
+func mountMetrics(r chi.Router, cfg config.Config, registry *metrics.Registry) *http.Server {
+	if registry == nil {
+		return nil
+	}
+	h := registry.Handler(cfg.MetricsToken)
+	if cfg.MetricsListen == "" {
+		r.Method(http.MethodGet, "/metrics", h)
+		r.Method(http.MethodHead, "/metrics", h)
+		return nil
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", h)
+	return &http.Server{Addr: cfg.MetricsListen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 }
 
 // readyz reports whether this replica should take traffic: the pool answers
