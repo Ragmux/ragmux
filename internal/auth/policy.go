@@ -62,6 +62,41 @@ func RequireRole(min Role) func(http.Handler) http.Handler {
 	}
 }
 
+// RequireScope narrows an api-key principal to the scopes its key carries.
+// It is a no-op for a dashboard session, which is already bounded by the
+// user's role, and it never widens anything: RequireRole still runs on the
+// same route and still consults the owner's live role, so demoting or
+// deactivating a user immediately narrows every key they hold. A key's
+// effective permission is its scopes intersected with that role.
+func RequireScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			se := SessionFrom(r.Context())
+			if se.IsKey() && !hasScope(se.Scopes, scope) {
+				insufficientScope(w, scope)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func hasScope(scopes []string, want string) bool {
+	for _, s := range scopes {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func insufficientScope(w http.ResponseWriter, scope string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`{"error":{"message":"api key is not authorised for the ` + scope +
+		` scope","type":"forbidden","code":"insufficient_scope"}}`))
+}
+
 // Forbidden writes the standard 403 response.
 func Forbidden(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
