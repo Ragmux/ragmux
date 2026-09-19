@@ -271,7 +271,8 @@ td.json{font-family:var(--mono);font-size:11.5px;color:var(--tx2);max-width:360p
       <button class="nav-item" data-tab="rag" title="RAG stores"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nav-text">RAG stores</span><span class="nav-badge" data-badge="rag"></span></button>
       <button class="nav-item" data-tab="projects" title="Projects"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.9 12.1 20 3M15 8l2 2M18 5l2 2"/></svg><span class="nav-text">Projects</span><span class="nav-badge" data-badge="projects"></span></button>
       <button class="nav-item" data-tab="playground" title="Playground"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12 15h5"/></svg><span class="nav-text">Playground</span></button>
-      <div class="nav-label" data-role="admin">Administer</div>
+      <div class="nav-label" data-role="editor">Administer</div>
+      <button class="nav-item" data-tab="prices" data-role="editor" title="Prices"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v20"/><path d="M17 6.5c0-2-2.2-3-5-3s-5 1-5 3 2.2 2.8 5 3.5 5 1.5 5 3.5-2.2 3-5 3-5-1-5-3"/></svg><span class="nav-text">Prices</span></button>
       <button class="nav-item" data-tab="users" data-role="admin" title="Users"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><circle cx="17" cy="9" r="2.5"/><path d="M16 14.5c3 0 5.5 2 5.5 5.5"/></svg><span class="nav-text">Users</span><span class="nav-badge" data-badge="users"></span></button>
       <button class="nav-item" data-tab="audit" data-role="admin" title="Audit log"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg><span class="nav-text">Audit log</span></button>
     </nav>
@@ -307,6 +308,9 @@ const fmtTime = s => s ? new Date(s).toLocaleTimeString([], { hour: '2-digit', m
 const fmtDay = s => s ? new Date(s).toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
 const fmtMonthDay = s => new Date(s).toLocaleDateString([], { month: 'short', day: '2-digit' });
 const fmtMs = ms => `${fmtN(Math.round(ms || 0))} ms`;
+// Estimated spend. Sub-cent amounts keep four decimals so a single cheap
+// request does not read as $0.00; larger ones round to cents.
+const fmtUSD = v => { v = Number(v || 0); const d = v && Math.abs(v) < 0.01 ? 4 : 2; return '$' + v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); };
 // "34 s", "6h 12m", "3d 4h" for a duration in milliseconds.
 function fmtDur(ms) {
   if (ms <= 0) return 'now';
@@ -472,8 +476,9 @@ function render() {
   $$('[data-role]', $('#nav')).forEach(el => el.classList.toggle('hidden', !can(el.dataset.role)));
   $$('.nav-item').forEach(b => { const active = b.dataset.tab === state.tab; b.classList.toggle('active', active); if (active) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
   updateBadges();
-  const tabs = { overview: renderOverview, models: renderModels, rag: renderRAG, projects: renderProjects, playground: renderPlayground, users: renderUsers, audit: renderAudit };
-  if (!tabs[state.tab] || ($('.nav-item[data-tab=' + state.tab + ']').dataset.role && !can('admin'))) state.tab = 'overview';
+  const tabs = { overview: renderOverview, models: renderModels, rag: renderRAG, projects: renderProjects, playground: renderPlayground, prices: renderPrices, users: renderUsers, audit: renderAudit };
+  const navItem = $('.nav-item[data-tab=' + state.tab + ']');
+  if (!tabs[state.tab] || (navItem && navItem.dataset.role && !can(navItem.dataset.role))) state.tab = 'overview';
   clearTimeout(pollTimer); clearInterval(ringTimer);
   tabs[state.tab]();
 }
@@ -663,18 +668,19 @@ async function renderOverview() {
       <div class="stat"><div class="l">Completion tokens</div><div class="v">${fmtK(w.completion_tokens)}</div>${delta(w.completion_tokens, prev.completion_tokens, { suffix: vs }) || `<div class="d">≈ ${fmtN(Math.round(w.completion_tokens / (w.requests || 1)))} / request</div>`}</div>
       <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(w.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(w.p95_latency_ms)} ms${prev.avg_latency_ms ? ` · ${delta(w.avg_latency_ms, prev.avg_latency_ms, { invert: true }).replace(/<[^>]+>/g, '')}${vs}` : ''}</div></div>
       <div class="stat"><div class="l">Rate limited</div><div class="v">${fmtN(w.rate_limited)}</div><div class="d ${w.rate_limited ? 'down' : ''}">429 · ${w.requests ? (100 * w.rate_limited / w.requests).toFixed(1) : '0.0'}% of calls</div></div>
+      <div class="stat" title="Estimated from the price table; not a bill"><div class="l">Spend (est.)</div><div class="v">${fmtUSD(w.cost_usd)}</div>${delta(w.cost_usd, prev.cost_usd, { invert: true, suffix: vs }) || `<div class="d">all time ${fmtUSD(t.cost_usd)}</div>`}<div class="d">estimated · ${fmtUSD(t.cost_usd)} all time</div></div>
     </div>
     <div class="ov-grid">
       <section class="card"><div class="card-head"><div><h2>Requests per day</h2><div class="hint">${W.days} days · ${fmtN(w.rag_requests)} RAG-augmented in ${W.label} · all time ${fmtN(t.requests)} requests · ${fmtK(t.prompt_tokens + t.completion_tokens)} tokens</div></div>
         <div class="legend"><span><i style="background:var(--amber)"></i>requests</span><span><i style="background:var(--rose)"></i>errors</span></div></div>${areaChart(daily)}</section>
       <section class="card stack" style="gap:14px"><div class="card-head m0"><h2>Traffic by project</h2><span class="hint">${W.label}</span></div>
-        <div class="stack">${byProject.map((p, i) => `<div class="bar-row"><div class="row between"><span class="dim ellip">${esc(p.name)}</span><span class="mono muted nowrap">${fmtN(p.requests)} · ${pct(p.requests, w.requests)}%${p.errors ? ` · ${fmtN(p.errors)} err` : ''}</span></div><div class="meter ${COLORS[i % COLORS.length]}"><i style="width:${pct(p.requests, maxP)}%"></i></div></div>`).join('') || '<div class="hint">No traffic in this window.</div>'}</div>
+        <div class="stack">${byProject.map((p, i) => `<div class="bar-row"><div class="row between"><span class="dim ellip">${esc(p.name)}</span><span class="mono muted nowrap">${fmtN(p.requests)} · ${pct(p.requests, w.requests)}%${p.errors ? ` · ${fmtN(p.errors)} err` : ''} · <span title="estimated spend">${fmtUSD(p.cost_usd)}</span></span></div><div class="meter ${COLORS[i % COLORS.length]}"><i style="width:${pct(p.requests, maxP)}%"></i></div></div>`).join('') || '<div class="hint">No traffic in this window.</div>'}</div>
         <div class="stack" style="border-top:1px solid var(--line);padding-top:14px;gap:10px"><h3>Budget watch</h3>
           ${budgets.map(b => `<div class="row between"><span class="dim ellip">${esc(b.name)} · ${b.kind}</span>${pctPill(b.pct)}</div>${meter(b.pct)}${b.at ? `<div class="hint">at the current rate exhausted ${new Date(b.at) <= Date.now() ? 'now' : 'in ' + fmtDur(new Date(b.at) - Date.now())} · resets ${esc(fmtDay(b.resets))}</div>` : ''}`).join('') || '<div class="hint">No project has a token budget.</div>'}</div></section>
     </div>
     <section class="card"><div class="card-head"><h2>Recent requests</h2><div class="row"><span class="pill">last 50</span><button class="btn sm ghost" data-goto="projects">All projects →</button></div></div>
-      <div class="tbl"><table><thead><tr><th>Time</th><th>Project</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
-      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td>${esc(projectName(r.project_id))}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:280px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No requests yet.</td></tr>'}</tbody></table></div></section>`;
+      <div class="tbl"><table><thead><tr><th>Time</th><th>Project</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th title="Estimated from the price table">$ (est.)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
+      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td>${esc(projectName(r.project_id))}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}${r.cached_prompt_tokens ? ` <span class="pill info" title="prompt tokens served from the provider cache">cache ${fmtK(r.cached_prompt_tokens)}</span>` : ''}</td><td class="mono ${r.cost_source === 'none' ? 'muted' : ''}" title="${r.cost_source === 'none' ? 'no price for this model' : 'estimated · ' + esc(r.cost_source) + ' price'}">${r.cost_source === 'none' ? '—' : fmtUSD(r.cost_usd)}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:280px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="9" class="muted">No requests yet.</td></tr>'}</tbody></table></div></section>`;
   bindChart(daily);
   on(app, '[data-win]', 'click', b => { state.overview.window = b.dataset.win; renderOverview(); });
   on(app, '[data-goto]', 'click', b => { state.tab = b.dataset.goto; render(); });
@@ -890,10 +896,10 @@ async function projectPanel() {
       <div class="stat"><div class="l">Requests 24h</div><div class="v">${fmtN(win.requests)}</div><div class="d">${fmtN(win.errors)} errors · ${fmtN(win.rate_limited)} rate limited</div></div>
       <div class="stat"><div class="l">Tokens 24h · p / c</div><div class="v" style="font-size:22px">${fmtK(win.prompt_tokens)} / ${fmtK(win.completion_tokens)}</div><div class="d">${fmtN(win.rag_requests)} RAG-augmented</div></div>
       <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(win.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(win.p95_latency_ms)} ms</div></div>
-      <div class="stat"><div class="l">All time</div><div class="v">${fmtN(t.requests)}</div><div class="d">${fmtK(t.prompt_tokens + t.completion_tokens)} tokens</div></div></div>
+      <div class="stat" title="Estimated from the price table; not a bill"><div class="l">Spend 24h (est.)</div><div class="v">${fmtUSD(win.cost_usd)}</div><div class="d">${fmtUSD(t.cost_usd)} all time · ${fmtN(t.requests)} requests</div></div></div>
     <div class="card"><div class="card-head"><h2>Recent</h2><span class="hint">last 50 · newest first</span></div>
-      <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
-      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
+      <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th title="Estimated from the price table">$ (est.)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
+      ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}${r.cached_prompt_tokens ? ` <span class="pill info" title="prompt tokens served from the provider cache">cache ${fmtK(r.cached_prompt_tokens)}</span>` : ''}</td><td class="mono ${r.cost_source === 'none' ? 'muted' : ''}" title="${r.cost_source === 'none' ? 'no price for this model' : 'estimated · ' + esc(r.cost_source) + ' price'}">${r.cost_source === 'none' ? '—' : fmtUSD(r.cost_usd)}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
   // Live countdown on the reset labels; the minute ring is refetched when its window rolls over.
   const resets = { minute: u.minute.resets_at, day: u.day.resets_at, month: u.month.resets_at };
   ringTimer = setInterval(() => { if (state.tab !== 'projects' || state.openProject !== id) { clearInterval(ringTimer); return; }
@@ -976,6 +982,62 @@ async function sendMessage(text) {
     pg.last = { status, latency, firstToken, usage, ragHits, remaining: rem ? rem[1] : null, limit: lim ? lim[1] : null, headers };
     renderPlayground(); $('#pg-text').focus();
   }
+}
+
+// ---------------------------------------------------------------------------
+// prices (editor)
+// ---------------------------------------------------------------------------
+const priceState = { q: '', provider: 'all' };
+// A per-million-token rate. "—" means the row has no own cache price and
+// falls back to the input rate, which is what the API returns as null.
+const rate = v => v == null ? '<span class="muted" title="falls back to the input rate">—</span>' : `<span class="mono">${Number(v).toFixed(v && Math.abs(v) < 0.01 ? 4 : 2)}</span>`;
+const priceNum = (name, val, label, hint = '') => field(name, label, input(name, val == null ? '' : String(val), 'type=number min=0 max=100000 step=any inputmode=decimal'), hint);
+// An empty numeric field means "unset": null for the cache rates, which is
+// not the same as 0, and 0 for the two required ones.
+const numOrNull = v => String(v).trim() === '' ? null : Number(v);
+
+async function renderPrices() {
+  const app = $('#app'); app.innerHTML = '<div class="card">Loading…</div>';
+  let res;
+  try { res = await api('/prices'); } catch (e) { app.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
+  const all = res.prices || [], s = priceState, w = can('editor');
+  const providers = [...new Set(all.map(p => p.provider_type))].sort();
+  const rows = all.filter(p => (s.provider === 'all' || p.provider_type === s.provider) &&
+    (!s.q || (p.model_pattern + ' ' + p.provider_type).toLowerCase().includes(s.q.toLowerCase())));
+  const edited = all.filter(p => p.source === 'user').length;
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Prices · ${all.length} row${all.length === 1 ? '' : 's'} · built-in table v${fmtN(res.builtin_version)}</div><h1>Model prices</h1>
+      <p class="lede">What each model costs per <strong>million tokens</strong>, used to estimate the spend shown on request logs and the overview. <strong>Estimates only</strong> — providers round, discount and change prices without telling the gateway. A built-in row you edit becomes yours and upgrades stop touching it; built-in rows cannot be deleted, only edited or reset.</p></div>
+    <div class="actions">${w ? `<button class="btn primary" id="addPrice">${ICON.plus} Add price</button>` : ''}</div></div>
+    <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:280px">${ICON.search}<label for="p-q" class="sr">Search prices</label><input id="p-q" class="input" placeholder="Search model pattern" value="${esc(s.q)}" style="min-height:38px" autocomplete="off"></div>
+        <div class="tabs" role="tablist" aria-label="Provider">${['all', ...providers].map(t => `<button class="tab" role="tab" data-provider="${esc(t)}" aria-selected="${s.provider === t}">${esc(t)}</button>`).join('')}</div></div>
+        <span class="hint">${rows.length} of ${all.length} · ${edited} edited by hand</span></div>
+      <div class="tbl"><table><thead><tr><th>Provider</th><th>Model pattern</th><th class="right">Input</th><th class="right">Output</th><th class="right">Cache write</th><th class="right">Cache read</th><th>Source</th><th></th></tr></thead><tbody>
+      ${rows.map(p => `<tr><td><div class="row" style="gap:10px">${providerBadge(p.provider_type, 'sm')}<span class="dim">${esc(p.provider_type)}</span></div></td>
+        <td class="mono">${esc(p.model_pattern)}</td><td class="right">${rate(p.input_per_mtok)}</td><td class="right">${rate(p.output_per_mtok)}</td>
+        <td class="right">${rate(p.cache_write_per_mtok)}</td><td class="right">${rate(p.cache_read_per_mtok)}</td>
+        <td><span class="pill ${p.source === 'user' ? 'info' : ''}">${esc(p.source)}</span> <span class="muted mono">${esc(p.currency)}</span></td>
+        <td class="right nowrap">${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button> ${p.source === 'user' ? `<button class="btn sm ghost" data-reset="${p.id}">Reset</button> <button class="btn sm ghost danger" data-del="${p.id}">Delete</button>` : ''}` : ''}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No prices match.</td></tr>'}</tbody></table></div></section>`;
+  let qTimer; $('#p-q').oninput = e => { s.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(renderPrices, 200); };
+  on(app, '[data-provider]', 'click', b => { s.provider = b.dataset.provider; renderPrices(); });
+  if (!w) return;
+  const priceBody = p => `${twoCol(priceNum('input_per_mtok', p ? p.input_per_mtok : 0, 'Input / Mtok'), priceNum('output_per_mtok', p ? p.output_per_mtok : 0, 'Output / Mtok'))}
+    ${twoCol(priceNum('cache_write_per_mtok', p ? p.cache_write_per_mtok : null, 'Cache write / Mtok', 'Empty: charged at the input rate'), priceNum('cache_read_per_mtok', p ? p.cache_read_per_mtok : null, 'Cache read / Mtok', 'Empty: charged at the input rate'))}
+    ${field('currency', 'Currency', input('currency', p ? p.currency : 'USD', 'maxlength=3 autocapitalize=characters'), 'Three-letter code; the dashboard labels every figure as an estimate.')}`;
+  const payload = d => ({ input_per_mtok: Number(d.input_per_mtok || 0), output_per_mtok: Number(d.output_per_mtok || 0),
+    cache_write_per_mtok: numOrNull(d.cache_write_per_mtok), cache_read_per_mtok: numOrNull(d.cache_read_per_mtok), currency: d.currency });
+  $('#addPrice').onclick = () => drawer({ eyebrow: 'New', title: 'Model price', submitLabel: 'Add price', body: `
+      ${twoCol(field('provider_type', 'Provider type', select('provider_type', state.providerTypes.map(t => ({ value: t.type, label: t.label || t.type })), 'openai')),
+        field('model_pattern', 'Model pattern', input('model_pattern', '', 'required maxlength=128 autocomplete=off spellcheck=false'), 'An exact model name, or a prefix with <code>*</code> (e.g. <code>gpt-4o-mini*</code>). The longest literal prefix wins.'))}
+      ${priceBody(null)}`,
+    onSubmit: async d => { await api('/prices', { method: 'POST', body: { provider_type: d.provider_type, model_pattern: d.model_pattern, ...payload(d) } }); toast('Price added', 3000, 'ok'); renderPrices(); } });
+  on(app, '[data-edit]', 'click', b => { const p = all.find(x => x.id == b.dataset.edit);
+    drawer({ eyebrow: `${p.provider_type} · ${p.source}`, title: p.model_pattern, submitLabel: 'Save price',
+      body: `${priceBody(p)}${p.source === 'builtin' ? '<p class="hint">Saving turns this into your own row: later upgrades will not overwrite it again. Reset restores the shipped values.</p>' : ''}`,
+      onSubmit: async d => { await api('/prices/' + p.id, { method: 'PUT', body: payload(d) }); toast('Price saved', 3000, 'ok'); renderPrices(); } }); });
+  on(app, '[data-reset]', 'click', async b => { if (!await confirmDialog('Restore the shipped price for this model? Later upgrades will refresh it again.', { label: 'Reset price', danger: false })) return;
+    try { await api(`/prices/${b.dataset.reset}/reset`, { method: 'POST' }); toast('Price reset', 3000, 'ok'); renderPrices(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this price? Requests for models it matched are logged without a cost estimate.', { label: 'Delete price' })) return;
+    try { await api('/prices/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); renderPrices(); } catch (e) { toast(e.message, 5000, 'err'); } });
 }
 
 // ---------------------------------------------------------------------------

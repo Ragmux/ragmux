@@ -91,8 +91,10 @@ func TestCSVRecordEscapesFormulas(t *testing.T) {
 	row.CreatedAt, row.ProjectID, row.ModelName, row.StatusCode = "2026-09-18T10:00:00Z", 3, "m", 200
 	row.PromptTokens, row.CompletionTokens, row.LatencyMs, row.Streamed, row.RAGUsed, row.RAGHits = 10, 2, 45, true, true, 2
 	row.Error = "-DDE"
+	row.CachedPromptTokens, row.CacheWriteTokens, row.CostUSD, row.CostSource = 6, 4, 0.001234, "builtin"
 	got := csvRecord(row)
-	want := []string{"2026-09-18T10:00:00Z", "3", "'=HYPERLINK(\"x\")", "m", "200", "10", "2", "false", "45", "true", "true", "2", "'-DDE"}
+	want := []string{"2026-09-18T10:00:00Z", "3", "'=HYPERLINK(\"x\")", "m", "200", "10", "2", "false", "45", "true", "true", "2", "'-DDE",
+		"6", "4", "0.001234", "builtin"}
 	if len(got) != len(csvHeader) || strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("record = %q\nwant     %q", got, want)
 	}

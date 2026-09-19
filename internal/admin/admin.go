@@ -27,6 +27,7 @@ import (
 	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/netguard"
+	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -46,6 +47,9 @@ type Admin struct {
 	Limiter *auth.LoginLimiter
 	// Usage reads project rate-limit counters; nil builds one on the Store.
 	Usage *limits.Limiter
+	// Prices is the gateway's cached price table; price mutations
+	// invalidate it so the next request is costed with the new numbers.
+	Prices *pricing.Cache
 	// ProviderConfig builds the provider configuration for a connection the
 	// same way the gateway does (hardened HTTP client, limits); nil falls
 	// back to a bare configuration.
@@ -152,6 +156,15 @@ func (a *Admin) authenticated(r chi.Router) {
 	r.Get("/api/projects/{id}/usage", a.projectUsage)
 	r.Get("/api/projects/{id}/members", a.listMembers)
 	editor.Put("/api/projects/{id}/members", a.setMembers)
+
+	// Model prices: viewers read the table that costs their requests,
+	// editors maintain it. A built-in row can be edited or reset but never
+	// deleted, so an upgrade cannot resurrect it.
+	r.Get("/api/prices", a.listPrices)
+	editor.Post("/api/prices", a.createPrice)
+	editor.Put("/api/prices/{id}", a.updatePrice)
+	editor.Delete("/api/prices/{id}", a.deletePrice)
+	editor.Post("/api/prices/{id}/reset", a.resetPrice)
 
 	r.Get("/api/metrics/summary", a.metricsSummary)
 	r.Get("/api/metrics/requests", a.recentRequests)
@@ -1653,8 +1666,11 @@ func (a *Admin) requestsCSV(w http.ResponseWriter, r *http.Request) {
 	a.exportCSV(w, r, f, "ragmux-requests")
 }
 
+// csvHeader keeps its original columns in their original order and grows
+// only at the end, so an importer that reads by position keeps working.
 var csvHeader = []string{"created_at", "project_id", "project_name", "model_name", "status_code", "prompt_tokens",
-	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error"}
+	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error",
+	"cached_prompt_tokens", "cache_write_tokens", "cost_usd", "cost_source"}
 
 // exportCSV streams the window's request logs (oldest first, at most
 // store.MaxExportRows) as a CSV download. Errors after the first row can
@@ -1680,7 +1696,11 @@ func csvRecord(row *store.RequestExportRow) []string {
 	rec := []string{row.CreatedAt, strconv.FormatInt(row.ProjectID, 10), row.ProjectName, row.ModelName,
 		strconv.Itoa(row.StatusCode), strconv.Itoa(row.PromptTokens), strconv.Itoa(row.CompletionTokens),
 		strconv.FormatBool(row.Estimated), strconv.FormatInt(row.LatencyMs, 10), strconv.FormatBool(row.Streamed),
-		strconv.FormatBool(row.RAGUsed), strconv.Itoa(row.RAGHits), row.Error}
+		strconv.FormatBool(row.RAGUsed), strconv.Itoa(row.RAGHits), row.Error,
+		strconv.Itoa(row.CachedPromptTokens), strconv.Itoa(row.CacheWriteTokens),
+		// Six decimals is the full precision of cost_micros; anything
+		// shorter would round a cheap request to zero.
+		strconv.FormatFloat(row.CostUSD, 'f', 6, 64), row.CostSource}
 	for i, c := range rec {
 		rec[i] = csvCell(c)
 	}
