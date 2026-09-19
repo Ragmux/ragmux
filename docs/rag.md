@@ -78,9 +78,12 @@ document's `status` goes `pending` → `processing` → `ready` or `failed` (wit
 and `progress_percent` reports how far a job got: `10` after parsing, `20` after chunking,
 then the share of embedding batches done, `100` when ready (a failed document keeps its
 last value). PDFs also report `page_count` once parsed; other formats leave it `null`.
-Jobs interrupted by a restart resume automatically. The queue holds 1024 documents; when
-it is full an upload or reprocess request answers `503 ingestion queue is full, retry
-later` and the affected documents are marked `failed` with that message.
+The queue is the `documents` table itself, not a channel in the process: a job a restart
+cut short is picked up again automatically, by this gateway or by another replica. When
+the backlog of `pending` documents reaches `MAX_PENDING_DOCUMENTS` (1024) an upload or
+reprocess answers `503 the ingestion backlog is full (MAX_PENDING_DOCUMENTS), retry
+later` and the affected documents are marked `failed` with that message. The count is
+cluster-wide; see [Ingestion across replicas](scaling.md#ingestion-across-replicas).
 
 ## Chunking and contextual chunks
 

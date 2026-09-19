@@ -21,7 +21,11 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `CORS_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call the API (`*` allows all). Unset means no CORS headers at all. |
 | `SESSION_TTL` | `24h` | Dashboard session lifetime (Go duration such as `12h`, `30m`). |
 | `UPSTREAM_TIMEOUT` | `5m` | Timeout for a non-streaming provider call. Streaming calls use it for the connect and response-header phase only. |
-| `INGEST_WORKERS` | `2` | Parallel document ingestion jobs (`>= 1`). |
+| `INGEST_WORKERS` | `2` | Parallel document ingestion jobs on this replica (`>= 1`). |
+| `INGEST_LEASE` | `2m` | How long this replica owns a document it claimed without renewing the claim (Go duration, minimum `3s`). The worker renews it every third of this while the job runs, so it bounds how long a crashed replica's document stays untouchable, not how long a job may take. See [Ingestion across replicas](scaling.md#ingestion-across-replicas). |
+| `INGEST_POLL_INTERVAL` | `5s` | How often the ingestion dispatcher looks for claimable documents when nothing wakes it (Go duration, minimum `100ms`). An upload on this replica kicks it immediately; the poll is what finds work another replica queued. |
+| `INGEST_MAX_ATTEMPTS` | `5` | How many times one document may be claimed before the retention job marks it `failed` (`>= 1`). It stops a document that kills the process from becoming a cluster-wide crash loop. A successful ingest, an upload and a reprocess each reset the counter. |
+| `MAX_PENDING_DOCUMENTS` | `1024` | Cluster-wide ingestion backlog an upload is still accepted into (`>= 1`). Beyond it the upload gets `503`; the count is `documents` in status `pending` across every replica, cached for about a second. |
 | `MAX_UPLOAD_MB` | `50` | Maximum size of one document upload request in MiB (`>= 1`). |
 | `MAX_CHUNKS_PER_DOCUMENT` | `20000` | A document that splits into more chunks than this is marked `failed` before anything is embedded (`>= 1`). Bounds the memory and embedding cost of one document. |
 | `MAX_DOCUMENTS_PER_STORE` | `0` | Instance-wide ceiling on the documents one RAG store may hold (`0` = unlimited). A store's own `max_documents` can only lower it; uploads over the limit get `422 store_quota`. See [Quotas](rag.md#quotas). |
@@ -82,8 +86,9 @@ The same policy applies to the `POST /admin/api/models/{id}/test` ping.
 
 Without flags the binary loads the configuration, connects to the database, applies
 pending migrations under an advisory lock (several replicas may start against the same
-database), creates the first admin if needed, resumes unfinished document ingestion and
-starts listening.
+database), checks that `SECRET_KEY` is the one the database was written with (see
+[SECRET_KEY](scaling.md#secret-key)), creates the first admin if needed, starts working
+the document ingestion queue and starts listening.
 
 ## Fixed server limits
 
@@ -103,10 +108,10 @@ These are not configurable:
 - Document parsing: PDFs are read for at most 60 s and 2000 pages; a DOCX
   `word/document.xml` may be at most 32 MiB (and at most 100× its compressed size); the
   extracted text of any document is capped at 20 MiB; one ingestion job may run 15 min.
-- The ingestion queue holds 1024 documents; uploads beyond that get `503`.
 - Graceful shutdown on `SIGINT`/`SIGTERM`: in-flight HTTP requests get 15 s, running
-  ingestion jobs 30 s, then the retention job and the pool stop. Documents whose
-  ingestion was cut short resume on the next start.
+  ingestion jobs 30 s, then the documents this process still owned go back into the
+  queue and the retention job and the pool stop. See
+  [Rolling restarts and shutdown](scaling.md#rolling-restarts-and-shutdown).
 - `GET /` redirects to `/admin/`.
 
 ## Deployment layouts
@@ -123,6 +128,7 @@ least-privilege database role `ragmux_app`; they differ in where PostgreSQL runs
 | Required `.env` | nothing (`SECRET_KEY` recommended) | `SECRET_KEY`, `POSTGRES_PASSWORD`, `RAGMUX_DB_PASSWORD` |
 | Database access | unix socket inside the container, no TCP listener | TCP inside the Compose network, password authentication |
 | Use it for | single-host installs, evaluation, small teams | an existing or managed PostgreSQL, a database you operate separately, scaling the gateway independently |
+| More than one gateway replica | **no** - the container bundles PostgreSQL | yes, with `docker-compose.scale.yml` on top; see [Running more than one replica](scaling.md) |
 
 **All-in-one.** `docker compose up -d` starts one container. Its entrypoint runs as
 root only long enough to prepare the volume, then starts `postgres` as the `postgres`
@@ -283,7 +289,9 @@ From v0.3.1 on both are signed with cosign; see
   `Connection: keep-alive`, which nginx honours for `proxy_pass` upstreams. On other
   proxies disable response buffering for `/v1/` explicitly and make sure the proxy
   read timeout is longer than your longest completion (the gateway itself does not
-  time out an established stream).
+  time out an established stream). Streams keep no server-side state, so a fleet of
+  replicas needs plain round robin and **no** session affinity; see
+  [Streaming](scaling.md#streaming).
 - **Upload size.** Raise the proxy's body limit to at least `MAX_UPLOAD_MB` for
   `/admin/api/rag-stores/*/documents`.
 - **CORS.** If browsers call the API from another origin, set `CORS_ORIGINS`; the
