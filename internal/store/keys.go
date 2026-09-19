@@ -40,21 +40,27 @@ const (
 	ScopeKeys  = "keys"
 )
 
+// The scope lists are functions rather than package-level slices on purpose.
+// A shared slice is one append or index assignment away from changing what
+// every future key in the process gets, and the caller that did it would be
+// nowhere near this file. Handing out a fresh slice each time costs one tiny
+// allocation on a path that already talks to the database.
+
 // DefaultGatewayScopes is what a gateway key gets when none are given.
-var DefaultGatewayScopes = []string{ScopeChat, ScopeModels}
+func DefaultGatewayScopes() []string { return []string{ScopeChat, ScopeModels} }
 
 // GatewayScopes and ManagementScopes list the valid scopes per kind.
-var (
-	GatewayScopes    = []string{ScopeChat, ScopeModels}
-	ManagementScopes = []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeKeys}
-)
+func GatewayScopes() []string { return []string{ScopeChat, ScopeModels} }
+
+// ManagementScopes lists the scopes a management key may carry.
+func ManagementScopes() []string { return []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeKeys} }
 
 // ValidScopes returns the scopes a key of this kind may carry.
 func ValidScopes(kind string) []string {
 	if kind == KindManagement {
-		return ManagementScopes
+		return ManagementScopes()
 	}
-	return GatewayScopes
+	return GatewayScopes()
 }
 
 // KeyPrefixFor returns the credential prefix of a key kind.

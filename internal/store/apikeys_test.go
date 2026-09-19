@@ -52,7 +52,7 @@ func newKeyFixture(t *testing.T) *keyFixture {
 func (f *keyFixture) gatewayKey(name string, projects ...int64) (*store.APIKey, string) {
 	f.t.Helper()
 	k, raw, err := f.st.CreateAPIKey(f.ctx, &store.APIKey{Kind: store.KindGateway, Name: name, UserID: f.user.ID,
-		Scopes: store.DefaultGatewayScopes, ProjectIDs: projects})
+		Scopes: store.DefaultGatewayScopes(), ProjectIDs: projects})
 	if err != nil {
 		f.t.Fatal(err)
 	}
