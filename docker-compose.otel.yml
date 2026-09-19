@@ -1,0 +1,45 @@
+# Tracing overlay: an OpenTelemetry Collector next to the gateway.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.otel.yml up -d
+#
+# It also layers onto docker-compose.split.yml and docker-compose.scale.yml,
+# which is where it earns its keep: several gateway replicas all export into
+# one Collector.
+#
+# Out of the box the Collector prints the spans it receives, which is enough
+# to confirm the wiring. Point it at a real backend by editing the exporters
+# in otel-collector.yaml; the commented blocks there cover Jaeger, Tempo and
+# a vendor OTLP endpoint.
+#
+# Why a Collector rather than a vendor endpoint directly: Ragmux speaks
+# OTLP/HTTP with the JSON encoding, which is exactly what a Collector accepts
+# on 4318 with no configuration. Vendor-direct endpoints vary and several are
+# protobuf-only. The Collector is also where compression, retries, tail
+# sampling and resource detection belong -- none of which the gateway's
+# hand-rolled exporter does. See docs/observability.md.
+services:
+  ragmux:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-ragmux}
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
+      # One request in twenty. The decision is made once per trace and
+      # inherited, so a sampled request is complete or absent, never half.
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.05}
+      # Off by default: any client holding an api key could otherwise pin
+      # every request into one trace and force the sampled flag on all of it.
+      TRACING_TRUST_INCOMING: ${TRACING_TRUST_INCOMING:-false}
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.137.0
+    container_name: ragmux-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
+    # No ports are published. The gateway reaches the Collector over the
+    # compose network; nothing outside needs to.
+    expose:
+      - "4318"

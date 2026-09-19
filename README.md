@@ -184,6 +184,7 @@ IBM Plex Sans, JetBrains Mono, all SIL OFL, `web/fonts/`) and runs under a stric
 | [Users, roles and limits](docs/users-and-limits.md) | roles matrix, project membership, login protection, audit log, rate limits and budgets, metrics and retention |
 | [Providers](docs/providers.md) | provider types and endpoints, Anthropic / Gemini / Ollama translation details, request passthrough, model echo |
 | [Backup and restore](docs/backup-restore.md) | what to back up, `scripts/backup.sh` and `scripts/restore.sh`, scheduled backups, PITR, restore runbook |
+| [Observability](docs/observability.md) | `/metrics` and why it is authenticated, the metric table, the cardinality checklist, `/readyz` vs `/healthz`, tracing spans and sampling, running a Collector |
 | [Changelog](CHANGELOG.md) | release notes |
 
 ## Security
@@ -227,6 +228,9 @@ internal/gateway/     /v1 proxy, RAG injection, metrics
 internal/limits/      per-project rate limits, token budgets, usage counters
 internal/maintenance/ hourly retention job
 internal/admin/       /admin REST API + dashboard hosting
+internal/metrics/     dependency-free Prometheus registry and text exposition
+internal/tracing/     OTLP/HTTP span exporter over the standard library
+internal/obs/         the metric set, its labels and the HTTP middlewares
 web/                  dashboard (index.html, vanilla JS) and its fonts, embedded in the binary
 docker/aio/           entrypoint of the all-in-one image (Postgres + gateway supervision)
 docker/postgres-init/ ragmux_app role and vector extension SQL shared by both layouts
