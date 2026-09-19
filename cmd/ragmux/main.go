@@ -403,17 +403,24 @@ func run(cfg config.Config) error {
 				"spans", n)
 		}
 	}
-	// The metrics endpoint is closed last so that
+	// Only when METRICS_LISTEN is set. On the default configuration
+	// mountMetrics returns nil and /metrics lives on the main router, so the
+	// endpoint is already gone with srv.Shutdown above and the dropped-span
+	// count reaches nothing but the log line.
+	//
+	// Where there is a separate listener, closing it last means
 	// ragmux_tracing_spans_dropped_total has reached its final value while
 	// the endpoint still exists. A scrape is unlikely to land in the moment
-	// between the two -- the line logged above is what actually reports the
-	// count -- but closing the endpoint before the counter settles would
-	// have made the exported value wrong rather than merely missed.
+	// between the two, so the log line is still what reports the number; what
+	// the order buys is that the value served is never one taken before the
+	// counter settled.
 	//
-	// Its own budget, not shutCtx: by this point shutCtx has been alive
-	// through the HTTP drain, StopWithTimeout's 30 seconds and the tracer
-	// flush, so it is routinely expired here and Shutdown would abandon an
-	// in-flight scrape and log a deadline error on every clean shutdown.
+	// Its own budget, not shutCtx: shutCtx is created before the HTTP drain
+	// and by this point has also had to cover StopWithTimeout, which waits up
+	// to 30 seconds when ingestion jobs are running. On an idle process it
+	// has budget left, but in exactly the case this ordering exists for it is
+	// spent, and Shutdown would then drop an in-flight scrape and log a
+	// deadline error.
 	if metricsSrv != nil {
 		metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := metricsSrv.Shutdown(metricsCtx); err != nil {

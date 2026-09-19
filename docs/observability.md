@@ -258,11 +258,18 @@ from an unreserved alphabet — 51 bytes that pass any such filter — and so ar
 length cap. The header is therefore not read at all, which makes the guarantee
 structural rather than a question of how good the filter is.
 
-If a proxy in front of Ragmux generates `X-Request-Id` and you correlate your logs on it,
-that correlation ends at this hop — Ragmux answers with an id of its own. Propagate
-`traceparent` instead and set `TRACING_TRUST_INCOMING=true` so the two sides share a trace
-id; read [the trust gate](#the-trust-gate) first, because that setting also lets a client
-choose the trace id and the sampled flag.
+If a proxy in front of Ragmux generates `X-Request-Id` and you correlate on it, that
+correlation ends at this hop — Ragmux answers with an id of its own. Configure the proxy
+to emit `traceparent` as well and set `TRACING_TRUST_INCOMING=true`, and the two sides
+share a trace id in your tracing backend. Read [the trust gate](#the-trust-gate) first,
+because that setting also lets a client choose the trace id and the sampled flag.
+
+Be clear about what that does and does not recover. It joins **traces**. It does not join
+**logs**: Ragmux log lines carry `req_id`, which is the generated request id, and no log
+line carries a trace id, so a proxy log line and a Ragmux log line still have no shared
+field to match on. And the proxies that typically mint `X-Request-Id` — nginx's
+`$request_id`, HAProxy's `unique-id` — do not emit `traceparent` unless you configure it,
+which usually means an OpenTelemetry module rather than a log-format change.
 
 The registry enforces a backstop regardless: at `METRICS_MAX_SERIES` new combinations are
 refused, counted in `ragmux_metrics_series_dropped_total` and logged at **`error`** (at
