@@ -145,9 +145,21 @@ func (s *Store) buildBM25Index(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	// The second half of the key is the schema, because the index this
+	// guards is per-schema: two Ragmux instances sharing one database, and
+	// the tests, which isolate themselves by schema, must not queue behind
+	// each other's build. Without that they do, and this lock reports the
+	// wait as "another replica is still building" after bm25BuildLockWait --
+	// a silent downgrade to pgvector rather than the blocking wait
+	// ensureVecTable's global key gets away with.
+	//
+	// hashtext rather than hashtextextended here: pg_try_advisory_xact_lock
+	// takes two int4s, so 32 bits is the width the key actually has and
+	// narrowing a bigint into it would only add a cast that can overflow.
 	var locked bool
-	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1, $2)",
-		lockBM25Index, int32(0)).Scan(&locked); err != nil {
+	if err := tx.QueryRow(ctx,
+		"SELECT pg_try_advisory_xact_lock($1, pg_catalog.hashtext(pg_catalog.current_schema()))",
+		lockBM25Index).Scan(&locked); err != nil {
 		return false, err
 	}
 	if !locked {
@@ -187,11 +199,18 @@ func (s *Store) buildBM25Index(ctx context.Context) (bool, error) {
 
 // bm25IndexTokenizer reads the analyser the BM25 index on chunks was
 // actually built with, or "" when there is no such index.
+//
+// It looks the index up through pg_index on the chunks table this connection
+// resolves, not by schema name. CREATE INDEX puts the index in the schema of
+// the table it indexes, so with a multi-entry search_path a check against
+// current_schema() would miss the index that the DDL beside it is about to
+// touch and quietly disable the drift warning.
 func bm25IndexTokenizer(ctx context.Context, tx pgx.Tx) (string, error) {
 	var opts []string
 	err := tx.QueryRow(ctx, `SELECT COALESCE(c.reloptions, '{}')
-		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = current_schema()`,
+		FROM pg_class c
+		JOIN pg_index i ON i.indexrelid = c.oid
+		WHERE i.indrelid = to_regclass('chunks') AND c.relname = $1`,
 		bm25Index).Scan(&opts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil

@@ -2,8 +2,6 @@ package store
 
 import (
 	"context"
-	"fmt"
-	"io/fs"
 	"time"
 )
 
@@ -49,25 +47,6 @@ func (s *Store) TableConstraints(ctx context.Context, table string) ([]string, e
 		out = append(out, def)
 	}
 	return out, rows.Err()
-}
-
-// LatestMigration is the highest embedded migration version. Tests that
-// check a freshly opened schema is fully migrated read it from the embedded
-// files rather than from a literal, so adding a migration does not make an
-// unrelated test fail on a number.
-func LatestMigration() int {
-	entries, err := fs.ReadDir(migrationFS, "migrations")
-	if err != nil {
-		panic(err)
-	}
-	highest := 0
-	for _, e := range entries {
-		var version int
-		if _, err := fmt.Sscanf(e.Name(), "%d_", &version); err == nil && version > highest {
-			highest = version
-		}
-	}
-	return highest
 }
 
 // SwapSearchBackend registers b under name and returns the function that

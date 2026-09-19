@@ -126,17 +126,49 @@ func (s *Store) SearchBackendReason(name string) string {
 	return "the pg_search extension is not installed on this PostgreSQL server"
 }
 
-// backendWarned remembers which rag stores already logged the "configured
-// backend is unavailable" warning, so a store left pointing at a backend
-// this server does not carry costs one log line per process rather than one
-// per query. The key pairs the Store with the rag store id: two Stores in
+// backendWarned remembers which backend warnings are already standing, so a
+// degraded store costs one log line rather than one per query. At 50 requests
+// a second an undeduplicated warning is three thousand lines a minute, which
+// buries the one line an operator needs.
+//
+// The key pairs the Store with the rag store id and the reason: two Stores in
 // one process (tests, or a re-Open simulating a restart) must not silence
-// each other's first warning.
+// each other's first warning, and the three ways a backend can let a search
+// down must not silence each other either.
 var backendWarned sync.Map
 
 type backendWarnKey struct {
-	store *Store
-	rag   int64
+	store  *Store
+	rag    int64
+	reason string
+}
+
+// Reasons a backend warning is filed under.
+const (
+	// warnUnavailable: this server cannot run the configured backend at
+	// all. Capabilities are detected once at boot, so it cannot resolve
+	// without a restart and the gate is never cleared.
+	warnUnavailable = "unavailable"
+	// warnPrepare: the backend's index could not be built.
+	warnPrepare = "prepare"
+	// warnQuery: the backend built its query and the server rejected it.
+	warnQuery = "query"
+)
+
+// warnBackendOnce logs a backend warning unless the same one is already
+// standing for this rag store.
+func (s *Store) warnBackendOnce(storeID int64, reason, msg string, args ...any) {
+	if _, warned := backendWarned.LoadOrStore(backendWarnKey{s, storeID, reason}, true); warned {
+		return
+	}
+	s.log.Warn(msg, args...)
+}
+
+// clearBackendWarning reopens the gate for one reason, so a backend that
+// recovers and then fails again is reported again instead of staying silent
+// for the life of the process.
+func (s *Store) clearBackendWarning(storeID int64, reason string) {
+	backendWarned.Delete(backendWarnKey{s, storeID, reason})
 }
 
 // resolveBackend returns the backend a search should use. A store configured
@@ -156,9 +188,8 @@ func (s *Store) resolveBackend(name string, storeID int64) SearchBackend {
 	if b.Available(s.caps) {
 		return b
 	}
-	if _, warned := backendWarned.LoadOrStore(backendWarnKey{s, storeID}, true); !warned {
-		s.log.Warn("rag store is configured for a search backend this server cannot run; falling back to pgvector",
-			"rag_store", storeID, "backend", name, "reason", s.SearchBackendReason(name))
-	}
+	s.warnBackendOnce(storeID, warnUnavailable,
+		"rag store is configured for a search backend this server cannot run; falling back to pgvector",
+		"rag_store", storeID, "backend", name, "reason", s.SearchBackendReason(name))
 	return searchBackends[BackendPgvector]
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -267,35 +268,58 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 		if err := backend.Prepare(ctx, s); err != nil {
 			// A backend that cannot prepare its index is as unusable as one
 			// the server does not carry; degrade rather than fail the search.
-			s.log.Warn("search backend could not be prepared; falling back to pgvector",
+			s.warnBackendOnce(storeID, warnPrepare,
+				"search backend could not be prepared; falling back to pgvector",
 				"rag_store", storeID, "backend", backend.Name(), "err", err)
 			backend = searchBackends[BackendPgvector]
+		} else {
+			s.clearBackendWarning(storeID, warnPrepare)
 		}
 	}
 
 	hits, err := s.runSearch(ctx, backend, r, query, queryVec, opts)
-	// Only a hybrid search can fail *because of* its lexical backend. A
-	// vector-only search never reads a lexical index, and a cancelled
-	// context would fail the retry too, so neither is worth a second
-	// attempt or a warning that blames the wrong thing.
-	if err == nil || opts.Mode != SearchHybrid || ctx.Err() != nil || backend.Name() == BackendPgvector {
+	if err == nil {
+		if backend.Name() != BackendPgvector {
+			s.clearBackendWarning(storeID, warnQuery)
+		}
+		return hits, backend.Name(), nil
+	}
+	// Retry only what the lexical backend is actually to blame for. A
+	// vector-only search never reads a lexical index; a cancelled context
+	// would fail the retry too; and an error from Begin, SET LOCAL, Scan or
+	// Commit is the database or the pool, not the backend -- retrying those
+	// would double the load on a server that is already struggling, clear a
+	// perfectly good index flag into an extra DDL transaction per search,
+	// and name the wrong culprit in the log.
+	if opts.Mode != SearchHybrid || ctx.Err() != nil || backend.Name() == BackendPgvector ||
+		!errors.Is(err, errLexicalQuery) {
 		return hits, backend.Name(), err
 	}
-	// The lexical backend answered Prepare but not the query. The case this
-	// exists for is an index dropped under a running process -- which is
-	// exactly what docs/configuration.md tells an operator to do to change
-	// PG_SEARCH_TOKENIZER: Prepare returns from its in-process memory, the
-	// query sends @@@ at a table that no longer has a BM25 index, and every
-	// hybrid search on this replica would fail until it was restarted.
-	// Retrieval degrades instead (PRD behaviour rule 8), and Invalidate is
-	// what makes the next search rebuild rather than repeat this.
+	// What is left is the statement the backend built, rejected by the
+	// server. The case this exists for is an index dropped under a running
+	// process -- exactly what docs/configuration.md tells an operator to do
+	// to change PG_SEARCH_TOKENIZER: Prepare returns from this process's
+	// memory, the query sends @@@ at a table that no longer has a BM25
+	// index, and every hybrid search on this replica would fail until it was
+	// restarted. Retrieval degrades instead (PRD behaviour rule 8), and
+	// Invalidate is what makes the next search rebuild rather than repeat
+	// this.
 	backend.Invalidate(s)
-	s.log.Warn("hybrid search failed on its lexical backend; falling back to pgvector and rebuilding on the next search",
+	s.warnBackendOnce(storeID, warnQuery,
+		"hybrid search failed on its lexical backend; falling back to pgvector and rebuilding on the next search",
 		"rag_store", storeID, "backend", backend.Name(), "err", err)
 	backend = searchBackends[BackendPgvector]
 	hits, err = s.runSearch(ctx, backend, r, query, queryVec, opts)
 	return hits, backend.Name(), err
 }
+
+// errLexicalQuery marks the one failure the fallback may act on: the fused
+// statement a backend built was rejected by the server. Everything else
+// runSearch can return -- a transaction that would not begin, a session
+// setting that would not apply, a row that would not scan, a commit that
+// would not land -- is the database or the pool, and answers the same way on
+// pgvector.
+var errLexicalQuery = errors.New("search statement rejected")
 
 // runSearch executes one search with one backend. It is the whole database
 // half of SearchWithBackend, split out so a hybrid search whose lexical
@@ -349,9 +373,13 @@ func (s *Store) runSearch(ctx context.Context, backend SearchBackend, r *RAGStor
 		sql, args = backend.HybridQuery(SearchParams{VecTable: table, Vector: vec, StoreID: r.ID,
 			Candidates: opts.Candidates, MaxDistance: opts.MaxDistance, FTSConfig: opts.FTSConfig, Query: query})
 	}
+	// Query and rows.Err are the two places the server can reject the
+	// statement itself -- pgx reports a plan failure from either, depending
+	// on how far the protocol got -- so both carry errLexicalQuery and
+	// nothing else does.
 	rows, err = tx.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("%s search: %w", opts.Mode, err)
+		return nil, fmt.Errorf("%s search: %w: %w", opts.Mode, errLexicalQuery, err)
 	}
 	defer rows.Close()
 	hits := []SearchHit{}
@@ -364,7 +392,7 @@ func (s *Store) runSearch(ctx context.Context, backend SearchBackend, r *RAGStor
 		hits = append(hits, h)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s search: %w: %w", opts.Mode, errLexicalQuery, err)
 	}
 	return hits, tx.Commit(ctx)
 }

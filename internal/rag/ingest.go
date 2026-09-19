@@ -40,7 +40,10 @@ type Settings struct {
 	// than this before anything is embedded; 0 means DefaultMaxChunks.
 	MaxChunksPerDocument int
 	// EmbedBatchSize is how many chunks go to the embedder in one call;
-	// 0 means defaultEmbedBatch.
+	// 0 means defaultEmbedBatch. No environment variable sets it: it exists
+	// so a test can make progress reporting observable one batch at a time,
+	// and because the field it replaced was assigned after the dispatcher
+	// had already started reading it.
 	EmbedBatchSize int
 	// Metrics counts claims, jobs and chunks; nil records nothing.
 	Metrics *obs.Metrics

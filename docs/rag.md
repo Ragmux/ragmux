@@ -183,6 +183,14 @@ already built it find out on their next hybrid search: that one query is answere
 `pgvector` and logged, and the search after it rebuilds the index (or keeps falling back,
 if no store wants it any more).
 
+**The rebuild rides on that request.** `CREATE INDEX` runs on the context of the hybrid
+search that triggered it and scans every row of `chunks`, so on a large corpus that one
+request waits minutes. For its whole duration the index build holds a `SHARE` lock on
+`chunks`, which blocks ingestion writes - a job that waits past `INGEST_LEASE` loses its
+claim, and one that waits past the 15-minute processing timeout fails outright. Hybrid
+searches arriving meanwhile wait up to 15 s for the build lock and then answer from
+`pgvector`. Drop and rebuild the index during a quiet period, not under load.
+
 **Write time**: saving a store with `search_backend: "pg_search"` on a server without the
 extension is refused with `400` naming the extension and pointing here.
 `GET /admin/api/search-backends` returns `[{"id","available","reason"}]` so the dashboard

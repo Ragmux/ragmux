@@ -30,6 +30,10 @@ type brokenBackend struct {
 	// realPrepare runs the production ensureBM25Index, so the test exercises
 	// the actual short-circuit rather than a stand-in for it.
 	realPrepare bool
+	// wrongColumns builds a statement the server accepts and runs but whose
+	// result does not fit the twelve-column contract, so the search fails at
+	// the scan rather than at the plan.
+	wrongColumns bool
 }
 
 func (b *brokenBackend) Name() string { return store.BackendPgSearch }
@@ -56,6 +60,11 @@ func (b *brokenBackend) Invalidate(s *store.Store) {
 
 func (b *brokenBackend) HybridQuery(store.SearchParams) (string, []any) {
 	b.queried.Add(1)
+	if b.wrongColumns {
+		// Plans, runs, returns a row -- and has one column where the scan
+		// wants twelve.
+		return "SELECT 1", nil
+	}
 	// Stands for pg_search's "`chunks` does not contain a `USING bm25`
 	// index": a statement the server refuses to plan.
 	return "SELECT 1 FROM chunks_without_a_bm25_index", nil
@@ -152,6 +161,63 @@ func TestDroppedLexicalIndexFallsBackInsteadOfFailing(t *testing.T) {
 	}
 	if b.prepared.Load() != 2 {
 		t.Errorf("Prepare ran %d times, want 2: the flag must not survive the failure", b.prepared.Load())
+	}
+
+	// A degraded store must cost one log line, not one per request: an index
+	// left dropped under real traffic would otherwise bury the log.
+	before := len(h.msgs)
+	for range 5 {
+		if _, _, err := s.SearchWithBackend(ctx, r.ID, "zyxquux", q,
+			store.SearchOptions{Mode: store.SearchHybrid, Backend: r.SearchBackend, Candidates: 3}); err != nil {
+			t.Fatalf("repeat search: %v", err)
+		}
+	}
+	if n := len(h.msgs) - before; n != 0 {
+		t.Errorf("five more degraded searches logged %d warnings, want 0: %v", n, h.msgs[before:])
+	}
+}
+
+// TestOnlyARejectedStatementTriggersTheFallback pins the other side of the
+// retry condition. Only the statement a backend built, rejected by the
+// server, may trigger the fallback; a failure anywhere else in the search --
+// a transaction that will not begin, a row that will not scan, a commit that
+// will not land -- is the database or the column contract, and answers the
+// same way on pgvector. Retrying those would double the load on a server
+// already in trouble, throw away a valid index flag, and name the wrong
+// culprit in the log.
+//
+// A result that does not match the twelve-column contract stands in for the
+// class: the statement planned and ran, and what failed was the scan.
+func TestOnlyARejectedStatementTriggersTheFallback(t *testing.T) {
+	ctx := context.Background()
+	h := &countingHandler{}
+	s, err := store.Open(ctx, testdb.Config(t), slog.New(h))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	r := seedSearchable(t, s, "contract")
+
+	b := &brokenBackend{wrongColumns: true}
+	defer store.SwapSearchBackend(store.BackendPgSearch, b)()
+	s.SetBM25Ready(true)
+
+	before := len(h.msgs)
+	if _, _, err := s.SearchWithBackend(ctx, r.ID, "zyxquux", []float32{1, 0, 0, 0},
+		store.SearchOptions{Mode: store.SearchHybrid, Backend: r.SearchBackend, Candidates: 3}); err == nil {
+		t.Fatal("a result that does not match the column contract must fail the search")
+	}
+	if b.queried.Load() != 1 {
+		t.Errorf("the backend was asked for %d statements, want 1: there must be no retry", b.queried.Load())
+	}
+	if b.invalidated.Load() != 0 {
+		t.Error("a failure the lexical index did not cause must not invalidate it")
+	}
+	if !s.BM25Ready() {
+		t.Error("the cached index flag must survive a failure the backend's index did not cause")
+	}
+	if n := len(h.msgs) - before; n != 0 {
+		t.Errorf("logged %d backend warnings for a failure the backend did not cause: %v", n, h.msgs[before:])
 	}
 }
 
