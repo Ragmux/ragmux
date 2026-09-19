@@ -6,6 +6,43 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-19
+
+Documentation and release plumbing only. No Go code changed since 0.4.0, so the `v0.4.1`
+images carry the same gateway binary as `v0.4.0`; nothing about the runtime behaviour,
+the API or the database schema is different. Upgrading is optional.
+
+### Added
+- The release workflow publishes the **Docker Hub repository page** after every image is
+  pushed, from the new `docker/README.dockerhub.md`. It is a dedicated file rather than
+  `README.md` because its links have to be absolute — Docker Hub cannot resolve
+  repository-relative ones — and it runs last so the page never describes a release that
+  is not published yet.
+
+### Changed
+- **The README quick start leads with `docker run`.** It previously opened with
+  `cp .env.example .env` and `docker compose up -d`, which silently assumed you had
+  already cloned the repository. The first command now pulls `ragmux/ragmux:latest` and
+  needs nothing on disk; Compose follows as the second way in, with the `git clone` step
+  spelled out and a table of the five Compose files and what each one runs.
+- **A "Which image" section** in the README compares the three published variants
+  (`:latest`, `:latest-app`, `:latest-paradedb`) and says which installation each suits.
+  All three were already being built and signed — only the explanation was missing.
+- [Configuration](docs/configuration.md) names **Docker Hub** as the primary registry,
+  with `ghcr.io/ragmux/ragmux` kept as a mirror carrying identical tags. The
+  deployment-layout table had been naming the GHCR images while the repository's own
+  Compose files pull `ragmux/ragmux`. The published-images list also gained the
+  `-paradedb` variant and a heading of its own.
+- The note on the PostgreSQL major version inside the all-in-one image no longer ties the
+  promise to the 0.3 line: it is **17**, it never moves within a minor series, and a
+  release that does move it will say so and name the migration path.
+
+### Fixed
+- The `SECRET_KEY` cross-reference pointed at `scaling.md#secret-key`, which does not
+  resolve — the heading's anchor is `#secret_key`. Corrected in
+  [Configuration](docs/configuration.md) and
+  [Backup and restore](docs/backup-restore.md).
+
 ## [0.4.0] — 2026-09-19
 
 ### Added
@@ -639,7 +676,8 @@ Initial release: single-container gateway with SQLite + sqlite-vec, OpenAI-compa
 for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over PDF/TXT/MD,
 projects with `sk-proj-` keys, metrics and an embedded dashboard.
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/ragmux/ragmux/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ragmux/ragmux/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ragmux/ragmux/releases/tag/v0.3.1
 [0.3.0]: https://github.com/ragmux/ragmux/releases/tag/v0.3.0
