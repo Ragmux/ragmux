@@ -6,6 +6,21 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`IMAGE_FETCH_MAX_CONCURRENT`** (default `16`): image fetches the process runs at once,
+  and the image transport's per-host connection ceiling. `IMAGE_FETCH_MAX_PER_REQUEST`
+  bounds one request and nothing across them, so without this a key holder could aim the
+  gateway's own address at a host of their choosing. While another project is queueing, no
+  single one **takes** more than half the slots, so a tenant pointed at a slow image host
+  cannot starve the rest. Takes, not holds: a slot already taken is not reclaimed, so a
+  tenant can still be above half while those downloads finish. With nobody else waiting,
+  one project reaches the full value.
+- **`IMAGE_CACHE_MAX_MB`**: byte ceiling for the fetched-image cache. Unset, it follows
+  `IMAGE_FETCH_MAX_MB` — 64 MiB, or enough for two images of the largest size accepted,
+  capped at 256 MiB. A value too small to hold one encoded image is refused at startup,
+  and a derived ceiling that ends up below one is warned about, because such a cache
+  silently stores nothing.
+
 ### Changed
 - **The request id is generated, never taken from `X-Request-Id`.** Ragmux previously used
   chi's `middleware.RequestID`, which starts from the client's `X-Request-Id` header and
@@ -65,6 +80,47 @@ All notable changes to Ragmux are documented here. The format follows
   `true`, `false` or nothing will fail to start until the value is corrected — the error
   names the variable and the two values it accepts. Metrics were already off in every such
   installation, so fixing the value is a no-op unless `true` was what was meant.
+- **Inline `data:` images are validated** before anything is sent upstream, for the
+  `gemini`, `anthropic` and `ollama` connections. The URL must carry `;base64`, its media
+  type must be one the connection's upstream accepts, and the payload must decode as
+  standard base64 (padding included) and not be empty. Each failure is the gateway's own
+  `400` naming what is wrong; these used to travel to the provider and come back as an
+  upstream `400` that named nothing. The OpenAI-compatible types relay the body verbatim,
+  as before, so their images are still read by the upstream.
+- **Image media types are per connection.** `gemini` accepts png, jpeg, webp, **heic** and
+  **heif**; `anthropic` and `ollama` accept png, jpeg, gif and webp. One shared list was
+  wrong in both directions.
+- **A saturated image fetch queue answers `429`** with `Retry-After` and
+  `code: "image_fetch_saturated"`, rather than holding the request for the whole fetch
+  timeout. Queueing now has its own budget, so a wait is never charged to the image host
+  as a download timeout. `Retry-After` names `IMAGE_FETCH_TIMEOUT`, because a slot frees
+  when a download finishes.
+- **A redirect that drops from `https` to `http` is refused**, on the same host as well as
+  across hosts: same host is not the same connection, and the retry would put the
+  `Authorization` header on the wire in the clear.
+- **Gemini tool schemas are validated, not just filtered.** A keyword is kept only with
+  the type Gemini's `Schema` declares for it, so `{"type":"integer","enum":[1,2,3]}`,
+  `{"description":{...}}` and an out-of-range bound lose that keyword instead of
+  travelling to a rejection. `$ref` is matched on its full JSON Pointer, so two
+  same-named definitions no longer collide and an external reference resolves to none of
+  them; the same schema now sanitises to the same bytes every time. A malformed `required`
+  and an `anyOf`/`oneOf` that nothing survived in are now named in the per-tool `debug`
+  line rather than vanishing from it.
+- **Gemini's count bounds are held to `int64`.** `minItems`, `maxItems`, `minLength` and
+  `maxLength` are `int64` in Gemini's `Schema`, not doubles, so a fractional, negative or
+  oversized one (`{"minItems":1.5}`, `{"maxLength":1e30}`) is now dropped instead of
+  travelling to an `Invalid value at 'min_items'`.
+- **An `enum` on an `anyOf` node is dropped rather than typing the node.** A union is
+  typed by its branches, and `{"anyOf":[…],"enum":["a"]}` used to come out carrying
+  `"type":"string"` as well, contradicting every branch.
+- **A Gemini tool schema node with no `type` is given one**, inferred from the keywords
+  that survived, because Gemini rejects an untyped node and took the whole tool down with
+  it. The inference is lossy — a node carrying only `minimum`/`maximum` becomes `number`,
+  so a field meant as an integer can come back fractional — so give a `type` to anything
+  whose shape matters. `required` from an `allOf` is merged as a set rather than
+  concatenated, which also changes the list a tool sees.
+- **An inline `data:` URL is recognised whatever the case of its scheme.** `DATA:image/png`
+  used to be treated as a remote URL and skip every check.
 
 ### Fixed
 - A document whose file type is unsupported no longer quotes the rejected extension into

@@ -344,7 +344,7 @@ func geminiFileURI(u string) bool {
 }
 
 func openAIPartsToGemini(images *imageBudget, raw json.RawMessage) ([]geminiPart, error) {
-	parts, err := parseContent(raw)
+	parts, err := parseContent(raw, images.accepted())
 	if err != nil {
 		return nil, err
 	}

@@ -284,7 +284,7 @@ func anthropicSystem(blocks []anthropicContent) (json.RawMessage, error) {
 // prefix up to and including the marked block, so with several markers in
 // one message the final one is the breakpoint that covers all of it.
 func contentCacheControl(raw json.RawMessage) json.RawMessage {
-	parts, err := parseContent(raw)
+	parts, err := parseContent(raw, imageMediaTypesFor("anthropic"))
 	if err != nil {
 		return nil
 	}
@@ -298,7 +298,7 @@ func contentCacheControl(raw json.RawMessage) json.RawMessage {
 }
 
 func openAIPartsToAnthropic(images *imageBudget, raw json.RawMessage) ([]anthropicContent, error) {
-	parts, err := parseContent(raw)
+	parts, err := parseContent(raw, images.accepted())
 	if err != nil {
 		return nil, err
 	}

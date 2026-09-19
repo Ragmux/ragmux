@@ -199,6 +199,10 @@ func run(cfg config.Config) error {
 	imageTransport := transport.Clone()
 	imageTransport.Proxy = nil
 	imageTransport.DialContext = netguard.SafeDialContext(dialer, false, nil)
+	// The fetcher's semaphore caps image fetches process-wide; this caps the
+	// sockets one host may hold at the same number, so the pool cannot keep
+	// more connections to a target than the gateway allows fetches in total.
+	imageTransport.MaxConnsPerHost = cfg.ImageFetchMaxConcurrent
 	imageClient := &http.Client{Transport: imageTransport, CheckRedirect: netguard.CheckRedirect(3)}
 	var images *provider.ImageFetcher
 	if cfg.ImageFetch {
@@ -207,14 +211,23 @@ func run(cfg config.Config) error {
 			MaxBytes:      cfg.ImageFetchMaxBytes,
 			Timeout:       cfg.ImageFetchTimeout,
 			MaxPerRequest: cfg.ImageFetchMaxPerRequest,
+			MaxConcurrent: cfg.ImageFetchMaxConcurrent,
 			Logger:        log,
 		}
 		if cfg.ImageCacheEntries > 0 {
-			images.Cache = provider.NewImageCache(cfg.ImageCacheEntries, cfg.ImageCacheTTL)
+			images.Cache = provider.NewImageCache(cfg.ImageCacheEntries, cfg.ImageCacheMaxBytes, cfg.ImageCacheTTL)
 		}
 	}
 	log.Info("image policy", "fetch", cfg.ImageFetch, "max_mb", cfg.ImageFetchMaxBytes>>20,
-		"max_per_request", cfg.ImageFetchMaxPerRequest, "cache_entries", cfg.ImageCacheEntries)
+		"max_per_request", cfg.ImageFetchMaxPerRequest, "max_concurrent", cfg.ImageFetchMaxConcurrent,
+		"cache_entries", cfg.ImageCacheEntries, "cache_max_mb", cfg.ImageCacheMaxBytes>>20)
+	// A cache that cannot hold one image at the configured size stores
+	// nothing at all, which is silent unless it is said here.
+	if cfg.ImageFetch && cfg.ImageCacheEntries > 0 && cfg.ImageCacheMaxBytes < config.Base64Len(cfg.ImageFetchMaxBytes) {
+		log.Warn("image cache will hold nothing: its ceiling is smaller than one image at IMAGE_FETCH_MAX_MB",
+			"cache_max_mb", cfg.ImageCacheMaxBytes>>20, "image_max_mb", cfg.ImageFetchMaxBytes>>20,
+			"fix", "raise IMAGE_CACHE_MAX_MB or set IMAGE_CACHE_ENTRIES=0")
+	}
 	provCfg := func(c *store.ModelConnection) provider.Config {
 		return provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey,
 			Model: c.ModelName, Timeout: cfg.UpstreamTimeout, Client: httpClient,

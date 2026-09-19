@@ -404,6 +404,64 @@ func TestUpstream429IsRelayed(t *testing.T) {
 	}
 }
 
+// saturatedProvider stands in for a gateway resource that ran out and knows
+// when it will not have.
+type saturatedProvider struct{}
+
+func (saturatedProvider) Chat(context.Context, provider.ChatRequest) (*provider.ChatResponse, error) {
+	return nil, &provider.Error{Status: http.StatusTooManyRequests, Type: "rate_limit_exceeded",
+		Code: "image_fetch_saturated", RetryAfter: 2, Message: "retry after 2 seconds"}
+}
+
+func (saturatedProvider) ChatStream(context.Context, provider.ChatRequest, chan<- provider.StreamChunk) error {
+	return &provider.Error{Status: http.StatusTooManyRequests, Type: "rate_limit_exceeded",
+		Code: "image_fetch_saturated", RetryAfter: 2, Message: "retry after 2 seconds"}
+}
+
+// A provider error that says when to come back reaches the client as a
+// header, not only as prose in the body: Retry-After is what an HTTP client
+// already knows how to honour.
+func TestProviderErrorSetsRetryAfter(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "json"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.gw.Providers = func(*store.ModelConnection) (provider.Provider, error) {
+				return saturatedProvider{}, nil
+			}
+			resp, out := e.chat(map[string]any{"messages": userMsg, "stream": stream})
+			if resp.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("status = %d", resp.StatusCode)
+			}
+			if got := resp.Header.Get("Retry-After"); got != "2" {
+				t.Errorf("Retry-After = %q", got)
+			}
+			if errorField(t, out, "code") != "image_fetch_saturated" {
+				t.Errorf("body = %v", out)
+			}
+		})
+	}
+}
+
+// The image fetch ceiling shares its slots between projects, because the
+// project is the tenant boundary everywhere else here.
+func TestPrincipalImageTenant(t *testing.T) {
+	proj := &principal{project: &store.Project{ID: 7}, key: &store.APIKey{ID: 9}}
+	if got := proj.imageTenant(); got != "project:7" {
+		t.Errorf("tenant = %q", got)
+	}
+	keyOnly := &principal{key: &store.APIKey{ID: 9}}
+	if got := keyOnly.imageTenant(); got != "key:9" {
+		t.Errorf("tenant = %q", got)
+	}
+	if got := (&principal{}).imageTenant(); got != "" {
+		t.Errorf("tenant = %q", got)
+	}
+}
+
 func TestUpstream500BecomesBadGateway(t *testing.T) {
 	e := newEnv(t, nil)
 	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {

@@ -183,7 +183,7 @@ func openAIPartsToOllama(images *imageBudget, raw json.RawMessage) (string, []st
 	if len(raw) == 0 {
 		return "", nil, nil
 	}
-	parts, err := parseContent(raw)
+	parts, err := parseContent(raw, images.accepted())
 	if err != nil {
 		return "", nil, err
 	}
