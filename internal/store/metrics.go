@@ -21,18 +21,24 @@ type RequestLog struct {
 	Streamed         bool   `json:"streamed"`
 	RAGUsed          bool   `json:"rag_used"`
 	// RAGHits is the number of retrieved chunks injected into the prompt.
-	RAGHits   int    `json:"rag_hits"`
-	Error     string `json:"error"`
+	RAGHits int    `json:"rag_hits"`
+	Error   string `json:"error"`
+	// APIKeyID and UserID attribute the request to the user-owned key that
+	// made it; both are nil for a project's default key. UserID is
+	// denormalised so deleting the key (ON DELETE SET NULL) never loses who
+	// spent the tokens.
+	APIKeyID  *int64 `json:"api_key_id"`
+	UserID    *int64 `json:"user_id"`
 	CreatedAt string `json:"created_at"`
 }
 
 // InsertRequestLog persists a metric row.
 func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO request_logs
-		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed, rag_used, rag_hits, error)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed, rag_used, rag_hits, error, api_key_id, user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
-		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error)
+		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error, l.APIKeyID, l.UserID)
 	return err
 }
 
@@ -127,7 +133,7 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 		limit = 100
 	}
 	q := `SELECT id, project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated,
-		latency_ms, streamed, rag_used, rag_hits, error, created_at FROM request_logs WHERE true`
+		latency_ms, streamed, rag_used, rag_hits, error, api_key_id, user_id, created_at FROM request_logs WHERE true`
 	cond, args := f.where(nil)
 	args = append(args, limit)
 	q += cond + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
@@ -141,7 +147,8 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 		l := &RequestLog{}
 		var created time.Time
 		if err := rows.Scan(&l.ID, &l.ProjectID, &l.ModelName, &l.StatusCode, &l.PromptTokens, &l.CompletionTokens,
-			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.RAGHits, &l.Error, &created); err != nil {
+			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.RAGHits, &l.Error,
+			&l.APIKeyID, &l.UserID, &created); err != nil {
 			return nil, err
 		}
 		l.CreatedAt = ts(created)
