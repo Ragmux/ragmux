@@ -501,18 +501,30 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 		DefaultURL string `json:"default_base_url"`
 		Embeddings bool   `json:"supports_embeddings"`
 		NeedsKey   bool   `json:"requires_api_key"`
-		// Tools and Streaming mirror the adapter capabilities: every adapter
-		// streams; Gemini refuses requests with tools.
-		Tools     bool `json:"supports_tools"`
-		Streaming bool `json:"supports_streaming"`
+		// The flat supports_* fields stay for older clients; Capabilities is
+		// the full picture. Both are read from the provider package so this
+		// list cannot drift from what the adapters actually do.
+		Tools        bool                  `json:"supports_tools"`
+		Streaming    bool                  `json:"supports_streaming"`
+		Capabilities provider.Capabilities `json:"capabilities"`
 	}
-	out := []pt{
-		{"openai", "OpenAI", "https://api.openai.com/v1", true, true, true, true},
-		{"anthropic", "Anthropic", "https://api.anthropic.com", false, true, true, true},
-		{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", true, true, false, true},
-		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", false, true, true, true},
-		{"ollama", "Ollama", "http://localhost:11434", true, false, true, true},
-		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", true, false, true, true},
+	types := []struct {
+		typ, label, url string
+		needsKey        bool
+	}{
+		{"openai", "OpenAI", "https://api.openai.com/v1", true},
+		{"anthropic", "Anthropic", "https://api.anthropic.com", true},
+		{"gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", true},
+		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", true},
+		{"ollama", "Ollama", "http://localhost:11434", false},
+		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", false},
+	}
+	out := make([]pt, 0, len(types))
+	for _, t := range types {
+		caps := provider.CapabilitiesFor(t.typ)
+		out = append(out, pt{Type: t.typ, Label: t.label, DefaultURL: t.url,
+			Embeddings: caps.Embeddings, NeedsKey: t.needsKey,
+			Tools: caps.Tools, Streaming: caps.Streaming, Capabilities: caps})
 	}
 	writeJSON(w, http.StatusOK, out)
 }

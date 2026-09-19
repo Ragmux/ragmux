@@ -175,7 +175,11 @@ func TestPrivateUpstreamFlag(t *testing.T) {
 func TestProviderTypeCapabilities(t *testing.T) {
 	e := newEnv(t, testdb.Config(t))
 	list := e.call("GET", "/admin/api/provider-types", nil, "")["_list"].([]any)
-	wantTools := map[string]bool{"openai": true, "anthropic": true, "gemini": false, "deepseek": true, "ollama": true, "custom_openai": true}
+	// Every adapter now translates tools, Gemini included.
+	wantTools := map[string]bool{"openai": true, "anthropic": true, "gemini": true, "deepseek": true, "ollama": true, "custom_openai": true}
+	// Gemini sends a function call whole inside one chunk rather than as
+	// argument deltas, which is the one capability that separates it here.
+	wantToolStreaming := map[string]bool{"openai": true, "anthropic": true, "gemini": false, "deepseek": true, "ollama": false, "custom_openai": true}
 	seen := 0
 	for _, it := range list {
 		m := it.(map[string]any)
@@ -188,6 +192,20 @@ func TestProviderTypeCapabilities(t *testing.T) {
 		seen++
 		if m["supports_tools"] != want || m["supports_streaming"] != true {
 			t.Errorf("%s: %v", typ, m)
+		}
+		// The flat fields are kept for older clients, so they must keep
+		// agreeing with the capabilities object they are taken from.
+		caps, _ := m["capabilities"].(map[string]any)
+		if caps == nil {
+			t.Errorf("%s: no capabilities object", typ)
+			continue
+		}
+		if caps["tools"] != want || caps["streaming"] != true ||
+			caps["embeddings"] != m["supports_embeddings"] {
+			t.Errorf("%s: capabilities disagree with the flat fields: %v", typ, m)
+		}
+		if caps["tool_streaming"] != wantToolStreaming[typ] {
+			t.Errorf("%s: tool_streaming = %v, want %v", typ, caps["tool_streaming"], wantToolStreaming[typ])
 		}
 	}
 	if seen != len(wantTools) {

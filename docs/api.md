@@ -185,7 +185,7 @@ add no new unauthenticated surface. Both are skippable.
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
 | POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
-| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools` (false for `gemini`), `supports_streaming` |
+| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
 
 ### Model connections
 

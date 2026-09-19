@@ -153,10 +153,29 @@ func run(cfg config.Config) error {
 	httpClient := &http.Client{Transport: transport, CheckRedirect: netguard.CheckRedirect(3)}
 	log.Info("upstream policy", "allow_private_upstreams", cfg.AllowPrivateUpstreams,
 		"private_upstream_allowlist", len(cfg.PrivateUpstreamAllowlist))
+	// Image fetching shares the hardened client on purpose. An image URL is
+	// chosen by the API client rather than by an operator, so it needs the
+	// same private-address and redirect policy a provider base URL gets.
+	var images *provider.ImageFetcher
+	if cfg.ImageFetch {
+		images = &provider.ImageFetcher{
+			Client:        httpClient,
+			MaxBytes:      cfg.ImageFetchMaxBytes,
+			Timeout:       cfg.ImageFetchTimeout,
+			MaxPerRequest: cfg.ImageFetchMaxPerRequest,
+			Logger:        log,
+		}
+		if cfg.ImageCacheEntries > 0 {
+			images.Cache = provider.NewImageCache(cfg.ImageCacheEntries, cfg.ImageCacheTTL)
+		}
+	}
+	log.Info("image policy", "fetch", cfg.ImageFetch, "max_mb", cfg.ImageFetchMaxBytes>>20,
+		"max_per_request", cfg.ImageFetchMaxPerRequest, "cache_entries", cfg.ImageCacheEntries)
 	provCfg := func(c *store.ModelConnection) provider.Config {
 		return provider.Config{ProviderType: c.ProviderType, BaseURL: c.BaseURL, APIKey: c.APIKey,
 			Model: c.ModelName, Timeout: cfg.UpstreamTimeout, Client: httpClient,
-			StreamMaxDuration: cfg.StreamMaxDuration, StreamMaxBytes: cfg.StreamMaxBytes, Logger: log}
+			StreamMaxDuration: cfg.StreamMaxDuration, StreamMaxBytes: cfg.StreamMaxBytes, Logger: log,
+			Images: images}
 	}
 	providers := func(c *store.ModelConnection) (provider.Provider, error) { return provider.New(provCfg(c)) }
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) { return provider.NewEmbedder(provCfg(c)) }
