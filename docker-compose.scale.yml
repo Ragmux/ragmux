@@ -1,0 +1,51 @@
+# Overlay that makes the split layout scalable. Use it together with
+# docker-compose.split.yml:
+#
+#   docker compose -f docker-compose.split.yml -f docker-compose.scale.yml \
+#       up -d --scale ragmux=3
+#
+# Two things in the base file stop `--scale` on its own: container_name
+# pins one name, and the fixed host port 127.0.0.1:8765 can only be bound
+# once. Both are removed here, and an nginx in front does the load
+# balancing - no session affinity needed, see docs/scaling.md.
+#
+# SECRET_KEY is mandatory for more than one replica: without it every
+# replica generates its own key file and none of them can read the
+# provider credentials the others wrote. The base file already requires it.
+services:
+  ragmux:
+    # No container_name: Compose names the replicas ragmux-1, ragmux-2, ...
+    container_name: !reset null
+    # !override, not a merge: Compose would otherwise keep the base file's
+    # fixed 127.0.0.1:8765 next to this entry, and only one replica could
+    # bind it. A container port alone lets Compose pick an ephemeral host
+    # port per replica; nginx reaches them over the Compose network by
+    # service name, which round-robins across the replicas.
+    ports: !override
+      - "8765"
+    environment:
+      # Ingestion across replicas (defaults shown; see
+      # docs/configuration.md and docs/scaling.md#ingestion-across-replicas).
+      INGEST_LEASE: ${INGEST_LEASE:-2m}
+      INGEST_POLL_INTERVAL: ${INGEST_POLL_INTERVAL:-5s}
+      INGEST_MAX_ATTEMPTS: ${INGEST_MAX_ATTEMPTS:-5}
+      MAX_PENDING_DOCUMENTS: ${MAX_PENDING_DOCUMENTS:-1024}
+      # The proxy below is the only way in, so its headers can be trusted.
+      TRUST_PROXY_HEADERS: "true"
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+    # Give a replica time to finish the ingestion job it is on (30 s) and
+    # drain its HTTP requests (15 s) before the container is killed.
+    stop_grace_period: 60s
+
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: ragmux-proxy
+    restart: unless-stopped
+    ports:
+      # Bound to loopback like the single-replica layout: terminate TLS in
+      # front of this, or change it to "443:80" behind your own edge.
+      - "127.0.0.1:8765:80"
+    volumes:
+      - ./docker/nginx/ragmux.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - ragmux

@@ -10,17 +10,25 @@ and how to rehearse a disaster.
 | Where | What |
 |---|---|
 | PostgreSQL (`ragmux-data` volume, `/data/pg`, with the default all-in-one file; `pgdata` volume with `docker-compose.split.yml`) | users and sessions, model connections (provider API keys, AES-256-GCM encrypted), RAG stores, documents (the uploaded files as `bytea`), chunks, one `chunk_embeddings_<dims>` table per embedding width (HNSW vector indexes), projects and their hashed `sk-proj-…` keys, request logs, usage counters, login attempts, audit log, `schema_migrations` |
-| `SECRET_KEY` | the 32-byte key (64 hex characters) that decrypts the provider API keys stored in the database |
+| `SECRET_KEY` | the 32-byte key (64 hex characters) that decrypts the provider API keys stored in the database. The database records which key that is (`instance_settings`), and a restore with the wrong one fails at start rather than silently |
 | `/data/ragmux/secret.key` (all-in-one, only when `SECRET_KEY` is unset) | the generated fallback key; it lives in the same volume as the database, so a volume backup covers it, a `pg_dump` does not |
 
 With the split layout the gateway container itself is stateless: it can be deleted and
 recreated at any time. With the all-in-one layout the container is disposable too, as
 long as the `ragmux-data` volume stays.
 
-**Without `SECRET_KEY` a restored database is still usable** — users, projects, documents
-and vectors all come back — but every model connection fails with
-`decrypt api key for connection N: cipher: message authentication failed` until you
-re-enter its provider API key in the dashboard (Models -> Edit). Keep the key in a
+**Since 0.4 a wrong key stops the start instead of every provider call.** The database
+holds a canary in `instance_settings` that only the key it was written with can open, so
+a dump restored onto a host with a different `SECRET_KEY` fails at boot with
+`SECRET_KEY does not match the one this database was written with (key source: …)`
+rather than looking healthy until the first chat request. Put the matching key back — see
+[SECRET_KEY](scaling.md#secret-key).
+
+**Without the key at all**, the fastest way back is a database whose canary you own:
+restore the dump, drop the canary row (`DELETE FROM instance_settings WHERE key =
+'secret_key_canary'`) so the next start seals a new one, and then re-enter every provider
+API key in the dashboard (Models -> Edit) — users, projects, documents and vectors all
+come back, only the encrypted credentials are lost. Keep the key in a
 secret manager (or your deployment's env store) *and* in the backup bundle, encrypted
 at rest or in a separate location from the dumps. `scripts/backup.sh` can write it next
 to the dump with `INCLUDE_SECRET_KEY=1` (see below).
@@ -68,7 +76,8 @@ Notes:
   available (`pgvector/pgvector:pg17` does; on managed Postgres enable it first).
 - `pg_dump` runs in a consistent snapshot, so you can take it while the gateway is
   running. Documents that are being ingested at that moment are restored in their
-  `pending`/`processing` state and the gateway resumes them after restart.
+  `pending`/`processing` state; the gateway claims them again after a restart, once any
+  lease recorded in the dump has expired.
 - Use the same major version of `pg_dump`/`pg_restore` as the server (17). Running the
   tools *inside* the container that holds Postgres (`ragmux` in the all-in-one layout,
   `postgres` in the split one) guarantees that.
@@ -393,12 +402,14 @@ the number of rows changed. It needs the **current** key in the environment
 4. Put the new key into `.env` (or the secret file) and start the gateway:
    `docker compose up -d ragmux`.
 5. Verify: **Test chat** on a model connection succeeds. If the gateway was started with
-   the wrong key, connections fail with `cipher: message authentication failed`; put the
-   right key back, nothing was lost.
+   the wrong key it refuses to start at all (`SECRET_KEY does not match the one this
+   database was written with`); put the right key back, nothing was lost.
 
 Rows are only rewritten when every one of them decrypts with the current key and
 re-decrypts with the new one; otherwise the command exits `1` and the database is
-unchanged. Dumps taken before the rotation still need the old key.
+unchanged. The same transaction re-seals the `instance_settings` canary, so the first
+start after a rotation accepts the new key and refuses the old one. Dumps taken before
+the rotation still need the old key.
 
 Since 0.2.3 each stored key is also bound to its connection id (`key_version = 1` in
 `model_connections`), so a ciphertext moved to another row does not decrypt. Dumps taken

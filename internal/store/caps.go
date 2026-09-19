@@ -3,8 +3,9 @@ package store
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
+	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -91,32 +92,44 @@ func pgSearchSmokeTest(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
-// TryAdvisoryLock takes a session-scoped advisory lock held for the caller's
-// whole critical section. It returns ok=false when another replica holds the
-// lock; release drops the lock and returns the connection to the pool.
+// TryAdvisoryLock takes the session-level advisory lock for key without
+// waiting. It reports whether the lock was acquired and returns the
+// function that releases it; release is nil when ok is false.
 //
-// The connection is pinned on purpose: pg_try_advisory_lock issued through
-// pool.Exec would land on an arbitrary pooled connection and the lock would
-// be released the moment that connection was reused for something else.
-func (s *Store) TryAdvisoryLock(ctx context.Context, key int64) (release func(), ok bool, err error) {
+// The lock pins the connection it was taken on: a session advisory lock
+// belongs to its connection, so the pool must not hand that connection to
+// anybody else before the unlock. release returns it.
+//
+// The key is combined with the current schema, so two Ragmux instances
+// sharing one database in separate schemas elect their own leader (and so
+// tests, which are isolated by schema, do not fight over one lock).
+func (s *Store) TryAdvisoryLock(ctx context.Context, key int64) (func(), bool, error) {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, false, fmt.Errorf("acquire connection for advisory lock: %w", err)
+		return nil, false, err
 	}
-	var got bool
-	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", key).Scan(&got); err != nil {
+	var scoped int64
+	if err := conn.QueryRow(ctx, "SELECT hashtext(current_schema() || ':' || $1)::bigint",
+		strconv.FormatInt(key, 10)).Scan(&scoped); err != nil {
 		conn.Release()
-		return nil, false, fmt.Errorf("take advisory lock: %w", err)
+		return nil, false, err
 	}
-	if !got {
+	var ok bool
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", scoped).Scan(&ok); err != nil {
+		conn.Release()
+		return nil, false, err
+	}
+	if !ok {
 		conn.Release()
 		return nil, false, nil
 	}
 	return func() {
-		// A background context: the caller's context is usually cancelled by
-		// the time a shutdown path releases the lock, and an unlock that does
-		// not run leaves the lock held until the connection drops.
-		if _, err := conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", key); err != nil {
+		// The caller's context is usually already cancelled by the time a
+		// leader shuts down, so the unlock gets its own budget. Dropping
+		// the connection would release the lock anyway.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", scoped); err != nil {
 			s.log.Warn("release advisory lock", "key", key, "err", err)
 		}
 		conn.Release()

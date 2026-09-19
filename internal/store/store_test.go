@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"math"
 	"testing"
 	"time"
@@ -57,8 +59,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.MigrationsVersion != 12 {
-		t.Errorf("migrations version = %d, want 12", info.MigrationsVersion)
+	if info.MigrationsVersion != 13 {
+		t.Errorf("migrations version = %d, want 13", info.MigrationsVersion)
 	}
 }
 
@@ -111,12 +113,41 @@ func TestCredentialsRoundTripAcrossReopen(t *testing.T) {
 		t.Errorf("api key after reopen = %q", got.APIKey)
 	}
 
-	// A different SECRET_KEY cannot decrypt what was stored.
+	// A different SECRET_KEY no longer gets as far as reading a
+	// credential: the canary stops the store from opening at all.
 	other := cfg
 	other.SecretKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-	s3 := testdb.OpenWith(t, other)
-	if _, err := s3.GetConnection(ctx, c.ID); err == nil {
-		t.Error("expected decryption failure with a different key")
+	_, err = store.Open(ctx, other, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("opening with a different key should fail the canary, got %v", err)
+	}
+}
+
+// TestRotateKeyReSealsCanary is the hard dependency between rotate-key and
+// the boot check: a rotation that left the canary sealed with the old key
+// would make every later start fail.
+func TestRotateKeyReSealsCanary(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	s := testdb.OpenWith(t, cfg)
+	if _, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "o", ProviderType: "openai", APIKey: "sk-secret-123456", ModelName: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	newKey := "aabbccddeeff00112233445566778899aabbccddeeff001122334455667788990"[:64]
+	if _, err := s.ReencryptConnections(ctx, newKey); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	old := cfg
+	cfg.SecretKeyHex = newKey
+	s2 := testdb.OpenWith(t, cfg) // fatals here if the canary was not re-sealed
+	if list, err := s2.ListConnections(ctx); err != nil || len(list) != 1 {
+		t.Fatalf("connections after rotation: %v %d", err, len(list))
+	}
+	// And the key the database moved away from is refused.
+	if _, err := store.Open(ctx, old, slog.New(slog.NewTextHandler(io.Discard, nil))); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("the pre-rotation key should be refused, got %v", err)
 	}
 }
 

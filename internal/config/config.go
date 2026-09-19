@@ -36,6 +36,21 @@ type Config struct {
 	UpstreamTimeout time.Duration
 	// IngestWorkers is the number of concurrent document ingestion jobs.
 	IngestWorkers int
+	// IngestLease is how long a replica owns a document it claimed without
+	// renewing the claim. The worker renews it every third of this while
+	// the job runs, so it bounds how long a crashed replica's document
+	// stays untouchable, not how long a job may take.
+	IngestLease time.Duration
+	// IngestPollInterval is how often the ingestion dispatcher looks for
+	// claimable documents when nothing wakes it.
+	IngestPollInterval time.Duration
+	// IngestMaxAttempts caps how often one document may be claimed before
+	// the retention job marks it failed. It stops a document that kills the
+	// process from becoming a cluster-wide crash loop.
+	IngestMaxAttempts int
+	// MaxPendingDocuments is the cluster-wide ingestion backlog an upload
+	// is still accepted into; beyond it the upload gets 503.
+	MaxPendingDocuments int
 	// MaxUploadBytes caps a single document upload.
 	MaxUploadBytes int64
 	// LoginRateLimitPerMin caps failed logins per minute from one IP.
@@ -115,6 +130,11 @@ func Load() (Config, error) {
 		IngestWorkers:   2,
 		MaxUploadBytes:  50 << 20,
 
+		IngestLease:         2 * time.Minute,
+		IngestPollInterval:  5 * time.Second,
+		IngestMaxAttempts:   5,
+		MaxPendingDocuments: 1024,
+
 		LoginRateLimitPerMin: 10,
 		LoginUserLimitPerMin: 5,
 		LoginLockoutFailures: 20,
@@ -172,6 +192,39 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid INGEST_WORKERS %q", v)
 		}
 		c.IngestWorkers = n
+	}
+	for _, v := range []struct {
+		name string
+		dst  *time.Duration
+		min  time.Duration
+	}{
+		// The lease is renewed at a third of its length, so it must stay
+		// comfortably above the round trip of one renewal.
+		{"INGEST_LEASE", &c.IngestLease, 3 * time.Second},
+		{"INGEST_POLL_INTERVAL", &c.IngestPollInterval, 100 * time.Millisecond},
+	} {
+		if raw := os.Getenv(v.name); raw != "" {
+			d, err := time.ParseDuration(raw)
+			if err != nil || d < v.min {
+				return c, fmt.Errorf("invalid %s %q (minimum %s)", v.name, raw, v.min)
+			}
+			*v.dst = d
+		}
+	}
+	for _, v := range []struct {
+		name string
+		dst  *int
+	}{
+		{"INGEST_MAX_ATTEMPTS", &c.IngestMaxAttempts},
+		{"MAX_PENDING_DOCUMENTS", &c.MaxPendingDocuments},
+	} {
+		if raw := os.Getenv(v.name); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 1 {
+				return c, fmt.Errorf("invalid %s %q", v.name, raw)
+			}
+			*v.dst = n
+		}
 	}
 	if v := os.Getenv("MAX_UPLOAD_MB"); v != "" {
 		n, err := strconv.Atoi(v)

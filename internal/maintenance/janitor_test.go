@@ -235,6 +235,35 @@ func TestAPIKeyPurgeKeepsAttributedKeys(t *testing.T) {
 	}
 }
 
+// TestRetentionPassRunsOnLeaderOnly: every replica schedules the retention
+// job, and the advisory lock is what keeps them from all deleting the same
+// rows at the same time.
+func TestRetentionPassRunsOnLeaderOnly(t *testing.T) {
+	f := seed(t)
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+
+	// Another replica is mid-pass: this one skips its turn entirely.
+	release, ok, err := f.st.TryAdvisoryLock(f.ctx, store.LockJanitor)
+	if err != nil || !ok {
+		t.Fatalf("take the leader lock: ok=%v err=%v", ok, err)
+	}
+	if j.runLeader(f.ctx) {
+		t.Error("a replica without the leader lock must not run the pass")
+	}
+	if n := f.count("request_logs"); n != 2 {
+		t.Errorf("a follower deleted rows: %d left, want 2", n)
+	}
+	release()
+
+	// The leader is gone; the next pass runs here.
+	if !j.runLeader(f.ctx) {
+		t.Fatal("the pass should run once the lock is free")
+	}
+	if n := f.count("request_logs"); n != 1 {
+		t.Errorf("request_logs after the leader pass = %d, want 1", n)
+	}
+}
+
 func TestRunStopsOnCancel(t *testing.T) {
 	f := seed(t)
 	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}

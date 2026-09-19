@@ -33,7 +33,7 @@ func loadCipher(keyHex, dataDir string, log *slog.Logger) (*cipher, string, erro
 	if dataDir == "" {
 		return nil, "", errors.New("SECRET_KEY is unset and no data directory is configured for the secret.key fallback")
 	}
-	log.Warn("SECRET_KEY is not set; falling back to a key file. Set SECRET_KEY (openssl rand -hex 32) so credentials survive container recreation.",
+	log.Warn("SECRET_KEY is not set; falling back to a key file. Set SECRET_KEY (openssl rand -hex 32) so credentials survive container recreation. Set SECRET_KEY before running more than one replica: each replica would generate its own key file and none of them could read what the others wrote.",
 		"path", filepath.Join(dataDir, "secret.key"))
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return nil, "", fmt.Errorf("create data dir for secret.key fallback (set SECRET_KEY to avoid this): %w", err)

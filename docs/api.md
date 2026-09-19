@@ -299,8 +299,10 @@ reached. `page_count` is the number of pages of a PDF and `null` for other forma
 until the document has been parsed).
 Accepted extensions: `.pdf`, `.docx`, `.html`, `.htm`, `.md`, `.markdown`, `.txt`; the
 request body is limited to `MAX_UPLOAD_MB`. Upload and reprocess answer
-`503 ingestion queue is full, retry later` when the background queue (1024 documents) is
-full; the documents concerned are marked `failed` with that message.
+`503 the ingestion backlog is full (MAX_PENDING_DOCUMENTS), retry later` when the queue
+of `pending` documents is at `MAX_PENDING_DOCUMENTS` (1024); the documents concerned are
+marked `failed` with that message. The backlog is counted across every replica, not per
+process.
 
 Search request and response:
 

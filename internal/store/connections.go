@@ -294,6 +294,12 @@ func (s *Store) ReencryptConnections(ctx context.Context, newKeyHex string) (int
 	if err := s.resealRows(ctx, tx, newCipher, todo); err != nil {
 		return 0, err
 	}
+	// The canary moves with the credentials, in the same transaction: the
+	// next start verifies it before it reads anything, so a rotation that
+	// left it sealed with the old key would refuse to boot.
+	if err := resealCanaryTx(ctx, tx, newCipher); err != nil {
+		return 0, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
