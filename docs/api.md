@@ -61,6 +61,19 @@ Three routes refuse an api-key principal outright with
 `POST /users/{id}/reset-password` and creating a `kind=management` key — so a leaked key
 cannot take over the account it belongs to.
 
+**What that guard assumes.** It treats a session as a person at a keyboard and an api
+key as a stored credential, and grants the account-takeover routes only to the first.
+`"bearer": true` weakens the premise: the session token leaves the browser as a string
+in a JSON body, and a string can be pasted into a script, a CI secret or a chat window,
+at which point a "session" is doing exactly what the guard withholds from keys. The
+difference that remains is lifetime and revocation, not interactivity: a session token
+expires after `SESSION_TTL` (24 h by default), dies with a logout, a password change, a
+password reset, a session revoke or a deactivation, and cannot be listed, named or
+scoped — an api key outlives all of that until someone revokes it. Treat a bearer
+session token as a short-lived credential, keep it out of anything durable, and use a
+`sk-mgmt-…` key for automation that is supposed to persist; if a script genuinely needs
+one of the three routes above, it needs a human to sign in for it.
+
 Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-Id`;
 unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
 and log the detail under that id.
