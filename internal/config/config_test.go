@@ -63,7 +63,7 @@ func TestLoadImageSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !c.ImageFetch || c.ImageFetchMaxBytes != 8<<20 || c.ImageFetchTimeout != 10*time.Second ||
-		c.ImageFetchMaxPerRequest != 8 || c.ImageFetchMaxConcurrent != 4 ||
+		c.ImageFetchMaxPerRequest != 8 || c.ImageFetchMaxConcurrent != 16 ||
 		c.ImageCacheEntries != 64 || c.ImageCacheMaxBytes != 64<<20 || c.ImageCacheTTL != 10*time.Minute {
 		t.Errorf("defaults = %+v", c)
 	}
@@ -120,13 +120,19 @@ func TestImageCacheCeilingFollowsTheImageLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if one := base64Len(c.ImageFetchMaxBytes); c.ImageCacheMaxBytes < 2*one {
+	if one := Base64Len(c.ImageFetchMaxBytes); c.ImageCacheMaxBytes < 2*one {
 		t.Errorf("a %d MiB ceiling cannot hold two %d MiB entries", c.ImageCacheMaxBytes>>20, one>>20)
 	}
 	// A small per-image limit keeps the default rather than shrinking to it.
 	t.Setenv("IMAGE_FETCH_MAX_MB", "1")
 	if c, err = Load(); err != nil || c.ImageCacheMaxBytes != 64<<20 {
 		t.Errorf("ceiling = %d, err = %v", c.ImageCacheMaxBytes, err)
+	}
+	// And the derivation stops somewhere: following a 512 MiB per-image limit
+	// would hand a memory-limited container a 1.3 GiB cache nobody asked for.
+	t.Setenv("IMAGE_FETCH_MAX_MB", "512")
+	if c, err = Load(); err != nil || c.ImageCacheMaxBytes != 256<<20 {
+		t.Errorf("ceiling = %d MiB, err = %v; want the derivation capped", c.ImageCacheMaxBytes>>20, err)
 	}
 	// An explicit ceiling too small for one image is that same silent no-op,
 	// so it is refused at startup instead of discovered as a cache that never

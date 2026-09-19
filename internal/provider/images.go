@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	neturl "net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +43,7 @@ type imageRef struct {
 // parts — into content parts. Parts of a type no adapter can carry
 // (input_audio, file, ...) are dropped rather than rejected: the model just
 // does not see them, which beats failing a conversation over one part.
-func parseContent(raw json.RawMessage) ([]contentPart, error) {
+func parseContent(raw json.RawMessage, accepts map[string]bool) ([]contentPart, error) {
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return []contentPart{{Type: "text", Text: s}}, nil
@@ -68,7 +70,7 @@ func parseContent(raw json.RawMessage) ([]contentPart, error) {
 				// part of a type no adapter can carry is dropped.
 				continue
 			}
-			ref, err := parseImageURL(p.ImageURL.URL)
+			ref, err := parseImageURL(p.ImageURL.URL, accepts)
 			if err != nil {
 				return nil, err
 			}
@@ -92,15 +94,57 @@ const (
 	ollamaInlineImages    = true
 )
 
-// imageMediaTypes is what the gateway will carry, for a fetched image and an
-// inline data: one alike. For a fetched one the URL's extension is never
-// consulted; the response's own content type decides, because a URL can be
-// spelled to claim anything.
-var imageMediaTypes = map[string]bool{"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true}
+// imageMediaTypes is what each upstream documents itself as accepting, for a
+// fetched image and an inline data: one alike. For a fetched one the URL's
+// extension is never consulted; the response's own content type decides,
+// because a URL can be spelled to claim anything.
+//
+// The lists genuinely differ, so one shared list is wrong in both directions:
+// it refused the image/heic and image/heif Gemini takes, breaking requests
+// that worked before anything was checked, and it would have promised
+// Anthropic a format its API rejects. Each adapter asks for its own.
+var imageMediaTypes = map[string]map[string]bool{
+	"gemini": {"image/png": true, "image/jpeg": true, "image/webp": true,
+		"image/heic": true, "image/heif": true},
+	"anthropic": {"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true},
+	"ollama":    {"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true},
+}
 
-// defaultImageMaxConcurrent is how many image fetches the process runs at
-// once when nothing says otherwise.
-const defaultImageMaxConcurrent = 4
+// imageMediaTypesDefault is what a caller with no adapter behind it gets: the
+// four formats every vision provider here takes.
+var imageMediaTypesDefault = map[string]bool{
+	"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true,
+}
+
+func imageMediaTypesFor(providerType string) map[string]bool {
+	if types, ok := imageMediaTypes[providerType]; ok {
+		return types
+	}
+	return imageMediaTypesDefault
+}
+
+// imageTypesInMessage lists an accepted set for an error message, shortened
+// the way a caller writes them ("png, jpeg, ...").
+func imageTypesInMessage(accepts map[string]bool) string {
+	out := make([]string, 0, len(accepts))
+	for t := range accepts {
+		out = append(out, strings.TrimPrefix(t, "image/"))
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+const (
+	// defaultImageMaxConcurrent is how many image fetches the process runs at
+	// once when nothing says otherwise. It is well above what one chat
+	// request can spend -- an adapter pulls its images one at a time -- so
+	// the ceiling binds across requests rather than throttling a single one.
+	defaultImageMaxConcurrent = 16
+	// defaultImageQueueWait bounds the wait for a slot. It is deliberately a
+	// small fraction of Timeout: queueing is not progress, and a client told
+	// to retry in a second is better served than one held for ten.
+	defaultImageQueueWait = 2 * time.Second
+)
 
 // ImageFetcher resolves remote image URLs into base64 for adapters whose
 // upstream cannot fetch a URL itself.
@@ -119,7 +163,7 @@ type ImageFetcher struct {
 	// MaxPerRequest caps the images one chat request may pull (default 8).
 	MaxPerRequest int
 	// MaxConcurrent caps the image fetches in flight across the whole
-	// process (default 4).
+	// process (default 16).
 	//
 	// MaxPerRequest bounds one chat request and bounds nothing at all when a
 	// key holder sends many at once: every one of them turns into GETs
@@ -127,36 +171,130 @@ type ImageFetcher struct {
 	// the ceiling that makes the gateway a poor amplifier — and the reason
 	// the image transport also carries MaxConnsPerHost.
 	MaxConcurrent int
+	// QueueWait bounds the wait for one of those slots (default 2s),
+	// separately from Timeout: a fetch that spent its download budget in the
+	// queue would blame the image host for the gateway being busy.
+	QueueWait time.Duration
 	// Cache is optional; nil fetches every time.
 	Cache  *imageCache
 	Logger *slog.Logger
 
 	semOnce sync.Once
 	sem     chan struct{}
+	mu      sync.Mutex
+	tenants map[string]*imageTenantSlots
 }
 
-// acquire takes one of the process-wide fetch slots and returns the release.
-// The context it waits on already carries the per-fetch timeout, so a
-// saturated gateway queues for at most as long as one fetch may take rather
-// than until the client gives up.
-func (f *ImageFetcher) acquire(ctx context.Context) (func(), error) {
+// imageTenantSlots is one tenant's share of the fetcher. refs counts holders
+// and waiters together, so the entry lives exactly as long as someone is
+// using it and an idle tenant leaves nothing behind.
+type imageTenantSlots struct {
+	sem  chan struct{}
+	refs int
+}
+
+func (f *ImageFetcher) init() {
 	f.semOnce.Do(func() {
-		n := f.MaxConcurrent
-		if n <= 0 {
-			n = defaultImageMaxConcurrent
-		}
-		f.sem = make(chan struct{}, n)
+		f.sem = make(chan struct{}, f.maxConcurrent())
+		f.tenants = map[string]*imageTenantSlots{}
 	})
+}
+
+// tenantShare is the most slots one tenant may hold at once. Capping the
+// process alone stopped the gateway amplifying outward and opened starvation
+// inward: a few requests aimed at one slow image host filled every slot, and
+// an unrelated project's request then waited out the whole timeout and
+// failed. Half the ceiling leaves half of it for everyone else, whatever one
+// tenant is doing.
+func (f *ImageFetcher) tenantShare() int {
+	if n := f.maxConcurrent() / 2; n > 0 {
+		return n
+	}
+	return 1
+}
+
+// tenantSem hands out the tenant's channel and takes a reference to it.
+// Every caller must release it, whether or not it got a slot.
+func (f *ImageFetcher) tenantSem(tenant string) chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t := f.tenants[tenant]
+	if t == nil {
+		t = &imageTenantSlots{sem: make(chan struct{}, f.tenantShare())}
+		f.tenants[tenant] = t
+	}
+	t.refs++
+	return t.sem
+}
+
+func (f *ImageFetcher) releaseTenant(tenant string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t := f.tenants[tenant]
+	if t == nil {
+		return
+	}
+	if t.refs--; t.refs <= 0 {
+		delete(f.tenants, tenant)
+	}
+}
+
+// acquire takes the tenant's slot and then a process-wide one, and returns
+// the release for both. The wait has its own budget, so the download timeout
+// starts only once a slot is in hand.
+func (f *ImageFetcher) acquire(ctx context.Context, tenant string) (func(), error) {
+	f.init()
+	wait, cancel := context.WithTimeout(ctx, f.queueWait())
+	defer cancel()
+
+	// The tenant's own share comes first: a tenant already holding its share
+	// must not sit in the process-wide queue ahead of one holding nothing.
+	ts := f.tenantSem(tenant)
+	select {
+	case ts <- struct{}{}:
+	case <-wait.Done():
+		f.releaseTenant(tenant)
+		return nil, f.queueError(ctx)
+	}
 	select {
 	case f.sem <- struct{}{}:
-		return func() { <-f.sem }, nil
-	case <-ctx.Done():
-		// Not the client's mistake and not the image host's, so neither a 400
-		// nor a relayed upstream failure: the gateway is the thing that ran
-		// out, and a 503 is what tells a client to come back.
-		return nil, &Error{Status: http.StatusServiceUnavailable, Type: "overloaded",
-			Message: "the gateway is already fetching as many images as it may at once; retry shortly"}
+		return func() {
+			<-f.sem
+			<-ts
+			f.releaseTenant(tenant)
+		}, nil
+	case <-wait.Done():
+		<-ts
+		f.releaseTenant(tenant)
+		return nil, f.queueError(ctx)
 	}
+}
+
+// queueError separates the gateway running out from the caller going away. A
+// cancelled request context is a client that hung up, and handing back a
+// provider error there made providerError answer it before its own
+// context.Canceled check: the request log recorded saturation instead of 499
+// and the error counter rose on every disconnect.
+func (f *ImageFetcher) queueError(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	// Not the client's mistake and not the image host's, so neither a 400 nor
+	// a relayed upstream failure. 429 rather than 503 because this is a
+	// resource limit and not a fault, and the official SDKs retry 5xx
+	// automatically with backoff: a 503 would have every client spend its
+	// retries queueing again while the ceiling is still full.
+	retry := imageCeilSeconds(f.queueWait())
+	return &Error{Status: http.StatusTooManyRequests, Type: "rate_limit_exceeded",
+		Code: "image_fetch_saturated", RetryAfter: retry,
+		Message: fmt.Sprintf("the gateway is fetching as many images as it may at once; retry after %d seconds", retry)}
+}
+
+func imageCeilSeconds(d time.Duration) int {
+	if n := int((d + time.Second - 1) / time.Second); n > 0 {
+		return n
+	}
+	return 1
 }
 
 // Fetch downloads one image and returns its media type and base64 payload.
@@ -164,12 +302,19 @@ func (f *ImageFetcher) acquire(ctx context.Context) (func(), error) {
 // URL may carry a signed query string, and it is the client's own string
 // anyway. Transport and policy failures go through transportError so a
 // private-address image URL reads like a private base URL.
-func (f *ImageFetcher) Fetch(ctx context.Context, rawURL string) (string, string, error) {
+func (f *ImageFetcher) Fetch(ctx context.Context, rawURL, tenant string, accepts map[string]bool) (string, string, error) {
 	u, err := neturl.Parse(rawURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", "", imageError("image URLs must be http or https")
 	}
 	if mt, data, ok := f.Cache.get(rawURL); ok {
+		// The cache is keyed on the URL alone and the adapters do not accept
+		// the same formats, so a hit is checked again rather than trusted:
+		// an image/heic stored for Gemini must not be handed to Anthropic.
+		if !accepts[mt] {
+			return "", "", imageError(fmt.Sprintf("image URL at %s returned content type %q; %s are accepted",
+				u.Host, mt, imageTypesInMessage(accepts)))
+		}
 		return mt, data, nil
 	}
 	// Refuse rather than fall back to http.DefaultClient. This is the one
@@ -183,13 +328,17 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL string) (string, string
 	// The fetcher has no connection of its own; ProviderType and Logger are
 	// what transportError needs to log and classify the failure.
 	cfg := Config{ProviderType: "image", Logger: f.Logger}
-	ctx, cancel := context.WithTimeout(ctx, f.timeout())
-	defer cancel()
-	release, err := f.acquire(ctx)
+	release, err := f.acquire(ctx, tenant)
 	if err != nil {
 		return "", "", err
 	}
 	defer release()
+	// The download's budget starts once the slot is in hand. Starting it
+	// before the queue charged the wait to the host: the same saturation came
+	// back as a 429 or, when the wait ate most of the budget, as a transport
+	// timeout relayed as a 502 that blamed the image host.
+	ctx, cancel := context.WithTimeout(ctx, f.timeout())
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", "", imageError("image URL is not a valid request target")
@@ -207,9 +356,9 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL string) (string, string
 	}
 	mediaType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
 	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
-	if !imageMediaTypes[mediaType] {
-		return "", "", imageError(fmt.Sprintf("image URL at %s returned content type %q; png, jpeg, gif and webp are accepted",
-			u.Host, mediaType))
+	if !accepts[mediaType] {
+		return "", "", imageError(fmt.Sprintf("image URL at %s returned content type %q; %s are accepted",
+			u.Host, mediaType, imageTypesInMessage(accepts)))
 	}
 	if resp.ContentLength > f.maxBytes() {
 		return "", "", imageError(f.tooLarge(u.Host))
@@ -262,17 +411,58 @@ func (f *ImageFetcher) maxConcurrent() int {
 	return defaultImageMaxConcurrent
 }
 
+func (f *ImageFetcher) queueWait() time.Duration {
+	if f.QueueWait > 0 {
+		return f.QueueWait
+	}
+	if t := f.timeout(); t < defaultImageQueueWait {
+		return t
+	}
+	return defaultImageQueueWait
+}
+
+// imageTenantKey carries the identity the fetch ceiling shares slots between.
+type imageTenantKey struct{}
+
+// WithImageTenant tags a request context with who is asking, so one project
+// cannot hold more than its share of the image fetch slots. An untagged
+// context is one anonymous tenant, which is right for the paths that are not
+// serving an API client.
+func WithImageTenant(ctx context.Context, tenant string) context.Context {
+	if tenant == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, imageTenantKey{}, tenant)
+}
+
+func imageTenantFrom(ctx context.Context) string {
+	t, _ := ctx.Value(imageTenantKey{}).(string)
+	return t
+}
+
 // imageBudget is one chat request's share of the fetcher: images are pulled
 // one at a time and only so many of them, so a single client request cannot
 // fan out into a burst of outbound connections.
 type imageBudget struct {
-	ctx   context.Context
-	cfg   Config
-	taken int
+	ctx context.Context
+	cfg Config
+	// accepts is the adapter's own media type whitelist; the fetcher has no
+	// opinion of its own because the upstreams genuinely differ.
+	accepts map[string]bool
+	taken   int
 }
 
 func (c Config) imageBudget(ctx context.Context) *imageBudget {
-	return &imageBudget{ctx: ctx, cfg: c}
+	return &imageBudget{ctx: ctx, cfg: c, accepts: imageMediaTypesFor(c.ProviderType)}
+}
+
+// accepted is the whitelist to parse inline images against; a nil budget
+// belongs to a caller with no adapter behind it.
+func (b *imageBudget) accepted() map[string]bool {
+	if b == nil || b.accepts == nil {
+		return imageMediaTypesDefault
+	}
+	return b.accepts
 }
 
 // inline resolves a remote image into base64. A reference that is already
@@ -286,7 +476,7 @@ func (b *imageBudget) inline(ref imageRef) (imageRef, error) {
 		return ref, imageError(fmt.Sprintf("a chat request may fetch at most %d remote images", b.cfg.Images.maxPerRequest()))
 	}
 	b.taken++
-	mediaType, data, err := b.cfg.Images.Fetch(b.ctx, ref.URL)
+	mediaType, data, err := b.cfg.Images.Fetch(b.ctx, ref.URL, imageTenantFrom(b.ctx), b.accepted())
 	if err != nil {
 		return ref, err
 	}
@@ -306,24 +496,32 @@ func imageError(msg string) *Error {
 // with neither a type nor base64 encoding as well, each coming back as a
 // provider 400 that named nothing the caller could act on. The message never
 // echoes the payload.
-func parseImageURL(u string) (imageRef, error) {
-	if !strings.HasPrefix(u, "data:") {
+func parseImageURL(u string, accepts map[string]bool) (imageRef, error) {
+	// RFC 3986 makes a scheme name case-insensitive, and "DATA:" used to fall
+	// through to the remote path, where none of this ran.
+	if len(u) < len("data:") || !strings.EqualFold(u[:len("data:")], "data:") {
 		return imageRef{URL: u}, nil
 	}
-	meta, payload, ok := strings.Cut(strings.TrimPrefix(u, "data:"), ",")
+	meta, payload, ok := strings.Cut(u[len("data:"):], ",")
 	if !ok || !imageDataIsBase64(meta) {
 		return imageRef{}, imageError(
 			"an inline image must be a base64 data: URL, as in data:image/png;base64,<payload>")
 	}
 	mediaType, _, _ := strings.Cut(meta, ";")
 	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
-	if !imageMediaTypes[mediaType] {
+	if !accepts[mediaType] {
 		return imageRef{}, imageError(fmt.Sprintf(
-			"inline image media type %q is not supported; png, jpeg, gif and webp are accepted",
-			imageTypeInMessage(mediaType)))
+			"inline image media type %q is not supported; %s are accepted",
+			imageTypeInMessage(mediaType), imageTypesInMessage(accepts)))
+	}
+	if payload == "" {
+		// An empty payload decodes fine and then vanishes: every adapter
+		// keys the part on Base64 being non-empty, so the client was told
+		// 200 for a message the model never saw an image in.
+		return imageRef{}, imageError("inline image carries no payload")
 	}
 	if _, err := base64.StdEncoding.DecodeString(payload); err != nil {
-		return imageRef{}, imageError("inline image payload is not valid base64")
+		return imageRef{}, imageError("inline image payload is not valid standard base64, padding included")
 	}
 	return imageRef{MediaType: mediaType, Base64: payload}, nil
 }

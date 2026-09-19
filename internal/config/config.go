@@ -407,7 +407,7 @@ func Load() (Config, error) {
 	// IMAGE_FETCH_MAX_PER_REQUEST bounds one request and nothing across
 	// them: this is the process-wide ceiling, and the image transport's
 	// per-host connection limit is set from it too.
-	c.ImageFetchMaxConcurrent = 4
+	c.ImageFetchMaxConcurrent = 16
 	if v := os.Getenv("IMAGE_FETCH_MAX_CONCURRENT"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
@@ -430,10 +430,18 @@ func Load() (Config, error) {
 	// default now holds at least two images of the largest size the fetcher
 	// will accept, and a ceiling too small to hold even one is refused at
 	// startup rather than discovered as a cache that never hits.
-	oneImage := base64Len(c.ImageFetchMaxBytes)
+	oneImage := Base64Len(c.ImageFetchMaxBytes)
 	c.ImageCacheMaxBytes = 64 << 20
 	if floor := 2 * oneImage; floor > c.ImageCacheMaxBytes {
 		c.ImageCacheMaxBytes = floor
+	}
+	// The derivation follows IMAGE_FETCH_MAX_MB and must not follow it
+	// anywhere: IMAGE_FETCH_MAX_MB=512 would otherwise hand a memory-limited
+	// container a 1.3 GiB cache nobody asked for. Past this an operator who
+	// wants a larger one says so, and startup says the cache will not hold
+	// images that size.
+	if c.ImageCacheMaxBytes > maxDerivedImageCacheBytes {
+		c.ImageCacheMaxBytes = maxDerivedImageCacheBytes
 	}
 	if v := os.Getenv("IMAGE_CACHE_MAX_MB"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -548,9 +556,13 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// base64Len is what n bytes take once base64-encoded, which is the form the
+// Base64Len is what n bytes take once base64-encoded, which is the form the
 // image cache actually stores and measures.
-func base64Len(n int64) int64 { return (n + 2) / 3 * 4 }
+func Base64Len(n int64) int64 { return (n + 2) / 3 * 4 }
+
+// maxDerivedImageCacheBytes caps the ceiling Load derives from
+// IMAGE_FETCH_MAX_MB. IMAGE_CACHE_MAX_MB overrides it in either direction.
+const maxDerivedImageCacheBytes = 256 << 20
 
 // loadTracing reads the OTLP settings. The OTEL_* names are the ones the
 // OpenTelemetry specification defines, so a collector sidecar that already

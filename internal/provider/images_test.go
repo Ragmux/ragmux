@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -51,7 +52,7 @@ func TestParseContent(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseContent(json.RawMessage(tc.raw))
+			got, err := parseContent(json.RawMessage(tc.raw), imageMediaTypesDefault)
 			if tc.wantErr {
 				var pe *Error
 				if err == nil {
@@ -103,7 +104,19 @@ func TestParseInlineImage(t *testing.T) {
 			name: "parameters before base64", url: "data:image/webp;charset=binary;base64,QUJD",
 			want: imageRef{MediaType: "image/webp", Base64: "QUJD"},
 		},
-		{name: "empty payload", url: "data:image/gif;base64,", want: imageRef{MediaType: "image/gif"}},
+		{
+			// It decodes fine and then vanishes: every adapter keys the part
+			// on Base64 being non-empty, so the client got a 200 for a
+			// message the model never saw an image in.
+			name: "empty payload", url: "data:image/gif;base64,", wantErr: "carries no payload",
+		},
+		{
+			// RFC 3986 makes a scheme name case-insensitive. This used to
+			// fall through to the remote path, where none of these checks
+			// run at all.
+			name: "uppercase scheme", url: "DATA:image/png;base64,QUJD",
+			want: imageRef{MediaType: "image/png", Base64: "QUJD"},
+		},
 		{
 			name: "html", url: "data:text/html;base64,PGh0bWw+",
 			wantErr: `media type "text/html" is not supported`,
@@ -117,17 +130,17 @@ func TestParseInlineImage(t *testing.T) {
 			wantErr: "must be a base64 data: URL",
 		},
 		{name: "no comma", url: "data:image/png;base64", wantErr: "must be a base64 data: URL"},
-		{name: "corrupt payload", url: "data:image/png;base64,!!!", wantErr: "not valid base64"},
+		{name: "corrupt payload", url: "data:image/png;base64,!!!", wantErr: "not valid standard base64"},
 		{
 			name: "payload that is not padded", url: "data:image/png;base64,QUJDR",
-			wantErr: "not valid base64",
+			wantErr: "not valid standard base64",
 		},
 		{name: "remote url is left alone", url: "https://example.com/a.png",
 			want: imageRef{URL: "https://example.com/a.png"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseImageURL(tc.url)
+			got, err := parseImageURL(tc.url, imageMediaTypesDefault)
 			if tc.wantErr != "" {
 				var pe *Error
 				if !errors.As(err, &pe) || pe.Status != http.StatusBadRequest ||
@@ -152,11 +165,79 @@ func TestParseInlineImage(t *testing.T) {
 	}
 }
 
+// The upstreams do not accept the same formats, and one shared list was wrong
+// in both directions: it refused the image/heic Gemini takes -- a real
+// regression for requests that worked before anything was checked -- and it
+// would have promised Anthropic a format its API rejects.
+func TestInlineImagePerAdapterMediaTypes(t *testing.T) {
+	cases := []struct {
+		provider, mediaType string
+		ok                  bool
+	}{
+		{"gemini", "image/heic", true},
+		{"gemini", "image/heif", true},
+		{"gemini", "image/png", true},
+		// Gemini's documented list has no gif.
+		{"gemini", "image/gif", false},
+		{"anthropic", "image/gif", true},
+		{"anthropic", "image/heic", false},
+		{"ollama", "image/gif", true},
+		{"ollama", "image/heic", false},
+		// An unknown provider type gets what every vision provider here takes.
+		{"custom_openai", "image/png", true},
+		{"custom_openai", "image/heic", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.provider+" "+tc.mediaType, func(t *testing.T) {
+			accepts := imageMediaTypesFor(tc.provider)
+			got, err := parseImageURL("data:"+tc.mediaType+";base64,QUJD", accepts)
+			if !tc.ok {
+				var pe *Error
+				if !errors.As(err, &pe) || pe.Status != http.StatusBadRequest {
+					t.Fatalf("err = %v, want a 400", err)
+				}
+				// The message lists what this adapter takes, not a set
+				// borrowed from another one.
+				if !strings.Contains(pe.Message, imageTypesInMessage(accepts)) {
+					t.Errorf("message does not name the accepted types: %s", pe.Message)
+				}
+				return
+			}
+			if err != nil || got.MediaType != tc.mediaType {
+				t.Fatalf("ref = %+v, err = %v", got, err)
+			}
+		})
+	}
+}
+
+// The cache is keyed on the URL alone, so an image stored for one adapter can
+// be asked for by another that does not accept it.
+func TestImageFetcherRechecksCachedMediaType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/heic")
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	defer srv.Close()
+	f := &ImageFetcher{Client: srv.Client(), Cache: newImageCache(8, 1<<20, time.Minute)}
+
+	if _, _, err := f.Fetch(context.Background(), srv.URL+"/a.heic", "t",
+		imageMediaTypesFor("gemini")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := f.Fetch(context.Background(), srv.URL+"/a.heic", "t",
+		imageMediaTypesFor("anthropic"))
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Status != http.StatusBadRequest ||
+		!strings.Contains(pe.Message, `"image/heic"`) {
+		t.Fatalf("err = %v, want a 400 for a format this adapter does not take", err)
+	}
+}
+
 // A media type is unbounded client input, so it cannot go into an error
 // message whole.
 func TestParseInlineImageBoundsTheMediaTypeInTheMessage(t *testing.T) {
 	long := strings.Repeat("ü", 4096)
-	_, err := parseImageURL("data:" + long + ";base64,QUJD")
+	_, err := parseImageURL("data:"+long+";base64,QUJD", imageMediaTypesDefault)
 	var pe *Error
 	if !errors.As(err, &pe) {
 		t.Fatalf("err = %v", err)
@@ -207,7 +288,7 @@ func TestInlineImageNeverReachesProvider(t *testing.T) {
 }
 
 func TestParseContentKeepsCacheControl(t *testing.T) {
-	parts, err := parseContent(json.RawMessage(`[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}]`))
+	parts, err := parseContent(json.RawMessage(`[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}]`), imageMediaTypesDefault)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +336,7 @@ func TestImageFetcher(t *testing.T) {
 	f := &ImageFetcher{Client: client, MaxBytes: 16 << 10}
 
 	t.Run("png", func(t *testing.T) {
-		mt, data, err := f.Fetch(context.Background(), srv.URL+"/ok.png")
+		mt, data, err := f.Fetch(context.Background(), srv.URL+"/ok.png", "t", imageMediaTypesDefault)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -272,7 +353,7 @@ func TestImageFetcher(t *testing.T) {
 		{"missing", "/nope.png", "image URL returned 404"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := f.Fetch(context.Background(), srv.URL+tc.path)
+			_, _, err := f.Fetch(context.Background(), srv.URL+tc.path, "t", imageMediaTypesDefault)
 			var pe *Error
 			if !errors.As(err, &pe) || pe.Status != 400 || !strings.Contains(pe.Message, tc.want) {
 				t.Fatalf("err = %v", err)
@@ -284,7 +365,7 @@ func TestImageFetcher(t *testing.T) {
 		})
 	}
 	t.Run("cross-host redirect refused", func(t *testing.T) {
-		_, _, err := f.Fetch(context.Background(), srv.URL+"/away")
+		_, _, err := f.Fetch(context.Background(), srv.URL+"/away", "t", imageMediaTypesDefault)
 		var pe *Error
 		if !errors.As(err, &pe) || !strings.Contains(pe.Message, "redirect rejected") {
 			t.Fatalf("err = %v", err)
@@ -292,7 +373,7 @@ func TestImageFetcher(t *testing.T) {
 	})
 	t.Run("scheme", func(t *testing.T) {
 		for _, u := range []string{"file:///etc/passwd", "ftp://example.com/a.png", "notaurl"} {
-			_, _, err := f.Fetch(context.Background(), u)
+			_, _, err := f.Fetch(context.Background(), u, "t", imageMediaTypesDefault)
 			var pe *Error
 			if !errors.As(err, &pe) || pe.Status != 400 {
 				t.Errorf("%s: err = %v", u, err)
@@ -314,10 +395,10 @@ func TestImageFetcherCache(t *testing.T) {
 	defer srv.Close()
 	f := &ImageFetcher{Client: srv.Client(), Cache: newImageCache(8, 1<<20, time.Minute)}
 
-	if _, _, err := f.Fetch(context.Background(), srv.URL+"/a.png"); err != nil {
+	if _, _, err := f.Fetch(context.Background(), srv.URL+"/a.png", "t", imageMediaTypesDefault); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := f.Fetch(context.Background(), srv.URL+"/a.png"); err != nil {
+	if _, _, err := f.Fetch(context.Background(), srv.URL+"/a.png", "t", imageMediaTypesDefault); err != nil {
 		t.Fatal(err)
 	}
 	if hits != 1 {
@@ -325,7 +406,7 @@ func TestImageFetcherCache(t *testing.T) {
 	}
 	// A response that says not to store it is fetched again every time.
 	for i := 0; i < 2; i++ {
-		if _, _, err := f.Fetch(context.Background(), srv.URL+"/nostore.png"); err != nil {
+		if _, _, err := f.Fetch(context.Background(), srv.URL+"/nostore.png", "t", imageMediaTypesDefault); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -339,8 +420,18 @@ func TestImageFetcherCache(t *testing.T) {
 func TestImageFetcherDefaults(t *testing.T) {
 	f := &ImageFetcher{Client: http.DefaultClient, Cache: NewImageCache(16, 0, time.Minute)}
 	if f.maxBytes() != 8<<20 || f.timeout() != 10*time.Second || f.maxPerRequest() != 8 ||
-		f.maxConcurrent() != 4 {
-		t.Errorf("defaults = %d %v %d %d", f.maxBytes(), f.timeout(), f.maxPerRequest(), f.maxConcurrent())
+		f.maxConcurrent() != 16 || f.queueWait() != 2*time.Second || f.tenantShare() != 8 {
+		t.Errorf("defaults = %d %v %d %d %v %d", f.maxBytes(), f.timeout(), f.maxPerRequest(),
+			f.maxConcurrent(), f.queueWait(), f.tenantShare())
+	}
+	// A ceiling of one still leaves the tenant a slot; the share rounds down
+	// everywhere else.
+	if one := (&ImageFetcher{MaxConcurrent: 1}).tenantShare(); one != 1 {
+		t.Errorf("tenant share of a one-slot fetcher = %d", one)
+	}
+	// Queueing never outlasts the download budget it precedes.
+	if short := (&ImageFetcher{Timeout: 500 * time.Millisecond}).queueWait(); short != 500*time.Millisecond {
+		t.Errorf("queue wait = %v, want it clamped to the fetch timeout", short)
 	}
 	if f.Cache.maxEntries != 16 || f.Cache.ttl != time.Minute || f.Cache.maxBytes != 64<<20 {
 		t.Errorf("cache = %+v", f.Cache)
@@ -350,9 +441,10 @@ func TestImageFetcherDefaults(t *testing.T) {
 	if big := NewImageCache(16, 256<<20, time.Minute); big.maxBytes != 256<<20 {
 		t.Errorf("cache ceiling = %d", big.maxBytes)
 	}
-	set := &ImageFetcher{MaxBytes: 1 << 20, Timeout: time.Second, MaxPerRequest: 2, MaxConcurrent: 3}
+	set := &ImageFetcher{MaxBytes: 1 << 20, Timeout: time.Second, MaxPerRequest: 2, MaxConcurrent: 3,
+		QueueWait: 250 * time.Millisecond}
 	if set.maxBytes() != 1<<20 || set.timeout() != time.Second || set.maxPerRequest() != 2 ||
-		set.maxConcurrent() != 3 {
+		set.maxConcurrent() != 3 || set.queueWait() != 250*time.Millisecond {
 		t.Errorf("explicit settings ignored: %+v", set)
 	}
 }
@@ -413,44 +505,60 @@ func TestImageBudget(t *testing.T) {
 	}
 }
 
+// blockingImageServer parks every handler until release is called, and
+// reports each arrival on started.
+func blockingImageServer(t *testing.T, buf int) (srv *httptest.Server, started <-chan struct{}, release func()) {
+	t.Helper()
+	arrivals := make(chan struct{}, buf)
+	gate := make(chan struct{})
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		arrivals <- struct{}{}
+		<-gate
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(func() {
+		release()
+		srv.Close()
+	})
+	return srv, arrivals, release
+}
+
 // MaxPerRequest bounds one request and nothing across them: a key holder who
 // sends many at once turns the gateway into a GET amplifier aimed from its own
 // address at whatever host the requests name. This is the ceiling that stops
 // that, so it has to hold when the requests are concurrent.
 func TestImageFetcherConcurrencyCeiling(t *testing.T) {
 	const (
-		limit = 3
-		total = 9
+		limit   = 6
+		tenants = 6
+		total   = tenants * 2
 	)
-	started := make(chan struct{}, total)
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		started <- struct{}{}
-		<-release
-		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write([]byte("bytes"))
-	}))
-	defer srv.Close()
+	srv, started, release := blockingImageServer(t, total)
 
-	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: limit}
+	// Spread over enough tenants that none reaches its own share, so the
+	// process-wide ceiling is the only thing that can bind.
+	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: limit, QueueWait: 10 * time.Second}
 	done := make(chan error, total)
 	for i := 0; i < total; i++ {
 		go func(i int) {
-			_, _, err := f.Fetch(context.Background(), fmt.Sprintf("%s/%d.png", srv.URL, i))
+			_, _, err := f.Fetch(context.Background(), fmt.Sprintf("%s/%d.png", srv.URL, i),
+				fmt.Sprintf("tenant-%d", i%tenants), imageMediaTypesDefault)
 			done <- err
 		}(i)
 	}
 	for i := 0; i < limit; i++ {
 		<-started
 	}
-	// Every handler is parked, so the remaining fetches can only be waiting
-	// for a slot. If a fourth request arrives, the ceiling does not hold.
+	// Every handler is parked, so the rest can only be waiting for a slot.
 	select {
 	case <-started:
 		t.Fatal("more fetches went out at once than MaxConcurrent allows")
 	case <-time.After(200 * time.Millisecond):
 	}
-	close(release)
+	release()
 	for i := 0; i < total; i++ {
 		if err := <-done; err != nil {
 			t.Errorf("fetch %d: %v", i, err)
@@ -458,31 +566,103 @@ func TestImageFetcherConcurrencyCeiling(t *testing.T) {
 	}
 }
 
-// A fetch that cannot get a slot in time is the gateway running out, not the
-// client getting something wrong and not the image host failing, so it is
-// neither a 400 nor a relayed upstream error.
-func TestImageFetcherQueueSaturation(t *testing.T) {
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		started <- struct{}{}
-		<-release
-		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write([]byte("bytes"))
-	}))
-	defer srv.Close()
-	defer close(release)
+// Capping the process alone traded outward amplification for inward
+// starvation: a few requests pointed at one slow host filled every slot, and
+// an unrelated project then waited out its whole timeout and failed. No tenant
+// may hold more than half the slots.
+func TestImageFetcherTenantShare(t *testing.T) {
+	const limit = 8 // a share of 4
+	srv, started, release := blockingImageServer(t, limit*2)
 
-	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: 1}
-	go func() { _, _, _ = f.Fetch(context.Background(), srv.URL+"/held.png") }()
+	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: limit, QueueWait: 10 * time.Second}
+	done := make(chan error, limit)
+	for i := 0; i < limit; i++ {
+		go func(i int) {
+			_, _, err := f.Fetch(context.Background(), fmt.Sprintf("%s/hog%d.png", srv.URL, i),
+				"noisy", imageMediaTypesDefault)
+			done <- err
+		}(i)
+	}
+	for i := 0; i < f.tenantShare(); i++ {
+		<-started
+	}
+	select {
+	case <-started:
+		t.Fatalf("one tenant took more than its share of %d slots", f.tenantShare())
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// The other half is still there for somebody else.
+	quiet := make(chan error, 1)
+	go func() {
+		_, _, err := f.Fetch(context.Background(), srv.URL+"/quiet.png", "quiet", imageMediaTypesDefault)
+		quiet <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a second tenant was starved by the first")
+	}
+
+	release()
+	for i := 0; i < limit; i++ {
+		if err := <-done; err != nil {
+			t.Errorf("hog fetch %d: %v", i, err)
+		}
+	}
+	if err := <-quiet; err != nil {
+		t.Errorf("quiet fetch: %v", err)
+	}
+}
+
+// A fetch that cannot get a slot in time is the gateway running out, not the
+// client getting something wrong and not the image host failing. It answers
+// 429 with Retry-After rather than a 5xx: the official SDKs retry 5xx
+// automatically with backoff, so a 503 would spend every client's retries
+// queueing again while the ceiling is still full.
+func TestImageFetcherQueueSaturation(t *testing.T) {
+	srv, started, _ := blockingImageServer(t, 2)
+
+	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: 1, QueueWait: 100 * time.Millisecond}
+	go func() {
+		_, _, _ = f.Fetch(context.Background(), srv.URL+"/held.png", "a", imageMediaTypesDefault)
+	}()
 	<-started
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	_, _, err := f.Fetch(ctx, srv.URL+"/queued.png")
+	// A different tenant, so it is the process ceiling being reported.
+	_, _, err := f.Fetch(context.Background(), srv.URL+"/queued.png", "b", imageMediaTypesDefault)
 	var pe *Error
-	if !errors.As(err, &pe) || pe.Status != http.StatusServiceUnavailable {
-		t.Fatalf("err = %v, want a 503", err)
+	if !errors.As(err, &pe) || pe.Status != http.StatusTooManyRequests {
+		t.Fatalf("err = %v, want a 429", err)
+	}
+	if pe.Code != "image_fetch_saturated" || pe.RetryAfter < 1 {
+		t.Errorf("error = %+v", pe)
+	}
+}
+
+// A client that hangs up mid-request must not be recorded as saturation: the
+// gateway looks for a provider error before it looks for context.Canceled, so
+// returning one here put every disconnect in the log as a capacity problem and
+// on the saturation counter.
+func TestImageFetcherQueueReportsClientCancellation(t *testing.T) {
+	srv, started, _ := blockingImageServer(t, 2)
+
+	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: 1, QueueWait: 5 * time.Second}
+	go func() {
+		_, _, _ = f.Fetch(context.Background(), srv.URL+"/held.png", "a", imageMediaTypesDefault)
+	}()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	defer cancel()
+	_, _, err := f.Fetch(ctx, srv.URL+"/queued.png", "b", imageMediaTypesDefault)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	var pe *Error
+	if errors.As(err, &pe) {
+		t.Errorf("a client disconnect was dressed up as a provider error: %+v", pe)
 	}
 }
 
@@ -532,7 +712,7 @@ func TestImageCache(t *testing.T) {
 // private addresses.
 func TestImageFetcherWithoutClientRefuses(t *testing.T) {
 	f := &ImageFetcher{}
-	_, _, err := f.Fetch(context.Background(), "http://127.0.0.1/secret.png")
+	_, _, err := f.Fetch(context.Background(), "http://127.0.0.1/secret.png", "t", imageMediaTypesDefault)
 	if err == nil {
 		t.Fatal("a fetcher with no client fetched anyway")
 	}

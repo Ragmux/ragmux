@@ -89,6 +89,23 @@ func (pr *principal) subject() limits.Subject {
 	return s
 }
 
+// imageTenant is the identity the image fetch ceiling shares its slots
+// between. The project is the tenant boundary everywhere else here -- limits,
+// budgets, request logs -- so it is the one that must not be starved by
+// another; a multi-grant key that named no project falls back to the key,
+// which is as far as its identity goes.
+func (pr *principal) imageTenant() string {
+	switch {
+	case pr == nil:
+		return ""
+	case pr.project != nil:
+		return "project:" + strconv.FormatInt(pr.project.ID, 10)
+	case pr.key != nil:
+		return "key:" + strconv.FormatInt(pr.key.ID, 10)
+	}
+	return ""
+}
+
 // attribute stamps the request log with the key and owner that paid for the
 // request; a project's default key leaves both nil.
 func (pr *principal) attribute(rec *store.RequestLog) {
@@ -195,6 +212,7 @@ func (g *Gateway) authenticate(next http.Handler) http.Handler {
 			}
 		}
 		ctx = context.WithValue(ctx, principalKey{}, pr)
+		ctx = provider.WithImageTenant(ctx, pr.imageTenant())
 		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, ctxKey{}, pr.project)))
 	})
 }
@@ -583,6 +601,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		log.Warn("upstream error", "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
+		if pe.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
+		}
 		w.WriteHeader(status)
 		_, _ = w.Write(pe.ErrorJSON())
 		return
@@ -807,6 +828,9 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
+		if pe.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
+		}
 		w.WriteHeader(status)
 		_, _ = w.Write(pe.ErrorJSON())
 		return

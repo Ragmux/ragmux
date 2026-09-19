@@ -320,6 +320,11 @@ type Error struct {
 	Type    string
 	Code    string
 	Message string
+	// RetryAfter is seconds for the Retry-After header, set only where the
+	// gateway can say when the thing that was full will have room. It is a
+	// header rather than a body field because that is what an HTTP client
+	// already knows how to honour.
+	RetryAfter int
 }
 
 func (e *Error) Error() string {
