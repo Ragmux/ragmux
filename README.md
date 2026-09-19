@@ -104,9 +104,9 @@ Three variants are published from every release:
 | `ragmux/ragmux:latest-paradedb` | **All-in-one on ParadeDB:** same gateway and same data layout, but its PostgreSQL carries `pg_search` (BM25) as well as `pgvector` (`Dockerfile.aio.paradedb`). | You want the lexical half of hybrid retrieval answered by **BM25** instead of PostgreSQL full-text ranking. Swapping from the default all-in-one image needs no reprocessing. |
 
 The `-paradedb` image takes exactly the same command and the same volume layout as the
-default one. Images are published to **Docker Hub** (`ragmux/ragmux`) and, with identical
-tags, to the GitHub Container Registry as `ghcr.io/ragmux/ragmux` — either registry
-serves the same builds.
+default one. Docker Hub is the primary registry; the full tag matrix, the GHCR mirror and
+the platforms are listed under
+[Published images](docs/configuration.md#published-images).
 
 **`latest` is for trying it out; pin a version in production.** The commands here use
 `latest` so they keep working as you read them, but a deployment you care about should
