@@ -20,8 +20,8 @@ teknik.
 
 | Faz | Başlık | Sahip | Durum | Bağımlılık |
 |---|---|---|---|---|
-| 01 | Hazır olma ve seri tavanı kararları | backend-engineer | sürüyor | — |
-| 02 | Metrik ve trace etiket sınırları | backend-engineer | beklemede | 01 |
+| 01 | Hazır olma ve seri tavanı kararları | backend-engineer | **tamam** | — |
+| 02 | Metrik ve trace etiket sınırları | backend-engineer | sürüyor | 01 |
 | 03 | Provider: şema ve görsel doğrulama | backend-engineer | sürüyor | — |
 | 04 | Token muhasebesi ve fiyat tablosu | backend-engineer | sürüyor | — |
 | 05 | Depolama ve ölçek temizliği | backend-engineer | sürüyor | — |

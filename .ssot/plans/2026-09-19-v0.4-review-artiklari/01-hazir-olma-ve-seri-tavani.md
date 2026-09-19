@@ -1,6 +1,6 @@
 # Faz 01 — Hazır olma ve seri tavanı kararları
 
-- **Durum:** beklemede
+- **Durum:** tamam (review APPROVED, `v0.4`'e merge edildi)
 - **Sahip:** backend-engineer
 - **Bağımlılık:** yok
 - **İlgili karar:** ADR-001, ADR-002 (ikisi de `.ssot/ADR.md`'de kabul
@@ -95,5 +95,17 @@ ADR-001 bir koşula bağlı: Ragmux migration'larının **ekleyici** kalması.
 `docs/scaling.md` bu koşulu açıkça yazsın — kolon düşüren bir migration
 gelirse bu karar yeniden ele alınmalı.
 
-ADR-002'nin sayacı yayınlanmış metrik yüzeyine yeni bir isim ekliyor;
-`docs/observability.md`'deki metrik listesine de girsin.
+ADR-002'nin istediği sayaç `ragmux_metrics_series_dropped_total` adıyla
+zaten yayınlanıyordu; bu brief'in "yeni bir isim ekliyor" satırı yanlıştı.
+Yayınlanmış metrik yüzeyi değişmedi, yalnız log seviyesi ve tekrar
+davranışı değişti.
+
+**Uygulama sonrası bulunanlar:**
+
+- Review, ADR-001'in dayandığı "ekleyici migration" öncülünün karşı
+  örneğini buldu: `0008_users_ci_audit.sql` mevcut bir kolona
+  `lower(username)` unique index'i ekliyor. Koşul "ekleyici **ve
+  daraltmayan**" olarak düzeltildi ve karşı örnek dokümana somut olarak
+  yazıldı. ADR-001 geçerli, sınırı netleşti.
+- `/readyz`'in `db unavailable` dalı hâlâ testsiz; faz öncesinden de
+  öyleydi, bu fazın kapsamına alınmadı.
