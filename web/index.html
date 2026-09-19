@@ -342,16 +342,22 @@ const ICON = {
 
 const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], searchBackends: [], users: [], keys: [], system: null, sessionExp: null,
   overview: { window: '24h' }, openStore: null, openProject: null, users_filter: { q: '', role: 'all' },
-  keys_filter: { q: '', kind: 'all', mine: true }, setupStep: 0,
+  keys_filter: { q: '', kind: 'all', mine: true },
   playground: { key: '', system: '', stream: true, sources: true, msgs: [], last: null } };
 // The first-run wizard spans three screens and one of them creates the
 // session, so "am I mid-wizard?" has to survive a reload. sessionStorage
 // keeps it to the tab that started it: an established install where someone
 // deleted every project never falls back into the wizard.
+// The stored value is the step to resume at, so the screen a reload lands on
+// needs no network call to decide: GET /setup stops answering anything but
+// needs_setup once the first administrator exists, and state.models is only as
+// good as the last loadAll(), which leaves it empty when any one of its calls
+// failed.
 const WIZARD_KEY = 'ragmux_wizard';
 const wizard = {
-  get active() { try { return sessionStorage.getItem(WIZARD_KEY) === '1'; } catch (e) { return false; } },
-  start() { try { sessionStorage.setItem(WIZARD_KEY, '1'); } catch (e) { /* private mode: the wizard just does not resume */ } },
+  get step() { try { return Number(sessionStorage.getItem(WIZARD_KEY)) || 0; } catch (e) { return 0; } },
+  get active() { return this.step >= 2; },
+  start(step) { try { sessionStorage.setItem(WIZARD_KEY, String(step)); } catch (e) { /* private mode: the wizard just does not resume */ } },
   done() { try { sessionStorage.removeItem(WIZARD_KEY); } catch (e) { /* nothing to clean up */ } },
 };
 const ROLE_RANK = { viewer: 1, editor: 2, admin: 3 };
@@ -583,13 +589,11 @@ function renderLogin() {
 // ordinary authenticated calls to POST /api/models and POST /api/projects,
 // already role-gated and already audited, so the wizard adds no new
 // unauthenticated surface at all.
-// A reload lands here with setupStep back at 0, so the step is picked from the
-// connections the signed-in session can already see. GET /setup no longer
-// answers that question: once the first administrator exists it reports
-// needs_setup and nothing else.
+// wizard.step survives the reload, so a resumed wizard lands on the screen it
+// left rather than on whatever the boot calls happened to return.
 function renderSetup() {
   if (!state.user) { renderSetupAdmin(); return; }
-  if (state.setupStep === 3 || (state.setupStep !== 2 && state.models.length)) renderSetupProject();
+  if (wizard.step === 3) renderSetupProject();
   else renderSetupModel();
 }
 // setupCard renders one wizard step into the auth screen.
@@ -603,7 +607,7 @@ function setupCard(step, id, title, lede, body, submitLabel, extra = '') {
 }
 // finishWizard leaves the setup screens for the dashboard.
 async function finishWizard() {
-  wizard.done(); state.setupStep = 0;
+  wizard.done();
   try { await loadAll(); } catch (e) { toast(e.message, 4000, 'err'); }
   state.tab = 'overview'; render();
 }
@@ -634,12 +638,17 @@ function renderSetupModel() {
       out.innerHTML = `<div class="note ${r.ok ? 'ok' : 'err'}"><span class="pill ${r.ok ? 'ok' : 'err'}">${r.ok ? 'ok' : 'failed'} · ${fmtN(r.latency_ms)} ms</span><span class="hint" style="white-space:pre-wrap">${esc(r.ok ? (r.reply ? 'reply: ' + r.reply : 'reachable') : r.error)}</span></div>`; }
     catch (e) { out.innerHTML = `<div class="note err"><span class="hint">${esc(e.message)}</span></div>`; } finally { btn.disabled = false; } };
   // Skipping without a connection auto-skips step 3 too: a project needs one.
+  // Ask /models rather than trust state.models, which a partly failed loadAll()
+  // leaves empty; ending the wizard over an unrelated error would be wrong.
   $('#setupSkipModel').onclick = async () => {
+    const btn = $('#setupSkipModel'); btn.disabled = true;
+    try { state.models = await api('/models'); }
+    catch (e) { toast(e.message, 5000, 'err'); btn.disabled = false; return; }
     if (!state.models.length) { toast('Add a model connection first — a project needs one. You can do both from the Models tab.', 6000); await finishWizard(); return; }
-    state.setupStep = 3; renderSetup(); };
+    wizard.start(3); renderSetup(); };
   form.onsubmit = async e => { e.preventDefault(); const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true;
     try { await api('/models', { method: 'POST', body: { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name } });
-      state.models = await api('/models'); state.setupStep = 3; renderSetup(); }
+      state.models = await api('/models'); wizard.start(3); renderSetup(); }
     catch (err) { toast(err.message, 6000, 'err'); btn.disabled = false; } };
 }
 // Step 3: a project, which is what mints the first client key.
@@ -682,7 +691,7 @@ function renderSetupAdmin() {
     try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } });
       // needsSetup drops before anything else can fail, so a reload can
       // never land back on step 1 with the account already created.
-      state.needsSetup = false; state.user = r.user; wizard.start(); state.setupStep = 2; await afterSignIn(); }
+      state.needsSetup = false; state.user = r.user; wizard.start(2); await afterSignIn(); }
     catch (err) { toast(err.message, 5000, 'err'); if (/already completed/.test(err.message)) { state.needsSetup = false; render(); } }
     finally { btn.disabled = false; } };
 }
