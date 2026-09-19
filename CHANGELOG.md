@@ -89,11 +89,17 @@ All notable changes to Ragmux are documented here. The format follows
   set, samples at 5% by default, ignores an inbound `traceparent` unless told to trust it,
   and covers seven spans; point it at an OpenTelemetry Collector, which is the supported
   configuration. See [Observability](docs/observability.md).
-- **`GET /readyz`**: ready when the pool answers and the schema is at the version this
-  binary embeds. `/healthz` stays liveness-only, so container healthchecks are unchanged.
-  A store whose search backend is unavailable is reported as degraded with a `200`, not a
-  `503` — the fallback works, and taking the replica out of rotation would turn a
-  degraded-but-serving instance into an outage.
+- **`GET /readyz`**: ready when the pool answers and the schema has reached the version
+  this binary embeds. `/healthz` stays liveness-only, so container healthchecks are
+  unchanged. The schema comparison is one-directional on purpose: a schema *behind* the
+  binary answers `503` (`migrating`), a schema *ahead* of it answers `200` with a
+  `degraded` entry. Failing readiness on a newer schema would empty the fleet in the
+  middle of a `maxSurge` rolling upgrade — the first new pod migrates the shared database
+  and every old replica would take itself out of rotation at once — and would leave a
+  rollback permanently unready. The migrations are additive, so the older code keeps
+  serving. A store whose search backend is unavailable is likewise reported as degraded
+  with a `200`, not a `503` — the fallback works, and taking the replica out of rotation
+  would turn a degraded-but-serving instance into an outage.
 - `GET /admin/api/search-backends` reports which backends this server can actually run.
   `/admin/api/provider-types` now carries a full `capabilities` object taken from the
   provider package, so it cannot drift from what the adapters do.

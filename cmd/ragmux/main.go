@@ -460,10 +460,15 @@ func buildMetrics(cfg config.Config, st *store.Store, log *slog.Logger) (*metric
 		return nil, nil
 	}
 	reg := metrics.New(metrics.Options{MaxSeries: cfg.MetricsMaxSeries})
-	reg.OnSeriesDropped = func(metric string) {
-		log.Warn("metrics: series cap reached, new label combinations are being dropped; "+
+	// A full series cap is an error condition, not a note: from here on every
+	// new legitimate series -- a new project, a new model, a new cost series --
+	// is lost until the cap is raised or the cardinality comes down. It is
+	// logged at error level and counted in ragmux_metrics_series_dropped_total
+	// so it cannot pass unnoticed.
+	reg.OnSeriesDropped = func(metric string, dropped uint64) {
+		log.Error("metrics: series cap reached, new label combinations are being dropped; "+
 			"look for an unbounded label before raising METRICS_MAX_SERIES",
-			"metric", metric, "max_series", cfg.MetricsMaxSeries)
+			"metric", metric, "max_series", cfg.MetricsMaxSeries, "dropped_total", dropped)
 	}
 	reg.RegisterRuntime(version, runtime.Version())
 	m := obs.New(reg)
@@ -494,14 +499,28 @@ func mountMetrics(r chi.Router, cfg config.Config, registry *metrics.Registry) *
 }
 
 // readyz reports whether this replica should take traffic: the pool answers
-// and the schema is at the version this binary embeds. During a rolling
-// upgrade that second half is what keeps requests off a replica whose
-// database another replica has already migrated past it.
+// and the schema has reached the version this binary embeds.
+//
+// The schema comparison is deliberately one-directional. A schema *behind*
+// the binary means the tables this build expects do not exist yet, so the
+// replica cannot serve and answers 503 "migrating". A schema *ahead* of the
+// binary answers 200 with a "degraded" entry instead: during a maxSurge
+// rolling upgrade the first new pod migrates the shared database, and if that
+// made every old replica unready the load balancer would empty the fleet in
+// the middle of a deploy that is supposed to be seamless — and a rollback
+// could never become ready at all. Ragmux migrations are additive and
+// non-narrowing (ADD COLUMN IF NOT EXISTS, new tables, no drops), so the
+// older code keeps working against the newer schema. A migration that drops
+// or renames a column, narrows a type, or adds a constraint or unique index
+// to an existing column would invalidate that: the last one is not
+// hypothetical -- 0008 added a unique index on lower(username), which the
+// older code has no idea it must not violate. Such a change needs the staged
+// treatment described in docs/scaling.md, not this assumption.
 //
 // A RAG store configured for a search backend this server does not carry is
-// deliberately NOT a readiness failure. The search falls back to pgvector
-// and keeps answering, so removing the replica from rotation would turn a
-// degraded-but-working condition into an outage; it is reported as an
+// deliberately NOT a readiness failure either. The search falls back to
+// pgvector and keeps answering, so removing the replica from rotation would
+// turn a degraded-but-working condition into an outage; it is reported as an
 // informational "degraded" entry alongside a 200.
 //
 // /healthz stays liveness-only and unchanged, so the container HEALTHCHECK
@@ -529,13 +548,18 @@ func readyz(st *store.Store, log *slog.Logger) http.HandlerFunc {
 				ExpectedMigrations: head})
 			return
 		}
-		if applied != head {
+		if applied < head {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(response{Status: "migrating", Version: version,
 				Migrations: applied, ExpectedMigrations: head})
 			return
 		}
 		res := response{Status: "ok", Version: version, Migrations: applied, ExpectedMigrations: head}
+		if applied > head {
+			res.Degraded = append(res.Degraded, fmt.Sprintf(
+				"the database schema is at migration %d, ahead of the %d this binary embeds; "+
+					"this replica is running older code against a newer schema", applied, head))
+		}
 		if n, err := st.DegradedRAGStores(ctx); err != nil {
 			log.Warn("readiness: count degraded rag stores", "err", err)
 		} else if n > 0 {

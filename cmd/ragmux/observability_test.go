@@ -233,6 +233,89 @@ func TestReadyzDegradedStaysReady(t *testing.T) {
 	}
 }
 
+// TestReadyzMigratingWhenSchemaIsBehind: the binary expects tables the
+// database does not have yet, so this replica genuinely cannot serve.
+func TestReadyzMigratingWhenSchemaIsBehind(t *testing.T) {
+	st := testdb.Open(t)
+	head := store.HeadMigration()
+	if _, err := st.DB().Exec(t.Context(),
+		"DELETE FROM schema_migrations WHERE version = $1", head); err != nil {
+		t.Fatal(err)
+	}
+
+	got, code := getReadyz(t, st)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 while the schema is behind the binary", code)
+	}
+	if got.Status != "migrating" {
+		t.Errorf("status = %q, want migrating", got.Status)
+	}
+	if got.Migrations >= head || got.ExpectedMigrations != head {
+		t.Errorf("migrations = %d/%d, want an applied version below the head %d",
+			got.Migrations, got.ExpectedMigrations, head)
+	}
+}
+
+// TestReadyzSchemaAheadStaysReady is the other half of the matrix and the
+// reason the comparison is one-directional: during a rolling upgrade the
+// first new pod migrates the shared database, and every old replica still
+// carrying traffic then sees a schema ahead of its own. Failing readiness
+// there would take the whole fleet out of rotation mid-deploy. The
+// migrations are additive, so the old code keeps serving and only reports
+// the condition.
+func TestReadyzSchemaAheadStaysReady(t *testing.T) {
+	st := testdb.Open(t)
+	head := store.HeadMigration()
+	if _, err := st.DB().Exec(t.Context(),
+		"INSERT INTO schema_migrations (version) VALUES ($1)", head+1); err != nil {
+		t.Fatal(err)
+	}
+
+	got, code := getReadyz(t, st)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: a newer schema must not empty the fleet during a rolling upgrade", code)
+	}
+	if got.Status != "ok" {
+		t.Errorf("status = %q, want ok", got.Status)
+	}
+	if got.Migrations != head+1 || got.ExpectedMigrations != head {
+		t.Errorf("migrations = %d/%d, want %d applied against the embedded head %d",
+			got.Migrations, got.ExpectedMigrations, head+1, head)
+	}
+	var found bool
+	for _, d := range got.Degraded {
+		if strings.Contains(d, "ahead of") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("degraded = %v, want an entry reporting the schema is ahead of the binary", got.Degraded)
+	}
+}
+
+// readyzBody is the readiness response as a probe sees it.
+type readyzBody struct {
+	Status             string   `json:"status"`
+	Migrations         int      `json:"migrations"`
+	ExpectedMigrations int      `json:"expected_migrations"`
+	Degraded           []string `json:"degraded"`
+}
+
+// getReadyz calls the probe the way run() mounts it.
+func getReadyz(t *testing.T, st *store.Store) (readyzBody, int) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(discard{}, nil))
+	r := chi.NewRouter()
+	r.Get("/readyz", readyz(st, log))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	var got readyzBody
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	return got, w.Code
+}
+
 // discard swallows log output in tests.
 type discard struct{}
 

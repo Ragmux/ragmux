@@ -225,6 +225,50 @@ before another replica claims them. Nothing is lost; a document is only ever
   long as the schema change is backwards compatible - which is the rule these
   migrations follow (`ADD COLUMN IF NOT EXISTS`, new tables, no drops).
 
+### `/readyz` during a rolling upgrade
+
+There is one shared database and one schema, so the moment the first new replica
+starts, it migrates the database out from under every old replica still serving.
+`/readyz` compares the applied schema version against the one the binary embeds,
+and the comparison runs in **one direction only**:
+
+| Applied vs. embedded head | `/readyz` | Why |
+|---|---|---|
+| behind (`applied < head`) | `503`, `"status":"migrating"` | The tables this build expects do not exist yet. It cannot serve. |
+| equal | `200` | The normal case. |
+| ahead (`applied > head`) | `200` with a `degraded` entry | Older code, newer schema. It keeps serving. |
+
+Failing readiness on a newer schema would be the stricter reading, and it was
+rejected because of what it costs: with `maxSurge: 1` the first new pod migrates
+the database and *all N old replicas* go unready at once, so a deploy designed to
+be seamless empties the fleet instead - `maxUnavailable: 0` does not help,
+because the old pods take themselves out. Rolling back is worse: the previous
+image would never become ready against the schema the new one left behind.
+
+**This depends on migrations staying additive *and* non-narrowing.** Old code
+running against a newer schema is only safe while both hold. A migration breaks
+the replicas this behaviour deliberately keeps in rotation if it:
+
+- drops or renames a column or table,
+- narrows a type or adds `NOT NULL` to an existing column,
+- **adds a constraint or a unique index to an existing column.** This last one
+  is not hypothetical: `0008_users_ci_audit.sql` added
+  `CREATE UNIQUE INDEX ... ON users (lower(username))`. During the upgrade
+  window an old replica still allows creating `Alice` next to an existing
+  `alice` - its code predates the rule - and the write now fails on a
+  constraint it does not know about. Narrow and admin-only here, but the shape
+  is general: a new constraint makes previously valid writes fail in old code.
+
+Any of those needs the staged expand/contract treatment - ship the additive
+half, roll every replica onto code that respects the new rule, then add the
+constraint or drop the column in a later release - rather than a single
+migration. If one has to ship as a single migration, this readiness behaviour
+is not enough on its own and the upgrade needs a maintenance window.
+
+The `degraded` entry is informational and `/readyz` still returns `200`, so
+nothing pages on it by itself. It is expected for the length of a deploy;
+alert on it *persisting*, which means a replica was left behind.
+
 ## The Compose example
 
 ```bash
@@ -258,8 +302,11 @@ appears in `documents.claimed_by`.
 - `SECRET_KEY` and `DATABASE_URL` from a `Secret`. `SECRET_KEY_FILE` and
   `DATABASE_URL_FILE` read a mounted file instead, if you prefer that.
 - `terminationGracePeriodSeconds: 60` or more - see above.
-- Readiness and liveness on `GET /healthz`, which pings the database. Give
-  readiness a short period; the process is ready as soon as it listens.
+- Liveness on `GET /healthz`, which pings the database. Readiness on either:
+  `/healthz` keeps the 0.3 behaviour (ready as soon as the process listens and
+  the pool answers), `/readyz` additionally holds a replica back until the
+  schema it needs is applied - see above for how it behaves mid-upgrade. Give
+  readiness a short period.
 - A `Service` of type `ClusterIP` and any ingress controller. **Do not set
   session affinity.** Turn response buffering off for the ingress
   (`nginx.ingress.kubernetes.io/proxy-buffering: "off"`) and raise

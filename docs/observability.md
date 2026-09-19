@@ -198,7 +198,7 @@ values rather than zero: an alert would read a zero as "the backlog drained".
 | `ragmux_build_info` | gauge | Always `1`; `version` and `go_version` in the labels. |
 | `ragmux_process_start_time_seconds` | gauge | Process start, Unix seconds. |
 | `ragmux_go_goroutines`, `ragmux_go_memstats_heap_inuse_bytes`, `ragmux_go_memstats_alloc_bytes_total`, `ragmux_go_gc_cycles_total` | gauge | Read through `runtime/metrics`, which does not stop the world. |
-| `ragmux_metrics_series_dropped_total` | counter | Label combinations refused at `METRICS_MAX_SERIES`. The first drop is also logged at `warn`. |
+| `ragmux_metrics_series_dropped_total` | counter | Label combinations refused at `METRICS_MAX_SERIES`. Drops are also logged at `error`, at most once a minute. Alert on `increase(...[1h]) > 0`: any value above zero means metrics are being lost. |
 | `ragmux_tracing_spans_dropped_total` | gauge | Spans discarded because the export queue was full. |
 | `ragmux_tracing_export_failures_total` | gauge | Export attempts abandoned after their one retry. |
 
@@ -230,8 +230,21 @@ label added to this repository has to pass this list:
       string, a user agent or an IP address.
 
 The registry enforces a backstop regardless: at `METRICS_MAX_SERIES` new combinations are
-refused, counted in `ragmux_metrics_series_dropped_total` and logged once. Hitting it
-means a label went unbounded — look for the cause before raising the ceiling.
+refused, counted in `ragmux_metrics_series_dropped_total` and logged at **`error`** (at
+most once a minute, so a hot loop of refusals cannot become the log itself).
+
+**Treat a non-zero drop counter as an incident, not a note.** The cap has no eviction: once
+it is full, every *new* legitimate series is refused from then on — a project created
+today, a model added today, that project's `ragmux_gateway_cost_usd_total` series. Existing
+series keep updating, so nothing looks broken; the new ones simply never appear. Hitting
+the cap almost always means a label went unbounded, so look for the cause first and raise
+`METRICS_MAX_SERIES` only once you know the cardinality is legitimate.
+
+Eviction was considered and rejected. Dropping the least recently used series would keep
+legitimate metrics from freezing, but it costs a write on every observation — a lock or an
+atomic store on the scrape path — and an evicted counter that comes back starts at zero,
+which Prometheus reads as a counter reset and turns into a silently wrong `rate()`. Data
+that is visibly missing is preferred to data that is quietly wrong.
 
 ## `/readyz` and `/healthz`
 
@@ -241,7 +254,7 @@ anything about projects or usage.
 | | `/healthz` | `/readyz` |
 |---|---|---|
 | Question | Is this process alive? | Should this replica receive traffic? |
-| Checks | The pool answers a ping | The pool answers **and** `MAX(version)` in `schema_migrations` equals the head migration this binary embeds |
+| Checks | The pool answers a ping | The pool answers **and** `MAX(version)` in `schema_migrations` has reached the head migration this binary embeds |
 | Used by | The container `HEALTHCHECK`, `ragmux -healthcheck` | A load balancer or Kubernetes readiness probe |
 | Unchanged in 0.4 | yes | new |
 
@@ -251,14 +264,41 @@ anything about projects or usage.
 `/readyz` answers `200`:
 
 ```json
-{"status":"ok","version":"0.4.0","migrations":24,"expected_migrations":24}
+{"status":"ok","version":"0.4.0","migrations":13,"expected_migrations":13}
 ```
 
-and `503` with `"status":"migrating"` while the applied version is behind or ahead of the
-binary's. During a rolling upgrade that is what keeps requests off a replica whose
-database another replica has already migrated past it.
+and `503` with `"status":"migrating"` while the applied version is **behind** the binary's:
+the tables this build expects do not exist yet, so the replica cannot serve.
 
-**A degraded search backend is not a readiness failure.** A RAG store configured for
+**A schema ahead of the binary is not a readiness failure.** The comparison is deliberately
+one-directional. In a `maxSurge` rolling upgrade the first new pod migrates the shared
+database; from that moment every old replica — all of them still carrying traffic — sees a
+schema newer than its own. Failing readiness there would take the entire fleet out of
+rotation in the middle of a deploy that is supposed to be seamless, and a rollback to the
+previous image could never become ready at all. Ragmux migrations are additive and
+non-narrowing (`ADD COLUMN IF NOT EXISTS`, new tables, no drops), so the older code keeps
+working against the newer schema. It answers `200` and says so:
+
+```json
+{
+  "status": "ok",
+  "version": "0.4.0",
+  "migrations": 14,
+  "expected_migrations": 13,
+  "degraded": ["the database schema is at migration 14, ahead of the 13 this binary embeds; this replica is running older code against a newer schema"]
+}
+```
+
+Because `/readyz` returns `200`, nothing alerts on this by itself — that is the operator's
+to wire up. It is expected during a deploy and unexpected afterwards, so alert on the
+`degraded` entry persisting rather than on its appearance. **This rests on migrations
+staying additive and non-narrowing**; dropping a column, narrowing a type, or adding a
+constraint or unique index to an existing column would break the old replicas this
+decision keeps in rotation, and has to be staged instead — see
+[`/readyz` during a rolling upgrade](scaling.md#readyz-during-a-rolling-upgrade) for the
+full list and the expand/contract recipe.
+
+**A degraded search backend is not a readiness failure either.** A RAG store configured for
 `pg_search` on a server without the extension keeps answering — the search falls back to
 pgvector — so taking the replica out of rotation would turn a degraded-but-working
 condition into an outage. It is reported instead as an informational field alongside the
@@ -268,8 +308,8 @@ condition into an outage. It is reported instead as an informational field along
 {
   "status": "ok",
   "version": "0.4.0",
-  "migrations": 24,
-  "expected_migrations": 24,
+  "migrations": 13,
+  "expected_migrations": 13,
   "degraded": ["pg_search is not installed on this server; 2 rag store(s) configured for it fall back to pgvector"]
 }
 ```

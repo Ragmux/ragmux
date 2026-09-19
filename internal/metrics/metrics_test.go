@@ -99,8 +99,10 @@ func TestFloatCounterIgnoresNonPositive(t *testing.T) {
 
 func TestMaxSeriesDropsAndCounts(t *testing.T) {
 	var dropped string
+	var total uint64
+	var calls int
 	r := New(Options{MaxSeries: 2})
-	r.OnSeriesDropped = func(m string) { dropped = m }
+	r.OnSeriesDropped = func(m string, n uint64) { dropped, total, calls = m, n, calls+1 }
 	c := r.Counter("ragmux_capped_total", "Capped.", "id")
 	c.With("a").Inc()
 	c.With("b").Inc()
@@ -113,6 +115,14 @@ func TestMaxSeriesDropsAndCounts(t *testing.T) {
 	if dropped != "ragmux_capped_total" {
 		t.Errorf("OnSeriesDropped got %q", dropped)
 	}
+	// The report is rate limited, so a burst of refusals inside one window is
+	// a single log line carrying the running total.
+	if calls != 1 {
+		t.Errorf("OnSeriesDropped called %d times in one window, want 1", calls)
+	}
+	if total != 1 {
+		t.Errorf("OnSeriesDropped reported total %d, want the count at the time of the call", total)
+	}
 	got := r.Text()
 	if strings.Contains(got, `id="c"`) {
 		t.Error("a refused series was exported")
@@ -120,6 +130,49 @@ func TestMaxSeriesDropsAndCounts(t *testing.T) {
 	if !strings.Contains(got, "ragmux_metrics_series_dropped_total 2") {
 		t.Errorf("drop counter not exported:\n%s", got)
 	}
+}
+
+// TestSeriesCapKeepsReporting: the cap filling is an error condition that
+// lasts, so it must not be announced only once for the life of the process.
+func TestSeriesCapKeepsReporting(t *testing.T) {
+	var calls int
+	r := New(Options{MaxSeries: 1})
+	r.OnSeriesDropped = func(string, uint64) { calls++ }
+	c := r.Counter("ragmux_capped_total", "Capped.", "id")
+	c.With("a").Inc()
+	c.With("b").Inc() // refused, reported
+	// Age the last report past the interval, as a process that has been
+	// dropping series for a while would.
+	r.lastNotify.Store(time.Now().Add(-2 * notifyInterval).UnixNano())
+	c.With("c").Inc() // refused again, reported again
+
+	if calls != 2 {
+		t.Errorf("OnSeriesDropped called %d times, want 2 once the interval passed", calls)
+	}
+}
+
+// TestSeriesCapReportRunsOutsideTheLock: the owner's callback logs, and a log
+// collector that has gone slow must not stall every other observation on the
+// same metric family -- which is exactly the family under attack when the cap
+// fills. If the report ran under the vec's write lock, resolving an existing
+// series from inside it would block until the callback returned.
+func TestSeriesCapReportRunsOutsideTheLock(t *testing.T) {
+	r := New(Options{MaxSeries: 1})
+	c := r.Counter("ragmux_capped_total", "Capped.", "id")
+	r.OnSeriesDropped = func(string, uint64) {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c.With("a").Inc() // takes the family's read lock
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("an observation on an existing series blocked while a drop was being reported")
+		}
+	}
+	c.With("a").Inc()
+	c.With("b").Inc() // refused, reported
 }
 
 func TestRefusedSeriesStillAcceptsWrites(t *testing.T) {
