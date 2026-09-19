@@ -142,7 +142,8 @@ const (
 	defaultImageMaxConcurrent = 16
 	// defaultImageQueueWait bounds the wait for a slot. It is deliberately a
 	// small fraction of Timeout: queueing is not progress, and a client told
-	// to retry in a second is better served than one held for ten.
+	// when to come back is better served than one held to the end of a
+	// download it is not getting.
 	defaultImageQueueWait = 2 * time.Second
 )
 
@@ -171,9 +172,11 @@ type ImageFetcher struct {
 	// the ceiling that makes the gateway a poor amplifier — and the reason
 	// the image transport also carries MaxConnsPerHost.
 	MaxConcurrent int
-	// QueueWait bounds the wait for one of those slots (default 2s),
-	// separately from Timeout: a fetch that spent its download budget in the
-	// queue would blame the image host for the gateway being busy.
+	// QueueWait bounds the wait for one of those slots, separately from
+	// Timeout: a fetch that spent its download budget in the queue would
+	// blame the image host for the gateway being busy. It defaults to 2s, or
+	// to Timeout when that is shorter, since queueing past the budget the
+	// download itself gets is never worth it.
 	QueueWait time.Duration
 	// Cache is optional; nil fetches every time.
 	Cache  *imageCache
@@ -181,31 +184,36 @@ type ImageFetcher struct {
 
 	semOnce sync.Once
 	sem     chan struct{}
-	mu      sync.Mutex
-	tenants map[string]*imageTenantSlots
-}
 
-// imageTenantSlots is one tenant's share of the fetcher. refs counts holders
-// and waiters together, so the entry lives exactly as long as someone is
-// using it and an idle tenant leaves nothing behind.
-type imageTenantSlots struct {
-	sem  chan struct{}
-	refs int
+	mu sync.Mutex
+	// inflight is slots held per tenant; an entry is deleted at zero, so an
+	// idle tenant leaves nothing behind.
+	inflight map[string]int
+	// waiting counts acquirers queued for a slot they are entitled to, which
+	// is what tells a tenant already over its share to leave the next freed
+	// slot alone.
+	waiting int
+	// wake is closed and replaced on every release, so an acquirer parked
+	// outside its share re-checks without polling.
+	wake chan struct{}
 }
 
 func (f *ImageFetcher) init() {
 	f.semOnce.Do(func() {
 		f.sem = make(chan struct{}, f.maxConcurrent())
-		f.tenants = map[string]*imageTenantSlots{}
+		f.inflight = map[string]int{}
+		f.wake = make(chan struct{})
 	})
 }
 
-// tenantShare is the most slots one tenant may hold at once. Capping the
-// process alone stopped the gateway amplifying outward and opened starvation
-// inward: a few requests aimed at one slow image host filled every slot, and
-// an unrelated project's request then waited out the whole timeout and
-// failed. Half the ceiling leaves half of it for everyone else, whatever one
-// tenant is doing.
+// tenantShare is how many slots one tenant may hold before it has to give way
+// to another. It is a floor under everyone else's access, not a ceiling on
+// this tenant: capping the process alone let a few requests aimed at one slow
+// image host fill every slot and leave an unrelated project to wait out its
+// whole timeout, but capping each tenant hard was worse in the common case --
+// a single-project install would have reached only half of
+// IMAGE_FETCH_MAX_CONCURRENT, making the setting mean half of what it says.
+// So the share binds only while someone else is queueing.
 func (f *ImageFetcher) tenantShare() int {
 	if n := f.maxConcurrent() / 2; n > 0 {
 		return n
@@ -213,78 +221,119 @@ func (f *ImageFetcher) tenantShare() int {
 	return 1
 }
 
-// tenantSem hands out the tenant's channel and takes a reference to it.
-// Every caller must release it, whether or not it got a slot.
-func (f *ImageFetcher) tenantSem(tenant string) chan struct{} {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	t := f.tenants[tenant]
-	if t == nil {
-		t = &imageTenantSlots{sem: make(chan struct{}, f.tenantShare())}
-		f.tenants[tenant] = t
-	}
-	t.refs++
-	return t.sem
-}
-
-func (f *ImageFetcher) releaseTenant(tenant string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	t := f.tenants[tenant]
-	if t == nil {
-		return
-	}
-	if t.refs--; t.refs <= 0 {
-		delete(f.tenants, tenant)
-	}
-}
-
-// acquire takes the tenant's slot and then a process-wide one, and returns
-// the release for both. The wait has its own budget, so the download timeout
-// starts only once a slot is in hand.
+// acquire takes a process-wide slot for tenant and returns its release. The
+// wait has its own budget, so the download timeout starts only once the slot
+// is in hand.
+//
+// Within its share a tenant queues for a slot like anyone else. Past its
+// share it may still use spare capacity -- an idle gateway belongs to
+// whoever is on it -- but only while nobody entitled is queueing, and only
+// without parking on the semaphore, since a parked sender would be served
+// ahead of the next entitled arrival.
 func (f *ImageFetcher) acquire(ctx context.Context, tenant string) (func(), error) {
 	f.init()
 	wait, cancel := context.WithTimeout(ctx, f.queueWait())
 	defer cancel()
 
-	// The tenant's own share comes first: a tenant already holding its share
-	// must not sit in the process-wide queue ahead of one holding nothing.
-	ts := f.tenantSem(tenant)
-	select {
-	case ts <- struct{}{}:
-	case <-wait.Done():
-		f.releaseTenant(tenant)
-		return nil, f.queueError(ctx)
-	}
-	select {
-	case f.sem <- struct{}{}:
-		return func() {
-			<-f.sem
-			<-ts
-			f.releaseTenant(tenant)
-		}, nil
-	case <-wait.Done():
-		<-ts
-		f.releaseTenant(tenant)
-		return nil, f.queueError(ctx)
+	share := f.tenantShare()
+	for {
+		f.mu.Lock()
+		if f.inflight[tenant] < share {
+			f.waiting++
+			f.mu.Unlock()
+			select {
+			case f.sem <- struct{}{}:
+				f.mu.Lock()
+				f.waiting--
+				f.inflight[tenant]++
+				f.wakeIfQueueEmpty()
+				f.mu.Unlock()
+				return f.release(tenant), nil
+			case <-wait.Done():
+				f.mu.Lock()
+				f.waiting--
+				f.wakeIfQueueEmpty()
+				f.mu.Unlock()
+				return nil, f.queueError(ctx)
+			}
+		}
+		if f.waiting == 0 {
+			select {
+			case f.sem <- struct{}{}:
+				f.inflight[tenant]++
+				f.mu.Unlock()
+				return f.release(tenant), nil
+			default:
+			}
+		}
+		wake := f.wake
+		f.mu.Unlock()
+		select {
+		case <-wake:
+		case <-wait.Done():
+			return nil, f.queueError(ctx)
+		}
 	}
 }
 
+// release gives the slot back and wakes whoever was held outside its share.
+// The semaphore is drained first so a woken acquirer finds the capacity.
+func (f *ImageFetcher) release(tenant string) func() {
+	return func() {
+		<-f.sem
+		f.mu.Lock()
+		if n := f.inflight[tenant] - 1; n > 0 {
+			f.inflight[tenant] = n
+		} else {
+			delete(f.inflight, tenant)
+		}
+		f.broadcast()
+		f.mu.Unlock()
+	}
+}
+
+// wakeIfQueueEmpty wakes the acquirers parked outside their share once the
+// last entitled one has left the queue. Waking only on release was not
+// enough: an acquirer over its share parks because somebody entitled is
+// queued, and that queue empties when the waiter *takes* a slot, which frees
+// nothing and so sent no wake. It then slept out the whole queue wait beside
+// capacity it was allowed to use -- with four concurrent fetches from one
+// tenant, the fourth reliably gave up on an idle gateway.
+//
+// The caller holds f.mu.
+func (f *ImageFetcher) wakeIfQueueEmpty() {
+	if f.waiting == 0 {
+		f.broadcast()
+	}
+}
+
+// broadcast releases everyone parked on wake so they re-read the state. The
+// caller holds f.mu.
+func (f *ImageFetcher) broadcast() {
+	close(f.wake)
+	f.wake = make(chan struct{})
+}
+
 // queueError separates the gateway running out from the caller going away. A
-// cancelled request context is a client that hung up, and handing back a
-// provider error there made providerError answer it before its own
-// context.Canceled check: the request log recorded saturation instead of 499
-// and the error counter rose on every disconnect.
+// cancelled request context is a client that hung up, and that is what the
+// caller gets back: the gateway's own handlers check ctx.Err() before they
+// classify a provider error, so wrapping a disconnect in one here would only
+// have travelled to whatever else reads these errors.
 func (f *ImageFetcher) queueError(ctx context.Context) error {
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return ctx.Err()
 	}
 	// Not the client's mistake and not the image host's, so neither a 400 nor
-	// a relayed upstream failure. 429 rather than 503 because this is a
-	// resource limit and not a fault, and the official SDKs retry 5xx
-	// automatically with backoff: a 503 would have every client spend its
-	// retries queueing again while the ceiling is still full.
-	retry := imageCeilSeconds(f.queueWait())
+	// a relayed upstream failure. 429 rather than 503 because nothing is
+	// broken: a 5xx would report a fault, count against availability, and say
+	// the gateway is unwell when it is merely full.
+	//
+	// Retry-After is the fetch timeout, not the queue wait. A slot frees when
+	// a download finishes, and a download may take the whole timeout, so
+	// naming the queue wait sent a client that honours the header -- which
+	// the official SDKs do, for a 429 as much as for a 5xx -- back into the
+	// same full queue several times over one round of slow fetches.
+	retry := imageCeilSeconds(f.timeout())
 	return &Error{Status: http.StatusTooManyRequests, Type: "rate_limit_exceeded",
 		Code: "image_fetch_saturated", RetryAfter: retry,
 		Message: fmt.Sprintf("the gateway is fetching as many images as it may at once; retry after %d seconds", retry)}
@@ -311,8 +360,9 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL, tenant string, accepts
 		// The cache is keyed on the URL alone and the adapters do not accept
 		// the same formats, so a hit is checked again rather than trusted:
 		// an image/heic stored for Gemini must not be handed to Anthropic.
+		// Nothing was requested on this path, so nothing "returned" anything.
 		if !accepts[mt] {
-			return "", "", imageError(fmt.Sprintf("image URL at %s returned content type %q; %s are accepted",
+			return "", "", imageError(fmt.Sprintf("the image at %s is %q; %s are accepted",
 				u.Host, mt, imageTypesInMessage(accepts)))
 		}
 		return mt, data, nil

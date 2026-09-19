@@ -505,25 +505,62 @@ func TestImageBudget(t *testing.T) {
 	}
 }
 
-// blockingImageServer parks every handler until release is called, and
-// reports each arrival on started.
-func blockingImageServer(t *testing.T, buf int) (srv *httptest.Server, started <-chan struct{}, release func()) {
+// blockingImageServer parks every handler until the test lets it through.
+// started reports each arrival by request path; finish(n) releases n of them;
+// everything still parked is released when the test ends.
+func blockingImageServer(t *testing.T, buf int) (srv *httptest.Server, started <-chan string, finish func(int)) {
 	t.Helper()
-	arrivals := make(chan struct{}, buf)
-	gate := make(chan struct{})
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		arrivals <- struct{}{}
-		<-gate
+	arrivals := make(chan string, buf)
+	gate := make(chan struct{}, buf)
+	all := make(chan struct{})
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrivals <- r.URL.Path
+		select {
+		case <-gate:
+		case <-all:
+		}
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write([]byte("bytes"))
 	}))
 	var once sync.Once
-	release = func() { once.Do(func() { close(gate) }) }
 	t.Cleanup(func() {
-		release()
+		once.Do(func() { close(all) })
 		srv.Close()
 	})
-	return srv, arrivals, release
+	return srv, arrivals, func(n int) {
+		for i := 0; i < n; i++ {
+			gate <- struct{}{}
+		}
+	}
+}
+
+// nothingStarts fails if another handler arrives within the settling window.
+// Every started handler is parked, so an arrival can only mean somebody got a
+// slot that was not theirs to take.
+func nothingStarts(t *testing.T, started <-chan string, why string) {
+	t.Helper()
+	select {
+	case path := <-started:
+		t.Fatalf("%s: %s went out anyway", why, path)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// waitForWaiters blocks until n acquirers are queued for a slot they are
+// entitled to. Reading the counter beats sleeping: the point of the tenant
+// share is what happens once somebody is actually waiting.
+func waitForWaiters(t *testing.T, f *ImageFetcher, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		f.mu.Lock()
+		got := f.waiting
+		f.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d entitled waiters", n)
 }
 
 // MaxPerRequest bounds one request and nothing across them: a key holder who
@@ -532,33 +569,29 @@ func blockingImageServer(t *testing.T, buf int) (srv *httptest.Server, started <
 // that, so it has to hold when the requests are concurrent.
 func TestImageFetcherConcurrencyCeiling(t *testing.T) {
 	const (
-		limit   = 6
-		tenants = 6
-		total   = tenants * 2
+		limit = 6
+		total = 12
 	)
-	srv, started, release := blockingImageServer(t, total)
+	srv, started, finish := blockingImageServer(t, total)
 
-	// Spread over enough tenants that none reaches its own share, so the
-	// process-wide ceiling is the only thing that can bind.
+	// One tenant, because the share is a floor under other tenants rather
+	// than a ceiling on this one: with nobody else queueing, these may use
+	// the whole of MaxConcurrent and nothing beyond it.
 	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: limit, QueueWait: 10 * time.Second}
 	done := make(chan error, total)
 	for i := 0; i < total; i++ {
 		go func(i int) {
 			_, _, err := f.Fetch(context.Background(), fmt.Sprintf("%s/%d.png", srv.URL, i),
-				fmt.Sprintf("tenant-%d", i%tenants), imageMediaTypesDefault)
+				"one", imageMediaTypesDefault)
 			done <- err
 		}(i)
 	}
 	for i := 0; i < limit; i++ {
 		<-started
 	}
-	// Every handler is parked, so the rest can only be waiting for a slot.
-	select {
-	case <-started:
-		t.Fatal("more fetches went out at once than MaxConcurrent allows")
-	case <-time.After(200 * time.Millisecond):
-	}
-	release()
+	nothingStarts(t, started, "more fetches went out at once than MaxConcurrent allows")
+
+	finish(total)
 	for i := 0; i < total; i++ {
 		if err := <-done; err != nil {
 			t.Errorf("fetch %d: %v", i, err)
@@ -566,64 +599,193 @@ func TestImageFetcherConcurrencyCeiling(t *testing.T) {
 	}
 }
 
-// Capping the process alone traded outward amplification for inward
-// starvation: a few requests pointed at one slow host filled every slot, and
-// an unrelated project then waited out its whole timeout and failed. No tenant
-// may hold more than half the slots.
+// The share is soft. One tenant alone reaches the whole ceiling, because a
+// hard half would have made IMAGE_FETCH_MAX_CONCURRENT mean half its value on
+// the single-project installs that are the common case. What the share does
+// buy is that the moment somebody else queues, the tenant over its share
+// stops taking freed slots and the newcomer gets the next one.
 func TestImageFetcherTenantShare(t *testing.T) {
-	const limit = 8 // a share of 4
-	srv, started, release := blockingImageServer(t, limit*2)
+	const limit = 4 // a share of 2
+	srv, started, finish := blockingImageServer(t, limit*4)
 
 	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: limit, QueueWait: 10 * time.Second}
-	done := make(chan error, limit)
-	for i := 0; i < limit; i++ {
-		go func(i int) {
-			_, _, err := f.Fetch(context.Background(), fmt.Sprintf("%s/hog%d.png", srv.URL, i),
-				"noisy", imageMediaTypesDefault)
-			done <- err
-		}(i)
+	if f.tenantShare() != limit/2 {
+		t.Fatalf("share = %d", f.tenantShare())
 	}
-	for i := 0; i < f.tenantShare(); i++ {
+	noisy := make(chan error, limit*2)
+	send := func(path, tenant string, out chan<- error) {
+		go func() {
+			_, _, err := f.Fetch(context.Background(), srv.URL+path, tenant, imageMediaTypesDefault)
+			out <- err
+		}()
+	}
+
+	// Uncontended, one tenant fills every slot -- twice its share.
+	for i := 0; i < limit; i++ {
+		send(fmt.Sprintf("/hog%d.png", i), "noisy", noisy)
+	}
+	for i := 0; i < limit; i++ {
 		<-started
 	}
-	select {
-	case <-started:
-		t.Fatalf("one tenant took more than its share of %d slots", f.tenantShare())
-	case <-time.After(200 * time.Millisecond):
+	nothingStarts(t, started, "the ceiling did not hold")
+	f.mu.Lock()
+	held := f.inflight["noisy"]
+	f.mu.Unlock()
+	if held != limit {
+		t.Fatalf("one tenant held %d of %d slots with nobody else waiting", held, limit)
 	}
 
-	// The other half is still there for somebody else.
+	// A second tenant queues. It is inside its own share, so it is entitled.
 	quiet := make(chan error, 1)
-	go func() {
-		_, _, err := f.Fetch(context.Background(), srv.URL+"/quiet.png", "quiet", imageMediaTypesDefault)
-		quiet <- err
-	}()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("a second tenant was starved by the first")
+	send("/quiet.png", "quiet", quiet)
+	waitForWaiters(t, f, 1)
+
+	// More from the tenant that is already over its share. These must not
+	// take the next freed slot: somebody entitled is now queueing for it.
+	for i := 0; i < limit; i++ {
+		send(fmt.Sprintf("/more%d.png", i), "noisy", noisy)
+	}
+	nothingStarts(t, started, "a queued fetch jumped the full ceiling")
+
+	// Free exactly one slot. It belongs to the tenant that was waiting.
+	finish(1)
+	if path := <-started; path != "/quiet.png" {
+		t.Fatalf("the freed slot went to %s, not to the waiting tenant", path)
 	}
 
-	release()
-	for i := 0; i < limit; i++ {
-		if err := <-done; err != nil {
-			t.Errorf("hog fetch %d: %v", i, err)
-		}
-	}
+	// Let the rest through: the quiet fetch is parked in the handler now, so
+	// collecting it before releasing everyone would wait on a gate nobody
+	// opens.
+	finish(limit * 4)
 	if err := <-quiet; err != nil {
 		t.Errorf("quiet fetch: %v", err)
+	}
+	for i := 0; i < limit*2; i++ {
+		if err := <-noisy; err != nil {
+			t.Errorf("noisy fetch: %v", err)
+		}
+	}
+	// Nothing is left behind: the per-tenant table is empty once the last
+	// slot is given back.
+	f.mu.Lock()
+	left := len(f.inflight)
+	f.mu.Unlock()
+	if left != 0 {
+		t.Errorf("%d tenant entries survived their fetches", left)
+	}
+}
+
+// The counter, not the channel, is what makes the share yield.
+//
+// End to end a waiting tenant wins anyway, because it is parked on a blocking
+// send and Go hands a freed slot to a queued sender before anyone's
+// non-blocking send can see the capacity. That is luck, not the rule: an
+// entitled acquirer registers as waiting under the lock and only then parks,
+// and in the window between the two a tenant over its share could still take
+// the slot. This drives acquire directly, with a waiter registered and not
+// yet parked, because that window is what the counter closes and it cannot be
+// hit reliably from outside.
+func TestImageFetcherShareYieldsToARegisteredWaiter(t *testing.T) {
+	const limit = 2 // a share of 1
+	newFetcher := func() (*ImageFetcher, func()) {
+		f := &ImageFetcher{MaxConcurrent: limit, QueueWait: 50 * time.Millisecond}
+		f.init()
+		first, err := f.acquire(context.Background(), "noisy")
+		if err != nil {
+			t.Fatalf("first slot: %v", err)
+		}
+		// The second is already past the share and takes it anyway, because
+		// nobody else is asking.
+		second, err := f.acquire(context.Background(), "noisy")
+		if err != nil {
+			t.Fatalf("a tenant alone could not pass its share: %v", err)
+		}
+		first()
+		return f, second
+	}
+
+	t.Run("a registered waiter holds the slot", func(t *testing.T) {
+		f, release := newFetcher()
+		defer release()
+		f.mu.Lock()
+		f.waiting = 1 // registered, not yet parked
+		f.mu.Unlock()
+
+		if _, err := f.acquire(context.Background(), "noisy"); err == nil {
+			t.Fatal("a tenant over its share took a slot somebody was queued for")
+		}
+	})
+
+	t.Run("with nobody queued the same slot is free", func(t *testing.T) {
+		f, release := newFetcher()
+		defer release()
+		got, err := f.acquire(context.Background(), "noisy")
+		if err != nil {
+			t.Fatalf("spare capacity was refused with nobody waiting: %v", err)
+		}
+		got()
+	})
+}
+
+// An acquirer parked outside its share waits for a wake, and a release is not
+// the only thing that should send one: the queue also empties when an
+// entitled waiter *takes* a slot, which frees nothing. If capacity is still
+// spare at that moment -- and it is, whenever MaxConcurrent is at least the
+// number of fetches in flight -- the parked acquirer had nothing left to wake
+// it and slept out the whole queue wait beside a slot it was allowed to use.
+// Four concurrent fetches from one tenant on an idle gateway lost their
+// fourth to this.
+//
+// No HTTP here: the interleaving is between acquirers, and driving acquire
+// directly is what makes a narrow race worth running hundreds of times.
+func TestImageFetcherWakesWhenTheQueueEmpties(t *testing.T) {
+	const slots = 8 // a share of 4, so half of these start over it
+	for round := 0; round < 300; round++ {
+		f := &ImageFetcher{MaxConcurrent: slots, QueueWait: 2 * time.Second}
+		results := make(chan func(), slots)
+		errs := make(chan error, slots)
+		for i := 0; i < slots; i++ {
+			go func() {
+				release, err := f.acquire(context.Background(), "one")
+				if err != nil {
+					errs <- err
+				}
+				results <- release
+			}()
+		}
+		// Nothing is released until every acquirer has answered, so a wake
+		// can only have come from the queue emptying.
+		var releases []func()
+		for i := 0; i < slots; i++ {
+			if r := <-results; r != nil {
+				releases = append(releases, r)
+			}
+		}
+		for _, release := range releases {
+			release()
+		}
+		select {
+		case err := <-errs:
+			t.Fatalf("round %d: %d of %d slots taken, and a fetch inside MaxConcurrent was refused: %v",
+				round, len(releases), slots, err)
+		default:
+		}
 	}
 }
 
 // A fetch that cannot get a slot in time is the gateway running out, not the
-// client getting something wrong and not the image host failing. It answers
-// 429 with Retry-After rather than a 5xx: the official SDKs retry 5xx
-// automatically with backoff, so a 503 would spend every client's retries
-// queueing again while the ceiling is still full.
+// client getting something wrong and not the image host failing: 429, because
+// nothing is broken, rather than a 5xx that would report a fault.
+//
+// Retry-After names the fetch timeout and not the queue wait, because a slot
+// frees when a download finishes. The clients that honour the header -- the
+// official SDKs do, for a 429 as much as for a 5xx -- came straight back into
+// the same full queue when it named the two-second wait instead.
 func TestImageFetcherQueueSaturation(t *testing.T) {
 	srv, started, _ := blockingImageServer(t, 2)
 
-	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: 1, QueueWait: 100 * time.Millisecond}
+	f := &ImageFetcher{Client: srv.Client(), MaxConcurrent: 1,
+		QueueWait: 100 * time.Millisecond, Timeout: 7 * time.Second}
 	go func() {
 		_, _, _ = f.Fetch(context.Background(), srv.URL+"/held.png", "a", imageMediaTypesDefault)
 	}()
@@ -635,15 +797,27 @@ func TestImageFetcherQueueSaturation(t *testing.T) {
 	if !errors.As(err, &pe) || pe.Status != http.StatusTooManyRequests {
 		t.Fatalf("err = %v, want a 429", err)
 	}
-	if pe.Code != "image_fetch_saturated" || pe.RetryAfter < 1 {
+	if pe.Code != "image_fetch_saturated" {
 		t.Errorf("error = %+v", pe)
+	}
+	// Long enough for a slot to have actually freed: the queue wait is 100ms
+	// here, and answering with that would be an invitation to come back while
+	// every download is still running.
+	if pe.RetryAfter != 7 {
+		t.Errorf("Retry-After = %d, want the fetch timeout in seconds", pe.RetryAfter)
+	}
+	// A giving-up acquirer leaves no waiter and no tenant entry behind.
+	f.mu.Lock()
+	waiting, tenants := f.waiting, len(f.inflight)
+	f.mu.Unlock()
+	if waiting != 0 || tenants != 1 {
+		t.Errorf("after giving up: waiting = %d, tenants = %d", waiting, tenants)
 	}
 }
 
-// A client that hangs up mid-request must not be recorded as saturation: the
-// gateway looks for a provider error before it looks for context.Canceled, so
-// returning one here put every disconnect in the log as a capacity problem and
-// on the saturation counter.
+// A client that hangs up mid-request must not be reported as saturation. The
+// gateway's own handlers check ctx.Err() before they classify a provider
+// error, so this is about every other reader of these errors.
 func TestImageFetcherQueueReportsClientCancellation(t *testing.T) {
 	srv, started, _ := blockingImageServer(t, 2)
 
