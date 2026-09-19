@@ -69,3 +69,10 @@ func KeyPrefixFor(kind string) string {
 func GenerateAPIKey(kind string) (string, error) {
 	return generateToken(KeyPrefixFor(kind), keyBodyLen)
 }
+
+// GeneratePassword produces a random password of n characters from the same
+// alphabet, for the reset-password CLI. It has no punctuation, so it survives
+// being pasted through a shell or a password manager unchanged.
+func GeneratePassword(n int) (string, error) {
+	return generateToken("", n)
+}

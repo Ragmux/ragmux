@@ -42,6 +42,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "rotate-key" {
 		os.Exit(rotateKey(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "reset-password" {
+		os.Exit(resetPassword(os.Args[2:]))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "pdf-extract" {
 		// Internal: the ingester runs this on itself to parse PDFs out of
 		// process (see rag.PDFWorker).
