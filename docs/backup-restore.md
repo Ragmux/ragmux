@@ -83,6 +83,69 @@ Notes:
   tools *inside* the container that holds Postgres (`ragmux` in the all-in-one layout,
   `postgres` in the split one) guarantees that.
 
+### Restoring a ParadeDB dump onto a plain pgvector server
+
+A dump taken from one of the [ParadeDB variants](rag.md#search-backends) carries
+`pg_search` objects that a `pgvector/pgvector:pg17` target cannot create. `pg_restore`
+reports each one and **exits 1**, even though every ragmux table restores:
+
+```
+ERROR:  extension "pg_search" is not available
+ERROR:  relation "paradedb._typmod_cache" does not exist
+ERROR:  access method "bm25" does not exist
+```
+
+Note what that list means: dropping `idx_chunks_bm25` before the dump is **not enough on
+its own**. The BM25 index is only one of the entries — the `paradedb` schema, the
+`CREATE EXTENSION pg_search`, its comment and the extension's own `_typmod_cache` table
+are dumped too, and a restore that only lost the index still fails.
+
+The recipe that works is a TOC filter. `pg_dump` has no `--exclude-index`, so list the
+archive, drop the entries the target cannot create, and restore through the edited list.
+
+**First find them.** Do not assume the list is the ParadeDB ones: every extension present
+in the source database is in the dump, and the split ParadeDB image
+(`docker-compose.paradedb.yml`) ships more than `pg_search` — `postgis`,
+`postgis_topology`, `postgis_tiger_geocoder`, `pg_ivm`, `pg_stat_statements` and
+`fuzzystrmatch` are all installed in its default database, none of which a
+`pgvector/pgvector:pg17` target has. The all-in-one `:<version>-paradedb` image installs
+only `vector` and `pg_search`, so there the ParadeDB filter alone is complete.
+
+```bash
+pg_restore -l ragmux.dump | grep 'EXTENSION -'
+```
+
+Compare that against the target (`SELECT name FROM pg_available_extensions;`) and filter
+on what is missing. For an all-in-one ParadeDB dump that is:
+
+```bash
+pg_restore -l ragmux.dump > full.list
+grep -viE 'pg_search|paradedb|bm25' full.list > filtered.list
+pg_restore -U ragmux -d ragmux --no-owner -L filtered.list ragmux.dump
+```
+
+For a split ParadeDB dump, add the rest (`postgis|pg_ivm|pg_stat_statements|fuzzystrmatch|
+tiger|topology|spatial_ref_sys`). Check the filter before running it: `grep` matches
+anywhere in the TOC line, so a pattern like `bm25` or `paradedb` would also drop a table
+or index of your own whose name contains it, silently. `diff full.list filtered.list`
+shows exactly what is being dropped.
+
+A filtered restore finishes with no errors and exit 0. The database is complete:
+`chunks.content` and `chunks.tsv` are what the lexical half reads, and `idx_chunks_bm25`
+is a derived object that ragmux rebuilds lazily — on a ParadeDB server, on the first
+hybrid search of a store using the `pg_search` backend.
+
+Nothing else needs changing. A `rag_stores` row keeps `search_backend = "pg_search"`
+through the restore and the gateway falls back to `pgvector` for it — hits still come
+back, the search response names the backend that really ran, and one warning per store
+is logged (see [Search backends](rag.md#search-backends)). Restoring the same dump back
+onto a ParadeDB server later finds the setting still there and rebuilds the index; on a
+large corpus that first search is the one that pays for the build, so consider building
+it ahead of time (see the upgrade notes in [CHANGELOG.md](../CHANGELOG.md)).
+
+Roles are cluster-global and are never in a database dump, so create `ragmux_app` on the
+target before restoring a split-layout dump, whichever recipe you use.
+
 ## Scripts
 
 Both scripts live in `scripts/`, run with `bash`, print `-h` help, exit `0` on success,

@@ -64,6 +64,56 @@ All notable changes to Ragmux are documented here. The format follows
 - The Go runtime gauges shared one `runtime/metrics` sample buffer across every gauge and
   every concurrent scrape, so two overlapping scrapes could race and report one another's
   numbers.
+- **`PG_SEARCH_TOKENIZER` stemming works.** `en_stem` — the only stemming value the
+  documentation named — is not a tokenizer *type* `pg_search` 0.25 knows, so it rejected
+  the BM25 index DDL and every rag store set to the `pg_search` backend fell back to
+  `pgvector` for the life of the process: retrieval kept answering, BM25 never ran.
+  Stemming now reaches `pg_search` as the `default` tokenizer carrying a Snowball
+  stemmer, spelled `<iso-639-1>_stem` for twenty languages
+  (`ar cs da de el en es fi fr hu it nl no pl pt ro ru sv ta tr`); a code outside that
+  set is refused at startup instead of degrading silently. Pointing the setting somewhere
+  new on an installation that already has the index still keeps the old analyser — the
+  DDL is `CREATE INDEX IF NOT EXISTS` — but that is reported as a mismatch naming both
+  the analyser the index carries and the one the configuration asks for, and `bm25 index
+  ready` now logs the analyser queries actually use rather than the configured one.
+
+### Upgrade notes
+- **An installation running `PG_SEARCH_TOKENIZER=<code>_stem` never built its BM25
+  index.** After this fix the first hybrid search of a `pg_search` store builds it, over
+  every row in `chunks`, inside that HTTP request. The build takes a `SHARE` lock, so
+  ingest writes to `chunks` block until it finishes, and it is not `CONCURRENTLY`: if the
+  client gives up, the build is rolled back and the next request starts over. On a large
+  corpus that is minutes. Build it ahead of the upgrade instead, without blocking writes:
+
+  ```sql
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_bm25 ON chunks
+  USING bm25 (id, content, rag_store_id, document_id)
+  WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":{"type":"default","stemmer":"English"},"record":"position"}}',
+        numeric_fields = '{"rag_store_id":{"fast":true},"document_id":{"fast":true}}');
+  ```
+
+  Substitute the Snowball language for the code you run (`cs` → `Czech`, `tr` → `Turkish`,
+  …), or `{"type":"default"}` with no `stemmer` for the default analyser. Installations on
+  the default tokenizer already have the index and are unaffected.
+
+  `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so send it on its own
+  — not through `psql -1`, and not from a migration tool that wraps each step in one.
+
+  **Copy the statement exactly.** The gateway only ever checks the analyser: it compares
+  `text_fields.content.tokenizer` against `PG_SEARCH_TOKENIZER` and warns when they differ.
+  Nothing compares `key_field` or `numeric_fields`, so an index built here without
+  `numeric_fields` is accepted in silence, answers queries, and keeps `rag_store_id` off
+  the fast-field path for good — `CREATE INDEX IF NOT EXISTS` will never replace it. The
+  check is deliberately that narrow: it exists to explain a setting that looks applied and
+  is not, and comparing whole reloptions would warn on cosmetic JSON differences a future
+  ParadeDB might render. Verify instead, and drop and rebuild if it does not match:
+
+  ```sql
+  SELECT unnest(reloptions) FROM pg_class WHERE relname = 'idx_chunks_bm25';
+  ```
+- **A dump from a ParadeDB server needs a TOC filter to restore onto a plain pgvector
+  one.** Dropping `idx_chunks_bm25` first is not enough; see
+  [Backup and restore](docs/backup-restore.md#restoring-a-paradedb-dump-onto-a-plain-pgvector-server).
 
 ## [0.4.0] — 2026-09-19
 

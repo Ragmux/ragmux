@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/ragmux/ragmux/internal/bm25"
 )
 
 // The SQL builders are pure functions, so these tests need no PostgreSQL at
@@ -13,6 +15,16 @@ import (
 // no pg_search and can never execute the statement they check. That is the
 // point: the query the gateway would send to ParadeDB is reviewed on every
 // commit even where it cannot be run.
+//
+// What they cannot show is that ParadeDB accepts the statement: the golden
+// files were generated from this code, so on their own they only prove it has
+// not changed. That gap was closed by hand on 2026-09-19 against a live
+// ParadeDB (pg_search 0.25.9, PostgreSQL 17.11): the statement PostgreSQL
+// logged for a real admin search matched hybrid_pgsearch.sql exactly, and
+// paradedb.boolean(must => ARRAY[...]) + paradedb.score(c.id) +
+// ROW_NUMBER() OVER (...) returned non-zero BM25 scores. The executable half
+// of that check lives in TestPgSearchHybridSearch, which runs wherever
+// TEST_DATABASE_URL points at a ParadeDB (make test-paradedb).
 
 func goldenSQL(t *testing.T, name string) string {
 	t.Helper()
@@ -152,9 +164,20 @@ func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
 		!strings.Contains(ddl, `"rag_store_id":{"fast":true}`) {
 		t.Errorf("index DDL:\n%s", ddl)
 	}
+	// How an analyser name becomes JSON is bm25's business and is tested
+	// there. What matters here is that the DDL carries exactly what bm25
+	// renders, because that is what lets tokenizerFromReloptions read the
+	// analyser back out of an existing index.
 	stemmed := &Store{pgSearchTok: "en_stem"}
-	if !strings.Contains(stemmed.bm25IndexDDL(), `"type":"en_stem"`) {
-		t.Errorf("tokenizer override ignored:\n%s", stemmed.bm25IndexDDL())
+	if !strings.Contains(stemmed.bm25IndexDDL(), `"tokenizer":`+bm25.TokenizerJSON("en_stem")+`,`) {
+		t.Errorf("tokenizer object does not reach the DDL:\n%s", stemmed.bm25IndexDDL())
+	}
+	// And that the operator-facing spelling never reaches pg_search as a
+	// tokenizer type: "en_stem" as a type is rejected outright by pg_search
+	// 0.25 ("unknown tokenizer type: en_stem"), which used to leave every
+	// pg_search store permanently falling back to pgvector.
+	if strings.Contains(stemmed.bm25IndexDDL(), "en_stem") {
+		t.Errorf("the rejected tokenizer type reached the DDL:\n%s", stemmed.bm25IndexDDL())
 	}
 }
 
@@ -164,19 +187,37 @@ func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
 // analyser; reading it back is the only way the log can name the analyser
 // queries actually use rather than the one the configuration asks for.
 func TestTokenizerFromReloptions(t *testing.T) {
-	// What PostgreSQL stores for the DDL bm25IndexDDL builds.
+	// What PostgreSQL stores for the DDL bm25IndexDDL builds. The tokenizer
+	// object comes from the builder itself rather than a literal, so a
+	// change in how an analyser is rendered cannot leave this test asserting
+	// a shape no index ever has -- which is what "en_stem" was: a tokenizer
+	// type the DDL stopped emitting once pg_search turned out to reject it.
 	built := func(tok string) []string {
 		return []string{
 			"key_field=id",
-			`text_fields={"content":{"tokenizer":{"type":"` + tok + `"},"record":"position"}}`,
+			`text_fields={"content":{"tokenizer":` + bm25.TokenizerJSON(tok) + `,"record":"position"}}`,
 			`numeric_fields={"rag_store_id":{"fast":true},"document_id":{"fast":true}}`,
 		}
 	}
+	// A stemming analyser round-trips to the name an operator configured,
+	// not to the "default" type it is stored as: the caller compares this
+	// against PG_SEARCH_TOKENIZER, so returning the type would report every
+	// stemming index as drifted from the setting that built it.
 	if got := tokenizerFromReloptions(built("en_stem")); got != "en_stem" {
 		t.Errorf("tokenizer = %q, want en_stem", got)
 	}
+	if got := tokenizerFromReloptions(built("tr_stem")); got != "tr_stem" {
+		t.Errorf("tokenizer = %q, want tr_stem", got)
+	}
 	if got := tokenizerFromReloptions(built("default")); got != "default" {
 		t.Errorf("tokenizer = %q, want default", got)
+	}
+	// A stemmer language this build has no code for is "could not tell",
+	// not a guess.
+	if got := tokenizerFromReloptions([]string{
+		`text_fields={"content":{"tokenizer":{"type":"default","stemmer":"Klingon"},"record":"position"}}`,
+	}); got != "" {
+		t.Errorf("unknown stemmer language = %q, want the empty string", got)
 	}
 	// Everything unreadable degrades to "could not tell", never to a name.
 	// The value only reaches a log line, so a shape a future ParadeDB

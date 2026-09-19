@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ragmux/ragmux/internal/bm25"
 )
 
 // Config holds every tunable the gateway reads at startup.
@@ -232,6 +234,14 @@ func Load() (Config, error) {
 		// rather than trusted at the point of use.
 		if !pgSearchTokenizerPattern.MatchString(v) {
 			return c, fmt.Errorf("invalid PG_SEARCH_TOKENIZER %q: expected a name like \"default\" or \"en_stem\"", v)
+		}
+		// A "<code>_stem" name is translated to a Snowball language from a
+		// table in the store package, so one that is not in it can only fail.
+		// Caught here it is a startup error; left alone it would be a warning
+		// on every search and a store silently stuck on the pgvector
+		// fallback for the life of the process.
+		if err := bm25.ValidateTokenizer(v); err != nil {
+			return c, fmt.Errorf("invalid PG_SEARCH_TOKENIZER: %w", err)
 		}
 		c.PgSearchTokenizer = v
 	}

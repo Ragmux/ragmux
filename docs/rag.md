@@ -141,7 +141,7 @@ the fusion and every field of a hit are the same either way.
 | Query parsing | `websearch_to_tsquery(fts_config, …)`, words OR-ed | `paradedb.match`, which tokenises and OR-s the terms itself |
 | `fts_config` | used | **ignored** |
 | Requirement | none | the `pg_search` extension |
-| `lex_score` on a hit | `0` | the raw BM25 score |
+| `lex_score` on a hit | **absent** from the JSON | the raw BM25 score |
 
 `ts_rank_cd` is a term-density score, not BM25: it has no document-length normalisation
 and no inverse document frequency, so a long chunk that happens to repeat a word can
@@ -158,6 +158,30 @@ backend, so the setting is visibly inert rather than silently so. The index toke
 stemming) — the same treatment the `simple` tsvector configuration gives, so the two
 backends stay comparable out of the box.
 
+**Stemming** is `PG_SEARCH_TOKENIZER=<iso-639-1>_stem`, for the whole instance: the index
+is global, so the analyser cannot be a per-store setting. `en_stem` is English,
+`de_stem` German, `tr_stem` Turkish. The twenty codes this build translates are
+
+```
+ar cs da de el en es fi fr hu it nl no pl pt ro ru sv ta tr
+```
+
+which is the set of Snowball stemmers `pg_search` 0.25.9 accepted when each was tried
+against a live server. Other `pg_search` builds may know more or fewer; a code this build
+does not carry is **refused at startup** rather than left to fail on every search, so a
+version that adds one needs the table in `internal/bm25/analyser.go` extended.
+Stemming makes the lexical leg match `ranking` for a query of `rank`, at the cost of
+matching words the pgvector path would not, so the two backends stop being word-for-word
+comparable.
+
+**Changing the tokenizer only affects a fresh index.** The index is created with
+`CREATE INDEX IF NOT EXISTS`, so pointing `PG_SEARCH_TOKENIZER` at something new on an
+installation that already has the index changes nothing on its own: the old analyser keeps
+answering every query. The gateway logs the mismatch on the next search rather than
+ignoring it, naming both the analyser the index carries and the one the configuration
+asks for. To actually switch, drop and rebuild the index — the same operation, and the
+same cost, as [retiring the index](#retiring-the-bm25-index) below.
+
 **Switching a store between backends needs no reprocessing.** Both read `chunks.content`;
 neither touches the embeddings. `reprocess_recommended` is never set for a backend
 change, and switching back and forth costs nothing but the index.
@@ -171,6 +195,8 @@ insert, so an installation using only `pgvector` would otherwise carry the whole
 cost of a feature it does not use. On a large corpus the first search after the switch
 is the one that waits for the build.
 
+#### Retiring the BM25 index
+
 Going back the other way leaves the index behind; drop it by hand once no store uses
 `pg_search` any more:
 
@@ -182,6 +208,15 @@ Dropping it under a running gateway is safe and needs no restart. The replicas t
 already built it find out on their next hybrid search: that one query is answered from
 `pgvector` and logged, and the search after it rebuilds the index (or keeps falling back,
 if no store wants it any more).
+
+That intermediate query is **degraded, not failed**. It returns hits and the response
+names `pgvector` as the backend that ran, but its lexical half is `ts_rank_cd` over
+`chunks.tsv` rather than BM25, so the ranking is the one that store would have had on the
+`pgvector` backend all along and `lex_score` is **absent from the hit** (the field is
+`omitempty`, so a client testing `hit.lex_score === 0` reads `undefined`) — the pgvector path does not
+expose a lexical score, because `ts_rank_cd` is not comparable with BM25. Expect one such
+search whenever the index is dropped, including when it is dropped only to change
+`PG_SEARCH_TOKENIZER`.
 
 **The rebuild rides on that request.** `CREATE INDEX` runs on the context of the hybrid
 search that triggered it and scans every row of `chunks`, so on a large corpus that one

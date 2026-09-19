@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ragmux/ragmux/internal/bm25"
 )
 
 // pgSearchBackend answers the lexical half with ParadeDB's BM25 index. The
@@ -68,9 +70,9 @@ func (s *Store) pgSearchTokenizer() string {
 func (s *Store) bm25IndexDDL() string {
 	return fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON chunks
 USING bm25 (id, content, rag_store_id, document_id)
-WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":{"type":"%s"},"record":"position"}}',
+WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":%s,"record":"position"}}',
       numeric_fields = '{"rag_store_id":{"fast":true},"document_id":{"fast":true}}')`,
-		bm25Index, s.pgSearchTokenizer())
+		bm25Index, bm25.TokenizerJSON(s.pgSearchTokenizer()))
 }
 
 // bm25BuildLockWait bounds how long a search waits for another replica's
@@ -226,10 +228,15 @@ func bm25IndexTokenizer(ctx context.Context, tx pgx.Tx) (string, error) {
 // keeps text_fields as the JSON document bm25IndexDDL passed it, so the
 // analyser is at text_fields={"content":{"tokenizer":{"type":"<name>"}}}.
 //
+// The name returned is the one an operator writes in PG_SEARCH_TOKENIZER,
+// not the one in the JSON, because the caller compares it against exactly
+// that; bm25.TokenizerName does that translation.
+//
 // An empty result means "could not tell", never "no tokenizer": the value
 // only ever reaches a log line, so a reloptions shape a future ParadeDB
-// renders differently degrades to saying nothing rather than to warning
-// about a drift that is not there.
+// renders differently -- or a stemmer language this build has no code for --
+// degrades to saying nothing rather than to warning about a drift that is
+// not there.
 func tokenizerFromReloptions(opts []string) string {
 	const prefix = "text_fields="
 	for _, o := range opts {
@@ -237,14 +244,16 @@ func tokenizerFromReloptions(opts []string) string {
 			continue
 		}
 		var fields map[string]struct {
-			Tokenizer struct {
-				Type string `json:"type"`
-			} `json:"tokenizer"`
+			Tokenizer json.RawMessage `json:"tokenizer"`
 		}
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(o, prefix)), &fields); err != nil {
 			return ""
 		}
-		return fields["content"].Tokenizer.Type
+		raw := fields["content"].Tokenizer
+		if len(raw) == 0 {
+			return ""
+		}
+		return bm25.TokenizerName(raw)
 	}
 	return ""
 }
