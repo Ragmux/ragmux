@@ -232,8 +232,10 @@ func (s *Store) Search(ctx context.Context, storeID int64, query string, queryVe
 
 // SearchWithBackend is Search plus the backend that actually answered the
 // lexical half. It differs from opts.Backend when the configured backend is
-// not available on this server (or its index could not be prepared), in
-// which case the search silently degrades to pgvector rather than failing.
+// not available on this server, when its index could not be prepared, or
+// when its query failed; in each case the search degrades to pgvector and
+// logs rather than failing, because a retrieval problem must not take the
+// request down with it (PRD behaviour rule 8).
 func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query string, queryVec []float32, opts SearchOptions) ([]SearchHit, string, error) {
 	if opts.Candidates <= 0 {
 		opts.Candidates = 5
@@ -271,9 +273,40 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 		}
 	}
 
+	hits, err := s.runSearch(ctx, backend, r, query, queryVec, opts)
+	// Only a hybrid search can fail *because of* its lexical backend. A
+	// vector-only search never reads a lexical index, and a cancelled
+	// context would fail the retry too, so neither is worth a second
+	// attempt or a warning that blames the wrong thing.
+	if err == nil || opts.Mode != SearchHybrid || ctx.Err() != nil || backend.Name() == BackendPgvector {
+		return hits, backend.Name(), err
+	}
+	// The lexical backend answered Prepare but not the query. The case this
+	// exists for is an index dropped under a running process -- which is
+	// exactly what docs/configuration.md tells an operator to do to change
+	// PG_SEARCH_TOKENIZER: Prepare returns from its in-process memory, the
+	// query sends @@@ at a table that no longer has a BM25 index, and every
+	// hybrid search on this replica would fail until it was restarted.
+	// Retrieval degrades instead (PRD behaviour rule 8), and Invalidate is
+	// what makes the next search rebuild rather than repeat this.
+	backend.Invalidate(s)
+	s.log.Warn("hybrid search failed on its lexical backend; falling back to pgvector and rebuilding on the next search",
+		"rag_store", storeID, "backend", backend.Name(), "err", err)
+	backend = searchBackends[BackendPgvector]
+	hits, err = s.runSearch(ctx, backend, r, query, queryVec, opts)
+	return hits, backend.Name(), err
+}
+
+// runSearch executes one search with one backend. It is the whole database
+// half of SearchWithBackend, split out so a hybrid search whose lexical
+// backend fails can be retried on pgvector: the first attempt's transaction
+// is aborted by the failed query, so the retry needs a transaction of its
+// own rather than another statement on this one.
+func (s *Store) runSearch(ctx context.Context, backend SearchBackend, r *RAGStore,
+	query string, queryVec []float32, opts SearchOptions) ([]SearchHit, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, backend.Name(), err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 	// HNSW returns at most ef_search candidates; keep it comfortably above N.
@@ -282,7 +315,7 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 		efSearch = 40
 	}
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL hnsw.ef_search = %d", efSearch)); err != nil {
-		return nil, backend.Name(), err
+		return nil, err
 	}
 	table := vecTable(r.Dimensions)
 	vec := pgvector.NewVector(queryVec)
@@ -318,7 +351,7 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 	}
 	rows, err = tx.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, backend.Name(), fmt.Errorf("%s search: %w", opts.Mode, err)
+		return nil, fmt.Errorf("%s search: %w", opts.Mode, err)
 	}
 	defer rows.Close()
 	hits := []SearchHit{}
@@ -326,12 +359,12 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 		var h SearchHit
 		if err := rows.Scan(&h.ChunkID, &h.DocumentID, &h.Index, &h.Content, &h.Filename, &h.Section, &h.Page,
 			&h.Distance, &h.Score, &h.VectorRank, &h.FTSRank, &h.LexScore); err != nil {
-			return nil, backend.Name(), err
+			return nil, err
 		}
 		hits = append(hits, h)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, backend.Name(), err
+		return nil, err
 	}
-	return hits, backend.Name(), tx.Commit(ctx)
+	return hits, tx.Commit(ctx)
 }

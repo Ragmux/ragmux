@@ -75,6 +75,11 @@ type SearchBackend interface {
 	// Prepare creates whatever the backend needs before its first query
 	// (an index, typically). It is a no-op for pgvector.
 	Prepare(ctx context.Context, s *Store) error
+	// Invalidate drops whatever Prepare cached about this server, so the
+	// next Prepare re-reads the database. Store.Search calls it when a
+	// query fails: a backend whose index went away under a running process
+	// is the one thing Prepare cannot notice on its own.
+	Invalidate(s *Store)
 	// HybridQuery builds the fused query. The result set must carry the
 	// twelve columns Store.Search scans, in order: chunk_id, document_id,
 	// idx, content, filename, section, page, distance, score, vector_rank,

@@ -2,9 +2,13 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // pgSearchBackend answers the lexical half with ParadeDB's BM25 index. The
@@ -17,6 +21,18 @@ func (pgSearchBackend) Name() string { return BackendPgSearch }
 func (pgSearchBackend) Available(caps Capabilities) bool { return caps.PgSearch }
 
 func (pgSearchBackend) Prepare(ctx context.Context, s *Store) error { return s.ensureBM25Index(ctx) }
+
+// Invalidate forgets that the BM25 index was ever built, so the next
+// Prepare goes back to the database instead of trusting this process's
+// memory.
+//
+// It is what makes a dropped index recoverable. docs/configuration.md tells
+// an operator to change PG_SEARCH_TOKENIZER with
+// "DROP INDEX IF EXISTS idx_chunks_bm25;" and does not ask for a restart;
+// without this, every replica that had already built the index would keep
+// answering Prepare from a cached true, send @@@ at a table that no longer
+// carries a BM25 index, and fail every hybrid search until it was restarted.
+func (pgSearchBackend) Invalidate(s *Store) { s.bm25Ready.Store(false) }
 
 // bm25Index is the name of the one global BM25 index over chunks.
 const bm25Index = "idx_chunks_bm25"
@@ -80,21 +96,18 @@ func (s *Store) ensureBM25Index(ctx context.Context) error {
 	if s.bm25Ready.Load() {
 		return nil
 	}
-	// CREATE INDEX IF NOT EXISTS is not safe to race: two sessions both pass
-	// the existence check and the loser fails on pg_class's unique index. The
-	// advisory lock is what makes it safe, and it is taken with a retry
-	// rather than a blocking wait so a search never hangs on it -- if the
-	// lock does not come free within the deadline this one query falls back
-	// to pgvector and the next one finds the finished index.
+	// The lock is taken with a retry rather than a blocking wait so a search
+	// never hangs on it: if it does not come free within the deadline this
+	// one query falls back to pgvector and the next one finds the finished
+	// index.
 	deadline := time.Now().Add(bm25BuildLockWait)
 	for {
-		release, ok, err := s.TryAdvisoryLock(ctx, int64(lockBM25Index))
+		built, err := s.buildBM25Index(ctx)
 		if err != nil {
 			return err
 		}
-		if ok {
-			defer release()
-			break
+		if built {
+			return nil
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("another replica is still building %s", bm25Index)
@@ -105,12 +118,116 @@ func (s *Store) ensureBM25Index(ctx context.Context) error {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	if _, err := s.pool.Exec(ctx, s.bm25IndexDDL()); err != nil {
-		return fmt.Errorf("create %s: %w", bm25Index, err)
+}
+
+// buildBM25Index takes the DDL lock and creates the index if it is missing,
+// both inside one transaction. It reports false, and changes nothing, when
+// another replica holds the lock.
+//
+// CREATE INDEX IF NOT EXISTS is not safe to race: two sessions both pass the
+// existence check and the loser fails on pg_class's unique index. The
+// advisory lock is what makes it safe, and it is transaction scoped rather
+// than session scoped for two reasons.
+//
+// A session advisory lock belongs to its connection, and PgBouncer in
+// transaction mode hands that connection to somebody else between
+// statements, so the lock cannot be held across the DDL. The retention pass
+// survives that because every step of it is idempotent (docs/scaling.md);
+// this DDL is not. A transaction-scoped lock is held for exactly as long as
+// the transaction that also runs the DDL, which is the one unit PgBouncer
+// does keep on one server connection.
+//
+// And it puts the two lazy-DDL paths of this package on one pattern:
+// ensureVecTable already builds its tables under pg_advisory_xact_lock.
+func (s *Store) buildBM25Index(ctx context.Context) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	var locked bool
+	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1, $2)",
+		lockBM25Index, int32(0)).Scan(&locked); err != nil {
+		return false, err
+	}
+	if !locked {
+		return false, nil
+	}
+	// Read before the DDL: CREATE INDEX IF NOT EXISTS leaves an index that
+	// already exists exactly as it was, tokenizer included, so this is the
+	// only moment the analyser actually in use can be told apart from the
+	// one the configuration asks for.
+	want := s.pgSearchTokenizer()
+	have, err := bm25IndexTokenizer(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, s.bm25IndexDDL()); err != nil {
+		return false, fmt.Errorf("create %s: %w", bm25Index, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
 	}
 	s.bm25Ready.Store(true)
-	s.log.Info("bm25 index ready", "index", bm25Index, "tokenizer", s.pgSearchTokenizer())
-	return nil
+	if have != "" && have != want {
+		s.log.Warn("the bm25 index was built with a different analyser than PG_SEARCH_TOKENIZER asks for; "+
+			"searches use the index's own analyser until the index is dropped and rebuilt",
+			"index", bm25Index, "index_tokenizer", have, "configured_tokenizer", want)
+	}
+	// Report what the index carries, not what the configuration says: an
+	// index built by an earlier boot under a different PG_SEARCH_TOKENIZER
+	// would otherwise be logged as ready with an analyser no query uses.
+	effective := have
+	if effective == "" {
+		effective = want
+	}
+	s.log.Info("bm25 index ready", "index", bm25Index, "tokenizer", effective)
+	return true, nil
+}
+
+// bm25IndexTokenizer reads the analyser the BM25 index on chunks was
+// actually built with, or "" when there is no such index.
+func bm25IndexTokenizer(ctx context.Context, tx pgx.Tx) (string, error) {
+	var opts []string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(c.reloptions, '{}')
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = current_schema()`,
+		bm25Index).Scan(&opts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return tokenizerFromReloptions(opts), nil
+}
+
+// tokenizerFromReloptions pulls the analyser name out of an index's
+// reloptions. PostgreSQL stores each option as "name=value" and ParadeDB
+// keeps text_fields as the JSON document bm25IndexDDL passed it, so the
+// analyser is at text_fields={"content":{"tokenizer":{"type":"<name>"}}}.
+//
+// An empty result means "could not tell", never "no tokenizer": the value
+// only ever reaches a log line, so a reloptions shape a future ParadeDB
+// renders differently degrades to saying nothing rather than to warning
+// about a drift that is not there.
+func tokenizerFromReloptions(opts []string) string {
+	const prefix = "text_fields="
+	for _, o := range opts {
+		if !strings.HasPrefix(o, prefix) {
+			continue
+		}
+		var fields map[string]struct {
+			Tokenizer struct {
+				Type string `json:"type"`
+			} `json:"tokenizer"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(o, prefix)), &fields); err != nil {
+			return ""
+		}
+		return fields["content"].Tokenizer.Type
+	}
+	return ""
 }
 
 func (pgSearchBackend) HybridQuery(p SearchParams) (string, []any) {

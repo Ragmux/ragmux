@@ -20,6 +20,9 @@ func (pgvectorBackend) Available(Capabilities) bool { return true }
 // migrations, so there is nothing to build lazily.
 func (pgvectorBackend) Prepare(context.Context, *Store) error { return nil }
 
+// Invalidate is a no-op for the same reason: Prepare caches nothing.
+func (pgvectorBackend) Invalidate(*Store) {}
+
 func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 	// An empty or stop-word-only query yields a tsquery with numnode = 0;
 	// the full-text side is then simply empty instead of an error.
