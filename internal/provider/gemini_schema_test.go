@@ -42,6 +42,12 @@ func assertGeminiNode(t *testing.T, path string, node map[string]any) {
 	if typ == "" && node["anyOf"] == nil {
 		t.Errorf("%s: node has no type: %#v", path, node)
 	}
+	// What this does not check: whether the type and the keywords agree.
+	// {"type":"string","minItems":2} is a shape Gemini accepts and a
+	// contradiction all the same, and an inferred type can produce one --
+	// see geminiInferType. Gemini takes every field of Schema independently,
+	// so there is no single rule to assert here; the inference's own cases in
+	// the table are what pin its choices.
 	str := func(k string, v any) {
 		if _, ok := v.(string); !ok {
 			t.Errorf("%s/%s = %#v, want a string", path, k, v)

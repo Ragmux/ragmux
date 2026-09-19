@@ -279,7 +279,12 @@ cycle and `"(unresolved schema reference elided)"` for a definition this documen
 contain, which since references are matched on their full pointer is every external one. A
 node that is not an object, or one nothing survived in, becomes `{"type":"object"}`, a node
 that carried no `type` takes the one its surviving keywords imply (an `anyOf` node stays
-untyped, because its branches carry the types), and a declaration whose sanitised
+untyped, because its branches carry the types) — that inference is a guess, and a lossy
+one: a node carrying only `minimum`/`maximum` becomes `number`, so a field the caller
+meant as an integer can come back with a fractional value, and one carrying only
+`minItems` becomes `string`, keeping an array keyword on a scalar. Gemini rejects an
+untyped node outright, so a guess beats the alternative; give a `type` to anything whose
+shape matters. A declaration whose sanitised
 schema has no properties left is sent **without** `parameters` — several model versions
 reject `{"type":"object","properties":{}}`. Sanitising never fails; anything Gemini still
 objects to comes back relayed verbatim.
@@ -402,18 +407,24 @@ to probe the internal network. On top of that:
 - Across requests, `IMAGE_FETCH_MAX_CONCURRENT` caps the fetches the whole process runs
   at once and the connections it will hold to one host. A per-request limit bounds one
   request and nothing at all when many arrive together, which is what would make the
-  gateway a useful amplifier for a target an API key chose. **No single project may hold
-  more than half those slots**: capping the process alone closed the outward problem and
-  opened an inward one, where a few requests aimed at a slow image host filled every slot
-  and an unrelated project waited out its whole timeout.
-- A fetch that cannot get a slot within two seconds is answered `429` with `Retry-After`
-  and `code: "image_fetch_saturated"` — the gateway ran out, which is a resource limit
-  rather than the client getting anything wrong and rather than a fault. It is
-  deliberately not a `5xx`: the official SDKs retry those automatically with backoff, so
-  every client would spend its retries queueing again while the ceiling is still full.
-  The queue wait is its own budget, separate from `IMAGE_FETCH_TIMEOUT`, which starts
-  once a slot is in hand — otherwise the same saturation came back sometimes as a `429`
-  and sometimes as a download timeout blaming the image host.
+  gateway a useful amplifier for a target an API key chose. **While another project is
+  queueing, no single project holds more than half those slots**: capping the process
+  alone closed the outward problem and opened an inward one, where a few requests aimed at
+  a slow image host filled every slot and an unrelated project waited out its whole
+  timeout. The share is a floor under everybody else rather than a ceiling on one tenant —
+  with nobody else waiting, a single project reaches the whole of
+  `IMAGE_FETCH_MAX_CONCURRENT`, which is what the setting says it is.
+- A fetch that cannot get a slot within two seconds (or `IMAGE_FETCH_TIMEOUT`, if that is
+  shorter — the wait is not separately configurable) is answered `429` with `Retry-After`
+  and `code: "image_fetch_saturated"`. The gateway ran out, which is a resource limit
+  rather than the client getting anything wrong, and deliberately not a `5xx`, which would
+  report a fault and count against availability when nothing is broken. `Retry-After`
+  names `IMAGE_FETCH_TIMEOUT`, not the queue wait: a slot frees when a **download**
+  finishes, so naming the wait sent clients that honour the header — the official SDKs do,
+  for a `429` as much as for a `5xx` — straight back into the same full queue. The queue
+  wait is its own budget, separate from `IMAGE_FETCH_TIMEOUT`, which starts once a slot is
+  in hand; otherwise the same saturation came back sometimes as a `429` and sometimes as a
+  download timeout blaming the image host.
 
 Anything the client got wrong — a bad scheme, a non-image response, an oversized image,
 a non-2xx from the image host, too many images — is a `400 invalid_request_error` naming

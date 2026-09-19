@@ -10,9 +10,10 @@ All notable changes to Ragmux are documented here. The format follows
 - **`IMAGE_FETCH_MAX_CONCURRENT`** (default `16`): image fetches the process runs at once,
   and the image transport's per-host connection ceiling.
   `IMAGE_FETCH_MAX_PER_REQUEST` bounds one request and nothing across them, so without
-  this a key holder could aim the gateway's own address at a host of their choosing. No
-  single project or key may hold more than half the slots, so one tenant pointed at a slow
-  image host cannot starve the rest.
+  this a key holder could aim the gateway's own address at a host of their choosing. While
+  another project is queueing, no single one holds more than half the slots, so a tenant
+  pointed at a slow image host cannot starve the rest; with nobody else waiting, one
+  project still reaches the full value.
 - **`IMAGE_CACHE_MAX_MB`**: byte ceiling for the fetched-image cache. Unset, it follows
   `IMAGE_FETCH_MAX_MB` — 64 MiB, or enough for two images of the largest size accepted,
   capped at 256 MiB. A value too small to hold one encoded image is refused at startup,
@@ -91,7 +92,8 @@ All notable changes to Ragmux are documented here. The format follows
 - **A saturated image fetch queue answers `429`** with `Retry-After` and
   `code: "image_fetch_saturated"`, rather than holding the request for the whole fetch
   timeout. Queueing now has its own budget, so a wait is never charged to the image host
-  as a download timeout.
+  as a download timeout. `Retry-After` names `IMAGE_FETCH_TIMEOUT`, because a slot frees
+  when a download finishes.
 - **A redirect that drops from `https` to `http` is refused**, on the same host as well as
   across hosts: same host is not the same connection, and the retry would put the
   `Authorization` header on the wire in the clear.
@@ -101,6 +103,14 @@ All notable changes to Ragmux are documented here. The format follows
   travelling to a rejection. `$ref` is matched on its full JSON Pointer, so two
   same-named definitions no longer collide and an external reference resolves to none of
   them; the same schema now sanitises to the same bytes every time.
+- **A Gemini tool schema node with no `type` is given one**, inferred from the keywords
+  that survived, because Gemini rejects an untyped node and took the whole tool down with
+  it. The inference is lossy — a node carrying only `minimum`/`maximum` becomes `number`,
+  so a field meant as an integer can come back fractional — so give a `type` to anything
+  whose shape matters. `required` from an `allOf` is merged as a set rather than
+  concatenated, which also changes the list a tool sees.
+- **An inline `data:` URL is recognised whatever the case of its scheme.** `DATA:image/png`
+  used to be treated as a remote URL and skip every check.
 
 ### Fixed
 - A document whose file type is unsupported no longer quotes the rejected extension into

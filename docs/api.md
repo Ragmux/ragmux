@@ -785,7 +785,7 @@ Status codes:
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
-| `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx` the SDKs would retry automatically into the same full queue |
+| `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
 | `4xx`/`5xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted) |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
 | `502` | transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
