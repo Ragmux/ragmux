@@ -218,6 +218,11 @@ func TestCostMicrosSaturates(t *testing.T) {
 		{name: "negative cached share", price: p, prompt: 100, cached: -50, completion: 0, want: 300},
 		// A price row someone typed a minus into cannot make a credit.
 		{name: "negative price", price: Price{Input: -3, Output: -15}, prompt: 1000, completion: 500, want: 0},
+		// One negative rate is floored on its own: it prices nothing, and it
+		// does not discount the terms priced beside it. 500 x 15 stands.
+		{name: "one negative rate", price: Price{Input: -3, Output: 15}, prompt: 1000, completion: 500, want: 7500},
+		{name: "negative cache rates", price: Price{Input: 3, Output: 15, CacheWrite: -100, CacheRead: -100},
+			prompt: 1000, cached: 300, cacheWrite: 200, completion: 100, want: 1500 + 1500},
 		// Beyond int64 micros: saturate rather than wrap or go platform-specific.
 		{name: "overflow on input", price: huge, prompt: 1 << 40, want: math.MaxInt64},
 		{name: "overflow on output", price: huge, completion: 1 << 40, want: math.MaxInt64},

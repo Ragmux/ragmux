@@ -928,18 +928,40 @@ func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLo
 // fillUsage copies the upstream's token counts onto the log row, falling
 // back to a character estimate when it reported none. It is the one place
 // tokens enter request_logs, so it is also where a broken or hostile
-// upstream is stopped: a negative count is clamped to zero rather than
-// flowing on into the cost, the budget counters and the metrics, where it
-// would subtract from spend already recorded.
+// upstream is stopped: a negative count never reaches the cost, the budget
+// counters or the metrics, where it would subtract from spend that really
+// happened.
+//
+// A negative count is replaced half by half rather than zeroed. A request
+// that produced text and came back with completion_tokens: -78 really did
+// spend output tokens, and logging it as 0 would under-charge the budget
+// and leave the row looking exact; the character estimate is the same
+// answer as for an upstream that reported nothing, and rec.Estimated says
+// so on every surface that shows the row.
 func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {
+	promptEstimate := (nonNegative(promptChars) + 3) / 4
+	compEstimate := (nonNegative(compChars) + 3) / 4
 	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
-		rec.PromptTokens, rec.CompletionTokens = nonNegative(u.PromptTokens), nonNegative(u.CompletionTokens)
-		rec.CachedPromptTokens, rec.CacheWriteTokens = nonNegative(u.CachedTokens()), nonNegative(u.CacheWriteTokens())
+		rec.PromptTokens, rec.CompletionTokens = u.PromptTokens, u.CompletionTokens
+		rec.CachedPromptTokens, rec.CacheWriteTokens = u.CachedTokens(), u.CacheWriteTokens()
+		if rec.PromptTokens < 0 {
+			rec.PromptTokens, rec.Estimated = promptEstimate, true
+		}
+		if rec.CompletionTokens < 0 {
+			rec.CompletionTokens, rec.Estimated = compEstimate, true
+		}
+		// The cache split has no character to estimate from: an unusable
+		// one drops to zero, and the row is marked estimated all the same.
+		if rec.CachedPromptTokens < 0 {
+			rec.CachedPromptTokens, rec.Estimated = 0, true
+		}
+		if rec.CacheWriteTokens < 0 {
+			rec.CacheWriteTokens, rec.Estimated = 0, true
+		}
 		return
 	}
 	rec.Estimated = true
-	rec.PromptTokens = (nonNegative(promptChars) + 3) / 4
-	rec.CompletionTokens = (nonNegative(compChars) + 3) / 4
+	rec.PromptTokens, rec.CompletionTokens = promptEstimate, compEstimate
 }
 
 func nonNegative(n int) int {

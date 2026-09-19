@@ -146,10 +146,17 @@ func TestNegativeUpstreamUsageIsClamped(t *testing.T) {
 	if rec.CostMicros < 0 || rec.CostUSD < 0 {
 		t.Errorf("negative cost: %d micros, %v usd", rec.CostMicros, rec.CostUSD)
 	}
-	// The usable half survives; only the negative one is floored. 100 prompt
-	// tokens at 2.5 per Mtok is 250 micros, and the output adds nothing.
-	if rec.PromptTokens != 100 || rec.CompletionTokens != 0 || rec.CostMicros != 250 {
-		t.Errorf("clamped row = %+v, want 100/0 tokens at 250 micros", rec)
+	// The usable half survives; the negative one falls back to the character
+	// estimate rather than to zero, because the request really did produce
+	// output and a 0 there would under-charge the budget. The reply is "hi",
+	// so (2+3)/4 = 1 completion token: 100 x 2.5 + 1 x 10 = 260 micros.
+	if rec.PromptTokens != 100 || rec.CompletionTokens != 1 || rec.CostMicros != 260 {
+		t.Errorf("clamped row = %+v, want 100/1 tokens at 260 micros", rec)
+	}
+	// And the row says so, so the operator can see the number is not the
+	// upstream's own count.
+	if !rec.Estimated {
+		t.Error("a row with a half-broken usage block is not marked estimated")
 	}
 	// And the summary the dashboard reads stays non-negative.
 	m, err := e.st.Summarize(context.Background(), store.MetricsFilter{ProjectID: &e.proj.ID}, time.Now().Add(-time.Hour))

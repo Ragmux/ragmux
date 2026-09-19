@@ -119,12 +119,16 @@ func (p Price) CostMicros(promptTokens, cachedPrompt, cacheWrite, completionToke
 	if uncached < 0 {
 		uncached = 0
 	}
-	micros := float64(uncached)*p.Input +
-		float64(written)*p.CacheWrite +
-		float64(cached)*p.CacheRead +
-		float64(completion)*p.Output
-	// A NaN (a table row holding one, or 0 x Inf) fails every comparison and
-	// falls through to zero, which is the same answer a missing price gives.
+	// Every term is floored on its own, not just the sum. A single negative
+	// rate — a minus typed into one column of the table — would otherwise
+	// discount the other three, and the row that priced nothing would quietly
+	// reduce what the rest of the request cost.
+	micros := float64(uncached)*nonNegativeRate(p.Input) +
+		float64(written)*nonNegativeRate(p.CacheWrite) +
+		float64(cached)*nonNegativeRate(p.CacheRead) +
+		float64(completion)*nonNegativeRate(p.Output)
+	// A NaN (0 x Inf, say) fails every comparison and falls through to zero,
+	// which is the same answer a missing price gives.
 	if !(micros > 0) {
 		return 0
 	}
@@ -139,6 +143,16 @@ func nonNegative(n int) int {
 		return 0
 	}
 	return n
+}
+
+// nonNegativeRate floors one price per million tokens. The comparison is
+// written this way so a NaN, which is neither greater nor smaller than zero,
+// also lands on zero instead of poisoning the whole sum.
+func nonNegativeRate(v float64) float64 {
+	if !(v > 0) {
+		return 0
+	}
+	return v
 }
 
 func hasWildcard(pattern string) bool { return strings.Contains(pattern, "*") }
