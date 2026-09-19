@@ -213,7 +213,15 @@ isteği 10 sn asılı kalıp hata alıyor.
 
 Doygunlukta **429** dönülür, `Retry-After` başlığıyla ve
 `image_fetch_saturated` koduyla. Tavan varsayılanı **16**'dır ve tek bir
-key ya da proje slotların yarısından fazlasını tutamaz.
+key ya da proje, **başka bir kiracı beklerken** slotların yarısından
+fazlasını tutamaz. Pay yumuşaktır: kimse beklemiyorsa bir kiracı tavanın
+tamamını kullanabilir.
+
+Pay 2026-09-19'da sert (koşulsuz) olarak uygulanmıştı; ölçüm sert payın
+tek projeli kurulumda — en yaygın hâl — tavanın yarısını kalıcı olarak
+boşta bıraktığını, `IMAGE_FETCH_MAX_CONCURRENT=3` için indirme
+eşzamanlılığını 3'ten 1'e düşürdüğünü gösterdi. Karar aynı gün
+yumuşatıldı.
 
 ### Sonuçları
 
@@ -224,12 +232,17 @@ key ya da proje slotların yarısından fazlasını tutamaz.
   retry ediyor; 503 seçilseydi tavan dolu kaldığı sürece her istek 3×
   kuyrukta bekleyecekti.
 - `docs/api.md` durum kodu tablosuna yeni bir satır girer.
-- Pay ayrımı biraz kod maliyeti getirir ve tek takımlı kurulumlarda hiç
-  devreye girmez.
+- Pay ayrımı biraz kod maliyeti getirir (kiracı başına `inflight` ve
+  süreç geneli `waiting` sayacı) ve tek kiracılı kurulumlarda hiç devreye
+  girmez — çekişme yoksa pay da yoktur.
 
 ### Değerlendirilen alternatifler
 
 **503 + `Retry-After`:** "geçici olarak kapasitem yok" demenin standart
 yolu, ama SDK'ların ağır retry davranışını tetikliyordu. **Tavanı 4'te
 bırakmak:** dışa doğru en sıkı koruma, ama ölçülen kiracılar-arası açlığı
-kabul etmek demekti.
+kabul etmek demekti. **Sert pay:** ~20 satır daha az kod, ama tek projeli
+kurulumda tavanın yarısını kalıcı olarak boşta bırakıyordu; belgelenen
+`IMAGE_FETCH_MAX_CONCURRENT` değeriyle etkin değerin ayrışması, ayarın
+kendisini yanıltıcı kılardı. **Payı hiç koymamak:** en basiti, ama
+kiracılar-arası açlık ölçülmüş bir davranıştı, varsayımsal değil.
