@@ -44,9 +44,10 @@ const defaultMaxSeries = 5000
 // Options configures a registry.
 type Options struct {
 	// MaxSeries caps the total number of label combinations across every
-	// metric. Beyond it new combinations are dropped and counted in
-	// ragmux_metrics_series_dropped_total, so a pathological label value
-	// cannot grow the process without bound. Zero selects the default.
+	// metric. Beyond it new combinations are dropped, counted in
+	// ragmux_metrics_series_dropped_total and reported through
+	// OnSeriesDropped, so a pathological label value cannot grow the process
+	// without bound and cannot do it quietly. Zero selects the default.
 	MaxSeries int
 }
 
@@ -65,12 +66,14 @@ type Registry struct {
 
 	series  atomic.Int64
 	dropped atomic.Uint64
-	// warnOnce fires the first time the series cap is hit.
-	warnOnce sync.Once
-	// OnSeriesDropped, when set, is called once the first time a new label
-	// combination is refused. It exists so the owner can log it; the registry
-	// itself does not log.
-	OnSeriesDropped func(metric string)
+	// lastNotify holds the Unix nanosecond stamp of the most recent
+	// OnSeriesDropped call, which is how the report is rate limited.
+	lastNotify atomic.Int64
+	// OnSeriesDropped, when set, is called when a new label combination is
+	// refused, at most once per notifyInterval, with the metric that was
+	// refused and the running total of refusals. It exists so the owner can
+	// log it; the registry itself does not log.
+	OnSeriesDropped func(metric string, dropped uint64)
 }
 
 // New creates an empty registry.
@@ -102,21 +105,51 @@ func (r *Registry) register(name string, labels []string, c collector) {
 	r.cols = append(r.cols, c)
 }
 
+// notifyInterval is the shortest gap between two OnSeriesDropped calls. It
+// keeps a hot loop of refusals from becoming the log itself while still
+// letting a standing problem re-announce itself.
+const notifyInterval = time.Minute
+
 // admitSeries reserves room for one new label combination. It reports false
 // once the registry is at its cap, which is how a runaway label value degrades
 // into a counted drop instead of unbounded growth.
+//
+// Refusing is deliberately all this does: there is no eviction. Evicting the
+// least recently used series would keep the cap from freezing legitimate
+// metrics, but it would cost a write on every observation -- a lock or an
+// atomic store on the scrape path -- and a counter that is evicted and then
+// comes back starts from zero, which Prometheus reads as a counter reset and
+// silently turns into a wrong rate(). Visibly missing data is preferred to
+// quietly wrong data, so the drop is reported instead: counted in
+// ragmux_metrics_series_dropped_total and handed to OnSeriesDropped, which the
+// owner logs at error level.
 func (r *Registry) admitSeries(metric string) bool {
 	if r.series.Add(1) > int64(r.maxSeries) {
 		r.series.Add(-1)
-		r.dropped.Add(1)
-		r.warnOnce.Do(func() {
-			if r.OnSeriesDropped != nil {
-				r.OnSeriesDropped(metric)
-			}
-		})
+		r.notifyDropped(metric, r.dropped.Add(1))
 		return false
 	}
 	return true
+}
+
+// notifyDropped reports a refused series to the owner, at most once per
+// notifyInterval. Reporting only the very first refusal would leave a process
+// that has been losing series for a week with one log line from the day it
+// started; the counter carries the total, the log carries the alarm.
+func (r *Registry) notifyDropped(metric string, dropped uint64) {
+	if r.OnSeriesDropped == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := r.lastNotify.Load()
+	if last != 0 && now-last < int64(notifyInterval) {
+		return
+	}
+	// Losing the swap means another goroutine is reporting this window.
+	if !r.lastNotify.CompareAndSwap(last, now) {
+		return
+	}
+	r.OnSeriesDropped(metric, dropped)
 }
 
 // Dropped reports how many label combinations have been refused.

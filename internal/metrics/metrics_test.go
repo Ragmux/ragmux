@@ -99,8 +99,10 @@ func TestFloatCounterIgnoresNonPositive(t *testing.T) {
 
 func TestMaxSeriesDropsAndCounts(t *testing.T) {
 	var dropped string
+	var total uint64
+	var calls int
 	r := New(Options{MaxSeries: 2})
-	r.OnSeriesDropped = func(m string) { dropped = m }
+	r.OnSeriesDropped = func(m string, n uint64) { dropped, total, calls = m, n, calls+1 }
 	c := r.Counter("ragmux_capped_total", "Capped.", "id")
 	c.With("a").Inc()
 	c.With("b").Inc()
@@ -112,6 +114,33 @@ func TestMaxSeriesDropsAndCounts(t *testing.T) {
 	}
 	if dropped != "ragmux_capped_total" {
 		t.Errorf("OnSeriesDropped got %q", dropped)
+	}
+	// The report is rate limited, so a burst of refusals inside one window is
+	// a single log line carrying the running total.
+	if calls != 1 {
+		t.Errorf("OnSeriesDropped called %d times in one window, want 1", calls)
+	}
+	if total != 1 {
+		t.Errorf("OnSeriesDropped reported total %d, want the count at the time of the call", total)
+	}
+}
+
+// TestSeriesCapKeepsReporting: the cap filling is an error condition that
+// lasts, so it must not be announced only once for the life of the process.
+func TestSeriesCapKeepsReporting(t *testing.T) {
+	var calls int
+	r := New(Options{MaxSeries: 1})
+	r.OnSeriesDropped = func(string, uint64) { calls++ }
+	c := r.Counter("ragmux_capped_total", "Capped.", "id")
+	c.With("a").Inc()
+	c.With("b").Inc() // refused, reported
+	// Age the last report past the interval, as a process that has been
+	// dropping series for a while would.
+	r.lastNotify.Store(time.Now().Add(-2 * notifyInterval).UnixNano())
+	c.With("c").Inc() // refused again, reported again
+
+	if calls != 2 {
+		t.Errorf("OnSeriesDropped called %d times, want 2 once the interval passed", calls)
 	}
 	got := r.Text()
 	if strings.Contains(got, `id="c"`) {

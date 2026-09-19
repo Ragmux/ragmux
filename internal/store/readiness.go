@@ -30,9 +30,11 @@ var headMigration = sync.OnceValue(func() int {
 
 // HeadMigration reports the schema version this binary embeds. A readiness
 // probe compares it against MAX(version) in schema_migrations: during a
-// rolling upgrade a replica whose database has not reached its own head yet
-// is not ready to serve, and neither is an old replica left behind by a
-// newer one's migration.
+// rolling upgrade a replica whose database has not reached this version yet
+// is not ready to serve. A database that is *past* it is a different case --
+// an old replica running against the schema a newer one has already migrated
+// -- which stays ready, because these migrations are additive; see readyz in
+// cmd/ragmux.
 func HeadMigration() int { return headMigration() }
 
 // AppliedMigration reports the newest migration recorded in the database, or
