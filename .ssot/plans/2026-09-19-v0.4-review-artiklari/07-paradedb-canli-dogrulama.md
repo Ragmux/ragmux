@@ -1,6 +1,6 @@
 # Faz 07 — ParadeDB yolunun canlı doğrulaması
 
-- **Durum:** beklemede
+- **Durum:** tamam (review APPROVED, `v0.4`'e merge edildi)
 - **Sahip:** backend-engineer
 - **Bağımlılık:** yok
 - **İlgili karar:** yok

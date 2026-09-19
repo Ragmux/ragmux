@@ -1,6 +1,6 @@
 # v0.4 review artıkları — genel plan
 
-- **Durum:** sürüyor
+- **Durum:** 01–07 tamam; 08 (yayın) kullanıcı onayı bekliyor
 - **Tarih:** 2026-09-19
 - **Öncül:** `.ssot/plans/2026-09-19-v0.4/` (kod tamam, yayın bekliyor)
 
@@ -21,12 +21,12 @@ teknik.
 | Faz | Başlık | Sahip | Durum | Bağımlılık |
 |---|---|---|---|---|
 | 01 | Hazır olma ve seri tavanı kararları | backend-engineer | **tamam** | — |
-| 02 | Metrik ve trace etiket sınırları | backend-engineer | sürüyor | 01 |
-| 03 | Provider: şema ve görsel doğrulama | backend-engineer | sürüyor | — |
+| 02 | Metrik ve trace etiket sınırları | backend-engineer | **tamam** | 01 |
+| 03 | Provider: şema ve görsel doğrulama | backend-engineer | **tamam** | — |
 | 04 | Token muhasebesi ve fiyat tablosu | backend-engineer | **tamam** | — |
 | 05 | Depolama ve ölçek temizliği | backend-engineer | **tamam** | — |
-| 06 | Yapılandırma ve kapanış küçükleri | backend-engineer | sürüyor | — |
-| 07 | ParadeDB yolunun canlı doğrulaması | backend-engineer | sürüyor | — |
+| 06 | Yapılandırma ve kapanış küçükleri | backend-engineer | **tamam** | — |
+| 07 | ParadeDB yolunun canlı doğrulaması | backend-engineer | **tamam** | — |
 | 08 | Yayın: push, PR, tag | — (kullanıcı onayı) | beklemede | 01–07 |
 
 02–07 birbirinden bağımsız; paralel veriliyor. 02, 01'in dokunduğu

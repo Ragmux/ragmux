@@ -1,6 +1,6 @@
 # Faz 02 — Metrik ve trace etiket sınırları
 
-- **Durum:** beklemede
+- **Durum:** tamam (review APPROVED, `v0.4`'e merge edildi)
 - **Sahip:** backend-engineer
 - **Bağımlılık:** Faz 01 (tavan davranışı kararı — ADR-002 ile verildi)
 - **İlgili karar:** ADR-002; PRD davranış kuralı 10
