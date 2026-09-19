@@ -30,6 +30,7 @@ import (
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/maintenance"
 	"github.com/ragmux/ragmux/internal/netguard"
+	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -128,6 +129,13 @@ func run(cfg config.Config) error {
 		log.Info("provider keys re-sealed with their connection id", "connections", n)
 	}
 
+	// The built-in price table is written after the migrations so the cost
+	// estimate works out of the box. Rows an operator edited are left alone.
+	if _, err := pricing.Seed(ctx, st.DB(), log); err != nil {
+		return fmt.Errorf("seed model prices: %w", err)
+	}
+	prices := pricing.NewCache(st.DB(), log)
+
 	if err := bootstrapAdmin(ctx, st, cfg, log); err != nil {
 		return err
 	}
@@ -196,11 +204,12 @@ func run(cfg config.Config) error {
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",
 		TrustProxy: cfg.TrustProxyHeaders}
 	usage := &limits.Limiter{Store: st}
-	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20, Limiter: usage}
+	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
+		Limiter: usage, Prices: prices}
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
 		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
-		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage,
+		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage, Prices: prices,
 		ProviderConfig: provCfg, AllowPrivateUpstreams: cfg.AllowPrivateUpstreams, PrivateAllowlist: cfg.PrivateUpstreamAllowlist,
 		MaxDocumentsPerStore: cfg.MaxDocumentsPerStore, MaxBytesPerStore: cfg.MaxBytesPerStore}
 

@@ -85,6 +85,10 @@ non-streaming calls). Responses and SSE chunks are relayed in the OpenAI schema.
 `custom_openai` covers vLLM, LM Studio, LiteLLM, text-generation-inference's OpenAI
 route, Ollama's `/v1` shim and any other server speaking the Chat Completions format.
 
+Prompt caching on these providers is automatic and server-side: nothing is sent for it,
+and `prompt_tokens_details.cached_tokens` (DeepSeek's `prompt_cache_hit_tokens`) is
+surfaced back to the client. See [Prompt caching](#prompt-caching).
+
 ### Request field passthrough (`Extra`)
 
 `/v1/chat/completions` parses the known fields (`model`, `messages`, `stream`,
@@ -101,7 +105,8 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
 
 - `system` and `developer` messages are removed from the message list, joined with blank
   lines and sent as the top-level `system` field (this is where the project system prompt
-  and RAG context end up).
+  and RAG context end up). With a `cache_control` on one of them the field becomes an
+  array of blocks instead — see [Prompt caching](#prompt-caching).
 - `max_tokens` is required by Anthropic; when the client sends neither `max_tokens` nor
   `max_completion_tokens` the gateway uses **4096**.
 - `temperature`, `top_p` and `stop` are mapped; `n`, `response_format`, `user` and unknown
@@ -119,8 +124,9 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   `source.type: url` needs the images inlined instead; that is the one constant
   `anthropicInlineImages` in `internal/provider/images.go`.
 - Finish reasons: `end_turn`/`stop_sequence` → `stop`, `max_tokens` → `length`,
-  `tool_use` → `tool_calls`. Usage (`input_tokens`, `output_tokens`) is mapped to
-  `prompt_tokens`/`completion_tokens`, including on streams.
+  `tool_use` → `tool_calls`. Usage is mapped to `prompt_tokens`/`completion_tokens`,
+  including on streams; see [Prompt caching](#prompt-caching) for how the cache
+  counters are folded in.
 
 Anthropic has no embeddings API; choose another connection for RAG stores.
 
@@ -141,7 +147,9 @@ Requests are translated to `generateContent` / `streamGenerateContent`:
 - Finish reasons: `STOP` → `stop`, `MAX_TOKENS` → `length`, safety-related reasons
   (`SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`) → `content_filter`.
   A turn that called tools reports `tool_calls` whatever Gemini said, because Gemini has
-  no distinct reason for it. `usageMetadata` is mapped to OpenAI usage.
+  no distinct reason for it. `usageMetadata` is mapped to OpenAI usage, including
+  `cachedContentTokenCount` — see [Prompt caching](#prompt-caching). Explicit caching
+  (`cachedContents`) is not supported.
 - Embeddings use `batchEmbedContents`; the model name gets a `models/` prefix if missing.
 
 ### Tool calling
@@ -234,7 +242,8 @@ gives access to Ollama-only options:
   downloaded by the gateway first (see [Images](#images)); with `IMAGE_FETCH=false` it is
   rejected with `400`.
 - Finish reasons: `stop` → `stop`, `length` → `length`; usage is built from
-  `prompt_eval_count` / `eval_count`.
+  `prompt_eval_count` / `eval_count`. Ollama has no prompt cache, so no cache fields are
+  reported and the shipped price table charges `ollama` models nothing.
 
 Ollama itself is unauthenticated; if you set an `api_key` it is sent as
 `Authorization: Bearer …`, which is useful behind an authenticating reverse proxy.
@@ -293,6 +302,72 @@ multi-turn conversation resends the same image part on every turn. The cache is 
 the URL alone and is not written to disk, so an image whose content changes within the TTL
 keeps serving the old bytes until it expires; a response carrying `Cache-Control: no-store`
 is never cached.
+
+## Prompt caching
+
+Providers cache a repeated prompt prefix and charge less for the cached part. Ragmux
+passes a client's caching intent through where the provider has a field for it, and
+always reports back what the provider said it cached. Both sides feed the
+[cost estimate](api.md#model-prices) shown on request logs.
+
+### Response side: one accounting for every provider
+
+`usage` gains OpenAI's breakdown objects, so the same fields mean the same thing on
+every connection:
+
+```json
+"usage": {"prompt_tokens": 250, "completion_tokens": 500, "total_tokens": 750,
+          "prompt_tokens_details": {"cached_tokens": 200, "cache_creation_tokens": 40},
+          "completion_tokens_details": {"reasoning_tokens": 30}}
+```
+
+`prompt_tokens` **always includes** the cached and freshly written parts, and
+`prompt_tokens + completion_tokens == total_tokens` holds everywhere.
+`cache_creation_tokens` has no OpenAI equivalent — OpenAI does not bill cache writes,
+Anthropic does.
+
+| Provider | What it reports | How it is mapped |
+|---|---|---|
+| `openai` | `prompt_tokens_details.cached_tokens` (already inside `prompt_tokens`) | passed through unchanged |
+| `deepseek` | `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` at the top level (their sum is `prompt_tokens`) | the hit count is folded into `cached_tokens`; the top-level fields are still relayed |
+| `anthropic` | `input_tokens` **excluding** `cache_creation_input_tokens` and `cache_read_input_tokens` | all three are added up into `prompt_tokens`; reads become `cached_tokens`, writes `cache_creation_tokens` |
+| `gemini` | `usageMetadata.cachedContentTokenCount` (already inside `promptTokenCount`) | becomes `cached_tokens`; `thoughtsTokenCount` keeps counting as completion tokens and is also reported as `reasoning_tokens` |
+| `ollama` | nothing; Ollama has no prompt cache | no cache fields |
+
+> **Change from 0.3.x:** for a cached Anthropic request, `prompt_tokens` is now larger.
+> Earlier releases reported Anthropic's `input_tokens` verbatim and so under-reported a
+> cached prompt by the size of its cached prefix. Recorded token budgets and metrics for
+> such requests move up accordingly.
+
+### Request side: `cache_control`
+
+**Anthropic** takes a `cache_control` marker in three places, and Ragmux relays each of
+them verbatim (the gateway never inspects or invents one):
+
+| Where the client puts it | What is sent upstream |
+|---|---|
+| on a content part: `{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}` | copied onto the matching Anthropic content block |
+| on a tool, at the top level *or* inside `function` | copied onto the Anthropic tool object |
+| on a `system`/`developer` message's content part | the `system` field becomes an array of blocks, one per system message, carrying the marker |
+
+With no `cache_control` anywhere, `system` stays the plain joined string it has always
+been — a request that does not ask for caching is byte-identical to a 0.3.x one. When a
+message has several marked parts the last marker wins, since Anthropic caches the prefix
+up to and including the marked block.
+
+**OpenAI, DeepSeek and `custom_openai`: nothing is sent.** Their caching is automatic and
+server-side; there is no request field to emit, so Ragmux emits none. A `cache_control` a
+client embeds rides along untouched (message content is relayed raw) and OpenAI ignores
+it. Only the response side matters here — this is not a gap.
+
+**Gemini and Ollama: response side only.** Gemini's explicit caching needs a stateful
+`cachedContents` resource created and referenced across requests, which does not fit a
+stateless passthrough; its implicit caching happens automatically and is reported in
+`cachedContentTokenCount`. Ollama has no prompt cache at all.
+
+The project system prompt and the RAG context block the gateway injects are the stable
+prefix most worth a breakpoint, but the gateway does not mark one: a project-level
+`cache_prompt` switch needs a column and dashboard work of its own and is not in 0.4.
 
 ## Model field echo
 

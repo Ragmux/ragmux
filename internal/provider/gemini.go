@@ -101,10 +101,11 @@ type geminiResponse struct {
 		FinishReason string        `json:"finishReason"`
 	} `json:"candidates"`
 	UsageMetadata struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
+		PromptTokenCount        int `json:"promptTokenCount"`
+		CachedContentTokenCount int `json:"cachedContentTokenCount"`
+		CandidatesTokenCount    int `json:"candidatesTokenCount"`
+		ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+		TotalTokenCount         int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 }
 
@@ -516,9 +517,19 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 
 // geminiUsage maps usageMetadata to the OpenAI shape. Reasoning ("thoughts")
 // tokens are billed as output, so they count as completion tokens, which keeps
-// prompt + completion == total like the other providers.
+// prompt + completion == total like the other providers, and are reported
+// again in the completion breakdown. promptTokenCount already contains the
+// cached prefix, so caching only adds a breakdown, never changes the total.
 func geminiUsage(gr geminiResponse) *Usage {
 	u := gr.UsageMetadata
-	return &Usage{PromptTokens: u.PromptTokenCount, CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount,
+	out := &Usage{PromptTokens: u.PromptTokenCount, CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount,
 		TotalTokens: u.TotalTokenCount}
+	if u.CachedContentTokenCount > 0 {
+		out.PromptTokensDetails = &PromptTokensDetails{CachedTokens: u.CachedContentTokenCount}
+	}
+	if u.ThoughtsTokenCount > 0 {
+		out.CompletionTokensDetails = &CompletionTokensDetails{ReasoningTokens: u.ThoughtsTokenCount}
+	}
+	out.normalize()
+	return out
 }

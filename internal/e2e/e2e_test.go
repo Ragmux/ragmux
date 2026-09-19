@@ -394,7 +394,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(10) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(11) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
@@ -1251,7 +1251,7 @@ func TestMetricsExportAndSummaryOptions(t *testing.T) {
 		t.Fatalf("csv: %d %v", code, h)
 	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error" {
+	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error,cached_prompt_tokens,cache_write_tokens,cost_usd,cost_source,api_key_id,user_id" {
 		t.Fatalf("csv lines: %q", lines)
 	}
 	if !strings.Contains(lines[1], fmt.Sprintf(",%d,alpha,x,200,10,3,false,40,true,true,2,", idA)) {
