@@ -116,9 +116,15 @@ tanımlıyordu. Kod ile doküman aynı şeyi söylemiyordu.
 ### Karar
 
 Davranış korunur, doküman düzeltilir. Rol matrisi `viewer`'ın kendi
-gateway key'ini üretebildiğini ve harcamasının kendi limitine yazıldığını
-açıkça yazar. Roller **admin yüzeyine** erişimi sınırlar; gateway
-kullanımı kullanıcının kendi limitiyle sınırlanır.
+gateway key'ini üretebildiğini açıkça yazar. Roller **admin yüzeyine**
+erişimi sınırlar — rol kesişimi yalnız `/admin/api`'de, her istekte canlı
+okunur. Gateway kullanımını sınırlayan şey rol değil, **proje ve key
+sub-limit'leri**dir; `/v1` rolü hiç okumaz, yalnız hesabın aktif olup
+olmadığına bakar.
+
+Bunun doğrudan sonucu: bir kullanıcıyı `viewer`'a düşürmek elindeki
+`sk-mgmt-…` key'ini anında daraltır, `sk-user-…` key'ine ise hiçbir şey
+yapmaz.
 
 ### Sonuçları
 
