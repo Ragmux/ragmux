@@ -158,6 +158,29 @@ line 2</pre><svg><text>icon</text></svg><noscript>enable js</noscript>
 	}
 }
 
+// TestUnsupportedTypeIsASentinelWithoutTheFilename: this error reaches
+// span.RecordError on the ingest.document span, which is exported to a
+// third-party collector. The extension is part of a user-supplied filename,
+// so quoting it back would put a filename on a span -- what PRD rule 10
+// forbids. errors.Is must work for callers, and the message must name the
+// supported types rather than the rejected one.
+func TestUnsupportedTypeIsASentinelWithoutTheFilename(t *testing.T) {
+	const secret = "SECRETEXT-hunter2"
+	_, err := Extract(context.Background(), "quarterly-payroll."+secret, []byte("abc"))
+	if !errors.Is(err, ErrUnsupportedFileType) {
+		t.Fatalf("err = %v, want ErrUnsupportedFileType", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("the rejected extension is quoted back into the error: %q", err)
+	}
+	// Still useful to whoever reads it.
+	for _, ext := range []string{".pdf", ".docx", ".md"} {
+		if !strings.Contains(err.Error(), ext) {
+			t.Errorf("the error should name the supported types; %q omits %s", err, ext)
+		}
+	}
+}
+
 // buildPDF writes a minimal single-font PDF with one page per text.
 func buildPDF(t *testing.T, pages ...string) []byte {
 	t.Helper()

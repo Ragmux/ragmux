@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -84,6 +85,28 @@ const (
 // ErrTooMuchText reports a document whose extracted text exceeds the cap.
 var ErrTooMuchText = fmt.Errorf("document text exceeds %d MiB after extraction", maxExtractedText>>20)
 
+// ErrUnsupportedFileType reports a file whose extension names no parser.
+//
+// It is a sentinel, and deliberately does not quote the extension it
+// rejected. The extension comes from the uploaded filename, which is
+// user-supplied text; this error travels to span.RecordError on the
+// ingest.document span, and PRD rule 10 forbids a filename reaching a span
+// exported to a third-party collector. Naming the supported types instead is
+// both safe and more useful than echoing the rejected one back.
+var ErrUnsupportedFileType = fmt.Errorf("unsupported file type; supported types are %s",
+	strings.Join(supportedExtensionList(), ", "))
+
+// supportedExtensionList renders SupportedExtensions in a stable order, so
+// the sentinel's message does not shuffle between builds.
+func supportedExtensionList() []string {
+	out := make([]string, 0, len(SupportedExtensions))
+	for ext := range SupportedExtensions {
+		out = append(out, ext)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // ExtractBlocks parses an uploaded document into blocks. The file type is
 // taken from the filename extension.
 func ExtractBlocks(ctx context.Context, filename string, data []byte) ([]Block, error) {
@@ -119,7 +142,7 @@ func Extract(ctx context.Context, filename string, data []byte) (*Parsed, error)
 	case ".html", ".htm":
 		p, err = extractHTML(data)
 	default:
-		return nil, fmt.Errorf("unsupported file type %q", filepath.Ext(filename))
+		return nil, ErrUnsupportedFileType
 	}
 	if err != nil {
 		return nil, err
