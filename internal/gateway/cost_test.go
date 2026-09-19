@@ -118,6 +118,70 @@ func TestUnpricedModelLogsCostSourceNone(t *testing.T) {
 	}
 }
 
+// TestNegativeUpstreamUsageIsClamped: a broken or hostile upstream reporting
+// negative token counts must not write a credit into the request log. The row
+// is the input to the cost, the budget counters and the metrics, and a
+// negative one subtracts from spend that really happened. custom_openai is
+// the connection an operator points wherever they like, so it is the one
+// whose numbers are least worth trusting.
+func TestNegativeUpstreamUsageIsClamped(t *testing.T) {
+	e := newCostEnv(t, "custom_openai", "gpt-4o", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},
+			"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":-78,"total_tokens":22}}`))
+	})
+	if _, err := e.st.CreateModelPrice(context.Background(), &store.ModelPrice{ProviderType: "custom_openai",
+		ModelPattern: "gpt-4o*", InputPerMTok: 2.5, OutputPerMTok: 10, Currency: "USD"}); err != nil {
+		t.Fatal(err)
+	}
+	e.prices.Invalidate()
+
+	resp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": userMsg}, e.key)
+	resp.Body.Close()
+
+	rec := e.lastLog()
+	if rec.PromptTokens < 0 || rec.CompletionTokens < 0 || rec.CachedPromptTokens < 0 || rec.CacheWriteTokens < 0 {
+		t.Errorf("negative tokens reached the log: %+v", rec)
+	}
+	if rec.CostMicros < 0 || rec.CostUSD < 0 {
+		t.Errorf("negative cost: %d micros, %v usd", rec.CostMicros, rec.CostUSD)
+	}
+	// The usable half survives; only the negative one is floored. 100 prompt
+	// tokens at 2.5 per Mtok is 250 micros, and the output adds nothing.
+	if rec.PromptTokens != 100 || rec.CompletionTokens != 0 || rec.CostMicros != 250 {
+		t.Errorf("clamped row = %+v, want 100/0 tokens at 250 micros", rec)
+	}
+	// And the summary the dashboard reads stays non-negative.
+	m, err := e.st.Summarize(context.Background(), store.MetricsFilter{ProjectID: &e.proj.ID}, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.PromptTokens < 0 || m.CompletionTokens < 0 || m.CostMicros < 0 || m.CostUSD < 0 {
+		t.Errorf("summary went negative: %+v", m)
+	}
+}
+
+// TestFullyNegativeUpstreamUsageFallsBackToTheEstimate: a usage block with
+// nothing usable in it is no usage at all, so the row is marked estimated
+// rather than recorded as a request that spent nothing.
+func TestFullyNegativeUpstreamUsageFallsBackToTheEstimate(t *testing.T) {
+	e := newCostEnv(t, "custom_openai", "gpt-4o", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},
+			"finish_reason":"stop"}],"usage":{"prompt_tokens":-100,"completion_tokens":-78,"total_tokens":-178}}`))
+	})
+	resp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": userMsg}, e.key)
+	resp.Body.Close()
+
+	rec := e.lastLog()
+	if !rec.Estimated {
+		t.Errorf("row = %+v, want the character estimate", rec)
+	}
+	if rec.PromptTokens <= 0 || rec.CompletionTokens <= 0 || rec.CostMicros < 0 {
+		t.Errorf("estimated row = %+v", rec)
+	}
+}
+
 // TestCostRecordedOnClientDisconnect: the deferred block runs on the 499
 // path too, with whatever tokens the stream reported before the hang-up.
 func TestCostRecordedOnClientDisconnect(t *testing.T) {

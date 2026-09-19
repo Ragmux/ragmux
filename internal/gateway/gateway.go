@@ -747,6 +747,14 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		w.WriteHeader(http.StatusOK)
 	}
 
+	// Every adapter emits a usage-only trailer, and the OpenAI-compatible
+	// one always asks its upstream for one, because the token counts are
+	// what the request log, the budgets and the cost are built from. The
+	// client only sees that trailer when it asked for it: OpenAI sends none
+	// without stream_options.include_usage, and a chunk with an empty
+	// choices array is exactly what breaks a client indexing choices[0].
+	wantUsage := req.IncludeUsage()
+
 	var usage *provider.Usage
 	compChars := 0
 	clientGone := false
@@ -762,6 +770,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		chunk.Model = req.Model
 		if chunk.Usage != nil {
 			usage = chunk.Usage
+			if !wantUsage {
+				chunk.Usage = nil
+				if len(chunk.Choices) == 0 {
+					continue // a trailer the client never asked for
+				}
+			}
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != nil {
@@ -911,15 +925,28 @@ func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLo
 	rec.CostUSD = float64(rec.CostMicros) / 1e6
 }
 
+// fillUsage copies the upstream's token counts onto the log row, falling
+// back to a character estimate when it reported none. It is the one place
+// tokens enter request_logs, so it is also where a broken or hostile
+// upstream is stopped: a negative count is clamped to zero rather than
+// flowing on into the cost, the budget counters and the metrics, where it
+// would subtract from spend already recorded.
 func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {
 	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
-		rec.PromptTokens, rec.CompletionTokens = u.PromptTokens, u.CompletionTokens
-		rec.CachedPromptTokens, rec.CacheWriteTokens = u.CachedTokens(), u.CacheWriteTokens()
+		rec.PromptTokens, rec.CompletionTokens = nonNegative(u.PromptTokens), nonNegative(u.CompletionTokens)
+		rec.CachedPromptTokens, rec.CacheWriteTokens = nonNegative(u.CachedTokens()), nonNegative(u.CacheWriteTokens())
 		return
 	}
 	rec.Estimated = true
-	rec.PromptTokens = (promptChars + 3) / 4
-	rec.CompletionTokens = (compChars + 3) / 4
+	rec.PromptTokens = (nonNegative(promptChars) + 3) / 4
+	rec.CompletionTokens = (nonNegative(compChars) + 3) / 4
+}
+
+func nonNegative(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func completionChars(resp *provider.ChatResponse) int {

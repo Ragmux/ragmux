@@ -748,3 +748,57 @@ func TestCanaryAdoptsTheFirstKeyOnAnEmptyDatabase(t *testing.T) {
 		t.Errorf("once adopted, a different key must be refused, got %v", err)
 	}
 }
+
+// TestMetricsIgnoreNegativeRows pins the read side of the token clamp. The
+// gateway keeps negative counts out of new rows, but a row written by an
+// older build, restored from a dump or put there by anything else must not
+// subtract from totals the dashboard presents as usage and spend: one such
+// row used to turn a real day's traffic into a negative completion count and
+// a negative cost.
+func TestMetricsIgnoreNegativeRows(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "m", ProviderType: "custom_openai",
+		ModelName: "gpt-4o", BaseURL: "https://api.example.com/v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := s.CreateProject(ctx, &store.Project{Name: "p", ModelConnectionID: conn.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, l := range []store.RequestLog{
+		{StatusCode: 200, PromptTokens: 10, CompletionTokens: 22, CostMicros: 1500},
+		{StatusCode: 200, PromptTokens: -100, CompletionTokens: -100, CostMicros: -1500},
+	} {
+		l.ProjectID = p.ID
+		if err := s.InsertRequestLog(ctx, &l); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	since := time.Now().Add(-time.Hour)
+	m, err := s.Summarize(ctx, store.MetricsFilter{ProjectID: &p.ID}, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.PromptTokens != 10 || m.CompletionTokens != 22 || m.CostMicros != 1500 || m.CostUSD != 0.0015 {
+		t.Errorf("summary = %+v, want the negative row read as zero", m)
+	}
+	if m.Requests != 2 {
+		t.Errorf("summary counted %d requests, want both rows", m.Requests)
+	}
+	by, err := s.SummarizeByProject(ctx, store.MetricsFilter{}, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(by) != 1 || by[0].PromptTokens != 10 || by[0].CompletionTokens != 22 || by[0].CostMicros != 1500 {
+		t.Errorf("per-project = %+v", by)
+	}
+	series, err := s.DailySeries(ctx, store.MetricsFilter{ProjectID: &p.ID}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 1 || series[0].PromptTokens != 10 || series[0].CompletionTokens != 22 || series[0].CostMicros != 1500 {
+		t.Errorf("daily series = %+v", series)
+	}
+}

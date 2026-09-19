@@ -121,6 +121,12 @@ func (f MetricsFilter) whereCol(col string, base []any) (string, []any) {
 	return sb.String(), base
 }
 
+// Token and cost columns are summed through GREATEST(…, 0) wherever a total
+// is reported. The gateway clamps the counts it writes, but a row put there
+// by an older build, a restored dump or anything other than the gateway can
+// still be negative, and a single such row must not subtract from a figure
+// the dashboard presents as usage or spend.
+
 // Summarize computes totals matching the filter since the given time.
 func (s *Store) Summarize(ctx context.Context, f MetricsFilter, since time.Time) (*MetricsSummary, error) {
 	return s.SummarizeBetween(ctx, f, since, time.Time{})
@@ -132,12 +138,12 @@ func (s *Store) Summarize(ctx context.Context, f MetricsFilter, since time.Time)
 func (s *Store) SummarizeBetween(ctx context.Context, f MetricsFilter, since, until time.Time) (*MetricsSummary, error) {
 	q := `SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
+		COALESCE(SUM(GREATEST(prompt_tokens, 0)), 0), COALESCE(SUM(GREATEST(completion_tokens, 0)), 0),
 		COALESCE(AVG(latency_ms), 0)::float8,
 		COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::float8,
 		COALESCE(SUM(CASE WHEN rag_used THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN status_code = 429 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(cost_micros), 0)
+		COALESCE(SUM(GREATEST(cost_micros, 0)), 0)
 		FROM request_logs WHERE created_at >= $1`
 	base := []any{since.UTC()}
 	if !until.IsZero() {
@@ -216,8 +222,8 @@ func (s *Store) DailySeries(ctx context.Context, f MetricsFilter, days int) ([]D
 	since := time.Now().UTC().AddDate(0, 0, -days+1).Truncate(24 * time.Hour)
 	q := `SELECT date_trunc('day', created_at AT TIME ZONE 'UTC') AS day, COUNT(*),
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
-		COALESCE(SUM(cost_micros), 0)
+		COALESCE(SUM(GREATEST(prompt_tokens, 0)), 0), COALESCE(SUM(GREATEST(completion_tokens, 0)), 0),
+		COALESCE(SUM(GREATEST(cost_micros, 0)), 0)
 		FROM request_logs WHERE created_at >= $1`
 	cond, args := f.where([]any{since})
 	q += cond + " GROUP BY day ORDER BY day"
@@ -259,10 +265,10 @@ type ProjectMetrics struct {
 func (s *Store) SummarizeByProject(ctx context.Context, f MetricsFilter, since time.Time) ([]ProjectMetrics, error) {
 	q := `SELECT l.project_id, COALESCE(p.name, ''), COUNT(*),
 		COALESCE(SUM(CASE WHEN l.status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(l.prompt_tokens), 0), COALESCE(SUM(l.completion_tokens), 0),
+		COALESCE(SUM(GREATEST(l.prompt_tokens, 0)), 0), COALESCE(SUM(GREATEST(l.completion_tokens, 0)), 0),
 		COALESCE(SUM(CASE WHEN l.status_code = 429 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN l.rag_used THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(l.cost_micros), 0)
+		COALESCE(SUM(GREATEST(l.cost_micros, 0)), 0)
 		FROM request_logs l LEFT JOIN projects p ON p.id = l.project_id WHERE l.created_at >= $1`
 	cond, args := f.whereCol("l.project_id", []any{since.UTC()})
 	q += cond + " GROUP BY l.project_id, p.name ORDER BY COUNT(*) DESC, l.project_id"

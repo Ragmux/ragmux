@@ -1,7 +1,13 @@
 // Package pricing turns token counts into an estimated cost. It ships a
 // built-in price table (prices.json), seeds it into model_prices on start
-// and resolves a provider type plus a model name to a price, with the
-// operator's own rows taking precedence over the built-in ones.
+// and resolves a provider type plus a model name to a price.
+//
+// Precedence is by pattern specificity alone — exact, then longest literal
+// prefix, then lowest id — and never by where a row came from. An operator
+// overrides a shipped number by editing that row, which keeps its pattern
+// and flips its source to "user"; a broader pattern they add does not
+// shadow the more specific built-in rows, because that would silently
+// re-price every model the shipped table already knows.
 //
 // Every figure is an estimate for the dashboard, not a bill: providers
 // round, discount and change prices without telling the gateway.
@@ -90,6 +96,10 @@ func (t *Table) Lookup(providerType, model string) (Price, bool) {
 	return Price{}, false
 }
 
+// maxMicros is math.MaxInt64 as a float64. The conversion rounds up to
+// 2^63, so a product at or above it is out of int64 range and saturates.
+const maxMicros = float64(math.MaxInt64)
+
 // CostMicros is the cost of one request in millionths of a currency unit.
 // Because Price is per 10^6 tokens and a micro is 10^-6 dollars, tokens
 // times price-per-million is already the cost in micros; no extra scaling.
@@ -97,16 +107,38 @@ func (t *Table) Lookup(providerType, model string) (Price, bool) {
 // promptTokens includes the cached and freshly written parts (that is the
 // convention Usage normalises every provider onto), so the part billed at
 // the full input rate is what is left after both are taken out.
+//
+// The result is saturated to [0, math.MaxInt64]. A cost is never negative,
+// however broken the numbers an upstream reported, and the ceiling matters
+// for its own reason: int64(math.Round(x)) is implementation-defined for an
+// x outside int64's range and arm64 and amd64 disagree on what it produces.
 func (p Price) CostMicros(promptTokens, cachedPrompt, cacheWrite, completionTokens int) int64 {
-	uncached := promptTokens - cachedPrompt - cacheWrite
+	prompt, cached := nonNegative(promptTokens), nonNegative(cachedPrompt)
+	written, completion := nonNegative(cacheWrite), nonNegative(completionTokens)
+	uncached := prompt - cached - written
 	if uncached < 0 {
 		uncached = 0
 	}
 	micros := float64(uncached)*p.Input +
-		float64(cacheWrite)*p.CacheWrite +
-		float64(cachedPrompt)*p.CacheRead +
-		float64(completionTokens)*p.Output
-	return int64(math.Round(micros))
+		float64(written)*p.CacheWrite +
+		float64(cached)*p.CacheRead +
+		float64(completion)*p.Output
+	// A NaN (a table row holding one, or 0 x Inf) fails every comparison and
+	// falls through to zero, which is the same answer a missing price gives.
+	if !(micros > 0) {
+		return 0
+	}
+	if rounded := math.Round(micros); rounded < maxMicros {
+		return int64(rounded)
+	}
+	return math.MaxInt64
+}
+
+func nonNegative(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func hasWildcard(pattern string) bool { return strings.Contains(pattern, "*") }
