@@ -135,7 +135,7 @@ func RoutePattern(r *http.Request) string {
 
 // HTTPMetrics counts, times and sizes every request.
 //
-// It belongs directly after middleware.RequestID and before the request
+// It belongs directly after RequestID and before the request
 // logger, so it measures everything below it including the recoverer: a
 // request that panics is still a request that happened.
 func HTTPMetrics(m *Metrics) func(http.Handler) http.Handler {

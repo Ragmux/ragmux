@@ -29,17 +29,24 @@ func TestRequestIDHeaderNeverReachesASpan(t *testing.T) {
 		SampleRatio: 1, Timeout: 5 * time.Second})
 	e := newEnvOpts(t, testdb.Config(t), envOpts{bootstrap: true, tracer: tracer})
 
-	req, err := http.NewRequest("GET", e.srv.URL+"/healthz", nil)
+	// An /admin/api route on purpose: admin.requestIDHeader is mounted only
+	// there, so this is the one path where the id is written back to the
+	// client and the echo assertion below can actually fail.
+	req, err := http.NewRequest("GET", e.srv.URL+"/admin/api/models", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("X-Request-Id", secret)
+	req.Header.Set("Authorization", "Bearer "+e.session)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("GET /healthz: %v", err)
+		t.Fatalf("GET /admin/api/models: %v", err)
 	}
 	echoed := resp.Header.Get("X-Request-Id")
 	resp.Body.Close()
+	if echoed == "" {
+		t.Fatal("no X-Request-Id came back; the echo assertion below would prove nothing")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

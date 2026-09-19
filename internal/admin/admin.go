@@ -96,8 +96,9 @@ func (a *Admin) Routes(r chi.Router) {
 	}
 }
 
-// requestIDHeader echoes chi's request id so error responses and logs can
-// be matched; fail reads it back from the header.
+// requestIDHeader returns the id obs.RequestID generated for this request so
+// error responses and logs can be matched; fail reads it back from the
+// header. It is never the client's X-Request-Id: that header is not read.
 func requestIDHeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if id := middleware.GetReqID(r.Context()); id != "" {

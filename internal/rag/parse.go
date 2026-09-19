@@ -96,9 +96,13 @@ var ErrTooMuchText = fmt.Errorf("document text exceeds %d MiB after extraction",
 var ErrUnsupportedFileType = fmt.Errorf("unsupported file type; supported types are %s",
 	strings.Join(SupportedExtensionList(), ", "))
 
-// SupportedExtensionList renders SupportedExtensions in a stable order. It is
-// the one place the accepted types are spelled out, so the upload rejection
-// and the parse sentinel cannot drift apart when a format is added.
+// SupportedExtensionList renders SupportedExtensions in a stable order, so
+// the upload rejection in internal/admin and the parse sentinel above cannot
+// drift apart when a format is added.
+//
+// It does not reach every copy of the list: the dashboard's file input
+// (web/index.html) and docs/api.md still spell the types out by hand, and
+// adding a format means editing those too.
 func SupportedExtensionList() []string {
 	out := make([]string, 0, len(SupportedExtensions))
 	for ext := range SupportedExtensions {
