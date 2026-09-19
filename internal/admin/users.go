@@ -225,6 +225,9 @@ func (a *Admin) deleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Admin) resetPassword(w http.ResponseWriter, r *http.Request) {
+	if !sessionOnly(w, r) {
+		return
+	}
 	id, _ := idParam(r)
 	var in struct {
 		New string `json:"new_password"`

@@ -35,7 +35,9 @@ const setupLimiterUser = ""
 // setupStatus reports whether setup is pending plus three facts the setup
 // page shows so an operator can confirm which database the gateway is on:
 // the migration version, where SECRET_KEY came from and the database role.
-// Nothing here identifies users or hosts.
+// has_connections and has_projects let the wizard resume at the right step
+// after a reload. Nothing here identifies users or hosts: all five are
+// booleans or instance-wide facts.
 func (a *Admin) setupStatus(w http.ResponseWriter, r *http.Request) {
 	n, err := a.Store.CountUsers(r.Context())
 	if err != nil {
@@ -47,11 +49,18 @@ func (a *Admin) setupStatus(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	conns, projects, err := a.Store.SetupProgress(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"needs_setup":        n == 0,
 		"migrations_version": info.MigrationsVersion,
 		"secret_key_source":  a.Store.SecretKeySource,
 		"database_role":      info.DatabaseRole,
+		"has_connections":    conns,
+		"has_projects":       projects,
 	})
 }
 
