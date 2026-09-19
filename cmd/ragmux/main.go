@@ -304,7 +304,11 @@ func run(cfg config.Config) error {
 
 	metricsSrv := mountMetrics(r, cfg, registry)
 	if registry != nil {
-		log.Info("metrics enabled", "listen", or(cfg.MetricsListen, "main listener"),
+		listen := cfg.MetricsListen
+		if listen == "" {
+			listen = "main listener"
+		}
+		log.Info("metrics enabled", "listen", listen,
 			"authenticated", cfg.MetricsToken != "", "max_series", cfg.MetricsMaxSeries)
 	}
 
@@ -526,14 +530,6 @@ func readyz(st *store.Store, log *slog.Logger) http.HandlerFunc {
 		}
 		_ = json.NewEncoder(w).Encode(res)
 	}
-}
-
-// or is the first non-empty of two strings, for log lines.
-func or(v, def string) string {
-	if v != "" {
-		return v
-	}
-	return def
 }
 
 // realIP replaces RemoteAddr with the client address a trusted reverse proxy
