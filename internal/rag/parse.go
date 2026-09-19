@@ -94,11 +94,12 @@ var ErrTooMuchText = fmt.Errorf("document text exceeds %d MiB after extraction",
 // exported to a third-party collector. Naming the supported types instead is
 // both safe and more useful than echoing the rejected one back.
 var ErrUnsupportedFileType = fmt.Errorf("unsupported file type; supported types are %s",
-	strings.Join(supportedExtensionList(), ", "))
+	strings.Join(SupportedExtensionList(), ", "))
 
-// supportedExtensionList renders SupportedExtensions in a stable order, so
-// the sentinel's message does not shuffle between builds.
-func supportedExtensionList() []string {
+// SupportedExtensionList renders SupportedExtensions in a stable order. It is
+// the one place the accepted types are spelled out, so the upload rejection
+// and the parse sentinel cannot drift apart when a format is added.
+func SupportedExtensionList() []string {
 	out := make([]string, 0, len(SupportedExtensions))
 	for ext := range SupportedExtensions {
 		out = append(out, ext)

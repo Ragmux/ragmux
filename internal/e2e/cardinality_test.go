@@ -31,8 +31,8 @@ func seriesWithPrefix(text, prefix string) int {
 func TestInventedMethodCollapsesToOther(t *testing.T) {
 	e := newEnv(t, testdb.Config(t))
 
-	// One known verb first, so the test can tell "collapsed" from "not
-	// recorded at all".
+	// The baseline the invented verbs are measured against: the series the
+	// stack's own setup traffic has already created.
 	before := seriesWithPrefix(e.registry.Text(), "ragmux_http_requests_total{")
 
 	invented := []string{"PROPFIND", "FROBNICATE", "X-9f2c1b7e4a3d", "CHECKOUT", "BREW"}

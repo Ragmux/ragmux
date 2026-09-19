@@ -143,9 +143,16 @@ func (e *exporter) run() {
 			// this point a span that ended during the drain still had a
 			// chance to be exported. From here enqueue counts instead of
 			// accepting, and the second drain below counts the spans that
-			// raced in between the first drain and this store. Between them
-			// every span is either exported or counted, which is what makes
-			// ragmux_tracing_spans_dropped_total trustworthy at shutdown.
+			// raced in between the first drain and this store.
+			//
+			// This is best-effort, not a guarantee. An enqueue that has
+			// already read stopped as false can be descheduled and complete
+			// its send after both the store and the drain below, leaving one
+			// span neither exported nor counted. Closing that window means
+			// serialising enqueue against shutdown, which puts a lock on the
+			// path every span End takes, to make a shutdown-time counter
+			// exact. The counter is a signal, not an audit, so it is left
+			// racy on purpose.
 			e.stopped.Store(true)
 			for {
 				select {

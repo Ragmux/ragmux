@@ -1337,7 +1337,8 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	for _, fh := range files {
 		name := filepath.Base(fh.Filename)
 		if !rag.IsSupported(name) {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported file type for %q (pdf, docx, html, txt, md)", name))
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("unsupported file type for %q (supported types are %s)",
+				name, strings.Join(rag.SupportedExtensionList(), ", ")))
 			return
 		}
 		src, err := fh.Open()

@@ -371,18 +371,14 @@ func run(cfg config.Config) error {
 
 	// Shutdown order: stop accepting HTTP and drain in-flight requests, let
 	// running ingestion jobs finish, flush the spans both of them produced,
-	// stop the retention job, then the deferred st.Close releases the pool.
+	// close the metrics endpoint once those counters are final, stop the
+	// retention job, then the deferred st.Close releases the pool.
 	log.Info("shutting down: draining http")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	shutErr := srv.Shutdown(shutCtx)
 	if shutErr != nil {
 		log.Warn("http shutdown", "err", shutErr)
-	}
-	if metricsSrv != nil {
-		if err := metricsSrv.Shutdown(shutCtx); err != nil {
-			log.Warn("metrics shutdown", "err", err)
-		}
 	}
 	log.Info("shutting down: waiting for ingestion jobs")
 	if !ingester.StopWithTimeout(30 * time.Second) {
@@ -397,6 +393,22 @@ func run(cfg config.Config) error {
 			log.Warn("tracing shutdown", "err", err)
 		}
 		traceCancel()
+		// Spans that end after this point cannot be exported and are counted
+		// instead. The count is logged as well as exported because a span
+		// dropped during shutdown is the case a scrape is least likely to
+		// catch, and some deployments do not scrape this process at all.
+		if n := tracer.Dropped(); n > 0 {
+			log.Warn("spans dropped; the export queue was full or the exporter had already stopped",
+				"spans", n)
+		}
+	}
+	// The metrics endpoint outlives the tracer on purpose: it is what serves
+	// the final scrape, and ragmux_tracing_spans_dropped_total only reaches
+	// its shutdown value once the exporter above has stopped.
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutCtx); err != nil {
+			log.Warn("metrics shutdown", "err", err)
+		}
 	}
 	stopBackground()
 	<-janitorDone
