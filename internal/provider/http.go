@@ -37,6 +37,10 @@ type Config struct {
 	// Logger receives transport failures with their raw (redacted) cause;
 	// nil means slog.Default().
 	Logger *slog.Logger
+	// Images resolves remote image URLs for adapters whose upstream cannot
+	// fetch one. Nil keeps the plain rejection those adapters answered with
+	// before, so switching image fetching off changes nothing else.
+	Images *ImageFetcher
 }
 
 func (c Config) client() *http.Client {

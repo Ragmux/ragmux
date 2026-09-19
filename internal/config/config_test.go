@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadReadsSecretsFromFiles(t *testing.T) {
@@ -49,5 +50,51 @@ func TestLoadReadsSecretsFromFiles(t *testing.T) {
 	t.Setenv("TRUSTED_PROXY_CIDRS", "not-a-network")
 	if _, err := Load(); err == nil {
 		t.Error("bad CIDR should fail")
+	}
+}
+
+func TestLoadImageSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ImageFetch || c.ImageFetchMaxBytes != 8<<20 || c.ImageFetchTimeout != 10*time.Second ||
+		c.ImageFetchMaxPerRequest != 8 || c.ImageCacheEntries != 64 || c.ImageCacheTTL != 10*time.Minute {
+		t.Errorf("defaults = %+v", c)
+	}
+
+	t.Setenv("IMAGE_FETCH", "false")
+	t.Setenv("IMAGE_FETCH_MAX_MB", "2")
+	t.Setenv("IMAGE_FETCH_TIMEOUT", "3s")
+	t.Setenv("IMAGE_FETCH_MAX_PER_REQUEST", "1")
+	// 0 entries is the documented way to turn caching off, not an error.
+	t.Setenv("IMAGE_CACHE_ENTRIES", "0")
+	t.Setenv("IMAGE_CACHE_TTL", "45s")
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ImageFetch || c.ImageFetchMaxBytes != 2<<20 || c.ImageFetchTimeout != 3*time.Second ||
+		c.ImageFetchMaxPerRequest != 1 || c.ImageCacheEntries != 0 || c.ImageCacheTTL != 45*time.Second {
+		t.Errorf("overrides = %+v", c)
+	}
+
+	for _, bad := range []struct{ key, value string }{
+		{"IMAGE_FETCH_MAX_MB", "0"},
+		{"IMAGE_FETCH_MAX_MB", "huge"},
+		{"IMAGE_FETCH_TIMEOUT", "-1s"},
+		{"IMAGE_FETCH_TIMEOUT", "soon"},
+		{"IMAGE_FETCH_MAX_PER_REQUEST", "0"},
+		{"IMAGE_CACHE_ENTRIES", "-1"},
+		{"IMAGE_CACHE_TTL", "0"},
+	} {
+		t.Run(bad.key+"="+bad.value, func(t *testing.T) {
+			t.Setenv(bad.key, bad.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), bad.key) {
+				t.Errorf("err = %v", err)
+			}
+		})
 	}
 }

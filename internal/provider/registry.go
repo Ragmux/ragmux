@@ -43,9 +43,3 @@ func NewEmbedder(cfg Config) (Embedder, error) {
 	}
 	return nil, fmt.Errorf("unsupported provider type %q", cfg.ProviderType)
 }
-
-// SupportsEmbeddings reports whether a provider type can back a RAG store.
-func SupportsEmbeddings(providerType string) bool {
-	_, err := NewEmbedder(Config{ProviderType: providerType})
-	return err == nil
-}

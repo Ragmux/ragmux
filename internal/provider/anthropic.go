@@ -89,8 +89,9 @@ type anthropicResponse struct {
 }
 
 // translateAnthropic converts an OpenAI request into the Messages format.
-func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error) {
-	out := anthropicRequest{Model: model, MaxTokens: defaultMaxTokens}
+func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthropicRequest, error) {
+	out := anthropicRequest{Model: cfg.Model, MaxTokens: defaultMaxTokens}
+	images := cfg.imageBudget(ctx)
 	if n := req.MaxOutputTokens(); n > 0 {
 		out.MaxTokens = n
 	}
@@ -104,7 +105,7 @@ func translateAnthropic(req ChatRequest, model string) (anthropicRequest, error)
 		case "system", "developer":
 			system = append(system, m.Text())
 		case "user":
-			parts, err := openAIPartsToAnthropic(m.Content)
+			parts, err := openAIPartsToAnthropic(images, m.Content)
 			if err != nil {
 				return out, err
 			}
@@ -203,38 +204,28 @@ func appendAnthropic(msgs []anthropicMessage, role string, parts []anthropicCont
 	return append(msgs, anthropicMessage{Role: role, Content: parts})
 }
 
-func openAIPartsToAnthropic(raw json.RawMessage) ([]anthropicContent, error) {
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return []anthropicContent{{Type: "text", Text: s}}, nil
-	}
-	var parts []struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		ImageURL struct {
-			URL string `json:"url"`
-		} `json:"image_url"`
-	}
-	if err := json.Unmarshal(raw, &parts); err != nil {
-		return nil, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported message content"}
+func openAIPartsToAnthropic(images *imageBudget, raw json.RawMessage) ([]anthropicContent, error) {
+	parts, err := parseContent(raw)
+	if err != nil {
+		return nil, err
 	}
 	var out []anthropicContent
 	for _, p := range parts {
-		switch p.Type {
-		case "text":
+		if p.Type == "text" {
 			out = append(out, anthropicContent{Type: "text", Text: p.Text})
-		case "image_url":
-			u := p.ImageURL.URL
-			if strings.HasPrefix(u, "data:") {
-				meta, data, ok := strings.Cut(strings.TrimPrefix(u, "data:"), ",")
-				if !ok {
-					continue
-				}
-				mt := strings.TrimSuffix(meta, ";base64")
-				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: mt, Data: data}})
-			} else {
-				out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: u}})
+			continue
+		}
+		ref := p.Image
+		if anthropicInlineImages {
+			if ref, err = images.inline(ref); err != nil {
+				return nil, err
 			}
+		}
+		switch {
+		case ref.Base64 != "":
+			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "base64", MediaType: ref.MediaType, Data: ref.Base64}})
+		case ref.URL != "":
+			out = append(out, anthropicContent{Type: "image", Source: &anthropicImage{Type: "url", URL: ref.URL}})
 		}
 	}
 	if len(out) == 0 {
@@ -258,7 +249,7 @@ func anthropicFinish(stop string) *string {
 }
 
 func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	body, err := translateAnthropic(req, p.cfg.Model)
+	body, err := translateAnthropic(ctx, p.cfg, req)
 	if err != nil {
 		return nil, err
 	}
@@ -267,26 +258,16 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		return nil, err
 	}
 	var text strings.Builder
-	var toolCalls []map[string]any
+	var calls []toolCall
 	for _, c := range ar.Content {
 		switch c.Type {
 		case "text":
 			text.WriteString(c.Text)
 		case "tool_use":
-			args := string(c.Input)
-			if args == "" {
-				args = "{}"
-			}
-			toolCalls = append(toolCalls, map[string]any{
-				"id": c.ID, "type": "function",
-				"function": map[string]string{"name": c.Name, "arguments": args},
-			})
+			calls = append(calls, toolCall{ID: c.ID, Name: c.Name, Arguments: string(c.Input)})
 		}
 	}
-	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String())}
-	if len(toolCalls) > 0 {
-		msg.ToolCalls, _ = json.Marshal(toolCalls)
-	}
+	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String()), ToolCalls: toolCallsJSON(calls)}
 	id := ar.ID
 	if id == "" {
 		id = chatID()
@@ -300,7 +281,7 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 }
 
 func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
-	body, err := translateAnthropic(req, p.cfg.Model)
+	body, err := translateAnthropic(ctx, p.cfg, req)
 	if err != nil {
 		return err
 	}
@@ -323,10 +304,9 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 			return false
 		}
 	}
-	// Track tool_use blocks by content index so argument deltas map to the
-	// right OpenAI tool_calls index.
-	toolIndex := map[int]int{}
-	nextTool := 0
+	// Tool_use blocks are tracked by content index so argument deltas map to
+	// the right OpenAI tool_calls index.
+	var tools toolCallStream
 	var streamErr error
 	sentRole := false
 
@@ -365,12 +345,7 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				} `json:"content_block"`
 			}
 			if json.Unmarshal([]byte(ev.Data), &cb) == nil && cb.ContentBlock.Type == "tool_use" {
-				toolIndex[cb.Index] = nextTool
-				tc, _ := json.Marshal([]map[string]any{{
-					"index": nextTool, "id": cb.ContentBlock.ID, "type": "function",
-					"function": map[string]string{"name": cb.ContentBlock.Name, "arguments": ""},
-				}})
-				nextTool++
+				tc := tools.Open(cb.Index, cb.ContentBlock.ID, cb.ContentBlock.Name)
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
 			}
 			return true
@@ -395,13 +370,10 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				}
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}})
 			case "input_json_delta":
-				ti, ok := toolIndex[d.Index]
-				if !ok {
+				tc := tools.Args(d.Index, d.Delta.PartialJSON)
+				if tc == nil {
 					return true
 				}
-				tc, _ := json.Marshal([]map[string]any{{
-					"index": ti, "function": map[string]string{"arguments": d.Delta.PartialJSON},
-				}})
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
 			}
 			return true

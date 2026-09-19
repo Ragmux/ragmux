@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -180,6 +181,55 @@ func TestOllamaStreamNDJSON(t *testing.T) {
 	}
 }
 
+// Ollama can spread tool calls over several NDJSON lines. Each line used to
+// index its calls from zero, so a client accumulating by index merged them
+// into one call with concatenated arguments.
+func TestOllamaStreamToolCallIndexes(t *testing.T) {
+	srv, _ := ollamaServer(t, func(w http.ResponseWriter, _ ollamaRequest, _ map[string]json.RawMessage) {
+		for _, line := range []string{
+			`{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Ankara"}}}]},"done":false}`,
+			`{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_time","arguments":{"tz":"UTC"}}}]},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":6}`,
+		} {
+			_, _ = fmt.Fprintln(w, line)
+		}
+	})
+	p, _ := New(Config{ProviderType: "ollama", BaseURL: srv.URL, Model: "llama3"})
+	out := make(chan StreamChunk, 16)
+	if err := p.ChatStream(context.Background(), parseReq(t, `{"messages":[{"role":"user","content":"hi"}]}`), out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+	var deltas []string
+	var finish string
+	for c := range out {
+		for _, ch := range c.Choices {
+			if len(ch.Delta.ToolCalls) > 0 {
+				deltas = append(deltas, string(ch.Delta.ToolCalls))
+			}
+			if ch.FinishReason != nil {
+				finish = *ch.FinishReason
+			}
+		}
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("got %d tool deltas: %v", len(deltas), deltas)
+	}
+	for i, want := range []string{
+		`"index":0`, `"index":1`,
+	} {
+		if !strings.Contains(deltas[i], want) {
+			t.Errorf("delta %d = %s, want %s", i, deltas[i], want)
+		}
+	}
+	if !strings.Contains(deltas[0], `"name":"get_weather"`) || !strings.Contains(deltas[1], `"name":"get_time"`) ||
+		!strings.Contains(deltas[1], `{\"tz\":\"UTC\"}`) {
+		t.Errorf("deltas = %v", deltas)
+	}
+	if finish != "tool_calls" {
+		t.Errorf("finish = %q", finish)
+	}
+}
+
 func TestOllamaErrors(t *testing.T) {
 	t.Run("http error body", func(t *testing.T) {
 		srv, _ := ollamaServer(t, func(w http.ResponseWriter, _ ollamaRequest, _ map[string]json.RawMessage) {
@@ -221,7 +271,7 @@ func TestOllamaErrors(t *testing.T) {
 func TestTranslateOllamaImagesAndFormat(t *testing.T) {
 	req := parseReq(t, `{"messages":[{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]}],
 		"response_format":{"type":"json_object"}}`)
-	out, err := translateOllama(req, "llava")
+	out, err := translateOllama(context.Background(), Config{Model: "llava"}, req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,11 +284,46 @@ func TestTranslateOllamaImagesAndFormat(t *testing.T) {
 	if out.Options != nil {
 		t.Errorf("options should be omitted when empty: %v", out.Options)
 	}
-	if _, err := translateOllama(parseReq(t, `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}]}`), "m"); err == nil {
-		t.Error("remote image URLs should be rejected")
+	remote := parseReq(t, `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}]}`)
+	if _, err := translateOllama(context.Background(), Config{Model: "m"}, remote); err == nil {
+		t.Error("remote image URLs should be rejected without an image fetcher")
 	}
-	if _, err := translateOllama(ChatRequest{}, "m"); err == nil {
+	if _, err := translateOllama(context.Background(), Config{Model: "m"}, ChatRequest{}); err == nil {
 		t.Error("empty messages should be rejected")
+	}
+}
+
+// With a fetcher configured the same remote URL is downloaded and inlined,
+// because Ollama takes nothing else.
+func TestTranslateOllamaInlinesRemoteImages(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("PNGBYTES"))
+	}))
+	defer srv.Close()
+	cfg := Config{Model: "llava", Images: &ImageFetcher{Client: srv.Client()}}
+	req := parseReq(t, `{"messages":[{"role":"user","content":[{"type":"text","text":"what is this?"},
+		{"type":"image_url","image_url":{"url":"`+srv.URL+`/a.png"}}]}]}`)
+	out, err := translateOllama(context.Background(), cfg, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Messages[0].Images) != 1 || out.Messages[0].Images[0] != base64.StdEncoding.EncodeToString([]byte("PNGBYTES")) {
+		t.Errorf("images = %v", out.Messages[0].Images)
+	}
+	if got != "image/*" {
+		t.Errorf("accept = %q", got)
+	}
+	// The per-request cap bounds the fan-out of one chat request.
+	cfg.Images.MaxPerRequest = 1
+	two := parseReq(t, `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"`+srv.URL+`/a.png"}},
+		{"type":"image_url","image_url":{"url":"`+srv.URL+`/b.png"}}]}]}`)
+	_, err = translateOllama(context.Background(), cfg, two)
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Status != 400 || !strings.Contains(pe.Message, "at most 1 remote images") {
+		t.Errorf("err = %v", err)
 	}
 }
 
