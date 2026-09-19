@@ -26,28 +26,44 @@ only).
 The table above is about `/admin/api` and the dashboard. It is not a spending limit, and
 `viewer` is not a read-only *account* — only a read-only *administrator*. The key routes
 are deliberately role-free, because every account manages its own credentials, so a
-`viewer` can mint itself an `sk-user-…` gateway key and send traffic through `/v1` for
-the projects it is a member of. That spend is charged to the projects' budgets and to
-the key's owner in the usage records, exactly as an editor's or an admin's would be.
+`viewer` can mint itself an `sk-user-…` gateway key granting the projects it is a member
+of, and send traffic through `/v1`. That spend is charged to those projects' budgets and
+attributed to the key in the usage records, exactly as an editor's or an admin's would
+be.
 
-What bounds it is the user's own limits, not their role:
+What bounds that spend is never a role. It is:
 
 - the per-project rate limits and token budgets the key runs under (below), and
 - the optional per-key sub-limits set when the key is created ([Key sub-limits](#key-sub-limits)).
 
-To cap a particular user, give their key a sub-limit; note that `0` there means
-*unlimited*, not *nothing*, so capping means setting a small ceiling rather than a zero.
-To stop them outright, revoke the key (`POST /admin/api/keys/{id}/revoke`), drop their
-project membership, or deactivate the account (`PUT /admin/api/users/{id}` with
-`is_active: false`) — deactivation stops every key the user holds at once, at `/v1` with
-`401 key_owner_inactive`, because a key's effective permission is its scopes intersected
-with the owner's *live* role and status. Demoting someone to `viewer` takes away the
-admin surface and nothing else.
+A user carries no limit of its own; limits live on the project and on the key.
 
-Roles still bind everywhere they are the control: the key a `viewer` mints can carry no
-scope the `viewer` role does not cover, so it cannot reach a `write`, `admin` or `keys`
-management scope, and `management` keys need at least `editor` plus an interactive
-session. Recorded as ADR-003.
+**To cap one user**, give their key a sub-limit. Note that `0` there means *unlimited*,
+not *nothing*, so capping means setting a small ceiling — setting it to zero removes the
+ceiling instead of applying one.
+
+**To stop them outright**, revoke the key (`POST /admin/api/keys/{id}/revoke`), or
+deactivate the account (`PUT /admin/api/users/{id}` with `is_active: false`).
+Deactivation stops every key the user holds at once, at `/v1` with
+`401 key_owner_inactive`.
+
+**Two things that look like they would stop a key and do not:**
+
+- **Dropping the user's project membership.** A gateway key carries its own grants,
+  validated once when the key was created; `/v1` consults only those and never rechecks
+  `project_members` ([API keys](#api-keys) below). The user loses the project in the
+  dashboard while the key keeps spending against it.
+- **Setting a limit to `0`.** That is the unlimited value, as above.
+
+**Demoting the user to `viewer`** takes away the admin surface and nothing else on the
+gateway side. Role is intersected with a key's scopes on `/admin/api` only, where it is
+read live on every request, so a demotion narrows the `sk-mgmt-…` keys the user holds
+immediately. It changes nothing about an `sk-user-…` key: `/v1` does not consult roles,
+and `chat` and `models` are scopes every role including `viewer` already covers.
+
+Roles do still bind where they are the control: a `viewer` cannot put a `write`, `admin`
+or `keys` scope on any key it mints, and a `management` key needs at least `editor` plus
+an interactive session. Recorded as ADR-003.
 
 ## Project membership
 

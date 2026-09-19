@@ -24,14 +24,25 @@ import (
 //
 // A role bounds the *admin surface*, not gateway spend. The key routes are
 // deliberately role-free -- every account manages its own API keys -- so a
-// viewer can mint itself an sk-user-… key and spend through /v1 on the
-// projects it belongs to. That is not a hole in the matrix above: what the
-// spend is bounded by is the user's own limit, not their role, and the
-// operator who wants it stopped zeroes that limit or deactivates the account.
-// Roles still hold everywhere they are the control: the key a viewer mints
-// can carry no scope the viewer's live role does not cover (clipScopes), and
-// it narrows the moment the account is demoted or deactivated. Decided in
-// ADR-003; docs/users-and-limits.md states the same split.
+// viewer can mint itself an sk-user-… key and spend through /v1. That is not
+// a hole in the matrix above: spend is bounded by the project's limits and
+// the key's own sub-limits, never by a role. A user carries no limit of its
+// own.
+//
+// What stops a gateway key is revoking it, giving it a small sub-limit, or
+// deactivating the owner (gateway.go answers key_owner_inactive). Two things
+// that look like they would and do not: dropping the owner's project
+// membership, because grants are frozen when the key is created and outlive
+// membership on purpose (gateway.selectProject), and setting a limit to 0,
+// because 0 means unlimited here (limits.tighter).
+//
+// Demotion is a management-key tool, not a gateway one. Role is intersected
+// with a key's scopes on the /admin/api side only -- RequireRole below reads
+// the owner's live role on every request -- so demoting someone narrows the
+// sk-mgmt-… keys they hold at once. It changes nothing about an sk-user-…
+// key: /v1 never consults a role, and chat and models are scopes every role
+// including viewer already covers. Decided in ADR-003;
+// docs/users-and-limits.md states the same split.
 type Role string
 
 // The three roles, ordered from most to least privileged.
