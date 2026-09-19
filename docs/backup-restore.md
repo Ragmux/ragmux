@@ -22,7 +22,7 @@ holds a canary in `instance_settings` that only the key it was written with can 
 a dump restored onto a host with a different `SECRET_KEY` fails at boot with
 `SECRET_KEY does not match the one this database was written with (key source: …)`
 rather than looking healthy until the first chat request. Put the matching key back — see
-[SECRET_KEY](scaling.md#secret-key).
+[SECRET_KEY](scaling.md#secret_key).
 
 **Without the key at all**, the fastest way back is a database whose canary you own:
 restore the dump, drop the canary row (`DELETE FROM instance_settings WHERE key =

@@ -110,7 +110,7 @@ The same policy applies to the `POST /admin/api/models/{id}/test` ping.
 Without flags the binary loads the configuration, connects to the database, applies
 pending migrations under an advisory lock (several replicas may start against the same
 database), checks that `SECRET_KEY` is the one the database was written with (see
-[SECRET_KEY](scaling.md#secret-key)), creates the first admin if needed, starts working
+[SECRET_KEY](scaling.md#secret_key)), creates the first admin if needed, starts working
 the document ingestion queue and starts listening.
 
 ## Subcommands
@@ -200,7 +200,7 @@ least-privilege database role `ragmux_app`; they differ in where PostgreSQL runs
 | | All-in-one (default) | Split |
 |---|---|---|
 | Compose file | `docker-compose.yml` | `docker-compose.split.yml` |
-| Image | `ghcr.io/ragmux/ragmux:<version>`, `:latest` (`Dockerfile.aio`) | `ghcr.io/ragmux/ragmux:<version>-app`, `:latest-app` (`Dockerfile`, distroless) + `pgvector/pgvector:pg17` |
+| Image | `ragmux/ragmux:<version>`, `:latest` (`Dockerfile.aio`) | `ragmux/ragmux:<version>-app`, `:latest-app` (`Dockerfile`, distroless) + `pgvector/pgvector:pg17` |
 | Containers | one: PostgreSQL 17 + pgvector and the gateway, supervised by `docker/aio/entrypoint.sh` | two: gateway and database |
 | State | volume `ragmux-data` mounted at `/data` | volume `pgdata` (database only) |
 | Required `.env` | nothing (`SECRET_KEY` recommended) | `SECRET_KEY`, `POSTGRES_PASSWORD`, `RAGMUX_DB_PASSWORD` |
@@ -259,9 +259,11 @@ password. Use it when the database lives elsewhere anyway (managed PostgreSQL: r
 gateway image alone with `DATABASE_URL`), when you want to back up or upgrade the
 database on its own schedule, or when several gateway replicas share one database.
 
-**Upgrades.** The PostgreSQL major version inside the all-in-one image stays at **17**
-for the 0.3 line; pulling a newer Ragmux image never runs `pg_upgrade`, and the
-entrypoint refuses to start on a `PGDATA` of another major version. Migrations of the
+**Upgrades.** The PostgreSQL major version inside the all-in-one image is currently
+**17** and never changes within a minor series; when a release does move it, its notes
+say so and name the migration path. Pulling a newer Ragmux image never runs
+`pg_upgrade` on its own, and the entrypoint refuses to start on a `PGDATA` of another
+major version. Migrations of the
 Ragmux schema run at gateway start as before (back up first:
 `scripts/backup.sh && docker compose pull && docker compose up -d`).
 
@@ -319,15 +321,26 @@ The gateway reads each file once at startup and trims surrounding whitespace; th
 variable wins when both are set. (With the default file, a `DATABASE_URL_FILE` disables
 the embedded server just like `DATABASE_URL`.)
 
-Published images, `linux/amd64` and `linux/arm64`, built by the release workflow on
-every `v*` tag:
+## Published images
 
-- `ghcr.io/ragmux/ragmux:<version>` (also `:<major>.<minor>` and `:latest`): the
-  all-in-one image.
-- `ghcr.io/ragmux/ragmux:<version>-app` (also `:<major>.<minor>-app` and
-  `:latest-app`): the gateway alone on a distroless base.
+Three variants, `linux/amd64` and `linux/arm64`, built by the release workflow on every
+`v*` tag. Each gets the exact version, the `<major>.<minor>` series and a floating tag:
 
-From v0.3.1 on both are signed with cosign; see
+- `ragmux/ragmux:<version>` (also `:<major>.<minor>` and `:latest`): the all-in-one
+  image, the gateway and its own PostgreSQL 17 + pgvector (`Dockerfile.aio`).
+- `ragmux/ragmux:<version>-app` (also `:<major>.<minor>-app` and `:latest-app`): the
+  gateway alone on a distroless base, against your own `DATABASE_URL` (`Dockerfile`).
+- `ragmux/ragmux:<version>-paradedb` (also `:<major>.<minor>-paradedb` and
+  `:latest-paradedb`): the all-in-one image whose PostgreSQL carries `pg_search` (BM25)
+  as well as `pgvector` (`Dockerfile.aio.paradedb`).
+
+The primary registry is **Docker Hub**; the same images are published to the GitHub
+Container Registry as `ghcr.io/ragmux/ragmux` with identical tags, so either host serves
+the same builds. Which variant suits which installation is summarised in the
+[README quick start](../README.md#which-image).
+
+A floating tag is for trying it out: pin `<version>`, or the manifest digest, for
+anything you deploy. From v0.3.1 on all of them are signed with cosign; see
 [Verifying the container image](../SECURITY.md#verifying-the-container-image) for the
 `cosign verify` command to run before deploying.
 
