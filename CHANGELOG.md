@@ -78,6 +78,22 @@ All notable changes to Ragmux are documented here. The format follows
   instead of all of them.
 - **`docs/scaling.md`** and `docker-compose.scale.yml`: how to run several replicas, what
   is already shared, and what must be set first.
+- **A Prometheus `/metrics` endpoint and OpenTelemetry traces**, both written against the
+  standard library so the dependency list is unchanged. `/metrics` is **off by default**
+  and, when enabled, requires a bearer token or a loopback-only listener — a configuration
+  that would publish it unauthenticated on a public bind refuses to start. The metric set
+  names every project and model and reports per-project token counts and spend, which is
+  the same data the admin metrics endpoints already require a session for. Labels are
+  bounded by construction: the HTTP route is the chi pattern rather than the path, and the
+  model is the connection's, never the client's. Tracing is off unless an OTLP endpoint is
+  set, samples at 5% by default, ignores an inbound `traceparent` unless told to trust it,
+  and covers seven spans; point it at an OpenTelemetry Collector, which is the supported
+  configuration. See [Observability](docs/observability.md).
+- **`GET /readyz`**: ready when the pool answers and the schema is at the version this
+  binary embeds. `/healthz` stays liveness-only, so container healthchecks are unchanged.
+  A store whose search backend is unavailable is reported as degraded with a `200`, not a
+  `503` — the fallback works, and taking the replica out of rotation would turn a
+  degraded-but-serving instance into an outage.
 - `GET /admin/api/search-backends` reports which backends this server can actually run.
   `/admin/api/provider-types` now carries a full `capabilities` object taken from the
   provider package, so it cannot drift from what the adapters do.
