@@ -692,13 +692,17 @@ Non-streaming responses are the provider's answer normalised to the OpenAI schem
 `text/event-stream` with `data: {chunk}` lines and a final `data: [DONE]`; a failure
 after the stream has started is emitted as a `data: {"error": …}` event before `[DONE]`.
 
-Every chunk carries a non-empty `choices` array unless you set
-`stream_options: {"include_usage": true}`, which adds one final usage-only chunk
-(`"choices": []` with `usage`) before `[DONE]`, exactly as OpenAI does. This holds on
-every provider: the gateway always asks its upstream for token counts, because the
-request log, the budgets and the cost are built from them, but it does not pass a
-trailer on to a client that did not ask for one — a client indexing `choices[0]` on
-every chunk would break on it.
+**The usage-only trailer** — one final chunk carrying `"choices": []` and `usage`
+before `[DONE]` — is sent only when you set `stream_options: {"include_usage": true}`,
+exactly as OpenAI does. This holds on every provider: the gateway always asks its
+upstream for token counts, because the request log, the budgets and the cost are built
+from them, but it does not pass that trailer on to a client that did not ask for one,
+because a client indexing `choices[0]` on every chunk would break on it.
+
+That is a promise about Ragmux's own trailer, not about every chunk. An upstream is
+relayed as it comes, and some send frames of their own with an empty `choices` array —
+Azure's content-filter chunk, a proxy's keep-alive. Ragmux does not drop those: they
+carry information it does not own. Guard the array before indexing it.
 
 Response headers, only for limits that are set on the project or the key. Where both
 tiers have a limit, the header describes whichever has the smaller remaining allowance:
@@ -712,7 +716,10 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 ```
 
 `prompt_tokens` always includes the cached and freshly written parts, on every provider,
-and `prompt_tokens + completion_tokens == total_tokens`. `cache_creation_tokens` has no
+and `prompt_tokens + completion_tokens == total_tokens` — with one known exception, a
+Gemini request that called tools, where Gemini's own total can be larger and the
+difference is neither mapped nor priced (see
+[Gemini tool-use tokens](providers.md#tool-calling)). `cache_creation_tokens` has no
 OpenAI equivalent (OpenAI does not bill cache writes, Anthropic does). See
 [Prompt caching](providers.md#prompt-caching) for the per-provider mapping, including
 the accounting change for cached Anthropic requests.
