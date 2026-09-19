@@ -1,6 +1,6 @@
 # Faz 04 — Token muhasebesi ve fiyat tablosu
 
-- **Durum:** beklemede
+- **Durum:** tamam (review APPROVED, `v0.4`'e merge edildi)
 - **Sahip:** backend-engineer
 - **Bağımlılık:** yok
 - **İlgili karar:** PRD davranış kuralı 7 (maliyet tahmindir)

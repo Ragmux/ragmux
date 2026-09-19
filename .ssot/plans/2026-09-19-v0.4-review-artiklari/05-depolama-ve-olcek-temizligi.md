@@ -1,6 +1,6 @@
 # Faz 05 — Depolama ve ölçek temizliği
 
-- **Durum:** beklemede
+- **Durum:** tamam (review APPROVED, `v0.4`'e merge edildi)
 - **Sahip:** backend-engineer
 - **Bağımlılık:** yok
 - **İlgili karar:** PRD davranış kuralı 8 (retrieval hatası isteği düşürmez)
