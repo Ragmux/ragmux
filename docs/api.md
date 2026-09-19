@@ -565,10 +565,11 @@ already knows.
   **increases**; a release that does not bump it changes nothing.
 - **Built-in rows cannot be deleted**, only edited or reset. That removes the "deleted
   row resurrects on upgrade" problem without a tombstone column to remember it by.
-- **A model dropped from the shipped table is retired** on the next start: the seed
-  removes rows that are still `"builtin"` and not newer than the shipped version, so a
-  price that turned out to be wrong does not live on in existing installs. A row you
-  edited is yours and stays.
+- The seed only inserts and refreshes; it **never removes a row**. Dropping a model from
+  the shipped table therefore leaves existing installs holding the old row, and retiring
+  one is a numbered migration you can read in the release — a general "remove whatever
+  the shipped table stopped listing" rule would let a pattern renamed in a later release
+  silently drop a model's price everywhere.
 - `ollama` ships a `*` row at 0: it runs on your own hardware, so it must never report
   phantom spend. **`custom_openai` ships no row at all** — it is a URL, and it points at
   a paid API as readily as at vLLM, so its models are `cost_source: "none"` until you

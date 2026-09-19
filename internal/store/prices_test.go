@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/ragmux/ragmux/internal/pricing"
@@ -211,13 +213,14 @@ func insertPriceRow(t *testing.T, s *store.Store, providerType, pattern, source 
 	}
 }
 
-// TestSeedRetiresRowsDroppedFromTheShippedTable covers the other half of the
-// upgrade contract. Dropping an entry from prices.json has to reach existing
-// installs: the custom_openai catch-all priced a paid endpoint at $0.00 with
-// cost_source "builtin", and leaving it seeded forever would mean the fix
-// only ever helped fresh installs. An operator who made the row theirs keeps
-// it, and a newer table's rows survive an older binary.
-func TestSeedRetiresRowsDroppedFromTheShippedTable(t *testing.T) {
+// TestSeedNeverRemovesRows pins the seed's half of the upgrade contract. It
+// inserts and refreshes and does nothing else: a row the shipped table
+// stopped listing stays until a numbered migration removes it. The general
+// rule — delete whatever prices.json no longer lists — was considered and
+// rejected, because a pattern renamed in some later release would then drop
+// that model's price across every install and send it to cost_source "none"
+// with no migration to read and nothing in the release notes.
+func TestSeedNeverRemovesRows(t *testing.T) {
 	ctx := context.Background()
 	s := testdb.Open(t)
 	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
@@ -232,10 +235,10 @@ func TestSeedRetiresRowsDroppedFromTheShippedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Three rows the shipped table does not list.
+	// Rows the shipped table does not list, as an older release would have
+	// left them: one still builtin, one the operator made theirs.
 	insertPriceRow(t, s, "custom_openai", "*", store.PriceSourceBuiltin, version-1)
-	insertPriceRow(t, s, "openai", "retired-by-the-operator*", store.PriceSourceUser, version-1)
-	insertPriceRow(t, s, "openai", "from-a-newer-release*", store.PriceSourceBuiltin, version+1)
+	insertPriceRow(t, s, "openai", "dropped-in-a-later-release*", store.PriceSourceUser, version-1)
 
 	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
 		t.Fatal(err)
@@ -248,14 +251,8 @@ func TestSeedRetiresRowsDroppedFromTheShippedTable(t *testing.T) {
 	for _, p := range list {
 		have[p.ProviderType+"/"+p.ModelPattern] = true
 	}
-	if have["custom_openai/*"] {
-		t.Error("a builtin row the shipped table dropped survived the seed")
-	}
-	if !have["openai/retired-by-the-operator*"] {
-		t.Error("the seed retired a row an operator owns")
-	}
-	if !have["openai/from-a-newer-release*"] {
-		t.Error("an older binary retired a row a newer table seeded")
+	if !have["custom_openai/*"] || !have["openai/dropped-in-a-later-release*"] {
+		t.Error("the seed removed a row; retiring one is a migration's job, not the seed's")
 	}
 	for _, r := range shipped {
 		if !have[r.ProviderType+"/"+r.Pattern] {
@@ -263,7 +260,41 @@ func TestSeedRetiresRowsDroppedFromTheShippedTable(t *testing.T) {
 		}
 	}
 	if len(list) != len(shipped)+2 {
-		t.Errorf("table has %d rows, want the %d shipped plus the two kept", len(list), len(shipped))
+		t.Errorf("table has %d rows, want the %d shipped plus the two inserted", len(list), len(shipped))
+	}
+}
+
+// TestMigrationRetiredTheCustomOpenAICatchAll: 0015 removes the row on an
+// install that already had it seeded, and leaves one the operator edited.
+func TestMigrationRetiredTheCustomOpenAICatchAll(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	// The migration has already run on this fresh schema, so re-run its
+	// statement against rows planted the way an older install holds them.
+	insertPriceRow(t, s, "custom_openai", "*", store.PriceSourceBuiltin, 1)
+	insertPriceRow(t, s, "custom_openai", "mine*", store.PriceSourceUser, 1)
+	// go test runs with the package directory as the working directory, so
+	// this reads the very file that ships in the embedded migration set.
+	sql, err := os.ReadFile(filepath.Join("migrations", "0015_drop_custom_openai_catch_all_price.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(ctx, string(sql)); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListModelPrices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := map[string]string{}
+	for _, p := range list {
+		have[p.ProviderType+"/"+p.ModelPattern] = p.Source
+	}
+	if _, ok := have["custom_openai/*"]; ok {
+		t.Error("the seeded custom_openai catch-all survived the migration")
+	}
+	if have["custom_openai/mine*"] != store.PriceSourceUser {
+		t.Error("the migration removed a row the operator owns")
 	}
 }
 

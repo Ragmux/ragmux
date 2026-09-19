@@ -12,11 +12,13 @@ All notable changes to Ragmux are documented here. The format follows
   `cost_source: "builtin"` — a priced zero rather than the missing price it is. Those
   models are now `cost_source: "none"` until you add a row (**Prices** tab, or
   `POST /admin/api/prices`), and the shipped table's `version` moved to `2`. `ollama`
-  keeps its free catch-all: it runs on your own hardware. **On upgrade**, an install that
-  has the old seeded `custom_openai` `*` row loses it on the next start unless it was
-  edited, so a `custom_openai` connection that was showing `$0.00` will start showing no
-  cost at all. Add your own row to keep a figure. Nothing else about the table changes,
-  and a row you edited is still never touched by an upgrade.
+  keeps its free catch-all: it runs on your own hardware. **On upgrade**, migration
+  `0015` deletes that one seeded row, so a `custom_openai` connection that was showing
+  `$0.00` starts showing no cost at all; add your own row to keep a figure. The delete
+  is limited to that pattern and to rows still marked `builtin` — one you edited is
+  `user`, keeps your price and is left alone. Nothing else about the table changes: the
+  seed still only inserts and refreshes, and retiring a row stays a numbered migration
+  rather than something an upgrade decides on its own.
 - **The streaming usage trailer follows `include_usage` on every provider.** The final
   usage-only chunk (`"choices": []` with `usage`) is now sent only to a client that set
   `stream_options: {"include_usage": true}`, the way OpenAI behaves. Previously
