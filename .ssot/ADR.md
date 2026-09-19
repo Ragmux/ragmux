@@ -139,3 +139,91 @@ Key basmayı `editor` rolüne bağlamak: `viewer`'ı gerçekten salt-okunur
 yapardı. Mevcut kurulumlarda viewer'ların key üretme yolunu kapatan bir
 davranış değişikliğiydi ve rollerin anlamını (admin yüzeyi yetkisi)
 gateway kullanımına genişletiyordu.
+
+## ADR-004 — Fiyat tablosundan düşen satırlar tek seferlik migration'la silinir
+
+- **Durum:** kabul edildi
+- **Tarih:** 2026-09-19
+
+### Bağlam
+
+`prices.json` `ollama` ve `custom_openai` için `"*": 0/0` catch-all'ı
+taşıyordu. Ücretli bir API'ye bakan bir `custom_openai` bağlantısı bu
+yüzden `cost_source:"builtin"` ile 0,00 USD raporluyordu; doküman ise
+"eşleşme yoksa `none`" diyordu. Catch-all'ı dosyadan çıkarmak yalnız yeni
+kurulumlara ulaşır — mevcut kurulumlarda satır `model_prices` tablosunda
+durmaya devam eder.
+
+Uygulayan ajan bunu genel bir mekanizmayla çözmüştü: `Seed`, her
+yükseltmede shipped tablodan düşen ne varsa siler. Review bu mekanizmada
+veri kaybı yolu bulamadı (operatörün düzenlediği satır `source='user'`e
+dönüşüyor, downgrade guard'lı), ama sözleşme kayması tespit etti.
+
+### Karar
+
+Genel mekanizma kaldırılır. Yerine yalnız `custom_openai/*` satırını
+silen tek seferlik bir migration gelir; silme `source = 'builtin'`
+satırlarıyla sınırlıdır. `docs/api.md`'nin "Built-in rows cannot be
+deleted" sözleşmesi olduğu gibi kalır.
+
+### Sonuçları
+
+- Bugünkü kusur mevcut kurulumlarda da düzelir.
+- Gelecekteki sürümler için genel bir silme yetkisi açılmaz: v0.5'te bir
+  pattern yeniden adlandırılırsa eski satır tüm kurulumlarda sessizce yok
+  olmaz.
+- Silme, migration'ların zaten görünür ve tek seferlik olduğu yerde olur;
+  operatör ne silindiğini migration dosyasında okuyabilir.
+- Gelecekte gerçekten bir satırın emekliye ayrılması gerekirse, bu yine
+  kendi migration'ıyla ve kendi kararıyla yapılır.
+
+### Değerlendirilen alternatifler
+
+**Genel `retireRows` mekanizması:** bakımı kolay, her sürümde kendiliğinden
+çalışır. Bedeli, `prices.json`'ı düzenleyen herkese tüm kurulumlardan satır
+silme yetkisi vermesi ve boş bir dosyanın tüm builtin satırları
+silebilmesiydi. **Hiç silmemek:** düzeltme mevcut kurulumlara hiç ulaşmaz,
+operatör satırı elle silmek zorunda kalır — yani sessiz yanlış maliyet
+raporlaması sürer.
+
+## ADR-005 — Görsel indirme doygunluğu 429'dur ve kiracı payıyla sınırlanır
+
+- **Durum:** kabul edildi
+- **Tarih:** 2026-09-19
+
+### Bağlam
+
+Görsel indirmede süreç geneli bir eşzamanlılık tavanı yoktu: bir istemci
+isteği, keyfi bir hedefe gateway'in IP'sinden 8 eşzamanlı GET
+ürettirebiliyordu. Tavan eklendi, ama iki seçim açıkta kaldı — doygunlukta
+hangi durum kodunun döneceği ve tavanın kaç olacağı.
+
+Ölçülen: tek bir istek slotları tek başına doyuramıyor (adapter'lar
+görselleri sırayla çekiyor), ama 4 eşzamanlı istek yavaş bir görsel
+host'una yöneldiğinde tüm süreci doyuruyor ve başka bir projenin görselli
+isteği 10 sn asılı kalıp hata alıyor.
+
+### Karar
+
+Doygunlukta **429** dönülür, `Retry-After` başlığıyla ve
+`image_fetch_saturated` koduyla. Tavan varsayılanı **16**'dır ve tek bir
+key ya da proje slotların yarısından fazlasını tutamaz.
+
+### Sonuçları
+
+- Dışa doğru amplifikasyon kapalı kalırken içe doğru kiracılar-arası
+  açlık da kapanır.
+- 429 semantik olarak doğru olanı söyler: bu bir kaynak sınırlaması,
+  sunucu arızası değil. OpenAI SDK'ları ≥500'ü üssel backoff ile otomatik
+  retry ediyor; 503 seçilseydi tavan dolu kaldığı sürece her istek 3×
+  kuyrukta bekleyecekti.
+- `docs/api.md` durum kodu tablosuna yeni bir satır girer.
+- Pay ayrımı biraz kod maliyeti getirir ve tek takımlı kurulumlarda hiç
+  devreye girmez.
+
+### Değerlendirilen alternatifler
+
+**503 + `Retry-After`:** "geçici olarak kapasitem yok" demenin standart
+yolu, ama SDK'ların ağır retry davranışını tetikliyordu. **Tavanı 4'te
+bırakmak:** dışa doğru en sıkı koruma, ama ölçülen kiracılar-arası açlığı
+kabul etmek demekti.
