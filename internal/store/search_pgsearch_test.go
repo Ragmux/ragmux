@@ -158,6 +158,45 @@ func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
 	}
 }
 
+// TestTokenizerFromReloptions covers the drift check that runs before the
+// index DDL. CREATE INDEX IF NOT EXISTS leaves an existing index alone, so
+// an index built under an earlier PG_SEARCH_TOKENIZER keeps its own
+// analyser; reading it back is the only way the log can name the analyser
+// queries actually use rather than the one the configuration asks for.
+func TestTokenizerFromReloptions(t *testing.T) {
+	// What PostgreSQL stores for the DDL bm25IndexDDL builds.
+	built := func(tok string) []string {
+		return []string{
+			"key_field=id",
+			`text_fields={"content":{"tokenizer":{"type":"` + tok + `"},"record":"position"}}`,
+			`numeric_fields={"rag_store_id":{"fast":true},"document_id":{"fast":true}}`,
+		}
+	}
+	if got := tokenizerFromReloptions(built("en_stem")); got != "en_stem" {
+		t.Errorf("tokenizer = %q, want en_stem", got)
+	}
+	if got := tokenizerFromReloptions(built("default")); got != "default" {
+		t.Errorf("tokenizer = %q, want default", got)
+	}
+	// Everything unreadable degrades to "could not tell", never to a name.
+	// The value only reaches a log line, so a shape a future ParadeDB
+	// renders differently must stay quiet instead of reporting a drift that
+	// is not there.
+	for name, opts := range map[string][]string{
+		"no index":       nil,
+		"other options":  {"key_field=id", "fillfactor=90"},
+		"not json":       {"text_fields=en_stem"},
+		"no such field":  {`text_fields={"body":{"tokenizer":{"type":"en_stem"}}}`},
+		"no tokenizer":   {`text_fields={"content":{"record":"position"}}`},
+		"empty relopts":  {},
+		"truncated json": {`text_fields={"content":{"tokenizer":`},
+	} {
+		if got := tokenizerFromReloptions(opts); got != "" {
+			t.Errorf("%s: tokenizer = %q, want the empty string", name, got)
+		}
+	}
+}
+
 func TestSearchBackendRegistry(t *testing.T) {
 	if !IsValidSearchBackend(BackendPgvector) || !IsValidSearchBackend(BackendPgSearch) || IsValidSearchBackend("lucene") {
 		t.Error("backend validity")

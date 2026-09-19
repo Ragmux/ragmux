@@ -163,8 +163,8 @@ neither touches the embeddings. `reprocess_recommended` is never set for a backe
 change, and switching back and forth costs nothing but the index.
 
 The BM25 index is **built lazily**, on the first hybrid search of a store configured for
-`pg_search`, serialised across replicas with an advisory lock and remembered in-process
-afterwards. It is not part of a migration on purpose: a server that gains the extension
+`pg_search`, serialised across replicas with a transaction-scoped advisory lock and
+remembered in-process afterwards. It is not part of a migration on purpose: a server that gains the extension
 later (an operator swapping in the ParadeDB image) still gets the index, and a server
 that never gains it never pays for one — a BM25 index is maintained on every chunk
 insert, so an installation using only `pgvector` would otherwise carry the whole ingest
@@ -178,6 +178,19 @@ Going back the other way leaves the index behind; drop it by hand once no store 
 DROP INDEX IF EXISTS idx_chunks_bm25;
 ```
 
+Dropping it under a running gateway is safe and needs no restart. The replicas that had
+already built it find out on their next hybrid search: that one query is answered from
+`pgvector` and logged, and the search after it rebuilds the index (or keeps falling back,
+if no store wants it any more).
+
+**The rebuild rides on that request.** `CREATE INDEX` runs on the context of the hybrid
+search that triggered it and scans every row of `chunks`, so on a large corpus that one
+request waits minutes. For its whole duration the index build holds a `SHARE` lock on
+`chunks`, which blocks ingestion writes - a job that waits past `INGEST_LEASE` loses its
+claim, and one that waits past the 15-minute processing timeout fails outright. Hybrid
+searches arriving meanwhile wait up to 15 s for the build lock and then answer from
+`pgvector`. Drop and rebuild the index during a quiet period, not under load.
+
 **Write time**: saving a store with `search_backend: "pg_search"` on a server without the
 extension is refused with `400` naming the extension and pointing here.
 `GET /admin/api/search-backends` returns `[{"id","available","reason"}]` so the dashboard
@@ -188,6 +201,12 @@ restored onto a plain PostgreSQL, or a `pg_search` whose query API failed the bo
 test — falls back to `pgvector`. Retrieval degrades, it never fails: hits still come
 back, `backend` in the search response and `Result.Backend` name what actually ran, and
 a warning is logged once per store per process.
+
+The same fallback covers a backend that was available and then broke: an index that
+could not be built, and an index that answered one search and was dropped before the
+next. A failed lexical query is retried on `pgvector` rather than returned, and the
+cached "the index exists" flag is cleared so the following search rebuilds instead of
+repeating the failure.
 
 To get `pg_search`, run one of the ParadeDB variants: `docker-compose.paradedb.yml` (the
 split layout) or the `:<version>-paradedb` all-in-one image. Both carry `pg_search` and

@@ -115,6 +115,13 @@ func TestAPIKeyConstraints(t *testing.T) {
 		RateLimitRPM: 10}); err == nil {
 		t.Error("management key with limits was accepted")
 	}
+	// ...nor a project grant. The admin handler refuses this first with a
+	// message naming the field; 0014 is what holds the invariant up when
+	// something writes grants without going through that handler.
+	if _, _, err := f.st.CreateAPIKey(f.ctx, &store.APIKey{Kind: store.KindManagement, Name: "m4", UserID: f.user.ID,
+		ProjectIDs: []int64{f.prod.ID}}); err == nil {
+		t.Error("management key with a project grant was accepted")
+	}
 	if _, _, err := f.st.CreateAPIKey(f.ctx, &store.APIKey{Kind: "other", Name: "m3", UserID: f.user.ID}); err == nil {
 		t.Error("unknown kind was accepted")
 	}
@@ -313,5 +320,46 @@ func TestKeyUsageCounters(t *testing.T) {
 	minute, day, _, _ = f.st.GetKeyUsage(f.ctx, k.ID, w)
 	if minute.Requests != 0 || day.Requests != 1 {
 		t.Errorf("after purge: minute %+v day %+v", minute, day)
+	}
+}
+
+// TestAPIKeyProjectsIsAGatewayOnlyTable checks the shape migration 0014 left
+// behind, not only that a management key is refused a grant. The refusal has
+// to come from a composite foreign key that *replaced* 0010's single-column
+// one: two foreign keys side by side would keep accepting the row through
+// the wider one, and the kind column only means anything while the CHECK
+// pins it to 'gateway'.
+func TestAPIKeyProjectsIsAGatewayOnlyTable(t *testing.T) {
+	f := newKeyFixture(t)
+	defs, err := f.st.TableConstraints(f.ctx, "api_key_projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Join(defs, "\n")
+	for _, want := range []string{
+		"FOREIGN KEY (api_key_id, kind) REFERENCES api_keys(id, kind) ON DELETE CASCADE",
+		"kind = 'gateway'",
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("missing %q in:\n%s", want, all)
+		}
+	}
+	// 0010's inline foreign key must be gone, not merely shadowed by the
+	// composite one.
+	if strings.Contains(all, "FOREIGN KEY (api_key_id) REFERENCES") {
+		t.Errorf("the single-column foreign key survived:\n%s", all)
+	}
+
+	// A gateway key still holds grants, and deleting it still takes them
+	// with it -- the cascade moved onto the new constraint.
+	k, _ := f.gatewayKey("grants", f.prod.ID, f.stage.ID)
+	if len(k.ProjectIDs) != 2 {
+		t.Fatalf("gateway key grants = %v", k.ProjectIDs)
+	}
+	if err := f.st.DeleteAPIKey(f.ctx, k.ID); err != nil {
+		t.Fatalf("delete a key that holds grants: %v", err)
+	}
+	if _, err := f.st.GetAPIKey(f.ctx, k.ID); err == nil {
+		t.Error("the key survived its own deletion")
 	}
 }

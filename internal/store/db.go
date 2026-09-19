@@ -171,6 +171,27 @@ type BackupInfo struct {
 	LastMigrationAt *time.Time `json:"last_migration_at"`
 }
 
+// LatestMigration is the highest migration version this binary carries. A
+// freshly opened database reports exactly this as its MigrationsVersion, so
+// the two together say whether a schema is fully migrated without anyone
+// having to hard-code the number.
+var LatestMigration = sync.OnceValue(func() int {
+	entries, err := fs.ReadDir(migrationFS, "migrations")
+	if err != nil {
+		// The directory is embedded in the binary; a read failure here is
+		// a broken build, not a runtime condition.
+		panic("read embedded migrations: " + err.Error())
+	}
+	highest := 0
+	for _, e := range entries {
+		var version int
+		if _, err := fmt.Sscanf(e.Name(), "%d_", &version); err == nil && version > highest {
+			highest = version
+		}
+	}
+	return highest
+})
+
 // DatabaseInfo reports server, extension and migration versions plus size.
 func (s *Store) DatabaseInfo(ctx context.Context) (*DatabaseInfo, error) {
 	info := &DatabaseInfo{PostgresVersion: s.ServerVersion, PgSearchVersion: s.caps.PgSearchVersion}

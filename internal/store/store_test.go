@@ -59,8 +59,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.MigrationsVersion != 13 {
-		t.Errorf("migrations version = %d, want 13", info.MigrationsVersion)
+	if want := store.LatestMigration(); info.MigrationsVersion != want {
+		t.Errorf("migrations version = %d, want %d", info.MigrationsVersion, want)
 	}
 }
 

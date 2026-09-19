@@ -90,9 +90,10 @@ func (a *Admin) validateKey(r *http.Request, in *keyInput, k *store.APIKey) erro
 	}
 	k.Scopes = scopes
 	if k.Kind == store.KindManagement {
-		// The table refuses a default project and its own limits; the grant
-		// rows in api_key_projects it does not constrain, so this check is
-		// the only thing keeping a management key out of them.
+		// The schema refuses all three of these for a management key -- a
+		// default project, limits of its own (0010) and grant rows (0014) --
+		// so this check is what turns a constraint violation into a message
+		// naming the field the caller sent, not what holds the invariant up.
 		if len(in.ProjectIDs) > 0 || in.DefaultProjectID != nil {
 			return errors.New("a management key has no projects")
 		}

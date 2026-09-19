@@ -81,6 +81,13 @@ If you use **PgBouncer**, two things matter:
   hands that connection to somebody else between statements, so the lock cannot
   be held. Nothing breaks - every step of the retention pass is idempotent - but
   several replicas will each run a pass.
+- **Lazy DDL is safe in either mode.** The two things this gateway builds on
+  demand - a `chunk_embeddings_<dims>` table for a new embedding width, and the
+  BM25 index of the `pg_search` backend - are not idempotent the way the
+  retention pass is: `CREATE INDEX IF NOT EXISTS` raced by two sessions fails
+  on one of them. Both take `pg_advisory_xact_lock` in the same transaction
+  that runs the DDL, which is the one unit transaction mode keeps on a single
+  server connection, so neither depends on session mode.
 - **pgx v5 prepares statements** and caches them per connection. Under
   transaction mode a cached statement can be sent to a connection that never
   prepared it. Either use session mode, or disable the cache in the connection

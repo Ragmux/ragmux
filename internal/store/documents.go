@@ -169,21 +169,6 @@ func (s *Store) ClaimDocument(ctx context.Context, owner string, lease time.Dura
 		RETURNING `+docColsD, owner, lease.Seconds(), maxAttempts))
 }
 
-// ClaimDocumentByID claims one named document, whatever its status, unless
-// another owner still holds a live lease on it. It backs Ingester.Process,
-// which runs a document on demand rather than off the queue.
-func (s *Store) ClaimDocumentByID(ctx context.Context, id int64, owner string, lease time.Duration, maxAttempts int) (*Document, error) {
-	return scanDoc(s.pool.QueryRow(ctx, `WITH next AS (
-			SELECT id FROM documents
-			 WHERE id = $4
-			   AND (claimed_by IS NULL OR claimed_by = $1 OR lease_until IS NULL OR lease_until < now())
-			   AND attempts < $3
-			 FOR UPDATE SKIP LOCKED)
-		UPDATE documents d SET `+claimSet+`
-		  FROM next WHERE d.id = next.id
-		RETURNING `+docColsD, owner, lease.Seconds(), maxAttempts, id))
-}
-
 // ExtendDocumentLease pushes the lease of a document owner still holds out
 // by lease. ErrNotFound means the claim is gone: the lease expired and
 // another replica took the document over, so the caller must stop working
