@@ -150,6 +150,19 @@ jobs:
         env:
           DIGEST: ${{ steps.build_paradedb.outputs.digest }}
         run: cosign sign --yes "docker.io/ragmux/ragmux@${DIGEST}"
+      # The Docker Hub repository page: a dedicated file, not README.md, whose
+      # links are absolute — Docker Hub cannot resolve the repository-relative
+      # ones. Runs after every image is pushed, so the page never describes a
+      # release that is not published yet.
+      - name: Docker Hub description
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ragmux/ragmux
+          short-description: "Self-hosted OpenAI-compatible AI gateway with built-in RAG, in a single container"
+          readme-filepath: ./docker/README.dockerhub.md
       - name: GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
