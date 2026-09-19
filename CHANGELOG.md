@@ -6,6 +6,129 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-19
+
+### Added
+- **User-owned API keys** (`api_keys`, migration `0010`): a key now belongs to a dashboard
+  user and comes in two kinds. A **gateway** key (`sk-user-…`) calls `/v1` on the projects
+  it is granted; a **management** key (`sk-mgmt-…`) calls `/admin/api` within its scopes,
+  replacing the 24-hour session token scripts had to borrow. Both carry an optional
+  `expires_at`, can be revoked, record `last_used_at`, and may set their own rate limits
+  and budgets **under** the project's. A key never outranks its owner: its effective
+  permission is its scopes intersected with the owner's live role, so demoting or
+  deactivating a user immediately narrows every key they hold. A project's own
+  `sk-proj-…` key is unchanged and keeps working exactly as before. Managed from the new
+  **Keys** tab and `/admin/api/keys`, documented in
+  [Users, roles and limits](docs/users-and-limits.md#api-keys).
+- **`X-Ragmux-Project`**: a gateway key granting several projects selects one per request
+  with this header, falling back to the key's default project and then to its single
+  grant. There is deliberately no `"project/model"` convention — model names legitimately
+  contain slashes, so the split would be ambiguous and would silently reroute existing
+  clients.
+- **`ragmux reset-password <username>`**: resets a dashboard password straight in the
+  database when the last administrator is locked out. Needs `DATABASE_URL` and no running
+  gateway, takes the new password from `--generate` or `--stdin` (never a flag, which
+  would leak into `ps` and shell history), and writes an audit row attributed to `cli`, so
+  a console reset appears in the dashboard next to the ones done through the UI.
+- **A three-step first-run wizard**: the administrator form is now followed by an optional
+  first model connection and an optional first project with its key, so a fresh install
+  does not open on an empty dashboard. Steps two and three call the ordinary authenticated
+  endpoints and add no unauthenticated surface.
+- **Gemini tool calling.** `tools` and `tool_choice` are translated to
+  `functionDeclarations` and `toolConfig`, `role:"tool"` messages become
+  `functionResponse` parts (correlated by name, which is all Gemini offers), and function
+  calls are returned as OpenAI `tool_calls` in both the blocking and streaming paths.
+  Tool schemas are rewritten into the OpenAPI subset Gemini accepts: unknown keywords are
+  dropped, `const`, `oneOf`/`allOf` and nullable unions are rewritten, and local `$ref`s
+  are inlined. It is lossy by design — forwarding a schema unchanged fails on essentially
+  every OpenAI strict-mode tool, and the relayed error tells an SDK author nothing. The
+  exact whitelist is in [Providers](docs/providers.md#gemini).
+- **Remote images for Ollama and Gemini**: an `image_url` the upstream cannot fetch is now
+  downloaded and inlined by the gateway over the **same** hardened client provider calls
+  use, so the SSRF dialer and redirect policy apply to image hosts too. Bounded by
+  `IMAGE_FETCH_MAX_MB`, `IMAGE_FETCH_TIMEOUT` and `IMAGE_FETCH_MAX_PER_REQUEST`, cached in
+  memory, and switched off entirely with `IMAGE_FETCH=false`.
+- **Prompt caching passthrough**: Anthropic `cache_control` is carried through on content
+  parts, tools and the system block, and every provider's cache counters are reported back
+  in one shape — `usage.prompt_tokens_details` with `cached_tokens` and
+  `cache_creation_tokens`. OpenAI's caching is automatic and has nothing to send; only its
+  usage is surfaced.
+- **Cost estimation** (`model_prices`, migration `0011`): an embedded price table, seeded
+  into the database and editable from the new **Prices** tab, turns a finished request's
+  token counts into `cost_micros` on its log row, pricing cached reads and cache writes at
+  their own rates. Editing a shipped row makes it yours and upgrades never overwrite it
+  again. Summaries, the daily series, the by-project table and the CSV export all carry
+  the figure. **It is an estimate, not a bill.**
+- **A ParadeDB search backend**: a RAG store can set `search_backend: "pg_search"` and get
+  real BM25 ranking for the lexical half of a hybrid search instead of Postgres full-text
+  ranking, fused with the vector half by the same reciprocal-rank formula. Switching
+  needs **no reprocessing** — the lexical side is derived from the stored chunk text — and
+  the index is built lazily on first use. A server without the extension falls back to the
+  existing backend with a warning rather than failing. Ships as
+  `docker-compose.paradedb.yml` and a `:<version>-paradedb` image.
+- **Cohere and Voyage rerankers**: `rerank_backend` selects the existing LLM reranker,
+  `cohere` or `voyage`. Their credentials live in a `model_connections` row like every
+  other provider secret, so they are encrypted at rest and covered by `ragmux rotate-key`.
+  Any failure still falls back to the fused order instead of failing the request.
+- **Leased, cross-replica ingestion** (migration `0013`): a document is claimed with
+  `FOR UPDATE SKIP LOCKED` and held under a heartbeat lease, so several replicas share one
+  queue and a replica that dies hands its work back when the lease expires. Replaces the
+  in-process queue that could not be shared.
+- **A leader lock for the retention pass**, so one replica does the hourly deletions
+  instead of all of them.
+- **`docs/scaling.md`** and `docker-compose.scale.yml`: how to run several replicas, what
+  is already shared, and what must be set first.
+- `GET /admin/api/search-backends` reports which backends this server can actually run.
+  `/admin/api/provider-types` now carries a full `capabilities` object taken from the
+  provider package, so it cannot drift from what the adapters do.
+
+### Changed
+- **A wrong `SECRET_KEY` is now a boot failure rather than a per-request error.** The
+  database holds a canary only the right key can open, checked before any stored
+  credential is read. This catches a dump restored onto a new host, a key rotated on one
+  node only, a wiped data volume, and a second replica falling back to its own key file —
+  each of which previously surfaced as decrypt errors nobody could trace back.
+  `ragmux rotate-key` re-seals the canary in the same transaction.
+- **Anthropic `prompt_tokens` now includes cached and freshly written tokens.** 0.3.x
+  omitted them, under-reporting a cached request. Token counts, budgets and metrics move
+  up for those requests, and historical rows cannot be corrected.
+- **A `503` on document upload now means the cluster's backlog is full**, not that this
+  replica's in-process queue is — genuine cross-replica backpressure, bounded by
+  `MAX_PENDING_DOCUMENTS`.
+- The CSV export gains six columns at the end — `cached_prompt_tokens`,
+  `cache_write_tokens`, `cost_usd`, `cost_source`, `api_key_id`, `user_id`. Existing
+  columns keep their positions. The two attribution columns are empty, not zero, for a
+  request made with a project's default key, which has no owner.
+- `/admin/api/provider-types` reports `supports_tools: true` for `gemini`, and
+  `supports_embeddings: false` for `deepseek`. The second is not a new restriction — the
+  dashboard has always shown it — but `SupportsEmbeddings` disagreed, so a RAG store could
+  be pointed at a DeepSeek connection through the API. Editing such a store now fails
+  validation; change its embedding connection.
+- A Gemini `image_url` that is not a Files API or `gs://` URI is inlined by the gateway
+  instead of being forwarded as `fileData`, which Gemini rejected.
+- Content parts without a `type` are treated as text on every provider, matching OpenAI.
+- `Ingester.Resume` is gone. Unfinished work is found by the lease-based claim on every
+  poll, on every replica, so there is nothing left to resume at start.
+
+### Fixed
+- Ollama tool calls spread over several streaming lines were all given index `0` and
+  merged by clients into one corrupt call; they are now numbered across the whole stream.
+- Browser clients could not read `x-ratelimit-*`, `x-ragmux-*` or `Retry-After`: the
+  responses never carried `Access-Control-Expose-Headers`.
+
+### Security
+- A management key is accepted **only** from the `Authorization` header. One pasted into
+  the session cookie is refused before it is even looked up, which is what keeps the
+  existing CSRF exemption for bearer requests sound: a browser cannot attach an
+  `Authorization` header cross-origin without a preflight, while it will attach a cookie
+  to any cross-site request on its own.
+- Changing a password, resetting another user's password and minting a management key
+  require an interactive session, so a leaked key cannot take over the account it belongs
+  to.
+- An expired, revoked or deactivated-owner key answers `401` with a `code` explaining
+  which; an unknown key keeps the previous opaque message, so nothing can be enumerated by
+  a caller who does not already hold a valid key.
+
 ## [0.3.1] — 2026-09-18
 
 ### Added
