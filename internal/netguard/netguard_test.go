@@ -145,6 +145,14 @@ func TestCheckRedirect(t *testing.T) {
 	if err := check(mk("http://api.example.com/v2"), []*http.Request{plain}); err != nil {
 		t.Errorf("http to http: %v", err)
 	}
+	// The scheme belongs to the connection being left, so it is compared
+	// against the hop just taken. Against the first request instead, an
+	// http -> https -> http chain passed on the grounds that it started in
+	// the clear, after the credentials had already crossed TLS once.
+	secured, _ := http.NewRequest(http.MethodGet, "https://api.example.com/v2", nil)
+	if err := check(mk("http://api.example.com/v3"), []*http.Request{plain, secured}); !errors.As(err, &re) {
+		t.Errorf("downgrade after an upgrade: %v", err)
+	}
 	via := []*http.Request{first, first, first, first}
 	if err := check(mk("https://api.example.com/"), via); !errors.As(err, &re) {
 		t.Errorf("hops: %v", err)

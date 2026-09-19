@@ -223,7 +223,12 @@ func CheckRedirect(maxHops int) func(req *http.Request, via []*http.Request) err
 		// the host itself puts the Authorization header, and the response
 		// body, on the wire in the clear; checking the host alone let that
 		// through because the host had not changed.
-		if strings.EqualFold(first.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+		//
+		// The comparison is against the hop just taken, not the first one: an
+		// http -> https -> http chain would otherwise pass, having started in
+		// the clear, after the credentials had already crossed TLS once.
+		prev := via[len(via)-1].URL
+		if strings.EqualFold(prev.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
 			return &RedirectError{Reason: "target downgrades https to http"}
 		}
 		return nil
