@@ -125,6 +125,14 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL string) (string, string
 	if mt, data, ok := f.Cache.get(rawURL); ok {
 		return mt, data, nil
 	}
+	// Refuse rather than fall back to http.DefaultClient. This is the one
+	// place the gateway follows a URL a client chose, and it is only safe
+	// because it goes out over the same guarded transport as a provider call:
+	// an unguarded default client here would reach loopback and private
+	// addresses, which is exactly what netguard exists to prevent.
+	if f.Client == nil {
+		return "", "", imageError("remote image fetching is not configured")
+	}
 	// The fetcher has no connection of its own; ProviderType and Logger are
 	// what transportError needs to log and classify the failure.
 	cfg := Config{ProviderType: "image", Logger: f.Logger}
@@ -136,7 +144,7 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL string) (string, string
 	}
 	req.Header.Set("Accept", "image/*")
 	req.Header.Set("User-Agent", "ragmux/1.0")
-	resp, err := f.client().Do(req)
+	resp, err := f.Client.Do(req)
 	if err != nil {
 		return "", "", transportError(cfg, rawURL, err)
 	}
@@ -172,13 +180,6 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL string) (string, string
 
 func (f *ImageFetcher) tooLarge(host string) string {
 	return fmt.Sprintf("image at %s is larger than the %d MiB limit", host, f.maxBytes()>>20)
-}
-
-func (f *ImageFetcher) client() *http.Client {
-	if f.Client != nil {
-		return f.Client
-	}
-	return http.DefaultClient
 }
 
 func (f *ImageFetcher) maxBytes() int64 {

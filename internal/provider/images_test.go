@@ -258,3 +258,19 @@ func TestImageCache(t *testing.T) {
 		t.Error("a nil cache never hits")
 	}
 }
+
+// A fetcher without a client must refuse rather than reach for
+// http.DefaultClient: this is the one place the gateway follows a URL a
+// client chose, and an unguarded transport here would reach loopback and
+// private addresses.
+func TestImageFetcherWithoutClientRefuses(t *testing.T) {
+	f := &ImageFetcher{}
+	_, _, err := f.Fetch(context.Background(), "http://127.0.0.1/secret.png")
+	if err == nil {
+		t.Fatal("a fetcher with no client fetched anyway")
+	}
+	var perr *Error
+	if !errors.As(err, &perr) || perr.Status != 400 {
+		t.Fatalf("err = %v, want a 400 provider error", err)
+	}
+}
