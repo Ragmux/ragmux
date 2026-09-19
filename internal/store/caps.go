@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -52,18 +53,40 @@ func detectCapabilities(ctx context.Context, conn *pgx.Conn, log *slog.Logger) C
 	return caps
 }
 
-// pgSearchSmokeTest runs the cheapest query that exercises the operator and
-// the function this version relies on. LIMIT 0 keeps it from reading rows,
-// and the statement never needs the BM25 index to exist to parse.
+// pgSearchSmokeTest checks that the installed pg_search speaks the query API
+// the hybrid search is written against.
+//
+// It builds the query object and nothing else. That one statement exercises
+// every function, overload and named argument search_pgsearch.go uses --
+// paradedb.boolean(must => ARRAY[...]), paradedb.term on a bigint field,
+// paradedb.match on a text field -- and it touches no table and no index.
+//
+// Running an actual @@@ search here would be a better probe and is not
+// possible: pg_search refuses the operator until the table carries a BM25
+// index ("`chunks` does not contain a `USING bm25` index"), and that index is
+// built lazily on the first search of a store configured for this backend.
+// A probe that needed it would downgrade every ParadeDB server that has not
+// run such a search yet -- which is every server, because the downgrade is
+// what stops the index from ever being built. The operator and
+// paradedb.score are checked in the catalogue instead.
 func pgSearchSmokeTest(ctx context.Context, conn *pgx.Conn) error {
-	rows, err := conn.Query(ctx,
-		`SELECT 1 FROM chunks WHERE id @@@ paradedb.match('content', 'ragmux') LIMIT 0`)
+	var query string
+	err := conn.QueryRow(ctx,
+		`SELECT paradedb.boolean(must => ARRAY[paradedb.term('rag_store_id', $1::bigint),
+		                                       paradedb.match('content', $2::text)])::text`,
+		int64(0), "ragmux").Scan(&query)
 	if err != nil {
 		return err
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	var ok bool
+	if err := conn.QueryRow(ctx, `SELECT
+		EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+		        WHERE n.nspname = 'paradedb' AND p.proname = 'score')
+		AND EXISTS (SELECT 1 FROM pg_operator WHERE oprname = '@@@')`).Scan(&ok); err != nil {
 		return err
+	}
+	if !ok {
+		return errors.New("paradedb.score or the @@@ operator is missing")
 	}
 	return nil
 }

@@ -109,6 +109,47 @@ jobs:
         env:
           DIGEST: ${{ steps.build_app.outputs.digest }}
         run: cosign sign --yes "docker.io/ragmux/ragmux@${DIGEST}"
+      # "-paradedb" tags (<version>-paradedb, <major>.<minor>-paradedb,
+      # latest-paradedb): the all-in-one image on ParadeDB, whose PostgreSQL
+      # carries pg_search (BM25) as well as pgvector. Same gateway, same data
+      # layout; upgrading from the default image is a plain image swap.
+      - name: Image metadata (paradedb)
+        id: meta_paradedb
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ghcr.io/ragmux/ragmux
+            ${{ env.DOCKERHUB_USERNAME != '' && 'docker.io/ragmux/ragmux' || '' }}
+          flavor: |
+            suffix=-paradedb,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - name: Build and push (paradedb)
+        id: build_paradedb
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.aio.paradedb
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta_paradedb.outputs.tags }}
+          labels: ${{ steps.meta_paradedb.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Sign image (GHCR, paradedb)
+        env:
+          DIGEST: ${{ steps.build_paradedb.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/ragmux/ragmux@${DIGEST}"
+      - name: Sign image (Docker Hub, paradedb)
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        env:
+          DIGEST: ${{ steps.build_paradedb.outputs.digest }}
+        run: cosign sign --yes "docker.io/ragmux/ragmux@${DIGEST}"
       - name: GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:

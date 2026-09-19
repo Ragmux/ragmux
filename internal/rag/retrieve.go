@@ -13,17 +13,24 @@ import (
 )
 
 // Retriever embeds a query, runs vector or hybrid search in a store and
-// optionally reranks the candidates with a chat model.
+// optionally reranks the candidates.
 type Retriever struct {
-	store    *store.Store
-	factory  EmbedderFactory
-	Reranker *Reranker
-	Log      *slog.Logger
+	store   *store.Store
+	factory EmbedderFactory
+	// Rerankers builds the reranker a store is configured for. Nil is
+	// treated as the LLM default, so a Retriever built by hand still reranks.
+	Rerankers RerankerFactory
+	Log       *slog.Logger
 }
 
-// NewRetriever wires a retriever.
+// NewRetriever wires a retriever. Rerankers defaults to the LLM reranker,
+// which is what every store had before rerank backends existed.
 func NewRetriever(st *store.Store, factory EmbedderFactory) *Retriever {
-	return &Retriever{store: st, factory: factory, Reranker: &Reranker{}, Log: slog.Default()}
+	return &Retriever{store: st, factory: factory, Rerankers: defaultRerankers, Log: slog.Default()}
+}
+
+func defaultRerankers(context.Context, *store.RAGStore) (Reranker, error) {
+	return &LLMReranker{}, nil
 }
 
 // Result is the outcome of one retrieval.
@@ -31,19 +38,31 @@ type Result struct {
 	Hits []store.SearchHit
 	// Mode is the search mode that ran (vector or hybrid).
 	Mode string
-	// Reranked is true when the LLM reranker successfully reordered the hits.
+	// Backend is the search backend that actually answered the lexical
+	// half. It differs from the store's search_backend when the configured
+	// one is unavailable here and the search fell back to pgvector.
+	Backend string
+	// Reranked is true when the reranker successfully reordered the hits.
 	Reranked bool
+	// RerankBackend is the backend the store asked for (llm, cohere,
+	// voyage); empty when reranking was not attempted.
+	RerankBackend string
+	// RerankFallback is true when reranking was requested but the fused
+	// order was kept: no chat provider, no rerank connection, or the
+	// reranker failed. The hits are still usable; the request is not.
+	RerankFallback bool
 	// RetrievalLatencyMS covers embedding the query and the database search.
 	RetrievalLatencyMS int64
-	// RerankLatencyMS is the time spent in the reranker; nil when reranking
-	// did not run (off for the store, or no chat provider given).
+	// RerankLatencyMS is the time spent in the reranker. It is non-nil
+	// whenever the store has rerank on, even when the reranker was skipped,
+	// so the dashboard shows "0 ms, skipped" rather than a blank field.
 	RerankLatencyMS *int64
 }
 
 // Search returns the top-k hits for a query using the store's settings.
-// prov and model are the chat provider used for reranking; with a nil
-// provider reranking is skipped. Rerank failures are logged and the fused
-// order is returned instead.
+// prov and model are the chat provider used by the LLM rerank backend; with
+// a nil provider that backend is skipped. Rerank failures are logged and the
+// fused order is returned instead.
 func (r *Retriever) Search(ctx context.Context, rs *store.RAGStore, query string, k int, prov provider.Provider, model string) ([]store.SearchHit, error) {
 	res, err := r.SearchWith(ctx, rs, query, k, prov, model)
 	if err != nil {
@@ -52,13 +71,18 @@ func (r *Retriever) Search(ctx context.Context, rs *store.RAGStore, query string
 	return res.Hits, nil
 }
 
-// SearchWith is Search plus the mode and rerank outcome.
+// SearchWith is Search plus the mode, the effective backend and the rerank
+// outcome.
 func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query string, k int, prov provider.Provider, model string) (*Result, error) {
 	mode := rs.SearchMode
 	if mode == "" {
 		mode = store.SearchHybrid
 	}
-	res := &Result{Hits: []store.SearchHit{}, Mode: mode}
+	backend := rs.SearchBackend
+	if backend == "" {
+		backend = store.BackendPgvector
+	}
+	res := &Result{Hits: []store.SearchHit{}, Mode: mode, Backend: backend}
 	if rs.ChunkCount == 0 || strings.TrimSpace(query) == "" {
 		return res, nil
 	}
@@ -81,45 +105,84 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	if k <= 0 {
 		k = 5
 	}
-	rerank := rs.Rerank && prov != nil
 	candidates := k
 	switch {
-	case rerank:
+	case rs.Rerank:
 		candidates = max(k, rs.RerankCandidates)
 	case mode == store.SearchHybrid:
 		candidates = k * 3
 	}
-	hits, err := r.store.Search(ctx, rs.ID, query, vecs[0], store.SearchOptions{
-		Mode: mode, FTSConfig: rs.FTSConfig, MaxDistance: rs.MaxDistance, Candidates: candidates})
+	hits, used, err := r.store.SearchWithBackend(ctx, rs.ID, query, vecs[0], store.SearchOptions{
+		Mode: mode, Backend: backend, FTSConfig: rs.FTSConfig, MaxDistance: rs.MaxDistance, Candidates: candidates})
 	if err != nil {
 		return nil, err
 	}
+	res.Backend = used
 	res.RetrievalLatencyMS = time.Since(start).Milliseconds()
-	if rerank {
-		rerankStart := time.Now()
-		if len(hits) > 1 {
-			rr := r.Reranker
-			if rr == nil {
-				rr = &Reranker{}
-			}
-			ranked, err := rr.Rerank(ctx, prov, model, query, hits, k)
-			if err != nil {
-				if r.Log != nil {
-					r.Log.Warn("rerank failed; using fused order", "store", rs.ID, "err", err)
-				}
-			} else {
-				res.Reranked = true
-			}
-			hits = ranked
-		}
-		ms := time.Since(rerankStart).Milliseconds()
-		res.RerankLatencyMS = &ms
+	if rs.Rerank {
+		hits = r.rerank(ctx, rs, res, query, hits, k, prov, model)
 	}
 	if len(hits) > k {
 		hits = hits[:k]
 	}
 	res.Hits = hits
 	return res, nil
+}
+
+// rerank reorders hits and records the outcome on res. It never returns an
+// error: every failure path keeps the fused order, sets RerankFallback and
+// logs, which is the contract the whole rerank feature rests on.
+func (r *Retriever) rerank(ctx context.Context, rs *store.RAGStore, res *Result, query string,
+	hits []store.SearchHit, k int, prov provider.Provider, model string) []store.SearchHit {
+	backend := rs.RerankBackend
+	if backend == "" {
+		backend = store.RerankLLM
+	}
+	res.RerankBackend = backend
+	// Timed even when the reranker is skipped: RerankLatencyMS non-nil is
+	// how the caller tells "off" from "on but it did not run".
+	start := time.Now()
+	defer func() {
+		ms := time.Since(start).Milliseconds()
+		res.RerankLatencyMS = &ms
+	}()
+	if len(hits) < 2 {
+		return hits
+	}
+	factory := r.Rerankers
+	if factory == nil {
+		factory = defaultRerankers
+	}
+	rr, err := factory(ctx, rs)
+	if err != nil || rr == nil {
+		if err == nil {
+			err = ErrRerankUnavailable
+		}
+		res.RerankFallback = true
+		r.warn("reranker unavailable; using fused order", rs, backend, err)
+		return hits
+	}
+	// The LLM backend needs a chat model; without one there is nothing to
+	// ask and the fused order stands.
+	if rr.Name() == store.RerankLLM && prov == nil {
+		res.RerankFallback = true
+		r.warn("reranker unavailable; using fused order", rs, backend, ErrRerankUnavailable)
+		return hits
+	}
+	ranked, err := rr.Rerank(ctx, RerankInput{Query: query, Hits: hits, TopK: k, Provider: prov, Model: model})
+	if err != nil {
+		res.RerankFallback = true
+		r.warn("rerank failed; using fused order", rs, backend, err)
+	} else {
+		res.Reranked = true
+	}
+	return ranked
+}
+
+func (r *Retriever) warn(msg string, rs *store.RAGStore, backend string, err error) {
+	if r.Log != nil {
+		r.Log.Warn(msg, "store", rs.ID, "backend", backend, "err", err)
+	}
 }
 
 // ContextHeader introduces retrieved passages to the model and tells it to

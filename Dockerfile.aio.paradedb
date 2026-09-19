@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+#
+# All-in-one image on ParadeDB: the ragmux gateway and a PostgreSQL 17 that
+# carries pg_search (BM25) as well as pgvector, in one container, supervised by
+# docker/aio/entrypoint.sh. Published as :<version>-paradedb; ./Dockerfile.aio
+# builds the same image on the plain pgvector base and stays the default.
+#
+# This file is Dockerfile.aio with the base image swapped and one extra line
+# (the shared_preload_libraries trim below). The entrypoint is byte-identical
+# and needs no changes: the ParadeDB image is Debian-based and carries gosu at
+# /usr/local/bin/gosu and initdb, postgres, pg_ctl at /usr/lib/postgresql/17/bin,
+# the same paths the pgvector image uses.
+
+# ---- build stage -----------------------------------------------------------
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+ARG VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+    -o /out/ragmux ./cmd/ragmux
+
+# ---- runtime stage ---------------------------------------------------------
+# pg17: Debian with PostgreSQL 17, pg_search and vector; resolve a new digest
+# with `docker buildx imagetools inspect paradedb/paradedb:pg17`.
+FROM paradedb/paradedb:pg17@sha256:8da5d202fe31875af32a49e802ce17cfbc146b0672306f4109809efee1e6f916
+
+# shared_preload_libraries comes from the base image's postgresql.conf.sample,
+# which initdb copies into a fresh cluster. ParadeDB preloads pg_search,
+# pg_cron and pg_stat_statements; only the first is needed here, and pg_cron
+# would spend a background worker and a log line per start on a scheduler
+# nothing in this image uses. The entrypoint's own ragmux.conf is an include,
+# so trimming the sample is the only place this can be set for a cluster that
+# does not exist yet.
+RUN sed -i "s/^shared_preload_libraries = .*/shared_preload_libraries = 'pg_search'\t\t# (change requires restart)/" \
+      /usr/share/postgresql/17/postgresql.conf.sample \
+    && grep -q "^shared_preload_libraries = 'pg_search'" /usr/share/postgresql/17/postgresql.conf.sample
+
+# Unprivileged system user the gateway runs as; postgres comes with the base
+# image. The entrypoint starts as root, prepares /data and drops privileges
+# with gosu for both processes.
+RUN groupadd --system ragmux && useradd --system --gid ragmux --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin ragmux \
+    && mkdir -p /data/pg /data/ragmux /var/run/postgresql \
+    && chown postgres:postgres /data/pg /var/run/postgresql \
+    && chown ragmux:ragmux /data/ragmux \
+    && chmod 700 /data/pg /data/ragmux
+
+COPY --from=build /out/ragmux /usr/local/bin/ragmux
+# init.sql is re-run on every start, so the pg_search block inside it turns an
+# upgrade from the pgvector image into a plain image swap.
+COPY docker/postgres-init/01-ragmux.sql /usr/local/share/ragmux/init.sql
+COPY docker/postgres-init/02-extensions.sql /usr/local/share/ragmux/02-extensions.sql
+COPY docker/aio/entrypoint.sh /usr/local/bin/ragmux-aio
+RUN chmod 0755 /usr/local/bin/ragmux-aio /usr/local/bin/ragmux
+
+ENV PGDATA=/data/pg \
+    DATA_DIR=/data/ragmux \
+    PORT=8765 \
+    PG_SHARED_BUFFERS=128MB
+
+# Everything persistent lives under /data: /data/pg (PGDATA) and /data/ragmux
+# (the secret.key fallback). PostgreSQL only listens on a unix socket inside
+# the container, so 8765 is the only port.
+VOLUME ["/data"]
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["/usr/local/bin/ragmux", "-healthcheck"]
+
+# The base image's ENTRYPOINT/CMD (docker-entrypoint.sh postgres) are replaced.
+ENTRYPOINT ["/usr/local/bin/ragmux-aio"]
+CMD []

@@ -17,6 +17,8 @@ gateway. Connections are managed with `POST /admin/api/models` (see the
 | `deepseek` | `https://api.deepseek.com/v1` | `POST {base}/chat/completions` | reported as unsupported (`supports_embeddings: false`) | `Authorization: Bearer <api_key>` |
 | `ollama` | `http://localhost:11434` | `POST {base}/api/chat` (native API) | yes — `POST {base}/api/embed` | none; an `api_key` is sent as `Authorization: Bearer` for a proxy in front of Ollama |
 | `custom_openai` | *(required; dashboard suggests `http://localhost:8000/v1`)* | `POST {base}/chat/completions` | yes — `POST {base}/embeddings` | `Authorization: Bearer <api_key>` (optional) |
+| `cohere_rerank` | `https://api.cohere.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
+| `voyage_rerank` | `https://api.voyageai.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
 
 Base URL handling: a trailing `/` is trimmed. For `openai` and `deepseek` a `/v1` suffix
 is appended when the URL does not already end in one. For `custom_openai` the URL is used
@@ -60,6 +62,9 @@ type, because the translation exists — the model's own refusal is relayed as i
 | `cached_token_usage` | yes | yes | yes | yes | no | no |
 | `rerank` | no | no | no | no | no | no |
 
+`cohere_rerank` and `voyage_rerank` sit outside that table: `rerank` is the only
+capability they have, and `chat` and `embeddings` are both `no`.
+
 ¹ Tool calls still work in streams; they arrive as one complete delta per call instead of
 argument fragments, because that is how the upstream sends them — see
 [Ollama](#ollama-native-api) and [Gemini](#gemini).
@@ -74,6 +79,38 @@ only drift. It is a description, for the dashboard and for this page.
 `GET /admin/api/provider-types` reports it per type: the flat `supports_embeddings`,
 `requires_api_key`, `supports_streaming` and `supports_tools` fields, plus a
 `capabilities` object with the full table above.
+
+## Rerank providers (`cohere_rerank`, `voyage_rerank`)
+
+These two types are connections that can do exactly one thing: reorder retrieved
+passages by relevance to a query. **They cannot back a project and they cannot back a
+RAG store's embeddings.** `provider.New` and `NewEmbedder` reject them, the dashboard's
+model and embedding pickers filter them out, and saving a project or a store that names
+one is refused with `400` (`provider "cohere_rerank" cannot be used for chat`,
+`... cannot be used for embeddings`). The only place a connection of these types belongs
+is a RAG store's `rerank_connection_id` — see [Reranking](rag.md#reranking).
+
+| | `cohere_rerank` | `voyage_rerank` |
+|---|---|---|
+| Endpoint | `POST {base}/v2/rerank` | `POST {base}/v1/rerank` |
+| Request | `{"model","query","documents","top_n"}` | `{"model","query","documents","top_k","truncation":true}` |
+| Response | `{"results":[{"index","relevance_score"}]}` | `{"data":[{"index","relevance_score"}]}` |
+| `model_name` | e.g. `rerank-v3.5` | e.g. `rerank-2.5` |
+
+They are ordinary model connections in every other respect: the API key is AES-256-GCM
+encrypted at rest with the connection id as additional authenticated data, it is covered
+by `ragmux rotate-key`, it is masked in the API, the `base_url` goes through the same
+SSRF guard when it is saved, and the call itself travels the gateway's one hardened
+outbound path — the netguard dialer, the redirect cap, the fixed transport-error
+messages, redaction and the response body cap. `POST /admin/api/models/{id}/test` does
+not apply to them: they answer neither a chat nor an embedding ping. Test them from the
+RAG store's search panel instead, which shows whether reranking ran or was skipped.
+
+Each passage is cut to 4000 characters before it is sent. Indexes the API answers with
+are validated against the list that was sent: anything out of range or repeated is
+dropped, and a reply with nothing usable left is a `502`. Every failure — a timeout, a
+`429`, a malformed body — leaves the fused retrieval order in place; the request is
+answered without reranking and the reason is logged.
 
 ## OpenAI-compatible (`openai`, `deepseek`, `custom_openai`)
 
