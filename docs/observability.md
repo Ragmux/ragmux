@@ -27,7 +27,7 @@ takes no Go module dependency for either.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `METRICS_ENABLED` | `false` | Serve `/metrics` at all. Off, the route does not exist and returns `404`. |
+| `METRICS_ENABLED` | `false` | Serve `/metrics` at all. Off, the route does not exist and returns `404`. `true` or `false` only — any other value stops the start-up instead of quietly meaning off. |
 | `METRICS_TOKEN` / `METRICS_TOKEN_FILE` | *(none)* | Bearer token every scrape must present. Required unless `METRICS_LISTEN` binds a loopback address. |
 | `METRICS_LISTEN` | *(none)* | `host:port`. When set, `/metrics` moves to a second HTTP server and leaves the main router entirely. |
 | `METRICS_MAX_SERIES` | `5000` | Ceiling on label combinations; beyond it new ones are dropped and counted. |

@@ -165,7 +165,7 @@ func (e *env) userKey(name string, projects []int64, mutate func(*store.APIKey))
 		e.owner = u
 	}
 	k := &store.APIKey{Kind: store.KindGateway, Name: name, UserID: e.owner.ID,
-		Scopes: store.DefaultGatewayScopes, ProjectIDs: projects}
+		Scopes: store.DefaultGatewayScopes(), ProjectIDs: projects}
 	if mutate != nil {
 		mutate(k)
 	}

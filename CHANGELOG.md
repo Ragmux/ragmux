@@ -57,6 +57,14 @@ All notable changes to Ragmux are documented here. The format follows
   chunk could break. **If you read token counts off a stream, set `include_usage`**; the
   request log, budgets and cost estimate are unaffected either way, because the gateway
   still asks its upstream for the counts.
+- **`METRICS_ENABLED` rejects values that are neither `true` nor `false`.** It was
+  compared against `"true"` and everything else silently meant off, so `METRICS_ENABLED=1`
+  or `=yes` started a gateway whose `/metrics` answered `404` and was discovered from a
+  scrape target that never came up. `TRACING_ENABLED` already refused what it did not
+  understand; metrics now match it. **Upgrade note:** an installation setting anything but
+  `true`, `false` or nothing will fail to start until the value is corrected — the error
+  names the variable and the two values it accepts. Metrics were already off in every such
+  installation, so fixing the value is a no-op unless `true` was what was meant.
 
 ### Fixed
 - A document whose file type is unsupported no longer quotes the rejected extension into
@@ -64,6 +72,11 @@ All notable changes to Ragmux are documented here. The format follows
 - The Go runtime gauges shared one `runtime/metrics` sample buffer across every gauge and
   every concurrent scrape, so two overlapping scrapes could race and report one another's
   numbers.
+- Step 3 of the first-run wizard no longer offers a project form it cannot submit. The
+  model-connection picker is built from what the dashboard loaded at boot, so a reload
+  where that call failed drew an empty picker and a submit that posted a null connection
+  id and came back a validation error nobody could act on. The step now says the
+  connections could not be loaded, keeps the submit disabled, and offers a retry.
 - **`PG_SEARCH_TOKENIZER` stemming works.** `en_stem` — the only stemming value the
   documentation named — is not a tokenizer *type* `pg_search` 0.25 knows, so it rejected
   the BM25 index DDL and every rag store set to the `pg_search` backend fell back to
@@ -115,6 +128,17 @@ All notable changes to Ragmux are documented here. The format follows
   one.** Dropping `idx_chunks_bm25` first is not enough; see
   [Backup and restore](docs/backup-restore.md#restoring-a-paradedb-dump-onto-a-plain-pgvector-server).
 
+### Security
+- `GET /admin/api/setup` stops describing the installation once setup is done. The
+  endpoint is unauthenticated by design, and it used to answer in full whether or not
+  setup was still pending, handing an anonymous request the migrations version, the
+  PostgreSQL role, where `SECRET_KEY` came from and — since the wizard landed —
+  `has_connections` and `has_projects`. No one field is an opening; together they are a
+  free reconnaissance call on an internet-facing install. **Once any user exists the
+  response is `{"needs_setup": false}` and nothing else.** While setup is still pending
+  nothing changes: the wizard's first screen gets everything it shows. The dashboard now
+  resumes a reloaded wizard from its own stored step instead of from this endpoint.
+
 ## [0.4.0] — 2026-09-19
 
 ### Added
@@ -123,11 +147,14 @@ All notable changes to Ragmux are documented here. The format follows
   it is granted; a **management** key (`sk-mgmt-…`) calls `/admin/api` within its scopes,
   replacing the 24-hour session token scripts had to borrow. Both carry an optional
   `expires_at`, can be revoked, record `last_used_at`, and may set their own rate limits
-  and budgets **under** the project's. A key never outranks its owner: its effective
-  permission is its scopes intersected with the owner's live role, so demoting or
-  deactivating a user immediately narrows every key they hold. A project's own
-  `sk-proj-…` key is unchanged and keeps working exactly as before. Managed from the new
-  **Keys** tab and `/admin/api/keys`, documented in
+  and budgets **under** the project's. A key never outranks its owner: on `/admin/api` its
+  effective permission is its scopes intersected with the owner's live role, so demoting a
+  user narrows every `sk-mgmt-…` key they hold at once. A demotion changes nothing about
+  an `sk-user-…` key — `/v1` does not consult roles, and `chat` and `models` are covered
+  by every role including `viewer` — so what stops one of those is revoking it, giving it
+  a smaller sub-limit, or deactivating the owner, which stops every key they hold. A
+  project's own `sk-proj-…` key is unchanged and keeps working exactly as before. Managed
+  from the new **Keys** tab and `/admin/api/keys`, documented in
   [Users, roles and limits](docs/users-and-limits.md#api-keys).
 - **`X-Ragmux-Project`**: a gateway key granting several projects selects one per request
   with this header, falling back to the key's default project and then to its single

@@ -14,12 +14,56 @@ dashboard (**Users** tab) or via `POST /admin/api/users`. Every user has exactly
 |----------|------------------------------------------|----------|----------|------------------|
 | `admin`  | full access | all projects, all metrics | own and everyone's; only role that may delete one | full access |
 | `editor` | create, edit, delete, upload, test, search | create (becomes a member); read, edit, delete, rotate key, metrics and members only for projects it belongs to | own; may create `management` keys | list active users (`/users/lite`) |
-| `viewer` | read and search only | read and metrics only for projects it belongs to | own `gateway` keys for member projects | — |
+| `viewer` | read and search only | read and metrics only for projects it belongs to | own `gateway` (`sk-user-…`) keys for member projects — **which means a viewer can spend**, see below; no `management` keys | — |
 
 Writes the role does not allow answer `403 {"error":{"type":"forbidden"}}`. Everyone can
 change their own password (`POST /admin/api/me/password`), manage their own API keys and
 read `/admin/api/system` (the PostgreSQL and pgvector versions in it are shown to admins
 only).
+
+### A role bounds the admin surface, not spend
+
+The table above is about `/admin/api` and the dashboard. It is not a spending limit, and
+`viewer` is not a read-only *account* — only a read-only *administrator*. The key routes
+are deliberately role-free, because every account manages its own credentials, so a
+`viewer` can mint itself an `sk-user-…` gateway key granting the projects it is a member
+of, and send traffic through `/v1`. That spend is charged to those projects' budgets and
+attributed to the key in the usage records, exactly as an editor's or an admin's would
+be.
+
+What bounds that spend is never a role. It is:
+
+- the per-project rate limits and token budgets the key runs under (below), and
+- the optional per-key sub-limits set when the key is created ([Key sub-limits](#key-sub-limits)).
+
+A user carries no limit of its own; limits live on the project and on the key.
+
+**To cap one user**, give their key a sub-limit. Note that `0` there means *unlimited*,
+not *nothing*, so capping means setting a small ceiling — setting it to zero removes the
+ceiling instead of applying one.
+
+**To stop them outright**, revoke the key (`POST /admin/api/keys/{id}/revoke`), or
+deactivate the account (`PUT /admin/api/users/{id}` with `is_active: false`).
+Deactivation stops every key the user holds at once, at `/v1` with
+`401 key_owner_inactive`.
+
+**Two things that look like they would stop a key and do not:**
+
+- **Dropping the user's project membership.** A gateway key carries its own grants,
+  validated once when the key was created; `/v1` consults only those and never rechecks
+  `project_members` ([API keys](#api-keys) below). The user loses the project in the
+  dashboard while the key keeps spending against it.
+- **Setting a limit to `0`.** That is the unlimited value, as above.
+
+**Demoting the user to `viewer`** takes away the admin surface and nothing else on the
+gateway side. Role is intersected with a key's scopes on `/admin/api` only, where it is
+read live on every request, so a demotion narrows the `sk-mgmt-…` keys the user holds
+immediately. It changes nothing about an `sk-user-…` key: `/v1` does not consult roles,
+and `chat` and `models` are scopes every role including `viewer` already covers.
+
+Roles do still bind where they are the control: a `viewer` cannot put a `write`, `admin`
+or `keys` scope on any key it mints, and a `management` key needs at least `editor` plus
+an interactive session. Recorded as ADR-003.
 
 ## Project membership
 
@@ -63,10 +107,20 @@ All three prefixes keep the `sk-` head so secret scanners that watch for OpenAI-
 keys keep firing on a leak. The key is shown once at creation and only its first 15
 characters (`key_prefix`) are stored for identification, next to a SHA-256 hash.
 
-**A key can never exceed its owner.** The effective permission is the key's scopes
-intersected with the owner's role, and the role is read from the database on *every*
-request: demoting a user narrows all their keys at once, and deactivating one stops them
-resolving entirely. Scopes only ever narrow.
+**A key is never issued beyond its owner.** Scopes only ever narrow, grants are held at
+creation to what the owner can reach, and the owner is looked up on *every* request rather
+than copied onto the key. What that lookup can still take away, though, depends on the
+surface — a grant, once given, is not rechecked.
+
+What that lookup enforces differs by surface. On `/admin/api` the effective permission is
+the key's scopes intersected with the owner's role, so demoting a user narrows every
+`sk-mgmt-…` key they hold at once. `/v1` does not read the role at all — it checks only
+that the account is active — so a demotion changes nothing about an `sk-user-…` key:
+`chat` and `models` are scopes every role including `viewer` already covers. See
+[A role bounds the admin surface, not spend](#a-role-bounds-the-admin-surface-not-spend).
+
+**Deactivating** an account stops both kinds at once: the key stops resolving entirely
+(`401 key_owner_inactive` at `/v1`).
 
 | Kind | Scope | Allows |
 |---|---|---|

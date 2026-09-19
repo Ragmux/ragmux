@@ -1,6 +1,6 @@
 # Faz 06 — Yapılandırma ve kapanış küçükleri
 
-- **Durum:** beklemede
+- **Durum:** review
 - **Sahip:** backend-engineer
 - **Bağımlılık:** yok
 - **İlgili karar:** ADR-003 (5. madde)

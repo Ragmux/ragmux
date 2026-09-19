@@ -160,7 +160,11 @@ func keyID(t *testing.T, out map[string]any) int64 {
 }
 
 // A viewer can mint a gateway key for a project it belongs to; that is the
-// intended flow, since the key is bounded by the owner's live role anyway.
+// intended flow (ADR-003). What makes it safe is this gate, not a role: the
+// grants are held to what the owner could reach at creation time, which is
+// what the refusals below cover. The role is not a second bound here -- /v1
+// never reads one -- so what limits the spend afterwards is the project's own
+// rate limits and budgets and the key's sub-limits under them.
 func TestCreateGatewayKeyMembershipGate(t *testing.T) {
 	e := newAdminEnv(t)
 	viewer := e.user("viewer", "viewer", e.proj.ID)
@@ -481,7 +485,7 @@ func TestSessionOnlyActions(t *testing.T) {
 	ctx := context.Background()
 	admin := e.user("admin", "admin")
 	_, raw, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindManagement, Name: "everything",
-		UserID: admin.ID, Scopes: store.ManagementScopes})
+		UserID: admin.ID, Scopes: store.ManagementScopes()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +581,7 @@ func TestManagementKeyCannotWidenItself(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := map[string]any{"name": "ci", "scopes": store.ManagementScopes,
+	body := map[string]any{"name": "ci", "scopes": store.ManagementScopes(),
 		"expires_at": "2099-01-01T00:00:00Z"}
 	status, _ := e.do(http.MethodPut, "/api/keys/"+itoa(k.ID), body, raw)
 	if status != http.StatusForbidden {
@@ -618,12 +622,12 @@ func TestPasswordChangeRevokesManagementKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgmt, mgmtRaw, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindManagement,
-		Name: "minted-by-the-attacker", UserID: admin.ID, Scopes: store.ManagementScopes})
+		Name: "minted-by-the-attacker", UserID: admin.ID, Scopes: store.ManagementScopes()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	gw, _, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "app",
-		UserID: admin.ID, Scopes: store.DefaultGatewayScopes, ProjectIDs: []int64{e.proj.ID}})
+		UserID: admin.ID, Scopes: store.DefaultGatewayScopes(), ProjectIDs: []int64{e.proj.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,7 +671,7 @@ func TestDeletingAUserWithAttributedSpendIsRefused(t *testing.T) {
 	admin := e.user("admin", "admin")
 	victim := e.user("app-owner", "editor", e.proj.ID)
 	k, _, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "app",
-		UserID: victim.ID, Scopes: store.DefaultGatewayScopes, ProjectIDs: []int64{e.proj.ID}})
+		UserID: victim.ID, Scopes: store.DefaultGatewayScopes(), ProjectIDs: []int64{e.proj.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}

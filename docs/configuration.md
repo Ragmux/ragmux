@@ -51,7 +51,7 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `LOGIN_LOCKOUT_MINUTES` | `15` | Lockout window in minutes. |
 | `LOG_RETENTION_DAYS` | `90` | Request logs older than this many days are deleted by the hourly retention job (`0` keeps them forever). |
 | `AUDIT_RETENTION_DAYS` | `365` | Audit entries older than this many days are deleted (`0` keeps them forever). |
-| `METRICS_ENABLED` | `false` | `true` serves the Prometheus text exposition at `/metrics`. Off, the route does not exist and returns `404`. See [Observability](observability.md). |
+| `METRICS_ENABLED` | `false` | `true` serves the Prometheus text exposition at `/metrics`. Off, the route does not exist and returns `404`. Only `true` and `false` are accepted; anything else (`1`, `yes`, `TRUE`) is a start-up error rather than a silent off. See [Observability](observability.md). |
 | `METRICS_TOKEN` | *(none)* | Bearer token `/metrics` requires, compared in constant time. Required whenever `METRICS_LISTEN` is unset or binds a non-loopback address; see [Why the endpoint is authenticated](observability.md#why-the-endpoint-is-authenticated). |
 | `METRICS_TOKEN_FILE` | *(none)* | Path of a file whose trimmed content is used when `METRICS_TOKEN` is unset (Docker/Compose secrets). |
 | `METRICS_LISTEN` | *(none)* | `host:port` (e.g. `127.0.0.1:9090`). When set, `/metrics` is served by a **second** `http.Server` on that address and is **not mounted on the main router at all**, so no reverse-proxy rule can expose it. A loopback host (`127.0.0.1`, `::1`, `localhost`) is accepted without a token; any other host still needs one. Setting it without `METRICS_ENABLED=true` is a configuration error. |

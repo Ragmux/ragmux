@@ -347,7 +347,10 @@ func run(cfg config.Config) error {
 	log.Info("retention job scheduled", "log_retention_days", cfg.LogRetentionDays,
 		"audit_retention_days", cfg.AuditRetentionDays, "interval", maintenance.DefaultInterval)
 
-	errc := make(chan error, 1)
+	// One slot per listener goroutine: only the first error is acted on, but
+	// a second one must not park its goroutine on a full channel for the rest
+	// of the process's life.
+	errc := make(chan error, 2)
 	go func() {
 		log.Info("ragmux listening", "addr", srv.Addr, "version", version)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -245,7 +245,7 @@ func keySubject(t *testing.T, l *Limiter, p *store.Project, caps Caps) Subject {
 		t.Fatal(err)
 	}
 	k, _, err := l.Store.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "k", UserID: u.ID,
-		Scopes: store.DefaultGatewayScopes, ProjectIDs: []int64{p.ID},
+		Scopes: store.DefaultGatewayScopes(), ProjectIDs: []int64{p.ID},
 		RateLimitRPM: caps.RPM, RateLimitTPM: caps.TPM,
 		BudgetDailyTokens: caps.DailyTokens, BudgetMonthlyTokens: caps.MonthlyTokens})
 	if err != nil {

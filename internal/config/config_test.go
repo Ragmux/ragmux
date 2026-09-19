@@ -179,3 +179,34 @@ func TestRerankTimeoutMustParse(t *testing.T) {
 		t.Errorf("timeout = %v", c.RerankTimeout)
 	}
 }
+
+// METRICS_ENABLED used to accept exactly "true" and treat every other value
+// as off, so METRICS_ENABLED=1 or =yes was a silent no that only showed up as
+// an empty dashboard. TRACING_ENABLED in the same file already refused what
+// it did not understand; this holds metrics to the same contract.
+func TestMetricsEnabledRefusesUnknownValues(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x/y")
+	t.Setenv("SECRET_KEY", strings.Repeat("a", 64))
+	t.Setenv("METRICS_TOKEN", "t")
+	for _, bad := range []string{"1", "0", "yes", "no", "TRUE", "False", "on", "off"} {
+		t.Setenv("METRICS_ENABLED", bad)
+		_, err := Load()
+		if err == nil {
+			t.Errorf("METRICS_ENABLED %q was accepted", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "METRICS_ENABLED") {
+			t.Errorf("METRICS_ENABLED %q: the error must name the variable, got %q", bad, err)
+		}
+	}
+	for _, good := range []string{"true", "false", "", " true "} {
+		t.Setenv("METRICS_ENABLED", good)
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("METRICS_ENABLED %q rejected: %v", good, err)
+		}
+		if want := strings.TrimSpace(good) == "true"; c.MetricsEnabled != want {
+			t.Errorf("METRICS_ENABLED %q: enabled = %v, want %v", good, c.MetricsEnabled, want)
+		}
+	}
+}

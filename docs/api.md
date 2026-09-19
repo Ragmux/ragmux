@@ -61,6 +61,19 @@ Three routes refuse an api-key principal outright with
 `POST /users/{id}/reset-password` and creating a `kind=management` key — so a leaked key
 cannot take over the account it belongs to.
 
+**What that guard assumes.** It treats a session as a person at a keyboard and an api
+key as a stored credential, and grants the account-takeover routes only to the first.
+`"bearer": true` weakens the premise: the session token leaves the browser as a string
+in a JSON body, and a string can be pasted into a script, a CI secret or a chat window,
+at which point a "session" is doing exactly what the guard withholds from keys. The
+difference that remains is lifetime and revocation, not interactivity: a session token
+expires after `SESSION_TTL` (24 h by default), dies with a logout, a password change, a
+password reset, a session revoke or a deactivation, and cannot be listed, named or
+scoped — an api key outlives all of that until someone revokes it. Treat a bearer
+session token as a short-lived credential, keep it out of anything durable, and use a
+`sk-mgmt-…` key for automation that is supposed to persist; if a script genuinely needs
+one of the three routes above, it needs a human to sign in for it.
+
 Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-Id`;
 unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
 and log the detail under that id.
@@ -165,7 +178,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}`: `needs_setup` is `true` while the `users` table is empty; the next three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role); `has_connections` and `has_projects` are two `EXISTS` probes the first-run wizard uses to resume at the right step after a reload. `N` is the applied migration version, whatever this build has reached |
+| GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
@@ -175,7 +188,9 @@ The dashboard's first-run wizard has three steps, but only this first one is
 unauthenticated. Step 2 (a model connection) and step 3 (a project) are ordinary
 authenticated calls to `POST /api/models` and `POST /api/projects` made with the session
 the first step established, so they are role-gated and audited like any other write and
-add no new unauthenticated surface. Both are skippable.
+add no new unauthenticated surface. Both are skippable. A reload during step 2 or 3
+picks the step back up from `GET /api/models`, which the session can already read —
+not from `GET /setup`, which by then answers `needs_setup` alone.
 
 ### Session and account
 

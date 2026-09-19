@@ -145,7 +145,7 @@ func (a *Admin) validateKey(r *http.Request, in *keyInput, k *store.APIKey) erro
 func clipScopes(want []string, kind string, role auth.Role) ([]string, error) {
 	if len(want) == 0 {
 		if kind == store.KindGateway {
-			return store.DefaultGatewayScopes, nil
+			return store.DefaultGatewayScopes(), nil
 		}
 		return nil, errors.New("a management key needs at least one scope")
 	}
