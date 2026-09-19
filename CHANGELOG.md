@@ -7,7 +7,6 @@ All notable changes to Ragmux are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-<<<<<<< HEAD
 - **The request id is generated, never taken from `X-Request-Id`.** Ragmux previously used
   chi's `middleware.RequestID`, which starts from the client's `X-Request-Id` header and
   only generates an id when it is absent. That id reaches the `ragmux.request_id` span
