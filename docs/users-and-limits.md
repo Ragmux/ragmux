@@ -107,8 +107,10 @@ All three prefixes keep the `sk-` head so secret scanners that watch for OpenAI-
 keys keep firing on a leak. The key is shown once at creation and only its first 15
 characters (`key_prefix`) are stored for identification, next to a SHA-256 hash.
 
-**A key can never exceed its owner.** Scopes only ever narrow, and the owner is looked up
-on *every* request rather than copied onto the key.
+**A key is never issued beyond its owner.** Scopes only ever narrow, grants are held at
+creation to what the owner can reach, and the owner is looked up on *every* request rather
+than copied onto the key. What that lookup can still take away, though, depends on the
+surface — a grant, once given, is not rechecked.
 
 What that lookup enforces differs by surface. On `/admin/api` the effective permission is
 the key's scopes intersected with the owner's role, so demoting a user narrows every

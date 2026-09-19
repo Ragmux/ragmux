@@ -160,7 +160,11 @@ func keyID(t *testing.T, out map[string]any) int64 {
 }
 
 // A viewer can mint a gateway key for a project it belongs to; that is the
-// intended flow, since the key is bounded by the owner's live role anyway.
+// intended flow (ADR-003). What makes it safe is this gate, not a role: the
+// grants are held to what the owner could reach at creation time, which is
+// what the refusals below cover. The role is not a second bound here -- /v1
+// never reads one -- so what limits the spend afterwards is the project's own
+// rate limits and budgets and the key's sub-limits under them.
 func TestCreateGatewayKeyMembershipGate(t *testing.T) {
 	e := newAdminEnv(t)
 	viewer := e.user("viewer", "viewer", e.proj.ID)
