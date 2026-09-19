@@ -36,6 +36,12 @@ func assertGeminiNode(t *testing.T, path string, node map[string]any) {
 		t.Errorf("%s: empty schema node", path)
 	}
 	typ, _ := node["type"].(string)
+	// Every node is typed, or is a union of typed ones. Only checking for an
+	// empty node left {"description":"hi"} -- valid JSON Schema, and an error
+	// from Gemini -- passing the assertion that carries this file's promise.
+	if typ == "" && node["anyOf"] == nil {
+		t.Errorf("%s: node has no type: %#v", path, node)
+	}
 	str := func(k string, v any) {
 		if _, ok := v.(string); !ok {
 			t.Errorf("%s/%s = %#v, want a string", path, k, v)
@@ -146,9 +152,12 @@ func TestGeminiSchemaSanitize(t *testing.T) {
 			want: `{"properties":{"root":{"properties":{"next":{"description":"(recursive schema elided)","type":"string"}},"type":"object"}},"type":"object"}`,
 		},
 		{
+			// A reference matched on its full pointer is unresolvable far more
+			// often than it is recursive -- every external one is -- so it
+			// says which of the two happened.
 			name: "unresolvable ref elided",
 			in:   `{"type":"object","properties":{"a":{"$ref":"#/components/schemas/Missing"}}}`,
-			want: `{"properties":{"a":{"description":"(recursive schema elided)","type":"string"}},"type":"object"}`,
+			want: `{"properties":{"a":{"description":"(unresolved schema reference elided)","type":"string"}},"type":"object"}`,
 		},
 		{
 			name: "nullable union",
@@ -252,6 +261,34 @@ func TestGeminiSchemaSanitize(t *testing.T) {
 			dropped: []string{"description", "maxLength", "nullable", "pattern"},
 		},
 		{
+			// Valid JSON Schema, and an error from Gemini: an untyped node
+			// takes the type its surviving keywords imply.
+			name: "untyped nodes are typed from what is left",
+			in: `{"properties":{"note":{"description":"free text"},"n":{"minimum":1},` +
+				`"xs":{"items":{"type":"string"}},"o":{"properties":{"a":{"type":"string"}}}}}`,
+			want: `{"properties":{"n":{"minimum":1,"type":"number"},` +
+				`"note":{"description":"free text","type":"string"},` +
+				`"o":{"properties":{"a":{"type":"string"}},"type":"object"},` +
+				`"xs":{"items":{"type":"string"},"type":"array"}},"type":"object"}`,
+		},
+		{
+			// Schema.minimum is a double; json.Number validates the spelling
+			// and not the range, so this used to travel as a literal Gemini
+			// cannot hold.
+			name:    "out-of-range bound dropped",
+			in:      `{"type":"number","minimum":1e400,"maximum":2}`,
+			want:    `{"maximum":2,"type":"number"}`,
+			dropped: []string{"minimum"},
+		},
+		{
+			// Two branches naming the same field used to repeat it once per
+			// branch, and nested allOf chains multiplied that at every level.
+			name: "merged required is a set",
+			in: `{"allOf":[{"type":"object","properties":{"a":{"type":"string"}},"required":["a","b"]},` +
+				`{"type":"object","properties":{"b":{"type":"string"}},"required":["b","a"]}]}`,
+			want: `{"properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"],"type":"object"}`,
+		},
+		{
 			name:    "null exclusive bound dropped",
 			in:      `{"type":"object","properties":{"n":{"type":"number","exclusiveMinimum":null}}}`,
 			want:    `{"properties":{"n":{"type":"number"}},"type":"object"}`,
@@ -294,7 +331,7 @@ func TestSanitizeGeminiSchemaSameNamedDefs(t *testing.T) {
 	want := `{"properties":{` +
 		`"a":{"properties":{"outer":{"type":"string"}},"type":"object"},` +
 		`"b":{"properties":{"sibling":{"type":"integer"}},"type":"object"},` +
-		`"c":{"description":"(recursive schema elided)","type":"string"},` +
+		`"c":{"description":"(unresolved schema reference elided)","type":"string"},` +
 		`"d":{"properties":{"nested":{"type":"boolean"}},"type":"object"}},"type":"object"}`
 
 	first, _ := sanitizeGeminiSchema(json.RawMessage(in))

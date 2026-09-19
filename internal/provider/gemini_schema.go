@@ -36,9 +36,10 @@ const (
 	// geminiSchemaMaxNodes caps the whole walk. A hand-written tool schema
 	// runs to tens of nodes; hundreds is already unusual. Past this the rest
 	// of the tree is elided rather than expanded.
-	geminiSchemaMaxNodes  = 4096
-	geminiSchemaElided    = "(recursive schema elided)"
-	geminiSchemaTruncated = "(schema too large; elided)"
+	geminiSchemaMaxNodes   = 4096
+	geminiSchemaElided     = "(recursive schema elided)"
+	geminiSchemaUnresolved = "(unresolved schema reference elided)"
+	geminiSchemaTruncated  = "(schema too large; elided)"
 	// geminiSchemaRoot is the JSON Pointer of the schema's own root, which
 	// every definition's key is built from.
 	geminiSchemaRoot = "#"
@@ -107,6 +108,12 @@ func geminiScalar(kind geminiScalarKind, raw json.RawMessage) (any, bool) {
 	case geminiScalarNumber:
 		var n json.Number
 		if json.Unmarshal(raw, &n) != nil || n == "" {
+			return nil, false
+		}
+		// Schema.minimum and its neighbours are doubles. json.Number checks
+		// the spelling and not the range, so 1e400 is a valid literal here
+		// and an overflow there; ParseFloat is what says it fits.
+		if _, err := strconv.ParseFloat(n.String(), 64); err != nil {
 			return nil, false
 		}
 		return n, true
@@ -343,7 +350,29 @@ func (w *geminiSchemaWalk) node(raw json.RawMessage, depth int, visited map[stri
 		// what the root degrades to as well.
 		out["type"] = "object"
 	}
+	// Gemini reads an untyped node as an error, and a schema may legitimately
+	// carry none -- {"description":"the city"} is valid JSON Schema. The one
+	// exception is a pure union: an anyOf node is typed by its branches.
+	if out["type"] == nil && out["anyOf"] == nil {
+		out["type"] = geminiInferType(out)
+	}
 	return out
+}
+
+// geminiInferType picks a type for a node that declared none, from whatever
+// keywords survived. It is a guess, but a typed guess is a schema Gemini
+// reads and an untyped node is one it rejects.
+func geminiInferType(out map[string]any) string {
+	switch {
+	case out["properties"] != nil || out["required"] != nil:
+		return "object"
+	case out["items"] != nil:
+		return "array"
+	case out["minimum"] != nil || out["maximum"] != nil:
+		return "number"
+	default:
+		return "string"
+	}
 }
 
 // nodeType resolves the type keyword. A ["string","null"] union is Gemini's
@@ -422,13 +451,27 @@ func (w *geminiSchemaWalk) mergeAllOf(out map[string]any, raw json.RawMessage, d
 	if props == nil {
 		props = map[string]any{}
 	}
+	// required is merged as a set. Appending let a name repeat once per
+	// branch that mentioned it, and nested allOf chains multiplied that at
+	// every level with nothing bounding the result.
 	required, _ := out["required"].([]string)
+	seen := make(map[string]bool, len(required))
+	for _, name := range required {
+		seen[name] = true
+	}
 	for _, n := range nodes {
 		for k, v := range n["properties"].(map[string]any) {
 			props[k] = v
 		}
-		if req, ok := n["required"].([]string); ok {
-			required = append(required, req...)
+		req, ok := n["required"].([]string)
+		if !ok {
+			continue
+		}
+		for _, name := range req {
+			if !seen[name] {
+				seen[name] = true
+				required = append(required, name)
+			}
 		}
 	}
 	out["type"] = "object"
@@ -467,9 +510,14 @@ func (w *geminiSchemaWalk) inlineRef(raw json.RawMessage, depth int, visited map
 	// definition that happens to share a name would hand the model a shape
 	// the tool never described.
 	def, ok := w.defs[ref]
-	if !ok || visited[ref] || depth >= geminiSchemaMaxDepth {
-		// A cycle, or a definition we never saw: Gemini has no $ref, so there
-		// is nothing to defer to and the node degrades to a described string.
+	if !ok {
+		// A definition we never saw, which since references are matched on
+		// their full pointer is most often an external one. Gemini has no
+		// $ref, so there is nothing to defer to.
+		return geminiUnresolvedNode()
+	}
+	if visited[ref] || depth >= geminiSchemaMaxDepth {
+		// A cycle: the node degrades to a described string.
 		return geminiElidedNode()
 	}
 	next := make(map[string]bool, len(visited)+1)
@@ -511,6 +559,10 @@ func geminiPointerEscape(s string) string { return geminiPointerEscaper.Replace(
 
 func geminiElidedNode() map[string]any {
 	return map[string]any{"type": "string", "description": geminiSchemaElided}
+}
+
+func geminiUnresolvedNode() map[string]any {
+	return map[string]any{"type": "string", "description": geminiSchemaUnresolved}
 }
 
 // geminiTruncatedNode stands in for a subtree the node budget cut off. It is
