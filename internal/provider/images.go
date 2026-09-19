@@ -189,6 +189,13 @@ type ImageFetcher struct {
 	// inflight is slots held per tenant; an entry is deleted at zero, so an
 	// idle tenant leaves nothing behind.
 	inflight map[string]int
+	// queued is the same tenant's acquirers already promised a slot by the
+	// share and waiting for one. It counts towards the share alongside
+	// inflight, because inflight only rises once a slot is in hand: a burst
+	// of acquirers from one tenant all read the same pre-burst number and all
+	// queued as entitled, so the tenant could pass its share while another
+	// was queueing -- the share held eventually rather than throughout.
+	queued map[string]int
 	// waiting counts acquirers queued for a slot they are entitled to, which
 	// is what tells a tenant already over its share to leave the next freed
 	// slot alone.
@@ -202,6 +209,7 @@ func (f *ImageFetcher) init() {
 	f.semOnce.Do(func() {
 		f.sem = make(chan struct{}, f.maxConcurrent())
 		f.inflight = map[string]int{}
+		f.queued = map[string]int{}
 		f.wake = make(chan struct{})
 	})
 }
@@ -238,21 +246,30 @@ func (f *ImageFetcher) acquire(ctx context.Context, tenant string) (func(), erro
 	share := f.tenantShare()
 	for {
 		f.mu.Lock()
-		if f.inflight[tenant] < share {
+		if f.inflight[tenant]+f.queued[tenant] < share {
 			f.waiting++
+			f.queued[tenant]++
 			f.mu.Unlock()
 			select {
 			case f.sem <- struct{}{}:
 				f.mu.Lock()
 				f.waiting--
+				f.dequeue(tenant)
 				f.inflight[tenant]++
+				// The tenant's own total did not move, so only the process
+				// queue emptying can newly permit anybody.
 				f.wakeIfQueueEmpty()
 				f.mu.Unlock()
 				return f.release(tenant), nil
 			case <-wait.Done():
 				f.mu.Lock()
 				f.waiting--
-				f.wakeIfQueueEmpty()
+				f.dequeue(tenant)
+				// This one lowers the tenant's total without raising
+				// inflight, so a sibling parked outside the share may have
+				// just come back inside it. Waking only on an empty process
+				// queue would leave it asleep while another tenant waits.
+				f.broadcast()
 				f.mu.Unlock()
 				return nil, f.queueError(ctx)
 			}
@@ -273,6 +290,15 @@ func (f *ImageFetcher) acquire(ctx context.Context, tenant string) (func(), erro
 		case <-wait.Done():
 			return nil, f.queueError(ctx)
 		}
+	}
+}
+
+// dequeue drops one of the tenant's promised slots. The caller holds f.mu.
+func (f *ImageFetcher) dequeue(tenant string) {
+	if n := f.queued[tenant] - 1; n > 0 {
+		f.queued[tenant] = n
+	} else {
+		delete(f.queued, tenant)
 	}
 }
 

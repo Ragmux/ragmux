@@ -773,6 +773,58 @@ func TestImageFetcherWakesWhenTheQueueEmpties(t *testing.T) {
 	}
 }
 
+// The share counts the tenant's queued acquirers, not only the slots it holds.
+//
+// inflight rises once a slot is in hand, so acquirers that check before it
+// does all read the same number and all join the entitled queue; the tenant
+// then sat ahead of a newcomer in the semaphore's queue with more claims than
+// its share. Counting the queue closes that at registration.
+//
+// Driven directly, because the difference is in a decision rather than an
+// outcome: given spare capacity, an acquirer admitted to the entitled queue
+// and one taking spare capacity outside its share both end up with a slot.
+// What separates them is whether somebody else is queueing, so that is what
+// the state here says.
+func TestImageFetcherShareCountsTheQueue(t *testing.T) {
+	const slots = 8 // a share of 4
+	f := &ImageFetcher{MaxConcurrent: slots, QueueWait: 50 * time.Millisecond}
+	f.init()
+	share := f.tenantShare()
+
+	f.mu.Lock()
+	// The tenant's claims already add up to its share: share-1 slots in hand
+	// and one acquirer queued for the last.
+	f.inflight["noisy"] = share - 1
+	f.queued["noisy"] = 1
+	// And somebody else is queueing, which is what makes the share bind.
+	f.waiting = 1
+	f.mu.Unlock()
+
+	// Capacity is free -- only share-1 of eight slots are spoken for -- so an
+	// acquirer that still counted itself entitled would sail through.
+	if _, err := f.acquire(context.Background(), "noisy"); err == nil {
+		t.Fatal("a tenant at its share joined the entitled queue for one more")
+	}
+
+	// One claim fewer and the same acquirer belongs in the queue again.
+	f.mu.Lock()
+	delete(f.queued, "noisy")
+	f.mu.Unlock()
+	release, err := f.acquire(context.Background(), "noisy")
+	if err != nil {
+		t.Fatalf("a tenant inside its share was refused: %v", err)
+	}
+	release()
+
+	// Both select arms give the claim back, so nothing stays counted.
+	f.mu.Lock()
+	queued, inflight := len(f.queued), f.inflight["noisy"]
+	f.mu.Unlock()
+	if queued != 0 || inflight != share-1 {
+		t.Errorf("after the round trip: queued entries = %d, inflight = %d", queued, inflight)
+	}
+}
+
 // A fetch that cannot get a slot in time is the gateway running out, not the
 // client getting something wrong and not the image host failing: 429, because
 // nothing is broken, rather than a 5xx that would report a fault.
