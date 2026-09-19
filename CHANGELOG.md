@@ -6,6 +6,33 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **`custom_openai` ships without a price row.** The built-in table used to price every
+  `custom_openai` model at 0, which reported a paid endpoint's real bill as `$0.00` with
+  `cost_source: "builtin"` — a priced zero rather than the missing price it is. Those
+  models are now `cost_source: "none"` until you add a row (**Prices** tab, or
+  `POST /admin/api/prices`), and the shipped table's `version` moved to `2`. `ollama`
+  keeps its free catch-all: it runs on your own hardware. **On upgrade**, migration
+  `0015` deletes that one seeded row, so a `custom_openai` connection that was showing
+  `$0.00` starts showing no cost at all; add your own row to keep a figure. The delete
+  is limited to that pattern and to rows still marked `builtin` — one you edited is
+  `user`, keeps your price and is left alone. Nothing else about the table changes: the
+  seed still only inserts and refreshes, and retiring a row stays a numbered migration
+  rather than something an upgrade decides on its own. **Rolling back to 0.4.0 brings
+  the row back for good:** that binary's shipped table still lists it, so its seed
+  re-inserts it, and coming forward again finds `0015` already recorded and does not
+  re-run. Built-in rows cannot be deleted through the API, so the way to correct it is
+  to **edit** it — `PUT /admin/api/prices/{id}` flips a built-in row to `user`, which
+  lets you give the catch-all the real price of the endpoint it covers.
+- **The streaming usage trailer follows `include_usage` on every provider.** The final
+  usage-only chunk (`"choices": []` with `usage`) is now sent only to a client that set
+  `stream_options: {"include_usage": true}`, the way OpenAI behaves. Previously
+  `anthropic`, `gemini` and `ollama` always sent it, and the OpenAI-compatible path
+  relayed the one it requests upstream, so clients that index `chunk.choices[0]` on every
+  chunk could break. **If you read token counts off a stream, set `include_usage`**; the
+  request log, budgets and cost estimate are unaffected either way, because the gateway
+  still asks its upstream for the counts.
+
 ## [0.4.0] — 2026-09-19
 
 ### Added

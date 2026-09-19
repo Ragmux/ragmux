@@ -747,6 +747,14 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		w.WriteHeader(http.StatusOK)
 	}
 
+	// Every adapter emits a usage-only trailer, and the OpenAI-compatible
+	// one always asks its upstream for one, because the token counts are
+	// what the request log, the budgets and the cost are built from. The
+	// client only sees that trailer when it asked for it: OpenAI sends none
+	// without stream_options.include_usage, and a chunk with an empty
+	// choices array is exactly what breaks a client indexing choices[0].
+	wantUsage := req.IncludeUsage()
+
 	var usage *provider.Usage
 	compChars := 0
 	clientGone := false
@@ -762,6 +770,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		chunk.Model = req.Model
 		if chunk.Usage != nil {
 			usage = chunk.Usage
+			if !wantUsage {
+				chunk.Usage = nil
+				if len(chunk.Choices) == 0 {
+					continue // a trailer the client never asked for
+				}
+			}
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != nil {
@@ -911,15 +925,58 @@ func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLo
 	rec.CostUSD = float64(rec.CostMicros) / 1e6
 }
 
+// fillUsage copies the upstream's token counts onto the log row, falling
+// back to a character estimate when it reported none. It is the one place
+// tokens enter request_logs, so it is also where a broken or hostile
+// upstream is stopped: a negative count never reaches the cost, the budget
+// counters or the metrics, where it would subtract from spend that really
+// happened.
+//
+// A negative count is replaced half by half rather than zeroed. A request
+// that produced text and came back with completion_tokens: -78 really did
+// spend output tokens, and logging it as 0 would under-charge the budget
+// and leave the row looking exact; the character estimate is the same
+// answer as for an upstream that reported nothing, and rec.Estimated says
+// so on every surface that shows the row.
 func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {
+	promptEstimate := (nonNegative(promptChars) + 3) / 4
+	compEstimate := (nonNegative(compChars) + 3) / 4
 	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
 		rec.PromptTokens, rec.CompletionTokens = u.PromptTokens, u.CompletionTokens
 		rec.CachedPromptTokens, rec.CacheWriteTokens = u.CachedTokens(), u.CacheWriteTokens()
+		if rec.PromptTokens < 0 {
+			rec.PromptTokens, rec.Estimated = promptEstimate, true
+		}
+		if rec.CompletionTokens < 0 {
+			rec.CompletionTokens, rec.Estimated = compEstimate, true
+		}
+		// The cache split has no characters to estimate from, so an unusable
+		// one drops to zero. It does not set Estimated: that flag renders as
+		// "~" beside the prompt and completion counts and says those two are
+		// guesses, which would be a lie about numbers the upstream reported
+		// exactly. The row also shows no cache pill, which is the honest
+		// reading of a split that arrived unusable.
+		//
+		// Zero is a defined reading, not a conservative one. CostMicros bills
+		// prompt - cached - written at the input rate, so zeroing moves those
+		// tokens into that share: the estimate lands low wherever cache_write
+		// is dearer than input, which is every Anthropic row in prices.json,
+		// and high wherever cache_read is cheaper, which is every row that
+		// sets one. Either way it stays what cost_micros always is, an
+		// estimate rather than a bill; what it must not be is negative.
+		rec.CachedPromptTokens = nonNegative(rec.CachedPromptTokens)
+		rec.CacheWriteTokens = nonNegative(rec.CacheWriteTokens)
 		return
 	}
 	rec.Estimated = true
-	rec.PromptTokens = (promptChars + 3) / 4
-	rec.CompletionTokens = (compChars + 3) / 4
+	rec.PromptTokens, rec.CompletionTokens = promptEstimate, compEstimate
+}
+
+func nonNegative(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func completionChars(resp *provider.ChatResponse) int {

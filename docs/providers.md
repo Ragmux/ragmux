@@ -119,6 +119,12 @@ model name), `stream` (set by the gateway) and `stream_options` (set to
 `{"include_usage": true}` on streams so token counts are recorded; removed on
 non-streaming calls). Responses and SSE chunks are relayed in the OpenAI schema.
 
+What the gateway asks the upstream for is not what it passes on: the usage-only trailer
+chunk reaches the client only when the client itself sent
+`stream_options: {"include_usage": true}`. The same rule covers `anthropic`, `gemini`
+and `ollama`, whose adapters all emit that trailer so token counts are recorded — see
+[the streaming contract](api.md#post-v1chatcompletions).
+
 `custom_openai` covers vLLM, LM Studio, LiteLLM, text-generation-inference's OpenAI
 route, Ollama's `/v1` shim and any other server speaking the Chat Completions format.
 
@@ -211,6 +217,18 @@ more work than elsewhere:
 - In streams a `functionCall` always arrives complete inside one chunk, so each call is
   emitted as one `tool_calls` delta carrying the index, id, name and arguments together.
   No argument fragments are invented.
+
+**Known limit — tool-use tokens.** On a tool round Gemini also reports
+`usageMetadata.toolUsePromptTokenCount`, which Ragmux neither reads nor maps. Gemini's
+`totalTokenCount` is relayed as `total_tokens` as it arrives, so on those requests
+`prompt_tokens + completion_tokens` can be **less than** `total_tokens`, and whatever the
+difference covers is not priced: the cost estimate is built from the prompt and
+completion counts alone. Google's own references disagree on what `totalTokenCount`
+sums — the REST reference says prompt + thoughts + candidates, the published
+`generativelanguage` protobuf says prompt + candidates — and neither states whether
+tool-use tokens are inside it, so Ragmux does not guess. Every other provider keeps
+`prompt_tokens + completion_tokens == total_tokens`. Read a Gemini tool-round bill from
+Google's console, not from here.
 
 ### Tool schema sanitising
 
@@ -364,10 +382,13 @@ every connection:
           "completion_tokens_details": {"reasoning_tokens": 30}}
 ```
 
-`prompt_tokens` **always includes** the cached and freshly written parts, and
-`prompt_tokens + completion_tokens == total_tokens` holds everywhere.
-`cache_creation_tokens` has no OpenAI equivalent — OpenAI does not bill cache writes,
-Anthropic does.
+`prompt_tokens` **always includes** the cached and freshly written parts: the mapping
+guarantees that. `prompt_tokens + completion_tokens == total_tokens` is weaker — it is
+how each adapter assembles the block from an upstream that reports consistently, and it
+is not checked, so a Gemini tool round (see [Tool calling](#tool-calling)) or any
+upstream reporting a total that does not add up breaks it; the block is relayed as it
+came. `cache_creation_tokens` has no OpenAI equivalent — OpenAI does not bill cache
+writes, Anthropic does.
 
 | Provider | What it reports | How it is mapped |
 |---|---|---|

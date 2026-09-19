@@ -520,6 +520,15 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 // prompt + completion == total like the other providers, and are reported
 // again in the completion breakdown. promptTokenCount already contains the
 // cached prefix, so caching only adds a breakdown, never changes the total.
+//
+// toolUsePromptTokenCount is deliberately not read. On a tool round it makes
+// TotalTokenCount, which is copied through as-is, larger than the two parts,
+// and that difference is not priced. Folding it into either part would need
+// to know whether Gemini already counted it inside totalTokenCount: the REST
+// reference says the total is prompt + thoughts + candidates, the published
+// generativelanguage protobuf says prompt + candidates, and neither mentions
+// tool use. Until one of them says, a guess here would move every tool
+// round's bill. docs/providers.md documents the gap.
 func geminiUsage(gr geminiResponse) *Usage {
 	u := gr.UsageMetadata
 	out := &Usage{PromptTokens: u.PromptTokenCount, CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount,

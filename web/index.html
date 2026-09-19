@@ -1075,6 +1075,10 @@ async function sendMessage(text) {
   const history = pg.msgs.filter(m => m.content && !m.error).map(m => ({ role: m.role, content: m.content }));
   const messages = pg.system.trim() ? [{ role: 'system', content: pg.system.trim() }, ...history] : history;
   const payload = { model: 'default', stream: pg.stream, messages }; if (pg.sources && !pg.stream) payload.ragmux = { include_context: true };
+  // The gateway only sends the usage-only trailer chunk to a client that asks
+  // for it, the way OpenAI does; without this the token badge and the "Last
+  // response" card would go blank on streamed replies.
+  if (pg.stream) payload.stream_options = { include_usage: true };
   try {
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + pg.key, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     status = r.status;

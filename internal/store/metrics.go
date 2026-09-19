@@ -121,6 +121,48 @@ func (f MetricsFilter) whereCol(col string, base []any) (string, []any) {
 	return sb.String(), base
 }
 
+// Token and cost columns are floored at zero on every surface that reports
+// them: through GREATEST(…, 0) in the aggregates, through clampRequestLog on
+// the row surfaces. The gateway clamps the counts it writes, but a row put
+// there by an older build, a restored dump or anything other than the
+// gateway can still be negative, and a single such row must not subtract
+// from a figure the dashboard presents as usage or spend.
+//
+// Flooring in only one of the two places would be worse than either answer
+// alone: the summary would report 22 tokens for a window whose CSV export
+// reported -78, with nothing to say which to believe. So both floor, and the
+// row surfaces log what they floored — a floored figure is missing data, and
+// missing data that announces itself beats wrong data that does not.
+
+// clampRequestLog floors the token and cost fields of a row read back from
+// the table and reports whether anything had to be floored.
+func clampRequestLog(l *RequestLog) bool {
+	clamped := false
+	for _, n := range []*int{&l.PromptTokens, &l.CompletionTokens, &l.CachedPromptTokens, &l.CacheWriteTokens} {
+		if *n < 0 {
+			*n, clamped = 0, true
+		}
+	}
+	if l.CostMicros < 0 {
+		l.CostMicros, clamped = 0, true
+	}
+	return clamped
+}
+
+// logClamped names the rows a read had to floor, so the operator can find
+// them instead of wondering why a total looks low.
+func (s *Store) logClamped(surface string, rows []int64) {
+	if len(rows) == 0 {
+		return
+	}
+	ids := rows
+	if len(ids) > 20 {
+		ids = ids[:20]
+	}
+	s.log.Warn("request log rows hold negative token or cost values; reported as zero",
+		"surface", surface, "rows", len(rows), "ids", ids)
+}
+
 // Summarize computes totals matching the filter since the given time.
 func (s *Store) Summarize(ctx context.Context, f MetricsFilter, since time.Time) (*MetricsSummary, error) {
 	return s.SummarizeBetween(ctx, f, since, time.Time{})
@@ -132,12 +174,12 @@ func (s *Store) Summarize(ctx context.Context, f MetricsFilter, since time.Time)
 func (s *Store) SummarizeBetween(ctx context.Context, f MetricsFilter, since, until time.Time) (*MetricsSummary, error) {
 	q := `SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
+		COALESCE(SUM(GREATEST(prompt_tokens, 0)), 0), COALESCE(SUM(GREATEST(completion_tokens, 0)), 0),
 		COALESCE(AVG(latency_ms), 0)::float8,
 		COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::float8,
 		COALESCE(SUM(CASE WHEN rag_used THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN status_code = 429 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(cost_micros), 0)
+		COALESCE(SUM(GREATEST(cost_micros, 0)), 0)
 		FROM request_logs WHERE created_at >= $1`
 	base := []any{since.UTC()}
 	if !until.IsZero() {
@@ -174,6 +216,7 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 	}
 	defer rows.Close()
 	out := []*RequestLog{}
+	var clamped []int64
 	for rows.Next() {
 		l := &RequestLog{}
 		var created time.Time
@@ -184,10 +227,17 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 			return nil, err
 		}
 		l.CreatedAt = ts(created)
+		if clampRequestLog(l) {
+			clamped = append(clamped, l.ID)
+		}
 		l.CostUSD = usd(l.CostMicros)
 		out = append(out, l)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	s.logClamped("recent_requests", clamped)
+	return out, nil
 }
 
 // DailyBucket is request volume for one UTC day.
@@ -216,8 +266,8 @@ func (s *Store) DailySeries(ctx context.Context, f MetricsFilter, days int) ([]D
 	since := time.Now().UTC().AddDate(0, 0, -days+1).Truncate(24 * time.Hour)
 	q := `SELECT date_trunc('day', created_at AT TIME ZONE 'UTC') AS day, COUNT(*),
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
-		COALESCE(SUM(cost_micros), 0)
+		COALESCE(SUM(GREATEST(prompt_tokens, 0)), 0), COALESCE(SUM(GREATEST(completion_tokens, 0)), 0),
+		COALESCE(SUM(GREATEST(cost_micros, 0)), 0)
 		FROM request_logs WHERE created_at >= $1`
 	cond, args := f.where([]any{since})
 	q += cond + " GROUP BY day ORDER BY day"
@@ -259,10 +309,10 @@ type ProjectMetrics struct {
 func (s *Store) SummarizeByProject(ctx context.Context, f MetricsFilter, since time.Time) ([]ProjectMetrics, error) {
 	q := `SELECT l.project_id, COALESCE(p.name, ''), COUNT(*),
 		COALESCE(SUM(CASE WHEN l.status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(l.prompt_tokens), 0), COALESCE(SUM(l.completion_tokens), 0),
+		COALESCE(SUM(GREATEST(l.prompt_tokens, 0)), 0), COALESCE(SUM(GREATEST(l.completion_tokens, 0)), 0),
 		COALESCE(SUM(CASE WHEN l.status_code = 429 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN l.rag_used THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(l.cost_micros), 0)
+		COALESCE(SUM(GREATEST(l.cost_micros, 0)), 0)
 		FROM request_logs l LEFT JOIN projects p ON p.id = l.project_id WHERE l.created_at >= $1`
 	cond, args := f.whereCol("l.project_id", []any{since.UTC()})
 	q += cond + " GROUP BY l.project_id, p.name ORDER BY COUNT(*) DESC, l.project_id"
@@ -309,6 +359,7 @@ func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.
 		return err
 	}
 	defer rows.Close()
+	var clamped []int64
 	for rows.Next() {
 		var r RequestExportRow
 		var created time.Time
@@ -319,10 +370,20 @@ func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.
 			return err
 		}
 		r.CreatedAt = ts(created)
+		// The export floors what the summary floors: the same window must
+		// not read differently in the dashboard and in the CSV. The column
+		// order is untouched; only the values are.
+		if clampRequestLog(&r.RequestLog) {
+			clamped = append(clamped, r.ID)
+		}
 		r.CostUSD = usd(r.CostMicros)
 		if err := fn(&r); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	s.logClamped("request_export", clamped)
+	return nil
 }

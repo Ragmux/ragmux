@@ -3,27 +3,43 @@ package pricing
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"testing"
 )
 
-// pricesSHA256 pins the embedded table to its version number: change a
-// price without bumping "version" in prices.json and this fails, which is
-// what keeps seeded builtin rows from silently disagreeing with the file.
-const pricesSHA256 = "45c8ce28eca57e738c77666c9dfbb336febe84c3dae031f2ac091da46c3c24af"
+// pricesSHA256 pins every released version of the embedded table to its
+// digest. The map is append-only: a released version's digest is a fact
+// about what shipped, so the way to record a price change is to add an
+// entry, never to edit one.
+//
+// That is what forces the version bump. Seed refreshes a seeded builtin row
+// only when "version" grows, so a price edited without a bump leaves every
+// existing install on the old number. Editing the digest in place used to
+// make that green; now the version the file carries is already pinned to a
+// different digest and the test says so.
+var pricesSHA256 = map[int]string{
+	1: "45c8ce28eca57e738c77666c9dfbb336febe84c3dae031f2ac091da46c3c24af",
+	2: "317856df091340f07a0c632c829fd2dee56dc4bc473b5b277d7abd4721054948",
+}
 
 func TestPricesVersionPinned(t *testing.T) {
-	sum := sha256.Sum256(BuiltinBytes())
-	got := hex.EncodeToString(sum[:])
-	if got != pricesSHA256 {
-		t.Fatalf("prices.json changed: sha256 = %s\n"+
-			"bump \"version\" in prices.json (seeded builtin rows only refresh when it grows), then set pricesSHA256 to the new digest", got)
-	}
 	v, err := BuiltinVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if v < 1 {
-		t.Errorf("builtin version = %d", v)
+		t.Fatalf("builtin version = %d", v)
+	}
+	sum := sha256.Sum256(BuiltinBytes())
+	got := hex.EncodeToString(sum[:])
+	want, pinned := pricesSHA256[v]
+	switch {
+	case pinned && want != got:
+		t.Fatalf("prices.json changed but still says \"version\": %d, which is pinned to %s (now %s)\n"+
+			"bump \"version\" — seeded builtin rows only refresh when it grows — and add the new digest to pricesSHA256",
+			v, want, got)
+	case !pinned:
+		t.Fatalf("prices.json version %d is not pinned\nadd %d: %q to pricesSHA256", v, v, got)
 	}
 }
 
@@ -35,7 +51,7 @@ func TestBuiltinTableParses(t *testing.T) {
 	if len(rows) < 10 {
 		t.Fatalf("built-in table has only %d rows", len(rows))
 	}
-	local := map[string]bool{}
+	local := false
 	for _, r := range rows {
 		p := r.Price
 		if p.Input < 0 || p.Output < 0 || p.CacheWrite < 0 || p.CacheRead < 0 {
@@ -44,18 +60,24 @@ func TestBuiltinTableParses(t *testing.T) {
 		if p.Currency != "USD" || p.Source != SourceBuiltin {
 			t.Errorf("%s/%s: currency %q source %q", r.ProviderType, r.Pattern, p.Currency, p.Source)
 		}
-		if r.ProviderType == "ollama" || r.ProviderType == "custom_openai" {
-			local[r.ProviderType] = true
+		// custom_openai is a URL, not a place: it points at vLLM as readily
+		// as at a paid API. A catch-all would report a real bill as $0.00
+		// with cost_source "builtin", which reads as a priced zero rather
+		// than the missing price it is.
+		if r.ProviderType == "custom_openai" {
+			t.Errorf("custom_openai must ship no price row, got %s %+v", r.Pattern, p)
+		}
+		if r.ProviderType == "ollama" {
+			local = true
 			if r.Pattern != "*" || p.Input != 0 || p.Output != 0 {
-				t.Errorf("local provider %s must ship a free catch-all, got %s %+v", r.ProviderType, r.Pattern, p)
+				t.Errorf("ollama must ship a free catch-all, got %s %+v", r.Pattern, p)
 			}
 		}
 	}
-	// Local models must never report phantom spend.
-	for _, pt := range []string{"ollama", "custom_openai"} {
-		if !local[pt] {
-			t.Errorf("no catch-all row for %s", pt)
-		}
+	// Ollama runs on the operator's own hardware: it must never report
+	// phantom spend, and there is no endpoint where it could cost money.
+	if !local {
+		t.Error("no catch-all row for ollama")
 	}
 	// An absent cache price resolves to the input rate.
 	table := NewTable(rows)
@@ -174,5 +196,52 @@ func TestCostMicros(t *testing.T) {
 	cheap := Price{Input: 0.15}
 	if got := cheap.CostMicros(7, 0, 0, 0); got != 1 {
 		t.Errorf("rounded cost = %d, want 1", got)
+	}
+}
+
+// TestCostMicrosSaturates pins the two ends of the range. A cost is never
+// negative, whatever a broken or hostile upstream reported, and it never
+// leaves int64: int64(math.Round(x)) is implementation-defined outside the
+// range and arm64 and amd64 do not agree on the answer.
+func TestCostMicrosSaturates(t *testing.T) {
+	p := Price{Input: 3, Output: 15, CacheWrite: 3.75, CacheRead: 0.30}
+	huge := Price{Input: 1e18, Output: 1e18, CacheWrite: 1e18, CacheRead: 1e18}
+	cases := []struct {
+		name                                   string
+		price                                  Price
+		prompt, cached, cacheWrite, completion int
+		want                                   int64
+	}{
+		{name: "negative completion", price: p, prompt: 100, completion: -100, want: 300},
+		{name: "negative prompt", price: p, prompt: -100, completion: 10, want: 150},
+		{name: "everything negative", price: p, prompt: -1, cached: -1, cacheWrite: -1, completion: -1, want: 0},
+		{name: "negative cached share", price: p, prompt: 100, cached: -50, completion: 0, want: 300},
+		// A price row someone typed a minus into cannot make a credit.
+		{name: "negative price", price: Price{Input: -3, Output: -15}, prompt: 1000, completion: 500, want: 0},
+		// One negative rate is floored on its own: it prices nothing, and it
+		// does not discount the terms priced beside it. 500 x 15 stands.
+		{name: "one negative rate", price: Price{Input: -3, Output: 15}, prompt: 1000, completion: 500, want: 7500},
+		{name: "negative cache rates", price: Price{Input: 3, Output: 15, CacheWrite: -100, CacheRead: -100},
+			prompt: 1000, cached: 300, cacheWrite: 200, completion: 100, want: 1500 + 1500},
+		// Beyond int64 micros: saturate rather than wrap or go platform-specific.
+		{name: "overflow on input", price: huge, prompt: 1 << 40, want: math.MaxInt64},
+		{name: "overflow on output", price: huge, completion: 1 << 40, want: math.MaxInt64},
+		{name: "overflow just under", price: Price{Input: 1}, prompt: 1 << 40, want: 1 << 40},
+	}
+	for _, c := range cases {
+		got := c.price.CostMicros(c.prompt, c.cached, c.cacheWrite, c.completion)
+		if got != c.want {
+			t.Errorf("%s: CostMicros = %d, want %d", c.name, got, c.want)
+		}
+		if got < 0 {
+			t.Errorf("%s: CostMicros returned a negative cost", c.name)
+		}
+	}
+	// A NaN in the table prices nothing rather than poisoning the total.
+	if got := (Price{Input: math.NaN()}).CostMicros(10, 0, 0, 0); got != 0 {
+		t.Errorf("NaN price cost = %d, want 0", got)
+	}
+	if got := (Price{Input: math.Inf(1)}).CostMicros(10, 0, 0, 0); got != math.MaxInt64 {
+		t.Errorf("infinite price cost = %d, want saturation", got)
 	}
 }

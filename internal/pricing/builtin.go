@@ -53,17 +53,45 @@ func Builtin() ([]Row, error) {
 	return rows, nil
 }
 
-// BuiltinPrice returns the shipped price for one exact provider/pattern
-// pair. Resetting an edited row restores it from here.
-func BuiltinPrice(providerType, pattern string) (Price, bool) {
-	rows, err := Builtin()
+// Shipped is one entry of the built-in table as prices.json spells it,
+// before resolve() fills the fallbacks in. CacheWrite and CacheRead stay nil
+// when the file leaves them out, because that is how Seed stores them: NULL
+// means "this provider charges the input rate" and keeps following
+// input_per_mtok, while a number copied from the input rate freezes.
+type Shipped struct {
+	Input      float64
+	Output     float64
+	CacheWrite *float64
+	CacheRead  *float64
+	Currency   string
+}
+
+// ShippedPrice returns the unresolved shipped entry for one exact
+// provider/pattern pair. Resetting an edited row restores it from here: a
+// reset must write the same NULLs the seed wrote, or the reset row stops
+// tracking a later input price change while its unedited siblings follow it.
+func ShippedPrice(providerType, pattern string) (Shipped, bool) {
+	f, err := loadBuiltin()
 	if err != nil {
-		return Price{}, false
+		return Shipped{}, false
 	}
-	for _, r := range rows {
-		if r.ProviderType == providerType && r.Pattern == pattern {
-			return r.Price, true
+	for _, m := range f.Models {
+		if m.ProviderType != providerType || m.Model != pattern {
+			continue
 		}
+		// The pointers are copied rather than shared: builtinData is parsed
+		// once and handed to every caller.
+		return Shipped{Input: m.Input, Output: m.Output,
+			CacheWrite: copyFloat(m.CacheWrite), CacheRead: copyFloat(m.CacheRead),
+			Currency: f.Currency}, true
 	}
-	return Price{}, false
+	return Shipped{}, false
+}
+
+func copyFloat(v *float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	out := *v
+	return &out
 }

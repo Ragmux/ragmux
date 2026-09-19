@@ -16,6 +16,14 @@ import (
 // cannot be deleted either (only edited or reset), which is what keeps a
 // deleted row from resurrecting on the next upgrade without a tombstone
 // column to remember it by.
+//
+// Seed only ever inserts and refreshes; it removes nothing. Dropping an
+// entry from prices.json therefore leaves existing installs holding the old
+// row, and retiring one is a deliberate, numbered migration — a general
+// "delete whatever the shipped table stopped listing" rule would let a
+// rename in some later release silently drop a model's price everywhere and
+// send it to cost_source "none", which is the same silent misreporting as
+// pricing it wrong.
 func Seed(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (int64, error) {
 	if log == nil {
 		log = slog.Default()

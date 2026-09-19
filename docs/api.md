@@ -165,7 +165,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": 10, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}`: `needs_setup` is `true` while the `users` table is empty; the next three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role); `has_connections` and `has_projects` are two `EXISTS` probes the first-run wizard uses to resume at the right step after a reload |
+| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}`: `needs_setup` is `true` while the `users` table is empty; the next three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role); `has_connections` and `has_projects` are two `EXISTS` probes the first-run wizard uses to resume at the right step after a reload. `N` is the applied migration version, whatever this build has reached |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
@@ -518,7 +518,7 @@ discount and change prices without telling the gateway.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 1, "unit": "per_million_tokens"}` |
+| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 2, "unit": "per_million_tokens"}` |
 | POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
 | PUT | `/prices/{id}` | editor | Same body without `provider_type`/`model_pattern` (they are fixed); sets `source: "user"` → `{price}` |
 | DELETE | `/prices/{id}` | editor | `{"ok": true}`; `409 {"code":"builtin_price"}` for a built-in row — reset it instead |
@@ -534,7 +534,7 @@ A row:
 {"id": 4, "provider_type": "anthropic", "model_pattern": "claude-sonnet-4-5*",
  "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_write_per_mtok": 3.75,
  "cache_read_per_mtok": 0.30, "currency": "USD", "source": "builtin",
- "builtin_version": 1, "created_at": "…", "updated_at": "…"}
+ "builtin_version": 2, "created_at": "…", "updated_at": "…"}
 ```
 
 Prices are **per million tokens** and prices are between 0 and 100000. The two cache
@@ -551,6 +551,12 @@ Longest prefix is why `gpt-4o-mini*` beats `gpt-4o*` for `gpt-4o-mini-2024-07-18
 no match the request is logged with `cost_micros: 0` and `cost_source: "none"` — a
 missing price is reported as missing, never guessed.
 
+`source` plays no part in matching. Your own row wins where its pattern is the more
+specific one, and you override a shipped number by **editing that row** (which keeps its
+pattern and flips it to `"user"`) rather than by adding a broader one — a `*` row that
+outranked every built-in pattern would silently re-price every model the shipped table
+already knows.
+
 **Built-in rows and upgrades.** The shipped table is seeded on every start.
 
 - Editing a built-in row flips its `source` to `"user"`, and **upgrades never touch a
@@ -559,8 +565,17 @@ missing price is reported as missing, never guessed.
   **increases**; a release that does not bump it changes nothing.
 - **Built-in rows cannot be deleted**, only edited or reset. That removes the "deleted
   row resurrects on upgrade" problem without a tombstone column to remember it by.
-- `ollama` and `custom_openai` ship a `*` row at 0, so local models never report
-  phantom spend. Add your own row for a paid `custom_openai` endpoint.
+- The seed only inserts and refreshes; it **never removes a row**. Dropping a model from
+  the shipped table therefore leaves existing installs holding the old row, and retiring
+  one is a numbered migration you can read in the release — a general "remove whatever
+  the shipped table stopped listing" rule would let a pattern renamed in a later release
+  silently drop a model's price everywhere.
+- `ollama` ships a `*` row at 0: it runs on your own hardware, so it must never report
+  phantom spend. **`custom_openai` ships no row at all** — it is a URL, and it points at
+  a paid API as readily as at vLLM, so its models are `cost_source: "none"` until you
+  add a price. A catch-all at 0 would report a real bill as `$0.00` with
+  `cost_source: "builtin"`, which reads as a priced zero rather than the missing price
+  it is.
 
 ### Users and audit log
 
@@ -617,13 +632,14 @@ lockout ends (empty when the lockout is disabled).
 
 ### System
 
-`GET /system` (viewer):
+`GET /system` (viewer), with sample values — `migrations_version` and `version` are
+whatever the running build reports:
 
 ```json
-{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": 8, "size_bytes": 8787635},
+{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
- "version": "0.3.0"}
+ "version": "0.4.0"}
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
@@ -678,8 +694,17 @@ Non-streaming responses are the provider's answer normalised to the OpenAI schem
 `text/event-stream` with `data: {chunk}` lines and a final `data: [DONE]`; a failure
 after the stream has started is emitted as a `data: {"error": …}` event before `[DONE]`.
 
-Response headers, only for limits that are set on the project or the key. Where both
-tiers have a limit, the header describes whichever has the smaller remaining allowance:
+**The usage-only trailer** — one final chunk carrying `"choices": []` and `usage`
+before `[DONE]` — is sent only when you set `stream_options: {"include_usage": true}`,
+exactly as OpenAI does. This holds on every provider: the gateway always asks its
+upstream for token counts, because the request log, the budgets and the cost are built
+from them, but it does not pass that trailer on to a client that did not ask for one,
+because a client indexing `choices[0]` on every chunk would break on it.
+
+That is a promise about Ragmux's own trailer, not about every chunk. An upstream is
+relayed as it comes, and some send frames of their own with an empty `choices` array —
+Azure's content-filter chunk, a proxy's keep-alive. Ragmux does not drop those: they
+carry information it does not own. Guard the array before indexing it.
 
 `usage` carries OpenAI's breakdown objects whenever the provider reports them:
 
@@ -689,13 +714,35 @@ tiers have a limit, the header describes whichever has the smaller remaining all
           "completion_tokens_details": {"reasoning_tokens": 30}}
 ```
 
-`prompt_tokens` always includes the cached and freshly written parts, on every provider,
-and `prompt_tokens + completion_tokens == total_tokens`. `cache_creation_tokens` has no
-OpenAI equivalent (OpenAI does not bill cache writes, Anthropic does). See
+`prompt_tokens` always includes the cached and freshly written parts, on every provider:
+that is a property of the mapping, so it holds whatever the upstream's own spelling was.
+`prompt_tokens + completion_tokens == total_tokens` is weaker — it describes how each
+adapter assembles the block from an upstream that reports its counts consistently, and
+it is not checked. Two things break it: a Gemini request that called tools, where
+Gemini's own total can be larger and the difference is neither mapped nor priced (see
+[Gemini tool-use tokens](providers.md#tool-calling)), and any upstream that reports
+something that does not add up, which is relayed as it came (below). A client that
+relies on the sum should verify it. `cache_creation_tokens` has no OpenAI equivalent
+(OpenAI does not bill cache writes, Anthropic does). See
 [Prompt caching](providers.md#prompt-caching) for the per-provider mapping, including
 the accounting change for cached Anthropic requests.
 
-Response headers, only for limits the project has set:
+The `usage` block in the response is the **upstream's own**. Normalising renames fields
+into the OpenAI shape and fills two gaps — a `total_tokens` of `0` is computed from the
+two parts, and DeepSeek's top-level `prompt_cache_hit_tokens` is folded into
+`cached_tokens` — but it validates nothing. A provider that reports something impossible,
+a negative count or a total that does not add up, reaches you that way.
+
+What Ragmux **records** is cleaned. The request log, the budget counters and the cost
+estimate floor every count at zero; a `prompt_tokens` or `completion_tokens` that arrived
+unusable is replaced with a character estimate and the row is flagged `estimated`; an
+unusable cache split drops to zero without that flag, because the flag speaks for those
+two counts and they were fine. So a request log row and the `usage` of the same request
+can differ when the upstream misreported. Trust the row for spend, and treat a mismatch
+as a signal about that provider.
+
+Response headers, only for limits that are set on the project or the key. Where both
+tiers have a limit, the header describes whichever has the smaller remaining allowance:
 
 | Header | Meaning |
 |---|---|

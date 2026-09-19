@@ -180,7 +180,7 @@ func (a *Admin) resetPrice(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	builtin, ok := pricing.BuiltinPrice(current.ProviderType, current.ModelPattern)
+	shipped, ok := pricing.ShippedPrice(current.ProviderType, current.ModelPattern)
 	if !ok {
 		writeErrCode(w, http.StatusConflict, "no_builtin_price",
 			"this price has no built-in value to reset to; edit or delete it instead")
@@ -191,11 +191,13 @@ func (a *Admin) resetPrice(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	cacheWrite, cacheRead := builtin.CacheWrite, builtin.CacheRead
+	// The cache prices go back as the shipped file spells them, nils
+	// included: a reset row must be indistinguishable from a freshly seeded
+	// one, and the seed writes an absent cache price as NULL.
 	p, err := a.Store.ResetModelPrice(r.Context(), id, &store.ModelPrice{
-		InputPerMTok: builtin.Input, OutputPerMTok: builtin.Output,
-		CacheWritePerMTok: &cacheWrite, CacheReadPerMTok: &cacheRead,
-		Currency: builtin.Currency, BuiltinVersion: version})
+		InputPerMTok: shipped.Input, OutputPerMTok: shipped.Output,
+		CacheWritePerMTok: shipped.CacheWrite, CacheReadPerMTok: shipped.CacheRead,
+		Currency: shipped.Currency, BuiltinVersion: version})
 	if err != nil {
 		a.fail(w, err)
 		return
