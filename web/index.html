@@ -436,7 +436,7 @@ const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${n
 const toggle = (name, checked, label, hint = '') => `<label class="toggle"><span><span class="dim">${esc(label)}</span>${hint ? `<div class="hint">${hint}</div>` : ''}</span><input type="checkbox" name="${name}" ${checked ? 'checked' : ''}><span class="switch" aria-hidden="true"></span></label>`;
 const checklist = (name, opts, vals = [], empty = 'Nothing to choose from.') => `<div class="checklist">${opts.map(o => `<label class="check"><input type="checkbox" name="${name}" value="${esc(o.value)}" ${vals.map(String).includes(String(o.value)) ? 'checked' : ''}>${esc(o.label)}</label>`).join('') || `<div class="hint" style="padding:6px 10px">${esc(empty)}</div>`}</div>`;
 const twoCol = (a, b) => `<div class="row" style="align-items:flex-start"><div class="grow">${a}</div><div class="grow">${b}</div></div>`;
-const ROLES = [{ value: 'admin', label: 'admin', hint: 'Everything, including users and the audit log' }, { value: 'editor', label: 'editor', hint: 'Models, RAG stores and own projects' }, { value: 'viewer', label: 'viewer', hint: 'Read-only across member projects' }];
+const ROLES = [{ value: 'admin', label: 'admin', hint: 'Everything, including users and the audit log' }, { value: 'editor', label: 'editor', hint: 'Models, RAG stores and own projects' }, { value: 'viewer', label: 'viewer', hint: 'Read-only on these screens. Can still create its own gateway key, so a demotion does not stop API spend.' }];
 const roleCards = val => `<fieldset class="field" style="border:0;padding:0;margin:0;gap:8px"><legend>Role</legend>${ROLES.map(r => `<label class="radio-card"><input type="radio" name="role" value="${r.value}" ${r.value === val ? 'checked' : ''}><div><div style="font-weight:500">${r.label}</div><div class="hint">${r.hint}</div></div></label>`).join('')}</fieldset>`;
 // Client-side strength heuristic: length and character variety; the server only enforces length.
 function strengthScore(pw) {
@@ -583,7 +583,7 @@ function renderLogin() {
     <button type="submit" class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Sign in</button>
     <div class="hint" style="text-align:center">Forgot your password? Ask an administrator to reset it.</div></form></section>`;
   heroVersion();
-  $('#loginForm').onsubmit = async e => { e.preventDefault(); const form = e.target; const d = formData(form); const btn = $('button', form); btn.disabled = true; const note = $('#loginNote');
+  $('#loginForm').onsubmit = async e => { e.preventDefault(); const form = e.target; const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true; const note = $('#loginNote');
     try {
       const r = await request('/login', { method: 'POST', body: { username: d.username, password: d.password } });
       if (r.ok) { state.user = r.data.user; state.needsSetup = false; await afterSignIn(); return; }
@@ -709,7 +709,7 @@ function renderSetupAdmin() {
   bindStrength($('[name=password]', $('#setupForm')), 'spw', 12);
   $('#setupForm').onsubmit = async e => { e.preventDefault(); const d = formData(e.target);
     if (d.password !== d.confirm) { toast('Passwords do not match', 3500, 'err'); return; }
-    const btn = $('button', e.target); btn.disabled = true;
+    const btn = $('button[type=submit]', e.target); btn.disabled = true;
     try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } });
       // needsSetup drops before anything else can fail, so a reload can
       // never land back on step 1 with the account already created.
@@ -1320,12 +1320,12 @@ async function renderUsers() {
   const f = state.users_filter; const count = r => users.filter(u => u.role === r).length; const inactive = users.filter(u => !u.is_active).length;
   const rows = users.filter(u => (f.role === 'all' || (f.role === 'inactive' ? !u.is_active : u.role === f.role)) && (!f.q || u.username.toLowerCase().includes(f.q.toLowerCase())));
   const lock = sec && sec.active_lockouts && sec.active_lockouts.length ? sec.active_lockouts : [];
-  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Users · admin only · ${users.length} account${users.length === 1 ? '' : 's'}</div><h1>Users</h1><p class="lede"><strong>admin</strong> manages everything including users, <strong>editor</strong> manages models, RAG stores and the projects it belongs to, <strong>viewer</strong> is read-only. Deactivated users cannot sign in and lose their sessions.</p></div>
+  app.innerHTML = `<div class="topbar"><div><div class="eyebrow">Users · admin only · ${users.length} account${users.length === 1 ? '' : 's'}</div><h1>Users</h1><p class="lede"><strong>admin</strong> manages everything including users, <strong>editor</strong> manages models, RAG stores and the projects it belongs to, <strong>viewer</strong> is read-only on these screens. A role bounds the dashboard, not API spend: every user can create its own <code>sk-user-…</code> gateway key, so demoting someone does not stop theirs — revoke the key or deactivate the account. Deactivated users cannot sign in, lose their sessions, and their keys stop resolving.</p></div>
     <div class="actions"><button class="btn primary" id="addUser">${ICON.plus} Add user</button></div></div>
     <div class="stats four">
       <div class="stat"><div class="l">Admins</div><div class="v">${count('admin')}</div><div class="d">last active admin is protected</div></div>
       <div class="stat"><div class="l">Editors</div><div class="v">${count('editor')}</div><div class="d">across ${state.projects.length} project${state.projects.length === 1 ? '' : 's'}</div></div>
-      <div class="stat"><div class="l">Viewers</div><div class="v">${count('viewer')}</div><div class="d">${inactive ? `${inactive} inactive account${inactive === 1 ? '' : 's'}` : 'read-only'}</div></div>
+      <div class="stat"><div class="l">Viewers</div><div class="v">${count('viewer')}</div><div class="d">${inactive ? `${inactive} inactive account${inactive === 1 ? '' : 's'}` : 'read-only screens'}</div></div>
       <div class="stat"><div class="l">Failed logins · 1h</div><div class="v">${sec ? fmtN(sec.failed_last_hour) : '—'}</div><div class="d ${lock.length ? 'down' : ''}">${sec ? (lock.length ? `${lock.length} lockout${lock.length === 1 ? '' : 's'} active · ${esc(lock[0].username)} @ ${esc(lock[0].ip)}` : `${fmtN(sec.failed_last_24h)} in 24h · no lockouts`) : 'unavailable'}</div></div></div>
     <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:300px">${ICON.search}<label for="u-q" class="sr">Search users</label><input id="u-q" class="input" placeholder="Search username" value="${esc(f.q)}" style="min-height:38px" autocomplete="off"></div>
         <div class="tabs" role="tablist" aria-label="Filter">${['all', 'admin', 'editor', 'viewer', 'inactive'].map(r => `<button class="tab" role="tab" data-role-filter="${r}" aria-selected="${f.role === r}">${r}</button>`).join('')}</div></div><span class="hint">${rows.length} of ${users.length} users</span></div>

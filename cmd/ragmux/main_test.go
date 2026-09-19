@@ -201,7 +201,7 @@ func TestDashboardSelectorsResolve(t *testing.T) {
 	if len(forms) < 5 {
 		t.Fatalf("found %d <form> templates, far fewer than the dashboard has; the scan is broken", len(forms))
 	}
-	typedSubmit := regexp.MustCompile(`<button[^>]*\stype="submit"`)
+	typedSubmit := regexp.MustCompile(`<button[^>]*\stype=["']?submit["'\s>]`)
 	for _, f := range forms {
 		if !typedSubmit.MatchString(f) {
 			head, _, _ := strings.Cut(f, "\n")
@@ -213,11 +213,9 @@ func TestDashboardSelectorsResolve(t *testing.T) {
 		}
 	}
 
-	// Every literal #id the script looks up is either written in the markup or
-	// passed to a template that interpolates it into id="${...}". The second
-	// case is why a bare quoted occurrence counts: setupCard is handed
-	// 'setupProjectForm' and writes the id itself. Values are collected quoted
-	// and unquoted, since the helpers emit both (id="app", id=backendSel).
+	// Every literal #id the script looks up is written in the markup. Values are
+	// collected quoted and unquoted, since the helpers emit both (id="app",
+	// id=backendSel).
 	written := map[string]bool{}
 	idAttr := regexp.MustCompile(`\bid=(?:"([^"]*)"|'([^']*)'|([A-Za-z][\w-]*))`)
 	for _, m := range idAttr.FindAllStringSubmatch(html, -1) {
@@ -226,6 +224,14 @@ func TestDashboardSelectorsResolve(t *testing.T) {
 				written[v] = true
 			}
 		}
+	}
+	// setupCard is the one template that takes the id as an argument and writes
+	// id="${id}", so its two callers cannot be seen in the markup. They are
+	// listed rather than inferred: accepting any name that appears quoted
+	// somewhere in the script would wave through a dead selector whenever the
+	// name doubles as a tab name, a field name or a state key.
+	for _, m := range regexp.MustCompile(`setupCard\(\d+,\s*'([^']+)'`).FindAllStringSubmatch(script, -1) {
+		written[m[1]] = true
 	}
 	selector := regexp.MustCompile(`\$\$?\(\s*(?:'([^'\n]*)'|"([^"\n]*)")`)
 	idSelector := regexp.MustCompile(`#([A-Za-z][\w-]*)`)
@@ -238,7 +244,7 @@ func TestDashboardSelectorsResolve(t *testing.T) {
 		for _, id := range idSelector.FindAllStringSubmatch(sel, -1) {
 			name := id[1]
 			checked++
-			if written[name] || strings.Contains(script, `'`+name+`'`) {
+			if written[name] {
 				continue
 			}
 			t.Errorf("selector %q looks for id %q, which nothing in the page sets", sel, name)
