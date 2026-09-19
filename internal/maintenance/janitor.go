@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/ragmux/ragmux/internal/limits"
@@ -38,6 +39,10 @@ type Janitor struct {
 	Now            func() time.Time
 	RequestLogDays int
 	AuditDays      int
+	// IngestMaxAttempts is INGEST_MAX_ATTEMPTS. Documents that reached it
+	// are invisible to the ingestion claim, so the pass writes their final
+	// failed status; 0 skips the step.
+	IngestMaxAttempts int
 }
 
 // Report counts the rows one pass removed.
@@ -48,6 +53,8 @@ type Report struct {
 	Sessions      int64
 	// UsagePurged reports whether the usage counter purge ran.
 	UsagePurged bool
+	// DocumentsFailed counts documents that ran out of ingestion attempts.
+	DocumentsFailed int64
 }
 
 func (j *Janitor) now() time.Time {
@@ -102,23 +109,35 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 			rep.UsagePurged = true
 		}
 	}
+	if j.IngestMaxAttempts > 0 {
+		n, err := j.Store.FailExhaustedDocuments(ctx, j.IngestMaxAttempts)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("exhausted documents: %w", err))
+		}
+		rep.DocumentsFailed = n
+	}
 	return rep, errors.Join(errs...)
 }
 
 // Run executes RunOnce StartDelay after it is called and then every interval
 // until ctx is cancelled. A non-positive interval uses DefaultInterval.
+//
+// The first pass is jittered over another StartDelay so a fleet that was
+// restarted together does not wake up together. That is cosmetic - only one
+// replica does the work anyway - but it keeps the logs and the database
+// load readable.
 func (j *Janitor) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
-	first := time.NewTimer(StartDelay)
+	first := time.NewTimer(StartDelay + rand.N(StartDelay))
 	defer first.Stop()
 	select {
 	case <-ctx.Done():
 		return
 	case <-first.C:
 	}
-	j.runLogged(ctx)
+	j.runLeader(ctx)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -126,9 +145,40 @@ func (j *Janitor) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			j.runLogged(ctx)
+			j.runLeader(ctx)
 		}
 	}
+}
+
+// runLeader performs one pass unless another replica is already doing it,
+// and reports whether this replica ran it.
+//
+// The election is pg_try_advisory_lock. The alternative, a leader_election
+// table holding a lease row, needs schema, a renewal loop and a window
+// where a dead leader's lease has not expired yet; a session advisory lock
+// needs none of that and disappears the moment the connection does, which
+// is also how the rest of the codebase serialises cluster-wide work.
+//
+// Every step of the pass is an idempotent "DELETE ... WHERE created_at <
+// cutoff", so the lock saves duplicated work rather than protecting
+// correctness. That is why a connection pooler in transaction mode - where
+// a session lock cannot be held and every replica sees the lock as free -
+// costs a duplicated pass and nothing else.
+func (j *Janitor) runLeader(ctx context.Context) bool {
+	release, ok, err := j.Store.TryAdvisoryLock(ctx, store.LockJanitor)
+	if err != nil {
+		if ctx.Err() == nil {
+			j.log().Warn("retention leader lock", "err", err)
+		}
+		return false
+	}
+	if !ok {
+		j.log().Debug("retention pass skipped: another replica holds the leader lock")
+		return false
+	}
+	defer release()
+	j.runLogged(ctx)
+	return true
 }
 
 func (j *Janitor) runLogged(ctx context.Context) {
@@ -140,5 +190,6 @@ func (j *Janitor) runLogged(ctx context.Context) {
 		j.log().Warn("retention pass failed", "err", err)
 	}
 	j.log().Info("retention pass", "request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
-		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "usage_purged", rep.UsagePurged)
+		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "usage_purged", rep.UsagePurged,
+		"documents_failed", rep.DocumentsFailed)
 }

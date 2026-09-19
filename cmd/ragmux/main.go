@@ -163,12 +163,18 @@ func run(cfg config.Config) error {
 	} else {
 		log.Warn("pdf parsing stays in-process: cannot locate own executable", "err", err)
 	}
-	ingester := rag.NewIngester(bgCtx, st, embedders, cfg.IngestWorkers, log)
+	ingester := rag.NewIngester(bgCtx, st, embedders, cfg.IngestWorkers, log, rag.Settings{
+		Lease: cfg.IngestLease, PollInterval: cfg.IngestPollInterval,
+		MaxAttempts: cfg.IngestMaxAttempts, MaxPending: cfg.MaxPendingDocuments})
 	ingester.MaxChunksPerDocument = cfg.MaxChunksPerDocument
 	defer ingester.Stop()
-	if err := ingester.Resume(ctx); err != nil {
-		log.Warn("resume ingestion", "err", err)
-	}
+	// Nothing to resume: the dispatcher's first poll claims every pending
+	// document and every processing one whose lease expired, here and on
+	// every other replica. The kick only saves it the first poll interval.
+	ingester.Kick()
+	log.Info("ingestion ready", "owner", ingester.Owner(), "workers", cfg.IngestWorkers,
+		"lease", cfg.IngestLease, "poll_interval", cfg.IngestPollInterval,
+		"max_attempts", cfg.IngestMaxAttempts, "max_pending", cfg.MaxPendingDocuments)
 	retriever := rag.NewRetriever(st, embedders)
 
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",
@@ -220,7 +226,8 @@ func run(cfg config.Config) error {
 	}
 
 	janitor := &maintenance.Janitor{Store: st, Limiter: usage, Log: log,
-		RequestLogDays: cfg.LogRetentionDays, AuditDays: cfg.AuditRetentionDays}
+		RequestLogDays: cfg.LogRetentionDays, AuditDays: cfg.AuditRetentionDays,
+		IngestMaxAttempts: cfg.IngestMaxAttempts}
 	janitorDone := make(chan struct{})
 	go func() {
 		defer close(janitorDone)
@@ -255,7 +262,7 @@ func run(cfg config.Config) error {
 	}
 	log.Info("shutting down: waiting for ingestion jobs")
 	if !ingester.StopWithTimeout(30 * time.Second) {
-		log.Warn("ingestion jobs cancelled; unfinished documents resume on next start")
+		log.Warn("ingestion jobs cancelled; their documents go back into the queue for another replica or the next start")
 	}
 	stopBackground()
 	<-janitorDone

@@ -52,13 +52,36 @@ func TestProcessRejectsTooManyChunks(t *testing.T) {
 	}
 }
 
-func TestEnqueueReportsFullQueue(t *testing.T) {
-	ing := &Ingester{queue: make(chan int64, 1), log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	if err := ing.Enqueue(1); err != nil {
+// TestEnqueueReportsClusterBacklog covers the changed meaning of the 503 on
+// upload: the ceiling is the pending documents of the whole cluster, not
+// the free room in this process's channel.
+func TestEnqueueReportsClusterBacklog(t *testing.T) {
+	st := testdb.Open(t)
+	ctx := context.Background()
+	conn, err := st.CreateConnection(ctx, &store.ModelConnection{Name: "e", ProviderType: "custom_openai", BaseURL: "http://example.invalid/v1", ModelName: "m"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ing.Enqueue(2); !errors.Is(err, ErrQueueFull) {
-		t.Errorf("err = %v", err)
+	rs, err := st.CreateRAGStore(ctx, &store.RAGStore{Name: "s", EmbeddingConnectionID: conn.ID, ChunkSize: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := st.CreateDocument(ctx, &store.Document{RAGStoreID: rs.ID, Filename: "d.md", SizeBytes: 1}, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Built by hand: no dispatcher, so the two documents stay pending and
+	// the backlog is what Enqueue looks at. Each ingester counts once,
+	// which is also what the one-second cache does in production.
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	roomy := &Ingester{store: st, log: log, maxPending: 5, notify: make(chan struct{}, 1)}
+	if err := roomy.Enqueue(1); err != nil {
+		t.Errorf("backlog of 2 under a ceiling of 5: %v", err)
+	}
+	full := &Ingester{store: st, log: log, maxPending: 1, notify: make(chan struct{}, 1)}
+	if err := full.Enqueue(2); !errors.Is(err, ErrQueueFull) {
+		t.Errorf("backlog of 2 over a ceiling of 1: %v", err)
 	}
 }
 

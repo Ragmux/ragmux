@@ -118,7 +118,15 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log}, nil
+	s := &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log}
+	// Before any stored credential is read (UpgradeConnectionKeys is the
+	// first caller and would fail with a raw decrypt error): prove this
+	// process holds the key the database was written with.
+	if err := s.verifySecretKey(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 // Close releases the connection pool.

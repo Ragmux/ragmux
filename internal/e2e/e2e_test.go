@@ -145,9 +145,11 @@ func newEnvWith(t *testing.T, cfg store.OpenConfig, bootstrap bool, tune func(*a
 	}
 	providers := func(c *store.ModelConnection) (provider.Provider, error) { return provider.New(provCfg(c)) }
 	embedders := func(c *store.ModelConnection) (provider.Embedder, error) { return provider.NewEmbedder(provCfg(c)) }
-	ing := rag.NewIngester(ctx, st, embedders, 1, log)
+	// A short poll keeps the tests quick: uploads kick the dispatcher, but
+	// a document another stack queued is only found by the next poll.
+	ing := rag.NewIngester(ctx, st, embedders, 1, log, rag.Settings{PollInterval: 100 * time.Millisecond})
 	t.Cleanup(ing.Stop)
-	ing.Resume(ctx)
+	ing.Kick()
 	ret := rag.NewRetriever(st, embedders)
 	authSvc := &auth.Service{Store: st, TTL: time.Hour}
 	usage := &limits.Limiter{Store: st}
@@ -394,7 +396,7 @@ func TestFullPipelineAndPersistence(t *testing.T) {
 	}
 	sys := e2.call("GET", "/admin/api/system", nil, "")
 	db := sys["database"].(map[string]any)
-	if db["pgvector_version"] == "" || db["migrations_version"] != float64(9) || sys["secret_key_source"] != "env" {
+	if db["pgvector_version"] == "" || db["migrations_version"] != float64(13) || sys["secret_key_source"] != "env" {
 		t.Errorf("system info: %v", sys)
 	}
 
