@@ -123,9 +123,15 @@ kullanımı kullanıcının kendi limitiyle sınırlanır.
 ### Sonuçları
 
 - Mevcut kurulumlarda hiçbir şey kırılmaz.
-- `viewer`, kişisel limiti kadar harcama yapabilen bir kullanıcıdır;
-  harcamayı sıfırlamak isteyen operatör kullanıcının limitini sıfırlar ya
-  da hesabı devre dışı bırakır. Bu yol dokümanda gösterilir.
+- `viewer`, kendisine açılmış proje ve key sub-limit'leri kadar harcama
+  yapabilen bir kullanıcıdır. Harcamayı durdurmak isteyen operatörün
+  araçları: key'i revoke etmek, key'e küçük bir sub-limit vermek, ya da
+  hesabı deaktive etmek (`401 key_owner_inactive`). Bu yol dokümanda
+  gösterilir.
+- İki şey bu amaçla **işe yaramaz** ve dokümanda öyle yazılır: kullanıcının
+  project membership'ini düşürmek (grant'lar membership'ten bağımsız
+  yaşar, key çalışmaya devam eder) ve bir limiti `0` yapmak (bu kod
+  tabanında `0` = **sınırsız** demektir, yani tavanı kaldırır).
 
 ### Değerlendirilen alternatifler
 
