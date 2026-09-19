@@ -355,9 +355,18 @@ const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag:
 // failed.
 const WIZARD_KEY = 'ragmux_wizard';
 const wizard = {
-  get step() { try { return Number(sessionStorage.getItem(WIZARD_KEY)) || 0; } catch (e) { return 0; } },
+  // A tab mid-wizard when a new version is deployed reloads into the new
+  // script and finds the old flag, which was a bare "1". Read it as step 2 so
+  // that tab resumes where it was instead of dropping to the dashboard with
+  // the key left behind.
+  get step() {
+    let raw = null;
+    try { raw = sessionStorage.getItem(WIZARD_KEY); } catch (e) { return 0; }
+    const step = Number(raw) || 0;
+    return step === 1 ? 2 : step;
+  },
   get active() { return this.step >= 2; },
-  start(step) { try { sessionStorage.setItem(WIZARD_KEY, String(step)); } catch (e) { /* private mode: the wizard just does not resume */ } },
+  setStep(step) { try { sessionStorage.setItem(WIZARD_KEY, String(step)); } catch (e) { /* private mode: the wizard just does not resume */ } },
   done() { try { sessionStorage.removeItem(WIZARD_KEY); } catch (e) { /* nothing to clean up */ } },
 };
 const ROLE_RANK = { viewer: 1, editor: 2, admin: 3 };
@@ -601,7 +610,7 @@ function setupCard(step, id, title, lede, body, submitLabel, extra = '') {
   $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="${id}">
     <div><div class="eyebrow">First run · step ${step} of 3</div><h2>${esc(title)}</h2><p class="lede" style="font-size:13.5px">${lede}</p></div>
     ${body}
-    <button class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">${esc(submitLabel)}</button>
+    <button type="submit" class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">${esc(submitLabel)}</button>
     ${extra}</form></section>`;
   heroVersion();
 }
@@ -645,22 +654,35 @@ function renderSetupModel() {
     try { state.models = await api('/models'); }
     catch (e) { toast(e.message, 5000, 'err'); btn.disabled = false; return; }
     if (!state.models.length) { toast('Add a model connection first — a project needs one. You can do both from the Models tab.', 6000); await finishWizard(); return; }
-    wizard.start(3); renderSetup(); };
+    wizard.setStep(3); renderSetup(); };
   form.onsubmit = async e => { e.preventDefault(); const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true;
     try { await api('/models', { method: 'POST', body: { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name } });
-      state.models = await api('/models'); wizard.start(3); renderSetup(); }
+      state.models = await api('/models'); wizard.setStep(3); renderSetup(); }
     catch (err) { toast(err.message, 6000, 'err'); btn.disabled = false; } };
 }
 // Step 3: a project, which is what mints the first client key.
 function renderSetupProject() {
   const models = connOpts(chatModels());
+  // A resumed step 3 draws the picker from what the boot calls returned, and
+  // that list is empty when either /models or /provider-types failed. Submitting
+  // then posts a null connection id and earns a validation error nobody can act
+  // on, so the form says what happened and offers the retry instead.
+  const stranded = !models.length;
   setupCard(3, 'setupProjectForm', 'Create your first project',
     'A project ties a client key to a model connection and, later, a RAG store. Its key is shown once — this is the credential your applications use.', `
     ${field('name', 'Project name', input('name', 'default', 'required'))}
     ${field('model_connection_id', 'Model connection', select('model_connection_id', models, models.length ? models[0].value : undefined))}
-    ${field('system_prompt', 'System prompt (optional)', textarea('system_prompt', '', 'placeholder="You are the company support assistant."'), 'Prepended to every request this project proxies.')}`,
+    ${field('system_prompt', 'System prompt (optional)', textarea('system_prompt', '', 'placeholder="You are the company support assistant."'), 'Prepended to every request this project proxies.')}
+    ${stranded ? `<div class="note warn"><span class="hint">No model connections loaded, and a project needs one. If you just created one, this is a load error rather than a missing connection. <button type="button" class="btn ghost" id="setupRetryModels">Try again</button></span></div>` : ''}`,
     'Create project & finish',
     `<button type="button" class="btn ghost" id="setupSkipProject" style="justify-content:center">Skip for now</button>`);
+  if (stranded) {
+    $('button[type=submit]', $('#setupProjectForm')).disabled = true;
+    $('#setupRetryModels').onclick = async e => {
+      const btn = e.currentTarget; btn.disabled = true;
+      try { [state.models, state.providerTypes] = await Promise.all([api('/models'), api('/provider-types')]); renderSetup(); }
+      catch (err) { toast(err.message, 5000, 'err'); btn.disabled = false; } };
+  }
   $('#setupSkipProject').onclick = finishWizard;
   $('#setupProjectForm').onsubmit = async e => { e.preventDefault(); const d = formData(e.target); const btn = $('button[type=submit]', e.target); btn.disabled = true;
     try { const r = await api('/projects', { method: 'POST', body: { name: d.name, model_connection_id: Number(d.model_connection_id), system_prompt: d.system_prompt } });
@@ -691,7 +713,7 @@ function renderSetupAdmin() {
     try { const r = await api('/setup', { method: 'POST', body: { username: d.username, password: d.password } });
       // needsSetup drops before anything else can fail, so a reload can
       // never land back on step 1 with the account already created.
-      state.needsSetup = false; state.user = r.user; wizard.start(2); await afterSignIn(); }
+      state.needsSetup = false; state.user = r.user; wizard.setStep(2); await afterSignIn(); }
     catch (err) { toast(err.message, 5000, 'err'); if (/already completed/.test(err.message)) { state.needsSetup = false; render(); } }
     finally { btn.disabled = false; } };
 }
