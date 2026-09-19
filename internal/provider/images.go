@@ -265,10 +265,19 @@ func (f *ImageFetcher) acquire(ctx context.Context, tenant string) (func(), erro
 				f.mu.Lock()
 				f.waiting--
 				f.dequeue(tenant)
-				// This one lowers the tenant's total without raising
-				// inflight, so a sibling parked outside the share may have
-				// just come back inside it. Waking only on an empty process
-				// queue would leave it asleep while another tenant waits.
+				// Unconditional, unlike the arm above, and it has to stay
+				// that way: this one lowers the tenant's total without
+				// raising inflight, so a sibling parked outside the share may
+				// have just come back inside it. wakeIfQueueEmpty would say
+				// nothing while another tenant is still queued, and that
+				// sibling would sleep out its whole wait next to a claim it
+				// had just regained.
+				//
+				// No test holds this. Reaching it needs a same-tenant
+				// acquirer to time out while another tenant is still
+				// queueing, which is not an interleaving a test can force,
+				// and narrowing this to wakeIfQueueEmpty passes the whole
+				// suite. It is here by argument, not by coverage.
 				f.broadcast()
 				f.mu.Unlock()
 				return nil, f.queueError(ctx)

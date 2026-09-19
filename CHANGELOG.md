@@ -10,10 +10,11 @@ All notable changes to Ragmux are documented here. The format follows
 - **`IMAGE_FETCH_MAX_CONCURRENT`** (default `16`): image fetches the process runs at once,
   and the image transport's per-host connection ceiling. `IMAGE_FETCH_MAX_PER_REQUEST`
   bounds one request and nothing across them, so without this a key holder could aim the
-  gateway's own address at a host of their choosing. While
-  another project is queueing, no single one holds more than half the slots, so a tenant
-  pointed at a slow image host cannot starve the rest; with nobody else waiting, one
-  project still reaches the full value.
+  gateway's own address at a host of their choosing. While another project is queueing, no
+  single one **takes** more than half the slots, so a tenant pointed at a slow image host
+  cannot starve the rest. Takes, not holds: a slot already taken is not reclaimed, so a
+  tenant can still be above half while those downloads finish. With nobody else waiting,
+  one project reaches the full value.
 - **`IMAGE_CACHE_MAX_MB`**: byte ceiling for the fetched-image cache. Unset, it follows
   `IMAGE_FETCH_MAX_MB` — 64 MiB, or enough for two images of the largest size accepted,
   capped at 256 MiB. A value too small to hold one encoded image is refused at startup,

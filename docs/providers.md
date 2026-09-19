@@ -410,11 +410,17 @@ to probe the internal network. On top of that:
   at once and the connections it will hold to one host. A per-request limit bounds one
   request and nothing at all when many arrive together, which is what would make the
   gateway a useful amplifier for a target an API key chose. **While another project is
-  queueing, no single project holds more than half those slots**: capping the process
+  queueing, no single project takes more than half those slots**: capping the process
   alone closed the outward problem and opened an inward one, where a few requests aimed at
   a slow image host filled every slot and an unrelated project waited out its whole
-  timeout. The share is a floor under everybody else rather than a ceiling on one tenant —
-  with nobody else waiting, a single project reaches the whole of
+  timeout.
+- **Takes, not holds.** A slot already taken is never reclaimed. A project that filled the
+  gateway while nobody was waiting keeps those downloads running and can sit above its
+  half until they finish; what changes the moment somebody else queues is that it takes
+  nothing further until it is back inside the share. Cutting a running download short to
+  rebalance would throw away a fetch that is already part paid for, which is not what this
+  ceiling is for. So the share is a floor under everybody else rather than a ceiling on
+  one tenant: with nobody else waiting, a single project reaches the whole of
   `IMAGE_FETCH_MAX_CONCURRENT`, which is what the setting says it is.
 - A fetch that cannot get a slot within two seconds (or `IMAGE_FETCH_TIMEOUT`, if that is
   shorter — the wait is not separately configurable) is answered `429` with `Retry-After`
