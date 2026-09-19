@@ -33,6 +33,14 @@ type imageEntry struct {
 	expires   time.Time
 }
 
+// NewImageCache builds the cache an ImageFetcher stores fetched images in.
+// The type stays unexported because nothing outside the package has any use
+// for it beyond assigning it to ImageFetcher.Cache; the byte ceiling is not a
+// setting, only the entry count and the TTL are.
+func NewImageCache(maxEntries int, ttl time.Duration) *imageCache {
+	return newImageCache(maxEntries, 0, ttl)
+}
+
 // newImageCache builds a cache; a non-positive argument takes the default
 // (64 entries, 64 MiB, 10 minutes).
 func newImageCache(maxEntries int, maxBytes int64, ttl time.Duration) *imageCache {

@@ -203,6 +203,22 @@ func TestImageFetcherCache(t *testing.T) {
 	}
 }
 
+// The exported surface main.go builds a fetcher from, so a wiring change in
+// the binary cannot silently lose a setting.
+func TestImageFetcherDefaults(t *testing.T) {
+	f := &ImageFetcher{Client: http.DefaultClient, Cache: NewImageCache(16, time.Minute)}
+	if f.maxBytes() != 8<<20 || f.timeout() != 10*time.Second || f.maxPerRequest() != 8 {
+		t.Errorf("defaults = %d %v %d", f.maxBytes(), f.timeout(), f.maxPerRequest())
+	}
+	if f.Cache.maxEntries != 16 || f.Cache.ttl != time.Minute || f.Cache.maxBytes != 64<<20 {
+		t.Errorf("cache = %+v", f.Cache)
+	}
+	set := &ImageFetcher{MaxBytes: 1 << 20, Timeout: time.Second, MaxPerRequest: 2}
+	if set.maxBytes() != 1<<20 || set.timeout() != time.Second || set.maxPerRequest() != 2 {
+		t.Errorf("explicit settings ignored: %+v", set)
+	}
+}
+
 func TestImageCache(t *testing.T) {
 	c := newImageCache(2, 1<<20, time.Minute)
 	c.put("a", "image/png", "aaa")
