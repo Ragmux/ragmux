@@ -21,6 +21,17 @@ import (
 //
 // Non-member projects are reported as not found (404) rather than forbidden so
 // project ids do not leak.
+//
+// A role bounds the *admin surface*, not gateway spend. The key routes are
+// deliberately role-free -- every account manages its own API keys -- so a
+// viewer can mint itself an sk-user-… key and spend through /v1 on the
+// projects it belongs to. That is not a hole in the matrix above: what the
+// spend is bounded by is the user's own limit, not their role, and the
+// operator who wants it stopped zeroes that limit or deactivates the account.
+// Roles still hold everywhere they are the control: the key a viewer mints
+// can carry no scope the viewer's live role does not cover (clipScopes), and
+// it narrows the moment the account is demoted or deactivated. Decided in
+// ADR-003; docs/users-and-limits.md states the same split.
 type Role string
 
 // The three roles, ordered from most to least privileged.

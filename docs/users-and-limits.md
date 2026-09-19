@@ -14,12 +14,40 @@ dashboard (**Users** tab) or via `POST /admin/api/users`. Every user has exactly
 |----------|------------------------------------------|----------|----------|------------------|
 | `admin`  | full access | all projects, all metrics | own and everyone's; only role that may delete one | full access |
 | `editor` | create, edit, delete, upload, test, search | create (becomes a member); read, edit, delete, rotate key, metrics and members only for projects it belongs to | own; may create `management` keys | list active users (`/users/lite`) |
-| `viewer` | read and search only | read and metrics only for projects it belongs to | own `gateway` keys for member projects | — |
+| `viewer` | read and search only | read and metrics only for projects it belongs to | own `gateway` (`sk-user-…`) keys for member projects — **which means a viewer can spend**, see below; no `management` keys | — |
 
 Writes the role does not allow answer `403 {"error":{"type":"forbidden"}}`. Everyone can
 change their own password (`POST /admin/api/me/password`), manage their own API keys and
 read `/admin/api/system` (the PostgreSQL and pgvector versions in it are shown to admins
 only).
+
+### A role bounds the admin surface, not spend
+
+The table above is about `/admin/api` and the dashboard. It is not a spending limit, and
+`viewer` is not a read-only *account* — only a read-only *administrator*. The key routes
+are deliberately role-free, because every account manages its own credentials, so a
+`viewer` can mint itself an `sk-user-…` gateway key and send traffic through `/v1` for
+the projects it is a member of. That spend is charged to the projects' budgets and to
+the key's owner in the usage records, exactly as an editor's or an admin's would be.
+
+What bounds it is the user's own limits, not their role:
+
+- the per-project rate limits and token budgets the key runs under (below), and
+- the optional per-key sub-limits set when the key is created ([Key sub-limits](#key-sub-limits)).
+
+To cap a particular user, give their key a sub-limit; note that `0` there means
+*unlimited*, not *nothing*, so capping means setting a small ceiling rather than a zero.
+To stop them outright, revoke the key (`POST /admin/api/keys/{id}/revoke`), drop their
+project membership, or deactivate the account (`PUT /admin/api/users/{id}` with
+`is_active: false`) — deactivation stops every key the user holds at once, at `/v1` with
+`401 key_owner_inactive`, because a key's effective permission is its scopes intersected
+with the owner's *live* role and status. Demoting someone to `viewer` takes away the
+admin surface and nothing else.
+
+Roles still bind everywhere they are the control: the key a `viewer` mints can carry no
+scope the `viewer` role does not cover, so it cannot reach a `write`, `admin` or `keys`
+management scope, and `management` keys need at least `editor` plus an interactive
+session. Recorded as ADR-003.
 
 ## Project membership
 
