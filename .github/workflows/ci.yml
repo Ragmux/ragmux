@@ -53,6 +53,43 @@ jobs:
           PY
           node --check /tmp/dash.js
 
+  # A SECOND job, never a replacement for the one above. The pgvector job is
+  # what proves the fallback: a rag store configured for pg_search on a server
+  # without it must degrade to the pgvector backend rather than fail, and only
+  # a server genuinely missing the extension can test that. This job runs the
+  # same suite where pg_search exists, so the capability-gated BM25 tests stop
+  # skipping.
+  test-paradedb:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: paradedb/paradedb:latest-pg17@sha256:8da5d202fe31875af32a49e802ce17cfbc146b0672306f4109809efee1e6f916
+        env:
+          POSTGRES_USER: ragmux
+          POSTGRES_PASSWORD: ragmux
+          POSTGRES_DB: ragmux_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ragmux -d ragmux_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The service container brings up its own extensions on an empty volume
+      # (10_bootstrap_paradedb.sh), but a service cannot mount init hooks, so
+      # the guarded block is applied here instead.
+      - name: Enable pg_search
+        env:
+          PGPASSWORD: ragmux
+        run: psql -v ON_ERROR_STOP=1 -h localhost -U ragmux -d ragmux_test -f docker/postgres-init/02-extensions.sql
+      - name: go test
+        env:
+          TEST_DATABASE_URL: postgres://ragmux:ragmux@localhost:5432/ragmux_test?sslmode=disable
+        run: go test -race -count=1 ./...
+
   docker:
     runs-on: ubuntu-latest
     needs: test
@@ -76,6 +113,16 @@ jobs:
           file: Dockerfile
           push: false
           tags: ragmux/ragmux:ci-app
+          build-args: VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build all-in-one ParadeDB image (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.aio.paradedb
+          push: false
+          tags: ragmux/ragmux:ci-paradedb
           build-args: VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

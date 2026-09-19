@@ -1,0 +1,33 @@
+# Development database with ParadeDB: `make dev-db-paradedb`.
+#
+# Host port 5434, one above the plain pgvector dev database (5433), so both
+# can run side by side: `make test` exercises the fallback path on a server
+# without pg_search while `make test-paradedb` exercises the BM25 path, and
+# the capability-gated tests pick whichever they are pointed at.
+#
+#   TEST_DATABASE_URL=postgres://ragmux:ragmux@localhost:5434/ragmux_test?sslmode=disable
+services:
+  postgres:
+    # Digest-pinned like docker-compose.paradedb.yml; resolve a new one with
+    # `docker buildx imagetools inspect paradedb/paradedb:latest-pg17`.
+    image: paradedb/paradedb:latest-pg17@sha256:8da5d202fe31875af32a49e802ce17cfbc146b0672306f4109809efee1e6f916
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      POSTGRES_USER: ragmux
+      POSTGRES_PASSWORD: ragmux
+      POSTGRES_DB: ragmux_test
+    volumes:
+      # Tests run as the superuser on throwaway schemas and create the
+      # extensions they need, but pg_search has to exist in the database
+      # before detectCapabilities can find it.
+      - ./docker/postgres-init/02-extensions.sql:/docker-entrypoint-initdb.d/20-extensions.sql:ro
+      - pgdata_dev_paradedb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragmux -d ragmux_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata_dev_paradedb:

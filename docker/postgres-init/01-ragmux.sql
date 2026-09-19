@@ -21,6 +21,19 @@
 -- The extension needs a superuser; the gateway only checks that it exists.
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 
+-- Optional: ParadeDB's BM25 index, used by the pg_search search backend.
+-- Guarded on pg_available_extensions so this file stays the same on every
+-- image; a plain PostgreSQL simply skips it and every rag store keeps using
+-- the pgvector backend. 02-extensions.sql carries the identical block so an
+-- existing database can be upgraded without re-running this whole file.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_search') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_search;
+    END IF;
+END
+$$;
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ragmux_app') THEN
@@ -41,6 +54,17 @@ GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO ragmux_app;
 -- CREATE on the schema: migrations create the tables the role then owns, and
 -- ingestion creates chunk_embeddings_<dims> when a new embedding width appears.
 GRANT CREATE, USAGE ON SCHEMA public TO ragmux_app;
+
+-- ParadeDB installs its functions into the "paradedb" schema. Ragmux always
+-- schema-qualifies them (paradedb.term, paradedb.match, paradedb.score), so
+-- the role's search_path stays "public" and USAGE is the only grant needed.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'paradedb') THEN
+        EXECUTE 'GRANT USAGE ON SCHEMA paradedb TO ragmux_app';
+    END IF;
+END
+$$;
 
 -- Tables that already exist (an existing deployment switching from the
 -- superuser URL, or a pg_restore run as the superuser) must be handed over,

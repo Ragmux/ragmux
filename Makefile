@@ -5,7 +5,14 @@ IMAGE   ?= ragmux/ragmux:latest
 TEST_DATABASE_URL ?= postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable
 export TEST_DATABASE_URL
 
-.PHONY: build run test vet dev-db dev-db-down docker-build docker-build-app docker-run backup restore clean
+# Local ParadeDB Postgres started by `make dev-db-paradedb`
+# (docker-compose.dev.paradedb.yml). One port up from the pgvector dev
+# database so both can run at once: the plain one is what proves the fallback
+# path, the ParadeDB one is what exercises BM25.
+PARADEDB_TEST_DATABASE_URL ?= postgres://ragmux:ragmux@localhost:5434/ragmux_test?sslmode=disable
+
+.PHONY: build run test test-paradedb vet dev-db dev-db-down dev-db-paradedb dev-db-paradedb-down \
+	docker-build docker-build-app docker-build-paradedb docker-run backup restore clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o bin/ragmux ./cmd/ragmux
@@ -17,6 +24,12 @@ run: build
 test:
 	go test -race -count=1 ./...
 
+# The same suite against ParadeDB: the pg_search tests skip themselves on the
+# plain database and run here. Both jobs matter -- `make test` is what proves
+# a store configured for pg_search degrades instead of failing.
+test-paradedb:
+	TEST_DATABASE_URL="$(PARADEDB_TEST_DATABASE_URL)" go test -race -count=1 ./...
+
 vet:
 	go vet ./...
 
@@ -26,6 +39,12 @@ dev-db:
 dev-db-down:
 	docker compose -f docker-compose.dev.yml down
 
+dev-db-paradedb:
+	docker compose -f docker-compose.dev.paradedb.yml up -d --wait
+
+dev-db-paradedb-down:
+	docker compose -f docker-compose.dev.paradedb.yml down
+
 # All-in-one image (gateway + embedded PostgreSQL), what docker-compose.yml runs.
 docker-build:
 	docker build -f Dockerfile.aio --build-arg VERSION=$(VERSION) -t $(IMAGE) .
@@ -33,6 +52,10 @@ docker-build:
 # Gateway-only distroless image for an external database (published as *-app).
 docker-build-app:
 	docker build -f Dockerfile --build-arg VERSION=$(VERSION) -t $(IMAGE)-app .
+
+# All-in-one image on ParadeDB (pg_search + pgvector), published as *-paradedb.
+docker-build-paradedb:
+	docker build -f Dockerfile.aio.paradedb --build-arg VERSION=$(VERSION) -t $(IMAGE)-paradedb .
 
 docker-run: docker-build
 	docker compose up -d
