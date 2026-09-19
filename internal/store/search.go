@@ -1,0 +1,159 @@
+package store
+
+import (
+	"context"
+	"sync"
+)
+
+// Search backends for the lexical half of a hybrid search.
+const (
+	// BackendPgvector answers the lexical side with PostgreSQL's own full
+	// text search: the generated chunks.tsv column and its GIN index.
+	BackendPgvector = "pgvector"
+	// BackendPgSearch answers it with ParadeDB's BM25 index (pg_search).
+	BackendPgSearch = "pg_search"
+)
+
+// rrfK is the reciprocal rank fusion constant: score = 1/(rrfK+rank) summed
+// over the two candidate lists. 60 is the value from the original RRF paper
+// and the one every stored score was produced with.
+//
+// Fusion stays rank based on purpose, and a weighted sum of the raw scores is
+// deliberately not offered:
+//
+//   - BM25 scores are unbounded and corpus dependent while a cosine distance
+//     is bounded to [0,2]. Summing them needs per-query normalisation, and
+//     normalisation is least stable exactly when one leg returns few
+//     candidates -- the case where the fusion matters most.
+//   - SearchHit.Score is a public contract. It is published in the
+//     x-ragmux-rag-sources header, in ragmux.sources[].score, in the admin
+//     search panel and in tests. Changing what it means per store is an API
+//     change wearing a config flag as a disguise.
+//   - The win a better lexical backend actually delivers is a better ordered
+//     candidate list, and RRF consumes an ordering directly.
+const rrfK = 60
+
+// SearchParams is everything a backend needs to build the hybrid query. The
+// values are passed to the driver as bind parameters; VecTable is the only
+// piece that is interpolated, and it is derived from a validated integer
+// dimension (see vecTable), never from user input.
+type SearchParams struct {
+	// VecTable is the chunk_embeddings_<dims> table of the store.
+	VecTable string
+	// Vector is the query embedding, ready to bind as $1.
+	Vector any
+	// StoreID scopes both candidate lists to one rag store.
+	StoreID int64
+	// Candidates caps each candidate list and the fused result.
+	Candidates int
+	// MaxDistance drops candidates further than this cosine distance; 0 = off.
+	MaxDistance float64
+	// FTSConfig is the text search configuration used to parse the query.
+	// Only the pgvector backend reads it: the pg_search index is global and
+	// tokenises at index time, so a per-store configuration has nothing to
+	// select there.
+	FTSConfig string
+	// Query is the raw user query. Each backend prepares it its own way.
+	Query string
+}
+
+// SearchBackend builds the SQL for one hybrid search.
+//
+// Only hybrid mode is pluggable. Vector-only retrieval is byte-identical
+// under every backend -- it never touches the lexical index at all -- so
+// Store.Search consults a backend exclusively when opts.Mode is
+// SearchHybrid, and a backend never sees a vector-only search.
+//
+// Backends return SQL and arguments rather than rows on purpose: there stays
+// exactly one scan loop and one column contract in Store.Search, so a new
+// backend cannot quietly change what a SearchHit means.
+type SearchBackend interface {
+	// Name is the identifier stored in rag_stores.search_backend.
+	Name() string
+	// Available reports whether this server can run the backend at all.
+	Available(caps Capabilities) bool
+	// Prepare creates whatever the backend needs before its first query
+	// (an index, typically). It is a no-op for pgvector.
+	Prepare(ctx context.Context, s *Store) error
+	// HybridQuery builds the fused query. The result set must carry the
+	// twelve columns Store.Search scans, in order: chunk_id, document_id,
+	// idx, content, filename, section, page, distance, score, vector_rank,
+	// fts_rank, lex_score.
+	HybridQuery(p SearchParams) (sql string, args []any)
+}
+
+// searchBackends holds one instance of each backend. They are stateless
+// builders; everything per-server lives on the Store.
+var searchBackends = map[string]SearchBackend{
+	BackendPgvector: pgvectorBackend{},
+	BackendPgSearch: pgSearchBackend{},
+}
+
+// SearchBackendNames lists the known backends in a stable order.
+var SearchBackendNames = []string{BackendPgvector, BackendPgSearch}
+
+// IsValidSearchBackend reports whether name is a known backend.
+func IsValidSearchBackend(name string) bool {
+	_, ok := searchBackends[name]
+	return ok
+}
+
+// SearchBackendAvailable reports whether this server can run a backend.
+func (s *Store) SearchBackendAvailable(name string) bool {
+	b, ok := searchBackends[name]
+	return ok && b.Available(s.caps)
+}
+
+// SearchBackendReason explains why a backend cannot be used here; the empty
+// string means it can.
+func (s *Store) SearchBackendReason(name string) string {
+	b, ok := searchBackends[name]
+	if !ok {
+		return "unknown search backend"
+	}
+	if b.Available(s.caps) {
+		return ""
+	}
+	if name == BackendPgSearch && s.caps.PgSearchVersion != "" {
+		return "the pg_search extension is installed (version " + s.caps.PgSearchVersion +
+			") but does not speak the query API this build uses"
+	}
+	return "the pg_search extension is not installed on this PostgreSQL server"
+}
+
+// backendWarned remembers which rag stores already logged the "configured
+// backend is unavailable" warning, so a store left pointing at a backend
+// this server does not carry costs one log line per process rather than one
+// per query. The key pairs the Store with the rag store id: two Stores in
+// one process (tests, or a re-Open simulating a restart) must not silence
+// each other's first warning.
+var backendWarned sync.Map
+
+type backendWarnKey struct {
+	store *Store
+	rag   int64
+}
+
+// resolveBackend returns the backend a search should use. A store configured
+// for a backend this server cannot run -- a dump restored onto a plain
+// PostgreSQL, or a pg_search whose query API failed the boot smoke test --
+// falls back to pgvector with one warning per store per process. Retrieval
+// degrades; it never fails.
+func (s *Store) resolveBackend(name string, storeID int64) SearchBackend {
+	if name == "" {
+		name = BackendPgvector
+	}
+	b, ok := searchBackends[name]
+	if !ok {
+		b = searchBackends[BackendPgvector]
+		name = BackendPgvector
+	}
+	if b.Available(s.caps) {
+		return b
+	}
+	if _, warned := backendWarned.LoadOrStore(backendWarnKey{s, storeID}, true); !warned {
+		s.log.Warn("rag store is configured for a search backend this server cannot run; falling back to pgvector",
+			"rag_store", storeID, "backend", name, "reason", s.SearchBackendReason(name))
+	}
+	return searchBackends[BackendPgvector]
+}

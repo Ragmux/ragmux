@@ -12,6 +12,41 @@ const (
 	SearchHybrid = "hybrid"
 )
 
+// Rerank backends for a RAG store. RerankLLM is the project's own chat model
+// (the original behaviour); the others are dedicated rerank APIs reached
+// through a model_connections row named by RerankConnectionID.
+const (
+	RerankLLM    = "llm"
+	RerankCohere = "cohere"
+	RerankVoyage = "voyage"
+)
+
+// RerankBackends lists the known rerank backends in a stable order.
+var RerankBackends = []string{RerankLLM, RerankCohere, RerankVoyage}
+
+// IsValidRerankBackend reports whether name is a known rerank backend.
+func IsValidRerankBackend(name string) bool {
+	for _, v := range RerankBackends {
+		if v == name {
+			return true
+		}
+	}
+	return false
+}
+
+// RerankConnectionType maps a rerank backend onto the provider_type its
+// model connection must carry. The empty string means the backend needs no
+// connection.
+func RerankConnectionType(backend string) string {
+	switch backend {
+	case RerankCohere:
+		return "cohere_rerank"
+	case RerankVoyage:
+		return "voyage_rerank"
+	}
+	return ""
+}
+
 // RAGStore is a named collection of documents sharing one embedding model.
 type RAGStore struct {
 	ID                    int64  `json:"id"`
@@ -22,12 +57,24 @@ type RAGStore struct {
 	TopK                  int    `json:"top_k"`
 	// SearchMode is "vector" or "hybrid" (vector + full-text fused with RRF).
 	SearchMode string `json:"search_mode"`
+	// SearchBackend answers the lexical half of a hybrid search:
+	// BackendPgvector (tsvector + GIN) or BackendPgSearch (ParadeDB BM25).
+	// Switching it needs no reprocessing: both read chunks.content.
+	SearchBackend string `json:"search_backend"`
 	// FTSConfig is the text search configuration used to parse queries.
-	// Chunks are always indexed with 'simple'.
+	// Chunks are always indexed with 'simple'. Ignored by the pg_search
+	// backend, whose index is global and tokenised once at index time.
 	FTSConfig string `json:"fts_config"`
-	// Rerank enables LLM reranking of the top RerankCandidates hits.
+	// Rerank enables reranking of the top RerankCandidates hits.
 	Rerank           bool `json:"rerank"`
 	RerankCandidates int  `json:"rerank_candidates"`
+	// RerankBackend is RerankLLM, RerankCohere or RerankVoyage.
+	RerankBackend string `json:"rerank_backend"`
+	// RerankConnectionID is the model connection holding the rerank API's
+	// credentials; nil for RerankLLM. A NULL behind an API backend (the
+	// connection was deleted, ON DELETE SET NULL) means the reranker is
+	// unavailable: the search skips it and logs, as it does for a failure.
+	RerankConnectionID *int64 `json:"rerank_connection_id"`
 	// MaxDistance drops hits whose cosine distance exceeds it; 0 disables.
 	MaxDistance float64 `json:"max_distance"`
 	// ContextualChunks prefixes the document title and section to the text
@@ -47,7 +94,8 @@ type RAGStore struct {
 }
 
 const ragCols = `r.id, r.name, r.embedding_connection_id, r.chunk_size, r.chunk_overlap, r.top_k,
-	r.search_mode, r.fts_config, r.rerank, r.rerank_candidates, r.max_distance, r.contextual_chunks,
+	r.search_mode, r.search_backend, r.fts_config, r.rerank, r.rerank_candidates,
+	r.rerank_backend, r.rerank_connection_id, r.max_distance, r.contextual_chunks,
 	r.max_documents, r.max_bytes, r.dimensions, r.created_at,
 	(SELECT COUNT(*) FROM documents d WHERE d.rag_store_id = r.id),
 	COALESCE((SELECT SUM(d.size_bytes) FROM documents d WHERE d.rag_store_id = r.id), 0),
@@ -58,7 +106,8 @@ func scanRAG(row interface{ Scan(...any) error }) (*RAGStore, error) {
 	var created time.Time
 	var maxDist float32
 	err := row.Scan(&r.ID, &r.Name, &r.EmbeddingConnectionID, &r.ChunkSize, &r.ChunkOverlap, &r.TopK,
-		&r.SearchMode, &r.FTSConfig, &r.Rerank, &r.RerankCandidates, &maxDist, &r.ContextualChunks,
+		&r.SearchMode, &r.SearchBackend, &r.FTSConfig, &r.Rerank, &r.RerankCandidates,
+		&r.RerankBackend, &r.RerankConnectionID, &maxDist, &r.ContextualChunks,
 		&r.MaxDocuments, &r.MaxBytes, &r.Dimensions, &created, &r.DocumentCount, &r.BytesUsed, &r.ChunkCount)
 	if err != nil {
 		return nil, scanErr(err)
@@ -74,8 +123,19 @@ func applyRAGDefaults(r *RAGStore) {
 	if r.SearchMode == "" {
 		r.SearchMode = SearchHybrid
 	}
+	if r.SearchBackend == "" {
+		r.SearchBackend = BackendPgvector
+	}
 	if r.FTSConfig == "" {
 		r.FTSConfig = "simple"
+	}
+	if r.RerankBackend == "" {
+		r.RerankBackend = RerankLLM
+	}
+	if r.RerankBackend == RerankLLM {
+		// The connection only ever carries rerank API credentials; leaving
+		// one on an LLM store would resurrect it on a later backend switch.
+		r.RerankConnectionID = nil
 	}
 	if r.RerankCandidates <= 0 {
 		r.RerankCandidates = 15
@@ -88,11 +148,13 @@ func (s *Store) CreateRAGStore(ctx context.Context, r *RAGStore) (*RAGStore, err
 	var id int64
 	err := s.pool.QueryRow(ctx, `INSERT INTO rag_stores
 		(name, embedding_connection_id, chunk_size, chunk_overlap, top_k,
-		 search_mode, fts_config, rerank, rerank_candidates, max_distance, contextual_chunks,
+		 search_mode, search_backend, fts_config, rerank, rerank_candidates,
+		 rerank_backend, rerank_connection_id, max_distance, contextual_chunks,
 		 max_documents, max_bytes)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id`,
 		r.Name, r.EmbeddingConnectionID, r.ChunkSize, r.ChunkOverlap, r.TopK,
-		r.SearchMode, r.FTSConfig, r.Rerank, r.RerankCandidates, float32(r.MaxDistance), r.ContextualChunks,
+		r.SearchMode, r.SearchBackend, r.FTSConfig, r.Rerank, r.RerankCandidates,
+		r.RerankBackend, r.RerankConnectionID, float32(r.MaxDistance), r.ContextualChunks,
 		r.MaxDocuments, r.MaxBytes).Scan(&id)
 	if err != nil {
 		return nil, err
@@ -113,10 +175,12 @@ func (s *Store) UpdateRAGStore(ctx context.Context, r *RAGStore) (*RAGStore, err
 	}
 	applyRAGDefaults(r)
 	_, err = s.pool.Exec(ctx, `UPDATE rag_stores SET name=$1, embedding_connection_id=$2, chunk_size=$3,
-		chunk_overlap=$4, top_k=$5, search_mode=$6, fts_config=$7, rerank=$8, rerank_candidates=$9,
-		max_distance=$10, contextual_chunks=$11, max_documents=$12, max_bytes=$13 WHERE id=$14`,
+		chunk_overlap=$4, top_k=$5, search_mode=$6, search_backend=$7, fts_config=$8, rerank=$9,
+		rerank_candidates=$10, rerank_backend=$11, rerank_connection_id=$12,
+		max_distance=$13, contextual_chunks=$14, max_documents=$15, max_bytes=$16 WHERE id=$17`,
 		r.Name, r.EmbeddingConnectionID, r.ChunkSize, r.ChunkOverlap, r.TopK,
-		r.SearchMode, r.FTSConfig, r.Rerank, r.RerankCandidates, float32(r.MaxDistance), r.ContextualChunks,
+		r.SearchMode, r.SearchBackend, r.FTSConfig, r.Rerank, r.RerankCandidates,
+		r.RerankBackend, r.RerankConnectionID, float32(r.MaxDistance), r.ContextualChunks,
 		r.MaxDocuments, r.MaxBytes, r.ID)
 	if err != nil {
 		return nil, err
