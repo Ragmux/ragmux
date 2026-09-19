@@ -88,8 +88,10 @@ func RequireRole(min Role) func(http.Handler) http.Handler {
 // It is a no-op for a dashboard session, which is already bounded by the
 // user's role, and it never widens anything: RequireRole still runs on the
 // same route and still consults the owner's live role, so demoting or
-// deactivating a user immediately narrows every key they hold. A key's
-// effective permission is its scopes intersected with that role.
+// deactivating a user immediately narrows every sk-mgmt-… key they hold. A
+// key's effective permission on this surface is its scopes intersected with
+// that role. It says nothing about /v1, which never reads a role -- see the
+// note on Role above.
 func RequireScope(scope string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

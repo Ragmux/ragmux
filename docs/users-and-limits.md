@@ -107,10 +107,18 @@ All three prefixes keep the `sk-` head so secret scanners that watch for OpenAI-
 keys keep firing on a leak. The key is shown once at creation and only its first 15
 characters (`key_prefix`) are stored for identification, next to a SHA-256 hash.
 
-**A key can never exceed its owner.** The effective permission is the key's scopes
-intersected with the owner's role, and the role is read from the database on *every*
-request: demoting a user narrows all their keys at once, and deactivating one stops them
-resolving entirely. Scopes only ever narrow.
+**A key can never exceed its owner.** Scopes only ever narrow, and the owner is looked up
+on *every* request rather than copied onto the key.
+
+What that lookup enforces differs by surface. On `/admin/api` the effective permission is
+the key's scopes intersected with the owner's role, so demoting a user narrows every
+`sk-mgmt-…` key they hold at once. `/v1` does not read the role at all — it checks only
+that the account is active — so a demotion changes nothing about an `sk-user-…` key:
+`chat` and `models` are scopes every role including `viewer` already covers. See
+[A role bounds the admin surface, not spend](#a-role-bounds-the-admin-surface-not-spend).
+
+**Deactivating** an account stops both kinds at once: the key stops resolving entirely
+(`401 key_owner_inactive` at `/v1`).
 
 | Kind | Scope | Allows |
 |---|---|---|
