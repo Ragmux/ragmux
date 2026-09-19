@@ -179,7 +179,8 @@ func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
 		t.Errorf("tr_stem tokenizer = %s", got)
 	}
 	// A code with no Snowball stemmer in pg_search is not quietly mapped to
-	// another language: it stays a type and fails loudly at index build.
+	// another language: it stays a type, and ValidatePgSearchTokenizer has
+	// already refused it at startup.
 	if got := (&Store{pgSearchTok: "hi_stem"}).bm25TokenizerJSON(); got != `{"type":"hi_stem"}` {
 		t.Errorf("unknown stemmer code = %s", got)
 	}
@@ -187,9 +188,10 @@ func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
 	if got := (&Store{pgSearchTok: "whitespace"}).bm25TokenizerJSON(); got != `{"type":"whitespace"}` {
 		t.Errorf("whitespace tokenizer = %s", got)
 	}
-	// The reloption the drift check compares is the one the DDL writes.
-	if !strings.Contains(ddl, "text_fields = '"+s.bm25TextFields()+"'") {
-		t.Errorf("text_fields does not match the DDL:\n%s\n%s", s.bm25TextFields(), ddl)
+	// The DDL carries exactly what bm25TokenizerJSON renders, which is what
+	// makes tokenizerFromReloptions able to read the analyser back.
+	if !strings.Contains(stemmed.bm25IndexDDL(), `"tokenizer":`+stemmed.bm25TokenizerJSON()+`,`) {
+		t.Errorf("tokenizer object does not reach the DDL:\n%s", stemmed.bm25IndexDDL())
 	}
 }
 
@@ -199,19 +201,37 @@ func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
 // analyser; reading it back is the only way the log can name the analyser
 // queries actually use rather than the one the configuration asks for.
 func TestTokenizerFromReloptions(t *testing.T) {
-	// What PostgreSQL stores for the DDL bm25IndexDDL builds.
+	// What PostgreSQL stores for the DDL bm25IndexDDL builds. The tokenizer
+	// object comes from the builder itself rather than a literal, so a
+	// change in how an analyser is rendered cannot leave this test asserting
+	// a shape no index ever has -- which is what "en_stem" was: a tokenizer
+	// type the DDL stopped emitting once pg_search turned out to reject it.
 	built := func(tok string) []string {
 		return []string{
 			"key_field=id",
-			`text_fields={"content":{"tokenizer":{"type":"` + tok + `"},"record":"position"}}`,
+			`text_fields={"content":{"tokenizer":` + (&Store{pgSearchTok: tok}).bm25TokenizerJSON() + `,"record":"position"}}`,
 			`numeric_fields={"rag_store_id":{"fast":true},"document_id":{"fast":true}}`,
 		}
 	}
+	// A stemming analyser round-trips to the name an operator configured,
+	// not to the "default" type it is stored as: the caller compares this
+	// against PG_SEARCH_TOKENIZER, so returning the type would report every
+	// stemming index as drifted from the setting that built it.
 	if got := tokenizerFromReloptions(built("en_stem")); got != "en_stem" {
 		t.Errorf("tokenizer = %q, want en_stem", got)
 	}
+	if got := tokenizerFromReloptions(built("tr_stem")); got != "tr_stem" {
+		t.Errorf("tokenizer = %q, want tr_stem", got)
+	}
 	if got := tokenizerFromReloptions(built("default")); got != "default" {
 		t.Errorf("tokenizer = %q, want default", got)
+	}
+	// A stemmer language this build has no code for is "could not tell",
+	// not a guess.
+	if got := tokenizerFromReloptions([]string{
+		`text_fields={"content":{"tokenizer":{"type":"default","stemmer":"Klingon"},"record":"position"}}`,
+	}); got != "" {
+		t.Errorf("unknown stemmer language = %q, want the empty string", got)
 	}
 	// Everything unreadable degrades to "could not tell", never to a name.
 	// The value only reaches a log line, so a shape a future ParadeDB
@@ -228,6 +248,56 @@ func TestTokenizerFromReloptions(t *testing.T) {
 	} {
 		if got := tokenizerFromReloptions(opts); got != "" {
 			t.Errorf("%s: tokenizer = %q, want the empty string", name, got)
+		}
+	}
+}
+
+func TestValidatePgSearchTokenizer(t *testing.T) {
+	// Every code in the table is accepted, and every code in the table has a
+	// non-empty Snowball language: an entry mapping to "" would build a DDL
+	// pg_search rejects, which is the failure this whole table exists to
+	// prevent. TestPgSearchStemmingTokenizerAnswersWithBM25 is what proves
+	// the languages themselves against a live server.
+	codes := PgSearchStemmerCodes()
+	if len(codes) != len(pgSearchStemmers) || len(codes) == 0 {
+		t.Fatalf("codes = %v", codes)
+	}
+	for i, code := range codes {
+		if i > 0 && codes[i-1] >= code {
+			t.Errorf("codes are not sorted: %v", codes)
+		}
+		if pgSearchStemmers[code] == "" {
+			t.Errorf("%q has no language", code)
+		}
+		if err := ValidatePgSearchTokenizer(code + "_stem"); err != nil {
+			t.Errorf("%s_stem rejected: %v", code, err)
+		}
+	}
+	// Two languages pg_search does support were missing from the first
+	// version of this table, so every store using them degraded exactly the
+	// way en_stem did. Naming them keeps them from being dropped again.
+	for _, code := range []string{"en", "cs", "pl", "tr"} {
+		if pgSearchStemmers[code] == "" {
+			t.Errorf("%q must be supported", code)
+		}
+	}
+	// Anything that is not a stemmer is none of this function's business:
+	// tokenizer types are pg_search's to define.
+	for _, ok := range []string{"default", "whitespace", "keyword", "source_code", ""} {
+		if err := ValidatePgSearchTokenizer(ok); err != nil {
+			t.Errorf("%q should pass through: %v", ok, err)
+		}
+	}
+	// A stemmer code with no entry is refused, and the message says what is
+	// available rather than only what is wrong.
+	for _, bad := range []string{"hi_stem", "sr_stem", "english_stem", "_stem"} {
+		err := ValidatePgSearchTokenizer(bad)
+		if err == nil {
+			t.Errorf("%q should be refused", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), bad) || !strings.Contains(err.Error(), "en_stem") {
+			t.Errorf("%q message should name the value and the supported set: %v", bad, err)
 		}
 	}
 }

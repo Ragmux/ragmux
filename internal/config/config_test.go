@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ragmux/ragmux/internal/store"
 )
 
 func TestLoadReadsSecretsFromFiles(t *testing.T) {
@@ -120,6 +122,42 @@ func TestPgSearchTokenizerRejectsInjection(t *testing.T) {
 	}
 	if c.PgSearchTokenizer != "en_stem" {
 		t.Errorf("tokenizer = %q", c.PgSearchTokenizer)
+	}
+}
+
+// A "<code>_stem" name is translated to a Snowball language from a table in
+// the store package. A code missing from it can only produce a DDL pg_search
+// refuses, which costs a warning per search and a store stuck on the pgvector
+// fallback for the life of the process -- invisible from the outside. It is
+// refused at startup instead, where an operator sees it.
+func TestPgSearchTokenizerRejectsUnsupportedStemmer(t *testing.T) {
+	base := func() { t.Setenv("DATABASE_URL", "postgres://x/y"); t.Setenv("SECRET_KEY", strings.Repeat("a", 64)) }
+	for _, bad := range []string{"hi_stem", "sr_stem", "ca_stem", "uk_stem"} {
+		base()
+		t.Setenv("PG_SEARCH_TOKENIZER", bad)
+		_, err := Load()
+		if err == nil {
+			t.Errorf("PG_SEARCH_TOKENIZER %q was accepted", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "PG_SEARCH_TOKENIZER") || !strings.Contains(err.Error(), bad) {
+			t.Errorf("%q error should name the variable and the value: %v", bad, err)
+		}
+	}
+	// Every supported code loads, including the two a first version of the
+	// table left out.
+	for _, code := range store.PgSearchStemmerCodes() {
+		base()
+		t.Setenv("PG_SEARCH_TOKENIZER", code+"_stem")
+		if _, err := Load(); err != nil {
+			t.Errorf("%s_stem rejected: %v", code, err)
+		}
+	}
+	// A plain tokenizer type is not a stemmer and is left to pg_search.
+	base()
+	t.Setenv("PG_SEARCH_TOKENIZER", "whitespace")
+	if _, err := Load(); err != nil {
+		t.Errorf("whitespace rejected: %v", err)
 	}
 }
 

@@ -160,12 +160,19 @@ backends stay comparable out of the box.
 
 **Stemming** is `PG_SEARCH_TOKENIZER=<iso-639-1>_stem`, for the whole instance: the index
 is global, so the analyser cannot be a per-store setting. `en_stem` is English,
-`de_stem` German, `tr_stem` Turkish; the languages with a Snowball stemmer in `pg_search`
-are `ar da de el en es fi fr hu it nl no pt ro ru sv ta tr`. A code outside that set is
-sent to `pg_search` as a tokenizer type, which rejects it — the failure is loud rather
-than a silent fall back to the wrong language. Stemming makes the lexical leg match
-`ranking` for a query of `rank`, at the cost of matching words the pgvector path would
-not, so the two backends stop being word-for-word comparable.
+`de_stem` German, `tr_stem` Turkish. The twenty codes this build translates are
+
+```
+ar cs da de el en es fi fr hu it nl no pl pt ro ru sv ta tr
+```
+
+which is the set of Snowball stemmers `pg_search` 0.25.9 accepted when each was tried
+against a live server. Other `pg_search` builds may know more or fewer; a code this build
+does not carry is **refused at startup** rather than left to fail on every search, so a
+version that adds one needs the table in `internal/store/search_pgsearch.go` extended.
+Stemming makes the lexical leg match `ranking` for a query of `rank`, at the cost of
+matching words the pgvector path would not, so the two backends stop being word-for-word
+comparable.
 
 **Changing the tokenizer only affects a fresh index.** The index is created with
 `CREATE INDEX IF NOT EXISTS`, so pointing `PG_SEARCH_TOKENIZER` at something new on an

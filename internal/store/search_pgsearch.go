@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -70,16 +71,49 @@ func (s *Store) pgSearchTokenizer() string {
 // code is matched, and the interpolated Snowball name comes from this table,
 // never from the environment.
 //
-// The languages are exactly the Snowball set pg_search 0.25 accepts; codes
-// with no stemmer there (Hindi, Indonesian, Serbian, ...) are deliberately
-// absent so they surface as an error at index build rather than silently
-// stemming with the wrong language.
+// The twenty languages are the ones pg_search 0.25.9 accepted when each was
+// tried against a live server on 2026-09-19. A language pg_search has no
+// Snowball stemmer for (Catalan, Hindi, Indonesian, Serbian, Ukrainian, ...)
+// has no entry rather than a nearby substitute, and ValidatePgSearchTokenizer
+// turns the missing entry into a startup error.
 var pgSearchStemmers = map[string]string{
-	"ar": "Arabic", "da": "Danish", "de": "German", "el": "Greek",
-	"en": "English", "es": "Spanish", "fi": "Finnish", "fr": "French",
-	"hu": "Hungarian", "it": "Italian", "nl": "Dutch", "no": "Norwegian",
-	"pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sv": "Swedish",
-	"ta": "Tamil", "tr": "Turkish",
+	"ar": "Arabic", "cs": "Czech", "da": "Danish", "de": "German",
+	"el": "Greek", "en": "English", "es": "Spanish", "fi": "Finnish",
+	"fr": "French", "hu": "Hungarian", "it": "Italian", "nl": "Dutch",
+	"no": "Norwegian", "pl": "Polish", "pt": "Portuguese", "ro": "Romanian",
+	"ru": "Russian", "sv": "Swedish", "ta": "Tamil", "tr": "Turkish",
+}
+
+// PgSearchStemmerCodes lists the "<code>_stem" analysers this build supports,
+// sorted, for error messages and documentation.
+func PgSearchStemmerCodes() []string {
+	codes := make([]string, 0, len(pgSearchStemmers))
+	for code := range pgSearchStemmers {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	return codes
+}
+
+// ValidatePgSearchTokenizer rejects a PG_SEARCH_TOKENIZER that names a
+// stemming analyser this build cannot translate.
+//
+// Only "<code>_stem" names are checked. Everything else is a tokenizer type,
+// and the set of those is pg_search's to define -- a wrong one still costs a
+// warning and a fallback on first search. A stemmer code is different: the
+// language has to come from the table above, so an unknown one can never do
+// anything but fail, and failing at startup beats failing invisibly on every
+// search for the life of the process.
+func ValidatePgSearchTokenizer(tok string) error {
+	code, ok := strings.CutSuffix(tok, "_stem")
+	if !ok {
+		return nil
+	}
+	if _, known := pgSearchStemmers[code]; known {
+		return nil
+	}
+	return fmt.Errorf("pg_search has no stemmer for %q: supported stemming analysers are %s",
+		tok, strings.Join(PgSearchStemmerCodes(), "_stem, ")+"_stem")
 }
 
 // bm25TokenizerJSON renders the configured analyser as the JSON object
@@ -87,8 +121,9 @@ var pgSearchStemmers = map[string]string{
 //
 // Anything that is not a recognised "<iso>_stem" name is passed through as a
 // tokenizer type unchanged: config.Load has already bounded it to
-// [a-z][a-z0-9_]* so it cannot break out of the literal, and an unknown type
-// is rejected by pg_search at index build, where the caller turns it into the
+// [a-z][a-z0-9_]* so it cannot break out of the literal, an unknown *stemmer*
+// was refused at startup by ValidatePgSearchTokenizer, and an unknown type is
+// rejected by pg_search at index build, where the caller turns it into the
 // usual "could not be prepared" warning and falls back to pgvector.
 func (s *Store) bm25TokenizerJSON() string {
 	tok := s.pgSearchTokenizer()

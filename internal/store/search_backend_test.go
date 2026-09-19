@@ -194,37 +194,103 @@ func TestPgSearchHybridSearch(t *testing.T) {
 	}
 }
 
-// TestPgSearchStemmingTokenizerBuildsAndSearches is the regression for the
+// TestPgSearchStemmingTokenizerAnswersWithBM25 is the regression for the
 // tokenizer the documentation has always named. "en_stem" is not a tokenizer
 // *type* pg_search knows -- it rejects the index DDL with "unknown tokenizer
 // type: en_stem" -- so setting PG_SEARCH_TOKENIZER to it used to make every
 // pg_search store fall back to pgvector for the life of the process, quietly
 // and permanently. Only a live server can catch that: the DDL is a string
 // until ParadeDB parses it.
-func TestPgSearchStemmingTokenizerBuildsAndSearches(t *testing.T) {
+//
+// Every code in the table has to be tried against the server, not just one:
+// the first version of this fix shipped a table missing two languages
+// pg_search does support, and a code that is merely absent fails exactly the
+// way "en_stem" did.
+func TestPgSearchStemmingTokenizerAnswersWithBM25(t *testing.T) {
+	for _, code := range store.PgSearchStemmerCodes() {
+		t.Run(code, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := testdb.Config(t)
+			cfg.PgSearchTokenizer = code + "_stem"
+			s := testdb.OpenWith(t, cfg)
+			testdb.RequirePgSearch(t, s)
+
+			r := seedStore(t, ctx, s, "stemmed", store.BackendPgSearch)
+			q := []float32{1, 0, 0, 0}
+			hits, used, err := s.SearchWithBackend(ctx, r.ID, "zyxquux", q,
+				store.SearchOptions{Mode: store.SearchHybrid, Backend: store.BackendPgSearch, Candidates: 2})
+			if err != nil {
+				t.Fatalf("stemming tokenizer: %v", err)
+			}
+			if used != store.BackendPgSearch {
+				t.Fatalf("backend = %q, want pg_search: the index DDL was rejected and the search degraded", used)
+			}
+			var lexical *store.SearchHit
+			for i := range hits {
+				if hits[i].Index == 2 {
+					lexical = &hits[i]
+				}
+			}
+			if lexical == nil || lexical.LexScore <= 0 {
+				t.Fatalf("BM25 should still score under a stemming analyser: %+v", hits)
+			}
+		})
+	}
+}
+
+// TestPgSearchTokenizerDriftIsReported covers the other half of the tokenizer
+// trap: the DDL is CREATE INDEX IF NOT EXISTS, so pointing
+// PG_SEARCH_TOKENIZER somewhere new on an installation that already built the
+// index silently keeps the old analyser. The warning is the only thing
+// standing between an operator and a setting that looks applied and is not,
+// and it is built out of pg_class.reloptions -- a shape only a real server
+// can confirm.
+func TestPgSearchTokenizerDriftIsReported(t *testing.T) {
 	ctx := context.Background()
 	cfg := testdb.Config(t)
 	cfg.PgSearchTokenizer = "en_stem"
-	s := testdb.OpenWith(t, cfg)
-	testdb.RequirePgSearch(t, s)
+	first := testdb.OpenWith(t, cfg)
+	testdb.RequirePgSearch(t, first)
 
-	r := seedStore(t, ctx, s, "stemmed", store.BackendPgSearch)
-	q := []float32{1, 0, 0, 0}
-	hits, used, err := s.SearchWithBackend(ctx, r.ID, "zyxquux", q,
-		store.SearchOptions{Mode: store.SearchHybrid, Backend: store.BackendPgSearch, Candidates: 2})
+	// Build the index under the stemming analyser.
+	r := seedStore(t, ctx, first, "drift", store.BackendPgSearch)
+	if _, used, err := first.SearchWithBackend(ctx, r.ID, "zyxquux", []float32{1, 0, 0, 0},
+		store.SearchOptions{Mode: store.SearchHybrid, Backend: store.BackendPgSearch, Candidates: 2}); err != nil || used != store.BackendPgSearch {
+		t.Fatalf("building the index: %q %v", used, err)
+	}
+
+	// Reopen the same schema asking for a different analyser. The index on
+	// disk is the old one and stays that way.
+	h := &countingHandler{}
+	cfg.PgSearchTokenizer = "default"
+	second, err := store.Open(ctx, cfg, slog.New(h))
 	if err != nil {
-		t.Fatalf("stemming tokenizer: %v", err)
+		t.Fatalf("reopen: %v", err)
 	}
-	if used != store.BackendPgSearch {
-		t.Fatalf("backend = %q, want pg_search: the index DDL was rejected and the search degraded", used)
+	t.Cleanup(func() { _ = second.Close() })
+	if _, used, err := second.SearchWithBackend(ctx, r.ID, "zyxquux", []float32{1, 0, 0, 0},
+		store.SearchOptions{Mode: store.SearchHybrid, Backend: store.BackendPgSearch, Candidates: 2}); err != nil || used != store.BackendPgSearch {
+		t.Fatalf("drift must not break retrieval: %q %v", used, err)
 	}
-	var lexical *store.SearchHit
-	for i := range hits {
-		if hits[i].Index == 2 {
-			lexical = &hits[i]
-		}
+	if n := h.count("bm25 index was built with a different analyser"); n != 1 {
+		t.Errorf("drift warnings = %d, want 1 (messages: %v)", n, h.msgs)
 	}
-	if lexical == nil || lexical.LexScore <= 0 {
-		t.Fatalf("BM25 should still score under a stemming analyser: %+v", hits)
+
+	// The matching case stays quiet, which is what makes the warning mean
+	// something: reopening with the analyser the index actually has must not
+	// warn at all.
+	h2 := &countingHandler{}
+	cfg.PgSearchTokenizer = "en_stem"
+	third, err := store.Open(ctx, cfg, slog.New(h2))
+	if err != nil {
+		t.Fatalf("reopen matching: %v", err)
+	}
+	t.Cleanup(func() { _ = third.Close() })
+	if _, _, err := third.SearchWithBackend(ctx, r.ID, "zyxquux", []float32{1, 0, 0, 0},
+		store.SearchOptions{Mode: store.SearchHybrid, Backend: store.BackendPgSearch, Candidates: 2}); err != nil {
+		t.Fatalf("matching tokenizer: %v", err)
+	}
+	if n := h2.count("bm25 index was built with a different analyser"); n != 0 {
+		t.Errorf("a matching tokenizer must not warn: %v", h2.msgs)
 	}
 }
