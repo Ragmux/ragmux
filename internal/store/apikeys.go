@@ -45,6 +45,7 @@ func (k *APIKey) Retired(t time.Time) bool {
 	return k.RevokedAt != nil || (k.ExpiresAt != nil && !k.ExpiresAt.After(t))
 }
 
+//nolint:gosec // G101: a SELECT column list, not a credential.
 const apiKeyCols = `k.id, k.kind, k.name, k.key_prefix, k.user_id, k.created_by, k.scopes, k.default_project_id,
 	k.rate_limit_rpm, k.rate_limit_tpm, k.budget_daily_tokens, k.budget_monthly_tokens,
 	k.expires_at, k.revoked_at, k.last_used_at, k.created_at, k.updated_at,
