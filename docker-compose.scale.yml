@@ -33,9 +33,11 @@ services:
       # The proxy below is the only way in, so its headers can be trusted.
       TRUST_PROXY_HEADERS: "true"
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
-    # Give a replica time to finish the ingestion job it is on (30 s) and
-    # drain its HTTP requests (15 s) before the container is killed.
-    stop_grace_period: 60s
+    # Give a replica room for the whole shutdown sequence: HTTP drain (15 s),
+    # the ingestion job it is on (30 s), returning that job's documents to the
+    # queue (10 s), the span flush (5 s) and the metrics listener (5 s).
+    # See docs/scaling.md#rolling-restarts-and-shutdown.
+    stop_grace_period: 90s
 
   proxy:
     image: nginx:1.27-alpine

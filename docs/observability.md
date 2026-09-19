@@ -224,10 +224,52 @@ label added to this repository has to pass this list:
       which orphans a series, and a name is user-supplied text.
 - [ ] **Failure reasons are constants from a closed set.** `rerank_failures_total` takes
       `timeout|upstream|parse|unavailable`, never `err.Error()`, which quotes upstream
-      bodies and model replies. `errors_total` takes `provider.Error.Type`.
-      `limits_denied_total` takes the `limits.Reason*` constants.
+      bodies and model replies. `limits_denied_total` takes the `limits.Reason*`
+      constants.
+- [ ] **Values the client or the upstream chooses are mapped onto a closed set plus
+      `other`.** Two labels look bounded and are not, so both go through an explicit
+      allowlist in `internal/obs`:
+    - `method` is whatever token the client wrote on the request line. `GET POST PUT
+      PATCH DELETE HEAD OPTIONS` pass through; every other verb — `PROPFIND`, a
+      lowercase `get`, a per-request UUID — becomes `other`.
+    - `errors_total{type}` is `provider.Error.Type`, which `upstreamError` copies out of
+      the upstream response body. The upstream therefore picks the value, and an
+      upstream that returns an id per response would mint a series per response. Known
+      types (Ragmux's own `upstream_error`, `invalid_request_error`, `timeout`, plus the
+      documented OpenAI and Anthropic vocabularies) pass through; anything else becomes
+      `other`. The error is still counted — only the label is collapsed.
 - [ ] **Never** a label taken from a header, an error message, a filename, a query
       string, a user agent or an IP address.
+
+The same rule binds span attributes, which leave the process for a third-party
+collector: `http.request.method` on `http.server` goes through the same mapping.
+
+`ragmux.request_id` is generated, never read from the request. Ragmux installs its own
+`obs.RequestID` in place of chi's `middleware.RequestID`, because chi's starts from the
+client's `X-Request-Id` header and only generates an id when it is absent — which would
+put attacker-chosen bytes on a span, in the `X-Request-Id` response header and in the
+request log.
+
+Validating the header instead was tried and does not work, which is worth stating
+plainly: a charset-and-length filter cannot tell a generated id from a credential,
+because they are the same shape. A Ragmux gateway key is `sk-user-` plus 43 characters
+from an unreserved alphabet — 51 bytes that pass any such filter — and so are an AWS
+`AKIA…` key, an OpenAI `sk-` key and every hex or base64url token short enough to fit a
+length cap. The header is therefore not read at all, which makes the guarantee
+structural rather than a question of how good the filter is.
+
+If a proxy in front of Ragmux generates `X-Request-Id` and you correlate on it, that
+correlation ends at this hop — Ragmux answers with an id of its own. Configure the proxy
+to emit `traceparent` as well and set `TRACING_TRUST_INCOMING=true`, and the two sides
+share a trace id in your tracing backend. Read [the trust gate](#the-trust-gate) first,
+because that setting also lets a client choose the trace id and the sampled flag.
+
+Be clear about what that does and does not recover. It joins **traces**. It does not join
+**logs**: Ragmux log lines carry `req_id`, which is the generated request id, and no log
+line carries a trace id, so a proxy log line and a Ragmux log line still have no shared
+field to match on. And the proxies that typically mint `X-Request-Id` — nginx's
+`$request_id`, HAProxy's `unique-id` — do not emit `traceparent` unless you configure it,
+which usually means an OpenTelemetry module rather than a log-format change.
 
 The registry enforces a backstop regardless: at `METRICS_MAX_SERIES` new combinations are
 refused, counted in `ragmux_metrics_series_dropped_total` and logged at **`error`** (at

@@ -7,6 +7,32 @@ All notable changes to Ragmux are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+<<<<<<< HEAD
+- **The request id is generated, never taken from `X-Request-Id`.** Ragmux previously used
+  chi's `middleware.RequestID`, which starts from the client's `X-Request-Id` header and
+  only generates an id when it is absent. That id reaches the `ragmux.request_id` span
+  attribute exported to your collector, the `X-Request-Id` response header and the request
+  log, so a client chose all three. Filtering the header by shape was considered and does
+  not work: a Ragmux gateway key, an AWS key and a bare hex token are the same shape as a
+  generated id, so the header is no longer read at all.
+  **If a proxy in front of Ragmux generates `X-Request-Id` and you correlate on it**, that
+  correlation stops here: Ragmux now answers with its own id. Configure the proxy to emit
+  `traceparent` and set `TRACING_TRUST_INCOMING=true` to join the two sides **in your
+  tracing backend** — see [the trust gate](docs/observability.md#the-trust-gate) for what
+  that opens up. Note this recovers trace correlation, not log correlation: Ragmux log
+  lines carry `req_id`, not a trace id, so a proxy log line and a Ragmux log line still
+  cannot be matched on a shared field. Proxies that mint `X-Request-Id` (nginx
+  `$request_id`, HAProxy `unique-id`) do not emit `traceparent` on their own.
+- The `method` label on `ragmux_http_requests_total` and
+  `ragmux_http_request_duration_seconds`, and the `type` label on
+  `ragmux_gateway_errors_total`, are now drawn from a closed set; unrecognised values are
+  counted under `other`. Both were bounded by traffic rather than by the size of the
+  installation — an invented HTTP verb or an upstream returning a fresh error type per
+  response minted a series per request. Metric names, label names and buckets are
+  unchanged, so existing dashboards keep working.
+- `ragmux_tracing_spans_dropped_total` now also counts spans that end after the exporter
+  has stopped, which previously vanished silently. The count is logged at shutdown as well.
+
 - **`custom_openai` ships without a price row.** The built-in table used to price every
   `custom_openai` model at 0, which reported a paid endpoint's real bill as `$0.00` with
   `cost_source: "builtin"` — a priced zero rather than the missing price it is. Those
@@ -32,6 +58,13 @@ All notable changes to Ragmux are documented here. The format follows
   chunk could break. **If you read token counts off a stream, set `include_usage`**; the
   request log, budgets and cost estimate are unaffected either way, because the gateway
   still asks its upstream for the counts.
+
+### Fixed
+- A document whose file type is unsupported no longer quotes the rejected extension into
+  its error, which put a piece of a user-supplied filename on the `ingest.document` span.
+- The Go runtime gauges shared one `runtime/metrics` sample buffer across every gauge and
+  every concurrent scrape, so two overlapping scrapes could race and report one another's
+  numbers.
 
 ## [0.4.0] — 2026-09-19
 

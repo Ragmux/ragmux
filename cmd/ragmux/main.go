@@ -289,7 +289,10 @@ func run(cfg config.Config) error {
 	}
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
+	// obs.RequestID, not middleware.RequestID: chi's starts from the
+	// client's X-Request-Id header, which would put attacker-chosen bytes on
+	// a span exported to a third-party collector.
+	r.Use(obs.RequestID)
 	if cfg.TrustProxyHeaders {
 		r.Use(realIP(cfg.TrustedProxyCIDRs))
 	}
@@ -368,18 +371,14 @@ func run(cfg config.Config) error {
 
 	// Shutdown order: stop accepting HTTP and drain in-flight requests, let
 	// running ingestion jobs finish, flush the spans both of them produced,
-	// stop the retention job, then the deferred st.Close releases the pool.
+	// close the metrics endpoint once those counters are final, stop the
+	// retention job, then the deferred st.Close releases the pool.
 	log.Info("shutting down: draining http")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	shutErr := srv.Shutdown(shutCtx)
 	if shutErr != nil {
 		log.Warn("http shutdown", "err", shutErr)
-	}
-	if metricsSrv != nil {
-		if err := metricsSrv.Shutdown(shutCtx); err != nil {
-			log.Warn("metrics shutdown", "err", err)
-		}
 	}
 	log.Info("shutting down: waiting for ingestion jobs")
 	if !ingester.StopWithTimeout(30 * time.Second) {
@@ -394,6 +393,40 @@ func run(cfg config.Config) error {
 			log.Warn("tracing shutdown", "err", err)
 		}
 		traceCancel()
+		// Spans that end after this point cannot be exported and are counted
+		// instead. This log line, not the metric, is what reports that: the
+		// counter reaches its final value only here, microseconds before the
+		// endpoint that would serve it closes, so no realistic scrape
+		// interval catches the difference.
+		if n := tracer.Dropped(); n > 0 {
+			log.Warn("spans dropped; the export queue was full or the exporter had already stopped",
+				"spans", n)
+		}
+	}
+	// Only when METRICS_LISTEN is set. On the default configuration
+	// mountMetrics returns nil and /metrics lives on the main router, so the
+	// endpoint is already gone with srv.Shutdown above and the dropped-span
+	// count reaches nothing but the log line.
+	//
+	// Where there is a separate listener, closing it last means
+	// ragmux_tracing_spans_dropped_total has reached its final value while
+	// the endpoint still exists. A scrape is unlikely to land in the moment
+	// between the two, so the log line is still what reports the number; what
+	// the order buys is that the value served is never one taken before the
+	// counter settled.
+	//
+	// Its own budget, not shutCtx: shutCtx is created before the HTTP drain
+	// and by this point has also had to cover StopWithTimeout, which waits up
+	// to 30 seconds when ingestion jobs are running. On an idle process it
+	// has budget left, but in exactly the case this ordering exists for it is
+	// spent, and Shutdown would then drop an in-flight scrape and log a
+	// deadline error.
+	if metricsSrv != nil {
+		metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := metricsSrv.Shutdown(metricsCtx); err != nil {
+			log.Warn("metrics shutdown", "err", err)
+		}
+		metricsCancel()
 	}
 	stopBackground()
 	<-janitorDone

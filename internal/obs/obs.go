@@ -232,10 +232,51 @@ type GatewayRequest struct {
 	// than the provider's report.
 	Estimated bool
 	CostUSD   float64
-	// ErrorType is provider.Error.Type, a bounded set; empty on success.
+	// ErrorType is provider.Error.Type. It is narrowed to knownErrorTypes
+	// before it becomes a label; empty on success.
 	ErrorType string
 	// ClientDisconnected reports the 499 path.
 	ClientDisconnected bool
+}
+
+// knownErrorTypes is the closed set ragmux_gateway_errors_total{type} is
+// drawn from.
+//
+// provider.Error.Type looks like a bounded set and is not one: upstreamError
+// copies it straight out of the upstream response body, so the value is
+// chosen by whatever answered the call. A provider having a bad day — or one
+// a user pointed at a host of their own via a custom_openai connection — can
+// return a fresh type per response and mint a series per response with it.
+//
+// The set is the union of the types this repository constructs itself and
+// the documented vocabularies of the upstreams it speaks to (OpenAI's and
+// Anthropic's, which the other OpenAI-compatible providers reuse). Anything
+// else is counted under "other": the error is still counted, the operator
+// still sees the rate move, and the cardinality stays fixed.
+var knownErrorTypes = map[string]bool{
+	// Constructed in internal/provider.
+	"upstream_error":        true,
+	"invalid_request_error": true,
+	"timeout":               true,
+	// Reported by upstreams.
+	"api_error":            true,
+	"authentication_error": true,
+	"insufficient_quota":   true,
+	"not_found_error":      true,
+	"overloaded_error":     true,
+	"permission_error":     true,
+	"rate_limit_error":     true,
+	"request_too_large":    true,
+	"server_error":         true,
+}
+
+// ErrorType maps a provider error type onto the closed set, so an upstream
+// cannot choose a label value.
+func ErrorType(t string) string {
+	if knownErrorTypes[t] {
+		return t
+	}
+	return otherLabel
 }
 
 // RecordGateway records one finished chat completion.
@@ -263,7 +304,7 @@ func (m *Metrics) RecordGateway(r GatewayRequest) {
 	}
 	m.gwCost.With(r.Project, r.Model).Add(r.CostUSD)
 	if r.ErrorType != "" {
-		m.gwErrors.With(r.Project, r.Provider, r.ErrorType).Inc()
+		m.gwErrors.With(r.Project, r.Provider, ErrorType(r.ErrorType)).Inc()
 	}
 	if r.ClientDisconnected {
 		m.gwDisconnects.With().Inc()

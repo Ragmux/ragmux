@@ -199,18 +199,50 @@ func (s *Span) SetAttributes(attrs ...Attr) {
 	s.mu.Unlock()
 }
 
+// maxErrorMessage caps the recorded error message.
+//
+// It is a backstop, not the rule. The rule is that callers pass errors from a
+// closed set — internal/rag uses errSpanEmbed and friends, internal/provider
+// passes messages transportError already reduced to fixed text — and the
+// caller is where a filename or an upstream body is kept out. The cap is what
+// stands between a caller that forgets and a collector receiving a document,
+// a stack trace or a base64 payload as an attribute value. A message long
+// enough to be truncated is already a bug at its call site; truncating it
+// makes the bug cheap rather than expensive.
+const maxErrorMessage = 256
+
+// truncated is appended to a message the cap cut, so a reader of the span
+// knows it is looking at a fragment rather than the whole failure.
+const truncated = "…[truncated]"
+
 // RecordError marks the span failed. Only the error's message is recorded,
-// and callers must pass errors that have already been redacted: provider
-// errors travel through transportError, which strips credentials.
+// capped at maxErrorMessage, and callers must pass errors that have already
+// been redacted: provider errors travel through transportError, which strips
+// credentials.
 func (s *Span) RecordError(err error) {
 	if s.tr == nil || err == nil {
 		return
 	}
+	msg := capMessage(err.Error())
 	s.mu.Lock()
 	s.status = codeError
-	s.msg = err.Error()
-	s.attrs = append(s.attrs, String("exception.message", err.Error()))
+	s.msg = msg
+	s.attrs = append(s.attrs, String("exception.message", msg))
 	s.mu.Unlock()
+}
+
+// capMessage trims a message to maxErrorMessage bytes without splitting a
+// UTF-8 rune, so the exported attribute stays valid JSON text.
+func capMessage(msg string) string {
+	if len(msg) <= maxErrorMessage {
+		return msg
+	}
+	cut := maxErrorMessage
+	// Back off to a rune boundary: continuation bytes are 0b10xxxxxx.
+	for cut > 0 && msg[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return msg[:cut] + truncated
 }
 
 // SetStatusOK marks the span explicitly successful.
@@ -228,9 +260,16 @@ func (s *Span) SetStatusOK() {
 // IsRecording reports whether this span will be exported.
 //
 // Start and End cost nothing on a disabled tracer, but building the
-// attributes to pass to SetAttributes does: the variadic slice escapes into
-// append, so it is heap-allocated whether or not anything reads it. A hot
-// call site that assembles several attributes should guard them with this.
+// attributes to pass to SetAttributes does. Attr.Value is an any, so every
+// value whose type does not fit in an interface word -- a string, or an int
+// the runtime's small-value cache does not cover -- is boxed onto the heap at
+// the call site, before SetAttributes is entered and can decline to keep it.
+// Escape analysis removes the variadic slice itself, but not that boxing.
+//
+// The cost is therefore one allocation per attribute with a non-constant
+// value, paid on every request of a deployment that has tracing off, which is
+// the default. Any call site on a request path should guard with this;
+// TestDisabledTracerAllocatesNothing holds the guarded pattern at zero.
 func (s *Span) IsRecording() bool { return s.tr != nil }
 
 // SpanContext reports the span's identity, for propagation.

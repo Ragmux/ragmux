@@ -212,21 +212,34 @@ On `SIGINT`/`SIGTERM` a replica shuts down in this order:
 
 1. Stop accepting HTTP and drain in-flight requests - **15 s**. A streaming
    completion still running at the end of that window is cut off and logged as
-   `499`.
+   `499`. On the default configuration `/metrics` is served by this router, so
+   it stops answering here.
 2. Wait for running ingestion jobs - **30 s**, then their context is cancelled.
 3. Put every document this replica still owned back into the queue, and give
-   the cancelled attempt back.
-4. Stop the retention job (releasing the leader lock with its connection) and
+   the cancelled attempt back - **10 s**, on its own budget after step 2.
+4. Flush queued spans to the collector - **5 s**, skipped when tracing is off.
+   Spans that end after this are counted in
+   `ragmux_tracing_spans_dropped_total` and logged.
+5. Close the separate metrics listener - **5 s**, and only when
+   `METRICS_LISTEN` is set; it is kept open this long so the dropped-span
+   count is final before the endpoint goes away.
+6. Stop the retention job (releasing the leader lock with its connection) and
    close the pool.
+
+Those budgets are sequential, so the worst case is **65 s** - and it is a
+worst case, not a typical one: an idle replica walks the whole list in
+milliseconds, because every step above is a deadline rather than a wait.
 
 So the worst case for the fleet is: a replica is `SIGKILL`ed before step 3 runs,
 and the documents it was working on wait out `INGEST_LEASE` (2 min by default)
 before another replica claims them. Nothing is lost; a document is only ever
 `ready` after one transactional write.
 
-- Give the container time for steps 1 and 2: `stop_grace_period: 60s` in
-  Compose, `terminationGracePeriodSeconds: 60` in Kubernetes. A shorter grace
-  period turns every deploy into the lease-expiry case.
+- Give the container room for the whole sequence: `stop_grace_period: 90s` in
+  Compose, `terminationGracePeriodSeconds: 90` in Kubernetes. A shorter grace
+  period turns every deploy into the lease-expiry case, and the defaults are
+  far shorter - 10 s in Docker, 30 s in Kubernetes - so this has to be set
+  explicitly.
 - Roll one replica at a time. Migrations are serialised by an advisory lock, so
   a new replica starting against a database an old one is still using is safe as
   long as the schema change is backwards compatible - which is the rule these
@@ -289,7 +302,7 @@ docker compose -f docker-compose.split.yml -f docker-compose.scale.yml \
 stops `--scale` from working), adds an nginx front end
 (`docker/nginx/ragmux.conf`) that resolves the `ragmux` service name per request
 so it picks up a scale change without a reload, and sets
-`stop_grace_period: 60s`.
+`stop_grace_period: 90s`.
 
 Check that all three replicas are working the queue:
 
@@ -308,7 +321,7 @@ appears in `documents.claimed_by`.
   mounts a replica needs are its configuration.
 - `SECRET_KEY` and `DATABASE_URL` from a `Secret`. `SECRET_KEY_FILE` and
   `DATABASE_URL_FILE` read a mounted file instead, if you prefer that.
-- `terminationGracePeriodSeconds: 60` or more - see above.
+- `terminationGracePeriodSeconds: 90` or more - see above.
 - Liveness on `GET /healthz`, which pings the database. Readiness on either:
   `/healthz` keeps the 0.3 behaviour (ready as soon as the process listens and
   the pool answers), `/readyz` additionally holds a replica back until the

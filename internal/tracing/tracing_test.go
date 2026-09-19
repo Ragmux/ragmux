@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // collector is a fake OTLP receiver.
@@ -42,6 +43,15 @@ func newCollector(t *testing.T) *collector {
 	}))
 	t.Cleanup(c.srv.Close)
 	return c
+}
+
+// payload is every OTLP body the exporter posted, concatenated, for tests
+// that search the wire bytes rather than the decoded spans.
+func (c *collector) payload(t *testing.T) string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.raw, "")
 }
 
 func (c *collector) spans(t *testing.T) []map[string]any {
@@ -79,6 +89,16 @@ func newTracer(t *testing.T, c *collector, cfg Config) *Tracer {
 	return tr
 }
 
+// Package-level so the compiler cannot fold these into constants. With
+// literals the attribute values box into an interface for free (a string
+// constant's header is static, a small int comes from the runtime's cache)
+// and the test would pass without proving anything about a real call site,
+// where the status code and the provider name are variables.
+var (
+	sinkProvider = "openai"
+	sinkStatus   = 503
+)
+
 func TestDisabledTracerAllocatesNothing(t *testing.T) {
 	tr := New(Config{})
 	if tr.Enabled() {
@@ -91,6 +111,30 @@ func TestDisabledTracerAllocatesNothing(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("a disabled span site allocated %v times per run, want 0", allocs)
+	}
+
+	// The same for a site that sets attributes, written the way every site
+	// in this repository is written: behind IsRecording.
+	//
+	// The guard is load-bearing, not decorative. Attr.Value is an any, so
+	// each value is boxed before SetAttributes ever gets the chance to
+	// decline it, and a variable int or string boxes onto the heap. Dropping
+	// the guard costs one allocation per attribute on every request of a
+	// deployment that has tracing switched off -- which is the default.
+	// internal/provider's doRequest and internal/rag's embedQuery are the
+	// hot sites this protects.
+	withAttrs := testing.AllocsPerRun(200, func() {
+		_, span := tr.Start(ctx, "provider.chat", KindClient)
+		if span.IsRecording() {
+			span.SetAttributes(
+				String("gen_ai.system", sinkProvider),
+				Int("http.response.status_code", sinkStatus),
+			)
+		}
+		span.End()
+	})
+	if withAttrs != 0 {
+		t.Fatalf("a disabled span site that sets attributes allocated %v times per run, want 0", withAttrs)
 	}
 }
 
@@ -323,6 +367,92 @@ func TestUnsampledTraceStillPropagates(t *testing.T) {
 	// the same trace id.
 	if _, ok := SpanContextFrom(ctx); !ok {
 		t.Fatal("an unsampled trace lost its context and cannot be propagated")
+	}
+}
+
+// TestSpansAfterShutdownAreCounted: once the exporter has stopped, nothing
+// reads its queue, so a span that ends afterwards can never reach the
+// collector. It has to be counted as dropped rather than vanish -- the spans
+// that outlive Shutdown belong to the requests that were still draining,
+// which is exactly what an operator goes looking for after a restart.
+func TestSpansAfterShutdownAreCounted(t *testing.T) {
+	c := newCollector(t)
+	tr := newTracer(t, c, Config{})
+
+	_, s := tr.Start(context.Background(), "http.server", KindServer)
+	s.End()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := tr.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	// The span that ended before shutdown was flushed, not dropped.
+	if got := tr.Dropped(); got != 0 {
+		t.Fatalf("Dropped = %d before any late span, want 0", got)
+	}
+	if n := len(c.spans(t)); n != 1 {
+		t.Fatalf("collector received %d spans, want the one flushed at shutdown", n)
+	}
+
+	// A late span: a handler that was still draining when the server stopped.
+	_, late := tr.Start(context.Background(), "provider.chat", KindClient)
+	late.End()
+	if got := tr.Dropped(); got != 1 {
+		t.Errorf("Dropped = %d after a span ended past shutdown, want 1; "+
+			"a span that cannot be exported must move the counter, not disappear", got)
+	}
+	if n := len(c.spans(t)); n != 1 {
+		t.Errorf("collector received %d spans; the late one must not have been exported", n)
+	}
+}
+
+// TestRecordErrorIsCapped: the cap is the backstop behind the rule that
+// callers pass errors from a closed set. A caller that forgets must cost a
+// truncated attribute, not a document, a stack trace or a base64 payload
+// shipped to a third-party collector.
+func TestRecordErrorIsCapped(t *testing.T) {
+	c := newCollector(t)
+	tr := newTracer(t, c, Config{})
+	_, s := tr.Start(context.Background(), "ingest.document", KindInternal)
+
+	const secret = "SECRETPAYROLL-do-not-export"
+	s.RecordError(errors.New(secret + strings.Repeat("x", 4096)))
+	s.End()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := tr.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	payload := c.payload(t)
+	if payload == "" {
+		t.Fatal("the collector received nothing; the test proves nothing")
+	}
+	if len(payload) > 4096 {
+		t.Errorf("a %d-byte payload carried a 4 KiB error message; RecordError must cap it", len(payload))
+	}
+	if !strings.Contains(payload, truncated) {
+		t.Errorf("a capped message must say it was truncated:\n%s", payload)
+	}
+
+	// A message that fits is recorded whole: the cap must not quietly
+	// mangle the ordinary case.
+	short := errors.New("embed_failed")
+	if got := capMessage(short.Error()); got != short.Error() {
+		t.Errorf("capMessage(%q) = %q, want it unchanged", short, got)
+	}
+}
+
+// TestCapMessageKeepsValidUTF8: the capped message is exported as JSON text,
+// so the cut may not land in the middle of a rune.
+func TestCapMessageKeepsValidUTF8(t *testing.T) {
+	// Every rune is 3 bytes, so some cap offsets necessarily fall inside one.
+	for n := 1; n <= 200; n++ {
+		got := capMessage(strings.Repeat("ç", n) + strings.Repeat("三", n))
+		if !utf8.ValidString(got) {
+			t.Fatalf("capMessage cut a rune in half at n=%d: %q", n, got)
+		}
 	}
 }
 

@@ -30,8 +30,11 @@ type exporter struct {
 	res     []Attr
 	log     *slog.Logger
 
-	in       chan *Span
-	done     chan struct{}
+	in   chan *Span
+	done chan struct{}
+	// stopped is set before done is closed, so enqueue can tell a span that
+	// arrived after the exporter stopped from one that is merely late.
+	stopped  atomic.Bool
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 
@@ -84,6 +87,18 @@ func tracesURL(endpoint string) string {
 }
 
 func (e *exporter) enqueue(s *Span) {
+	// After shutdown nothing reads e.in any more, so a span accepted here
+	// would sit in the buffer until the process exited and never reach the
+	// collector. It is still a dropped span and is counted as one: the
+	// requests that outlive Shutdown — a long stream still draining, a
+	// handler the graceful-shutdown deadline cut short — are exactly the
+	// ones an operator goes looking for in a trace, and their absence has to
+	// show up in ragmux_tracing_spans_dropped_total rather than in nothing
+	// at all.
+	if e.stopped.Load() {
+		e.dropped.Add(1)
+		return
+	}
 	select {
 	case e.in <- s:
 	default:
@@ -123,6 +138,30 @@ func (e *exporter) run() {
 			}
 			if len(batch) > 0 {
 				e.send(batch)
+			}
+			// Close the queue only now, after the last batch has gone: up to
+			// this point a span that ended during the drain still had a
+			// chance to be exported. From here enqueue counts instead of
+			// accepting, and the second drain below counts the spans that
+			// raced in between the first drain and this store.
+			//
+			// This is best-effort, not a guarantee. An enqueue that has
+			// already read stopped as false can be descheduled and complete
+			// its send after both the store and the drain below, leaving one
+			// span neither exported nor counted. Closing that window means
+			// serialising enqueue against shutdown, which puts a lock on the
+			// path every span End takes, to make a shutdown-time counter
+			// exact. The counter is a signal, not an audit, so it is left
+			// racy on purpose.
+			e.stopped.Store(true)
+			for {
+				select {
+				case <-e.in:
+					e.dropped.Add(1)
+					continue
+				default:
+				}
+				break
 			}
 			return
 		}

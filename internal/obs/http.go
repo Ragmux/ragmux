@@ -1,9 +1,14 @@
 package obs
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -19,6 +24,92 @@ const unmatchedRoute = "unmatched"
 
 // dashboardRoute collapses every embedded dashboard asset into one series.
 const dashboardRoute = "/admin/*"
+
+// otherLabel is the bucket every unrecognised label value falls into. It is
+// the shape of the guard used throughout this package: a closed set plus one
+// catch-all, so an attacker choosing the input chooses between existing
+// series and never mints a new one.
+const otherLabel = "other"
+
+// knownMethods is the closed set the method label is drawn from.
+//
+// r.Method is whatever the client put on the request line: net/http accepts
+// any token there, so PROPFIND, a random UUID or a 200-byte string all
+// arrive as a method. Used raw it is one series per invented verb, per
+// route, per status — the same unbounded-memory bug as labelling with the
+// path, reached from a slightly different direction.
+var knownMethods = map[string]bool{
+	http.MethodGet:     true,
+	http.MethodPost:    true,
+	http.MethodPut:     true,
+	http.MethodPatch:   true,
+	http.MethodDelete:  true,
+	http.MethodHead:    true,
+	http.MethodOptions: true,
+}
+
+// Method maps a request method onto the closed set, so the label is bounded
+// by the seven verbs this repository serves rather than by traffic.
+func Method(m string) string {
+	if knownMethods[m] {
+		return m
+	}
+	return otherLabel
+}
+
+// Request id generation. The prefix identifies this process, the counter
+// the request within it, which is chi's scheme and keeps ids sortable and
+// cheap.
+var (
+	requestIDPrefix  string
+	requestIDCounter atomic.Uint64
+)
+
+func init() {
+	host, err := os.Hostname()
+	if host == "" || err != nil {
+		host = "localhost"
+	}
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// A process that cannot read randomness still has to serve. The
+		// counter alone keeps ids unique within this process, which is what
+		// correlating one process's logs needs.
+		requestIDPrefix = host + "/0000000000"
+		return
+	}
+	requestIDPrefix = host + "/" + base64.RawURLEncoding.EncodeToString(buf[:])
+}
+
+// RequestID injects a request id that is always generated here, replacing
+// chi's middleware.RequestID.
+//
+// chi's version starts from the client's X-Request-Id header and only
+// generates when it is absent, so middleware.GetReqID returns
+// attacker-chosen bytes: that id then reaches the ragmux.request_id span
+// attribute exported to a third-party collector, the X-Request-Id response
+// header and the request log.
+//
+// Validating the header instead does not work, and the shape of the failure
+// is worth recording. A charset-and-length filter cannot tell a generated id
+// from a credential, because they are the same shape: Ragmux's own gateway
+// key is "sk-user-" plus 43 characters of keyAlphabet, 51 bytes that are all
+// unreserved -- and so are an AWS AKIA... key, an OpenAI sk- key, and every
+// hex or base64url token short enough to pass a length cap. A filter that
+// admits those admits exactly what it was written to exclude.
+//
+// So the header is not read at all. PRD rule 10's guarantee is then
+// structural rather than a matter of how good the filter is: there is no
+// path from a header to a label, a span or a log line.
+//
+// The id is stored under chi's middleware.RequestIDKey, so
+// middleware.GetReqID keeps working everywhere it is already called.
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := requestIDPrefix + "-" + strconv.FormatUint(requestIDCounter.Add(1), 10)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), middleware.RequestIDKey, id)))
+	})
+}
 
 // RoutePattern names the route of a finished request the only way that is
 // safe to use as a label: the chi pattern, which chi fills in during
@@ -44,7 +135,7 @@ func RoutePattern(r *http.Request) string {
 
 // HTTPMetrics counts, times and sizes every request.
 //
-// It belongs directly after middleware.RequestID and before the request
+// It belongs directly after RequestID and before the request
 // logger, so it measures everything below it including the recoverer: a
 // request that panics is still a request that happened.
 func HTTPMetrics(m *Metrics) func(http.Handler) http.Handler {
@@ -66,8 +157,9 @@ func HTTPMetrics(m *Metrics) func(http.Handler) http.Handler {
 					// touching the writer, which net/http answers as 200.
 					status = http.StatusOK
 				}
-				m.httpRequests.With(route, r.Method, strconv.Itoa(status)).Inc()
-				m.httpDuration.With(route, r.Method).Observe(time.Since(start).Seconds())
+				method := Method(r.Method)
+				m.httpRequests.With(route, method, strconv.Itoa(status)).Inc()
+				m.httpDuration.With(route, method).Observe(time.Since(start).Seconds())
 				if n := ww.BytesWritten(); n > 0 {
 					m.httpBytes.With(route).Add(uint64(n))
 				}
@@ -99,8 +191,13 @@ func HTTPTracing(tr *tracing.Tracer) func(http.Handler) http.Handler {
 					if status == 0 {
 						status = http.StatusOK
 					}
+					// The method goes through the same mapping the metric
+					// label uses: a span leaves this process for a
+					// third-party collector, so PRD rule 10 binds it too.
+					// The request id needs no guard because RequestID above
+					// generates it and never reads a header.
 					span.SetAttributes(
-						tracing.String("http.request.method", r.Method),
+						tracing.String("http.request.method", Method(r.Method)),
 						tracing.String("http.route", RoutePattern(r)),
 						tracing.Int("http.response.status_code", status),
 						tracing.String("ragmux.request_id", middleware.GetReqID(ctx)),
