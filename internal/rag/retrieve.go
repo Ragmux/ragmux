@@ -2,14 +2,27 @@ package rag
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/tracing"
+)
+
+// Span failure reasons. A span carries metadata, never payload: an upstream
+// error message can quote the request back, so a failure is recorded as one
+// of these constants rather than as the error itself.
+var (
+	errSpanEmbed  = errors.New("embed_failed")
+	errSpanSearch = errors.New("search_failed")
+	errSpanRerank = errors.New("rerank_failed")
 )
 
 // Retriever embeds a query, runs vector or hybrid search in a store and
@@ -21,6 +34,12 @@ type Retriever struct {
 	// treated as the LLM default, so a Retriever built by hand still reranks.
 	Rerankers RerankerFactory
 	Log       *slog.Logger
+	// Metrics records retrieval, embedding and rerank timings; nil records
+	// nothing.
+	Metrics *obs.Metrics
+	// Tracer opens the rag.retrieve, rag.embed_query and rag.rerank spans;
+	// nil is a disabled tracer.
+	Tracer *tracing.Tracer
 }
 
 // NewRetriever wires a retriever. Rerankers defaults to the LLM reranker,
@@ -86,6 +105,12 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	if rs.ChunkCount == 0 || strings.TrimSpace(query) == "" {
 		return res, nil
 	}
+	storeID := strconv.FormatInt(rs.ID, 10)
+	// No attribute here names the query, a passage or a filename: the span
+	// says which store was searched, how, and how much came back.
+	ctx, span := r.Tracer.Start(ctx, "rag.retrieve", tracing.KindInternal)
+	defer span.End()
+
 	start := time.Now()
 	conn, err := r.store.GetConnection(ctx, rs.EmbeddingConnectionID)
 	if err != nil {
@@ -95,8 +120,9 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	if err != nil {
 		return nil, err
 	}
-	vecs, err := emb.Embed(ctx, []string{query})
+	vecs, err := r.embedQuery(ctx, emb, conn.ProviderType, query)
 	if err != nil {
+		span.RecordError(errSpanEmbed)
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 	if k <= 0 {
@@ -115,10 +141,12 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	hits, used, err := r.store.SearchWithBackend(ctx, rs.ID, query, vecs[0], store.SearchOptions{
 		Mode: mode, Backend: backend, FTSConfig: rs.FTSConfig, MaxDistance: rs.MaxDistance, Candidates: candidates})
 	if err != nil {
+		span.RecordError(errSpanSearch)
 		return nil, err
 	}
 	res.Backend = used
-	res.RetrievalLatencyMS = time.Since(start).Milliseconds()
+	retrieval := time.Since(start)
+	res.RetrievalLatencyMS = retrieval.Milliseconds()
 	if rs.Rerank {
 		hits = r.rerank(ctx, rs, res, query, hits, k, prov, model)
 	}
@@ -126,7 +154,38 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 		hits = hits[:k]
 	}
 	res.Hits = hits
+	// used, not the store's configured backend: counting the effective one
+	// is what makes a silent fallback to pgvector visible.
+	r.Metrics.RecordRetrieval(storeID, used, mode, len(hits), retrieval)
+	if span.IsRecording() {
+		span.SetAttributes(
+			tracing.Int64("ragmux.rag.store_id", rs.ID),
+			tracing.String("ragmux.rag.mode", mode),
+			tracing.String("ragmux.rag.backend", used),
+			tracing.Int("ragmux.rag.top_k", k),
+			tracing.Int("ragmux.rag.hits", len(hits)),
+		)
+		span.SetStatusOK()
+	}
 	return res, nil
+}
+
+// embedQuery embeds the retrieval query in its own client span. The span
+// names the provider and nothing else: the query itself is exactly the kind
+// of payload that must not leave in a span.
+func (r *Retriever) embedQuery(ctx context.Context, emb provider.Embedder, providerType, query string) ([][]float32, error) {
+	ctx, span := r.Tracer.Start(ctx, "rag.embed_query", tracing.KindClient)
+	defer span.End()
+	span.SetAttributes(tracing.String("gen_ai.system", providerType))
+	start := time.Now()
+	vecs, err := emb.Embed(ctx, []string{query})
+	r.Metrics.RecordEmbedQuery(providerType, time.Since(start))
+	if err != nil {
+		span.RecordError(errSpanEmbed)
+		return nil, err
+	}
+	span.SetStatusOK()
+	return vecs, nil
 }
 
 // rerank reorders hits and records the outcome on res. It never returns an
@@ -142,9 +201,28 @@ func (r *Retriever) rerank(ctx context.Context, rs *store.RAGStore, res *Result,
 	// Timed even when the reranker is skipped: RerankLatencyMS non-nil is
 	// how the caller tells "off" from "on but it did not run".
 	start := time.Now()
+	var failure error
+	ctx, span := r.Tracer.Start(ctx, "rag.rerank", tracing.KindClient)
 	defer func() {
-		ms := time.Since(start).Milliseconds()
+		took := time.Since(start)
+		ms := took.Milliseconds()
 		res.RerankLatencyMS = &ms
+		// The reason is one of a fixed set, never err.Error(): a rerank
+		// failure quotes upstream bodies and model replies, which as a
+		// label value is unbounded.
+		r.Metrics.RecordRerank(backend, rerankFailureReason(failure), took)
+		if span.IsRecording() {
+			span.SetAttributes(
+				tracing.String("ragmux.rerank.backend", backend),
+				tracing.Bool("ragmux.rerank.fallback", res.RerankFallback),
+			)
+			if failure != nil {
+				span.RecordError(errSpanRerank)
+			} else {
+				span.SetStatusOK()
+			}
+		}
+		span.End()
 	}()
 	if len(hits) < 2 {
 		return hits
@@ -159,6 +237,7 @@ func (r *Retriever) rerank(ctx context.Context, rs *store.RAGStore, res *Result,
 			err = ErrRerankUnavailable
 		}
 		res.RerankFallback = true
+		failure = err
 		r.warn("reranker unavailable; using fused order", rs, backend, err)
 		return hits
 	}
@@ -166,17 +245,40 @@ func (r *Retriever) rerank(ctx context.Context, rs *store.RAGStore, res *Result,
 	// ask and the fused order stands.
 	if rr.Name() == store.RerankLLM && prov == nil {
 		res.RerankFallback = true
+		failure = ErrRerankUnavailable
 		r.warn("reranker unavailable; using fused order", rs, backend, ErrRerankUnavailable)
 		return hits
 	}
 	ranked, err := rr.Rerank(ctx, RerankInput{Query: query, Hits: hits, TopK: k, Provider: prov, Model: model})
 	if err != nil {
 		res.RerankFallback = true
+		failure = err
 		r.warn("rerank failed; using fused order", rs, backend, err)
 	} else {
 		res.Reranked = true
 	}
 	return ranked
+}
+
+// rerankFailureReason maps a rerank failure onto the closed label set the
+// metric uses. Anything unrecognised is "upstream" rather than a new label
+// value, which is what keeps this metric's cardinality a constant.
+func rerankFailureReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrRerankUnavailable):
+		return obs.RerankUnavailable
+	case errors.Is(err, errRerankParse):
+		return obs.RerankParse
+	case errors.Is(err, context.DeadlineExceeded):
+		return obs.RerankTimeout
+	}
+	var pe *provider.Error
+	if errors.As(err, &pe) && pe.Type == "timeout" {
+		return obs.RerankTimeout
+	}
+	return obs.RerankUpstream
 }
 
 func (r *Retriever) warn(msg string, rs *store.RAGStore, backend string, err error) {

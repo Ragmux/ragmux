@@ -349,7 +349,7 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		return nil, err
 	}
 	var ar anthropicResponse
-	if err := doJSON(ctx, p.cfg, p.base+"/v1/messages", p.headers(), body, &ar); err != nil {
+	if err := doJSON(ctx, p.cfg, opChat, p.base+"/v1/messages", p.headers(), body, &ar); err != nil {
 		return nil, err
 	}
 	var text strings.Builder

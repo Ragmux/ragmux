@@ -18,10 +18,12 @@ import (
 
 	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/tracing"
 )
 
 // ProviderFactory builds a chat adapter for a model connection.
@@ -39,6 +41,26 @@ type Gateway struct {
 	Limiter *limits.Limiter
 	// Prices estimates the cost of a completed request; nil records none.
 	Prices *pricing.Cache
+	// Metrics records the gateway counters at the deferred chokepoint of a
+	// finished request; nil records nothing.
+	Metrics *obs.Metrics
+	// Tracer opens the gateway.chat_completion span every downstream span
+	// hangs beneath; nil is a disabled tracer.
+	Tracer *tracing.Tracer
+}
+
+// requestObs collects the facts about one chat completion that the request
+// log does not carry: the provider's error type, which is a bounded label
+// set where the message is not, and the streaming timings. It is filled on
+// the way through and read once at the deferred chokepoint.
+type requestObs struct {
+	// errType is provider.Error.Type; empty when nothing failed.
+	errType string
+	// upstream is the time inside the provider call. For a stream it covers
+	// the whole stream, not just the header phase.
+	upstream time.Duration
+	// ttft is the wait for a stream's first chunk; zero when none arrived.
+	ttft time.Duration
 }
 
 type ctxKey struct{}
@@ -363,9 +385,16 @@ func modelObject(conn *store.ModelConnection) map[string]any {
 
 func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ctx := r.Context()
+	// Every span below -- rag.retrieve, rag.embed_query, rag.rerank and the
+	// provider client spans -- hangs beneath this one, so the traced context
+	// replaces the request's.
+	ctx, span := g.Tracer.Start(r.Context(), "gateway.chat_completion", tracing.KindInternal)
+	defer span.End()
+	r = r.WithContext(ctx)
 	p := projectFrom(ctx)
 	log := g.Log.With("project", p.ID)
+	projectID := strconv.FormatInt(p.ID, 10)
+	obsv := &requestObs{}
 
 	max := g.MaxBodyBytes
 	if max <= 0 {
@@ -426,6 +455,8 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		setLimitHeaders(w.Header(), decision)
 		if !decision.Allowed {
+			// Reason is one of the limits.Reason* constants, a closed set.
+			g.Metrics.RecordLimitDenied(projectID, decision.Reason)
 			// Nothing was sent upstream, so the row costs nothing.
 			rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, Streamed: req.Stream,
 				StatusCode: http.StatusTooManyRequests, Error: decision.Reason, CostSource: store.CostSourceNone,
@@ -508,14 +539,39 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Error("touch api key", "key", pr.key.ID, "err", err)
 			}
 		}
+		// The model label is conn.ModelName, never the model string the
+		// client sent: that value is attacker-controlled and would make the
+		// label unbounded. The project label is the numeric id.
+		g.Metrics.RecordGateway(obs.GatewayRequest{
+			Project: projectID, Model: conn.ModelName, Provider: conn.ProviderType,
+			Status: rec.StatusCode, Streamed: rec.Streamed,
+			Duration: time.Since(start), Upstream: obsv.upstream, TimeToFirstToken: obsv.ttft,
+			PromptTokens: rec.PromptTokens, CompletionTokens: rec.CompletionTokens,
+			Estimated: rec.Estimated, CostUSD: rec.CostUSD, ErrorType: obsv.errType,
+			ClientDisconnected: rec.StatusCode == statusClientClosed,
+		})
+		if span.IsRecording() {
+			span.SetAttributes(
+				tracing.Int64("ragmux.project.id", p.ID),
+				tracing.String("gen_ai.request.model", conn.ModelName),
+				tracing.Bool("ragmux.stream", rec.Streamed),
+				tracing.Int("gen_ai.usage.input_tokens", rec.PromptTokens),
+				tracing.Int("gen_ai.usage.output_tokens", rec.CompletionTokens),
+			)
+			if rec.StatusCode < 500 {
+				span.SetStatusOK()
+			}
+		}
 	}()
 
 	if req.Stream {
-		g.stream(w, r, prov, req, rec, promptChars)
+		g.stream(w, r, prov, conn, req, rec, obsv, promptChars)
 		return
 	}
 
+	upstreamStart := time.Now()
 	resp, err := prov.Chat(ctx, req)
+	obsv.upstream = time.Since(upstreamStart)
 	if err != nil {
 		if ctx.Err() != nil {
 			// The client went away while the upstream call was running; the
@@ -524,7 +580,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		status, pe := providerError(err)
-		rec.StatusCode, rec.Error = status, pe.Message
+		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		log.Warn("upstream error", "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -643,7 +699,8 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 	return append(b, '\n'), nil
 }
 
-func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, req provider.ChatRequest, rec *store.RequestLog, promptChars int) {
+func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, conn *store.ModelConnection,
+	req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by server")
@@ -651,6 +708,13 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+
+	// The chunk counter is resolved once, here: the registry's With costs an
+	// allocation, and a per-chunk lookup in a streaming handler is exactly
+	// the mistake its allocation note exists to prevent.
+	sm := g.Metrics.StreamStarted(conn.ProviderType)
+	defer sm.Ended()
+	upstreamStart := time.Now()
 
 	out := make(chan provider.StreamChunk, 16)
 	errc := make(chan error, 1)
@@ -687,6 +751,10 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	compChars := 0
 	clientGone := false
 	for chunk := range out {
+		sm.Chunk()
+		if obsv.ttft == 0 {
+			obsv.ttft = time.Since(upstreamStart)
+		}
 		if clientGone {
 			continue // drain until the provider notices the cancellation
 		}
@@ -711,6 +779,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		flusher.Flush()
 	}
 	err := <-errc
+	obsv.upstream = time.Since(upstreamStart)
 	if clientGone || r.Context().Err() != nil {
 		// The client disconnected before the completion finished. cancel()
 		// (deferred, or called above) has already torn down the upstream
@@ -721,7 +790,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	}
 	if err != nil && !headersSent {
 		status, pe := providerError(err)
-		rec.StatusCode, rec.Error = status, pe.Message
+		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -732,7 +801,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	if err != nil {
 		// Mid-stream failure: surface it as an SSE error event then end.
 		_, pe := providerError(err)
-		rec.StatusCode, rec.Error = http.StatusBadGateway, pe.Message
+		rec.StatusCode, rec.Error, obsv.errType = http.StatusBadGateway, pe.Message, pe.Type
 		g.Log.Warn("upstream stream failed", "project", rec.ProjectID, "msg", pe.Message)
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", pe.ErrorJSON())
 	} else {
@@ -837,6 +906,9 @@ func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLo
 	}
 	rec.CostMicros = p.CostMicros(rec.PromptTokens, rec.CachedPromptTokens, rec.CacheWriteTokens, rec.CompletionTokens)
 	rec.CostSource = p.Source
+	// The row stores micros (exact in BIGINT); CostUSD is the same figure in
+	// dollars, which is what the cost counter adds up.
+	rec.CostUSD = float64(rec.CostMicros) / 1e6
 }
 
 func fillUsage(rec *store.RequestLog, u *provider.Usage, promptChars, compChars int) {

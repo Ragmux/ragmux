@@ -71,7 +71,7 @@ func (r *cohereReranker) Rerank(ctx context.Context, query string, docs []string
 		} `json:"results"`
 	}
 	headers := map[string]string{"Authorization": "Bearer " + r.cfg.APIKey}
-	if err := doJSON(ctx, r.cfg, r.base+"/v2/rerank", headers, body, &out); err != nil {
+	if err := doJSON(ctx, r.cfg, opRerank, r.base+"/v2/rerank", headers, body, &out); err != nil {
 		return nil, err
 	}
 	res := make([]RerankResult, 0, len(out.Results))
@@ -104,7 +104,7 @@ func (r *voyageReranker) Rerank(ctx context.Context, query string, docs []string
 		} `json:"data"`
 	}
 	headers := map[string]string{"Authorization": "Bearer " + r.cfg.APIKey}
-	if err := doJSON(ctx, r.cfg, r.base+"/v1/rerank", headers, body, &out); err != nil {
+	if err := doJSON(ctx, r.cfg, opRerank, r.base+"/v1/rerank", headers, body, &out); err != nil {
 		return nil, err
 	}
 	res := make([]RerankResult, 0, len(out.Data))

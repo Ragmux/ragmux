@@ -17,6 +17,15 @@ import (
 	"time"
 
 	"github.com/ragmux/ragmux/internal/netguard"
+	"github.com/ragmux/ragmux/internal/tracing"
+)
+
+// Outbound call kinds, the suffix of the provider.* client span and the only
+// values that reach a span name from this package.
+const (
+	opChat   = "chat"
+	opEmbed  = "embed"
+	opRerank = "rerank"
 )
 
 // Config is the per-connection information adapters need.
@@ -41,6 +50,11 @@ type Config struct {
 	// fetch one. Nil keeps the plain rejection those adapters answered with
 	// before, so switching image fetching off changes nothing else.
 	Images *ImageFetcher
+	// Tracer records one client span per upstream call and is the single
+	// place traceparent is written outbound: every chat, embed, stream and
+	// rerank call in this package funnels through doRequest. Nil is a
+	// disabled tracer and costs nothing.
+	Tracer *tracing.Tracer
 }
 
 func (c Config) client() *http.Client {
@@ -87,28 +101,50 @@ func (c Config) baseURL(def string) string {
 
 // doJSON posts a JSON body and decodes a JSON response, mapping non-2xx
 // statuses to *Error.
-func doJSON(ctx context.Context, cfg Config, url string, headers map[string]string, body any, out any) error {
+func doJSON(ctx context.Context, cfg Config, op, url string, headers map[string]string, body any, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, cfg.timeout())
 	defer cancel()
-	resp, err := doRequest(ctx, cfg, url, headers, body)
+	resp, span, err := doRequest(ctx, cfg, op, url, headers, body)
 	if err != nil {
 		return err
 	}
+	defer span.End()
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
-		return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "read upstream response: " + RedactWith(err.Error(), cfg.APIKey)}
+		e := &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "read upstream response: " + RedactWith(err.Error(), cfg.APIKey)}
+		spanFailed(span, "read_failed")
+		return e
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return upstreamError(resp.StatusCode, raw, cfg.APIKey)
+		e := upstreamError(resp.StatusCode, raw, cfg.APIKey)
+		spanFailed(span, e.Type)
+		return e
 	}
+	span.SetStatusOK()
 	if out == nil {
 		return nil
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "decode upstream response: " + err.Error()}
+		e := &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "decode upstream response: " + err.Error()}
+		spanFailed(span, "decode_failed")
+		return e
 	}
 	return nil
+}
+
+// spanFailed marks an upstream span failed with a bounded reason.
+//
+// It deliberately does not record the provider's own message. That message
+// is relayed to the client and written to the request log, but a provider
+// that quotes the offending request back inside a 400 would otherwise
+// export prompt text to a third-party collector, and a span carries
+// metadata, never payload.
+func spanFailed(span *tracing.Span, reason string) {
+	if !span.IsRecording() {
+		return
+	}
+	span.RecordError(errors.New(reason))
 }
 
 // doStream posts a JSON body and returns the raw response for SSE reading.
@@ -116,7 +152,7 @@ func doJSON(ctx context.Context, cfg Config, url string, headers map[string]stri
 // StreamMaxDuration); closing it releases the timeout.
 func doStream(ctx context.Context, cfg Config, url string, headers map[string]string, body any) (*http.Response, error) {
 	sctx, cancel := context.WithTimeout(ctx, cfg.streamMaxDuration())
-	resp, err := doRequest(sctx, cfg, url, headers, body)
+	resp, span, err := doRequest(sctx, cfg, opChat, url, headers, body)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -125,19 +161,30 @@ func doStream(ctx context.Context, cfg Config, url string, headers map[string]st
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		cancel()
-		return nil, upstreamError(resp.StatusCode, raw, cfg.APIKey)
+		e := upstreamError(resp.StatusCode, raw, cfg.APIKey)
+		spanFailed(span, e.Type)
+		span.End()
+		return nil, e
 	}
-	resp.Body = &streamBody{body: resp.Body, remaining: cfg.streamMaxBytes(), ctx: sctx, parent: ctx, cancel: cancel}
+	// The span is handed to the body rather than ended here, so it covers
+	// the whole stream instead of only the header phase: a chat span that
+	// stopped at the response headers would report a 40-second completion
+	// as a 200-millisecond call.
+	resp.Body = &streamBody{body: resp.Body, remaining: cfg.streamMaxBytes(), limit: cfg.streamMaxBytes(),
+		ctx: sctx, parent: ctx, cancel: cancel, span: span}
 	return resp, nil
 }
 
-// streamBody enforces the byte and duration limits of a streaming response.
+// streamBody enforces the byte and duration limits of a streaming response
+// and holds the provider span open until the stream is closed.
 type streamBody struct {
 	body      io.ReadCloser
 	remaining int64
+	limit     int64
 	ctx       context.Context
 	parent    context.Context
 	cancel    context.CancelFunc
+	span      *tracing.Span
 }
 
 func (s *streamBody) Read(p []byte) (int, error) {
@@ -156,22 +203,46 @@ func (s *streamBody) Read(p []byte) (int, error) {
 }
 
 func (s *streamBody) Close() error {
+	if s.span.IsRecording() {
+		s.span.SetAttributes(tracing.Int64("ragmux.stream.bytes", s.limit-s.remaining))
+		s.span.SetStatusOK()
+	}
+	s.span.End()
 	s.cancel()
 	return s.body.Close()
 }
 
-func doRequest(ctx context.Context, cfg Config, url string, headers map[string]string, body any) (*http.Response, error) {
+// doRequest posts one upstream call. It is the only place in the process
+// that writes traceparent outbound: every chat, embed, stream and rerank
+// call funnels through here, so propagation is one code path rather than
+// one per adapter.
+//
+// The returned span is still open on success and must be ended by the
+// caller -- doJSON on the way out, streamBody.Close when the stream ends.
+// On failure the span is already ended.
+func doRequest(ctx context.Context, cfg Config, op, url string, headers map[string]string, body any) (*http.Response, *tracing.Span, error) {
+	ctx, span := cfg.Tracer.Start(ctx, "provider."+op, tracing.KindClient)
+	if span.IsRecording() {
+		span.SetAttributes(
+			tracing.String("server.address", hostOf(url)),
+			tracing.String("gen_ai.system", cfg.ProviderType),
+		)
+	}
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			spanFailed(span, "encode_failed")
+			span.End()
+			return nil, span, err
 		}
 		rdr = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, rdr)
 	if err != nil {
-		return nil, err
+		spanFailed(span, "bad_request")
+		span.End()
+		return nil, span, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
@@ -181,14 +252,37 @@ func doRequest(ctx context.Context, cfg Config, url string, headers map[string]s
 			req.Header.Set(k, v)
 		}
 	}
+	if sc, ok := tracing.SpanContextFrom(ctx); ok {
+		req.Header.Set("traceparent", tracing.Traceparent(sc))
+		if sc.State != "" {
+			req.Header.Set("tracestate", sc.State)
+		}
+	}
 	resp, err := cfg.client().Do(req)
 	if err != nil {
+		var e *Error
 		if ctx.Err() != nil {
-			return nil, &Error{Status: http.StatusGatewayTimeout, Type: "timeout", Message: "upstream request cancelled or timed out"}
+			e = &Error{Status: http.StatusGatewayTimeout, Type: "timeout", Message: "upstream request cancelled or timed out"}
+		} else {
+			e = transportError(cfg, url, err)
 		}
-		return nil, transportError(cfg, url, err)
+		// transportError's messages come from a closed set (plus the host a
+		// guard refused), so they are safe on a span.
+		spanFailed(span, e.Message)
+		span.End()
+		return nil, span, e
 	}
-	return resp, nil
+	span.SetAttributes(tracing.Int("http.response.status_code", resp.StatusCode))
+	return resp, span, nil
+}
+
+// hostOf is the host of a URL without its port, for server.address.
+func hostOf(rawURL string) string {
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // transportError maps a client-side failure to a short, fixed message so the

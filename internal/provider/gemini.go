@@ -418,7 +418,7 @@ func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	}
 	var gr geminiResponse
 	url := p.base + "/models/" + geminiModelPath(p.cfg.Model) + ":generateContent"
-	if err := doJSON(ctx, p.cfg, url, p.headers(), body, &gr); err != nil {
+	if err := doJSON(ctx, p.cfg, opChat, url, p.headers(), body, &gr); err != nil {
 		return nil, err
 	}
 	resp := &ChatResponse{ID: chatID(), Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,

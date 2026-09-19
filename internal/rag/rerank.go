@@ -46,6 +46,11 @@ type RerankerFactory func(ctx context.Context, rs *store.RAGStore) (Reranker, er
 // ErrRerankUnavailable reports that the store's reranker cannot be built.
 var ErrRerankUnavailable = errors.New("reranker not configured")
 
+// errRerankParse marks a reply that arrived but could not be read as a
+// ranking. It exists so the failure metric can tell a broken upstream from
+// a model that answered with prose, without matching on error strings.
+var errRerankParse = errors.New("unreadable ranking")
+
 // Rerank timeouts. The LLM path keeps its original 10 s: it is a full chat
 // completion over a prompt that can run to tens of thousands of characters.
 // A rerank API answers a single scoring call and gets 5 s. RERANK_TIMEOUT
@@ -130,7 +135,7 @@ func (rr *LLMReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 	}
 	order, ok := parseRankArray(reply, len(hits))
 	if !ok {
-		return hits[:topK], fmt.Errorf("rerank: could not parse ranking from reply %q", truncateRunes(reply, 200))
+		return hits[:topK], fmt.Errorf("rerank: %w from reply %q", errRerankParse, truncateRunes(reply, 200))
 	}
 	return reorder(hits, zeroBased(order), topK), nil
 }
@@ -188,7 +193,7 @@ func (rr *APIReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 		}
 	}
 	if len(order) == 0 {
-		return hits[:topK], fmt.Errorf("rerank: %s returned no usable passage index", rr.Backend)
+		return hits[:topK], fmt.Errorf("rerank: %s returned no usable passage index: %w", rr.Backend, errRerankParse)
 	}
 	return reorder(hits, order, topK), nil
 }
