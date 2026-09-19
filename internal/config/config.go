@@ -66,6 +66,21 @@ type Config struct {
 	StreamMaxDuration time.Duration
 	// StreamMaxBytes caps the bytes read from one streaming response.
 	StreamMaxBytes int64
+	// ImageFetch lets the gateway download an image_url a chat request
+	// carries, for providers whose upstream cannot fetch one itself (Gemini,
+	// Ollama). Off, those requests are refused as they were before.
+	ImageFetch bool
+	// ImageFetchMaxBytes caps one fetched image.
+	ImageFetchMaxBytes int64
+	// ImageFetchTimeout bounds one image fetch.
+	ImageFetchTimeout time.Duration
+	// ImageFetchMaxPerRequest caps how many images one chat request may pull,
+	// so a single request cannot fan out.
+	ImageFetchMaxPerRequest int
+	// ImageCacheEntries is the size of the fetched-image cache; 0 disables it.
+	ImageCacheEntries int
+	// ImageCacheTTL is how long a fetched image may be reused.
+	ImageCacheTTL time.Duration
 	// MaxChunksPerDocument fails ingestion of documents that split into more
 	// chunks than this, bounding memory and embedding cost per document.
 	MaxChunksPerDocument int
@@ -226,6 +241,51 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid STREAM_MAX_BYTES_MB %q", v)
 		}
 		c.StreamMaxBytes = int64(n) << 20
+	}
+	// Image fetching is on by default: without it a Gemini or Ollama
+	// connection cannot answer a request carrying an ordinary image URL at
+	// all, and the fetch goes through the same SSRF-guarded client as every
+	// other outbound call.
+	c.ImageFetch = os.Getenv("IMAGE_FETCH") != "false"
+	c.ImageFetchMaxBytes = 8 << 20
+	if v := os.Getenv("IMAGE_FETCH_MAX_MB"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("invalid IMAGE_FETCH_MAX_MB %q", v)
+		}
+		c.ImageFetchMaxBytes = int64(n) << 20
+	}
+	c.ImageFetchTimeout = 10 * time.Second
+	if v := os.Getenv("IMAGE_FETCH_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return c, fmt.Errorf("invalid IMAGE_FETCH_TIMEOUT %q", v)
+		}
+		c.ImageFetchTimeout = d
+	}
+	c.ImageFetchMaxPerRequest = 8
+	if v := os.Getenv("IMAGE_FETCH_MAX_PER_REQUEST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("invalid IMAGE_FETCH_MAX_PER_REQUEST %q", v)
+		}
+		c.ImageFetchMaxPerRequest = n
+	}
+	c.ImageCacheEntries = 64
+	if v := os.Getenv("IMAGE_CACHE_ENTRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return c, fmt.Errorf("invalid IMAGE_CACHE_ENTRIES %q (0 disables)", v)
+		}
+		c.ImageCacheEntries = n
+	}
+	c.ImageCacheTTL = 10 * time.Minute
+	if v := os.Getenv("IMAGE_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return c, fmt.Errorf("invalid IMAGE_CACHE_TTL %q", v)
+		}
+		c.ImageCacheTTL = d
 	}
 	c.MaxChunksPerDocument = 20000
 	if v := os.Getenv("MAX_CHUNKS_PER_DOCUMENT"); v != "" {
