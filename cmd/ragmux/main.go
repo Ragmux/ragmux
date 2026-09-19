@@ -436,7 +436,14 @@ func cors(origins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Vary", "Origin")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Ragmux-Project")
+				// Without this, browser JS cannot read a single one of the
+				// headers the gateway sets: the fetch API hides every
+				// response header that is not on the CORS safelist.
+				w.Header().Set("Access-Control-Expose-Headers",
+					"Retry-After, X-Request-Id, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, "+
+						"x-ratelimit-reset-requests, x-ragmux-budget-daily-remaining, x-ragmux-budget-monthly-remaining, "+
+						"x-ragmux-rag-hits, x-ragmux-rag-sources, x-ragmux-projects")
 				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 			if r.Method == http.MethodOptions {
