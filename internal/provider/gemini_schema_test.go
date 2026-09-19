@@ -2,6 +2,8 @@ package provider
 
 import (
 	"encoding/json"
+	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -118,5 +120,50 @@ func TestGeminiSchemaDepthCap(t *testing.T) {
 	got, _ := sanitizeGeminiSchema(json.RawMessage(deep))
 	if !json.Valid(got) || !strings.Contains(string(got), geminiSchemaElided) {
 		t.Errorf("schema = %s", got)
+	}
+}
+
+// A tool schema is client-supplied, so the sanitiser's cost has to be bounded
+// by its own budget rather than by the input's shape. Chaining differently
+// named definitions defeats the per-branch visited set -- each one is new on
+// its branch -- and the depth cap alone does not stop the width from
+// multiplying at every level.
+func TestSanitizeGeminiSchemaIsBoundedOnFanOut(t *testing.T) {
+	const n = 20
+	defs := map[string]any{}
+	names := []string{"A", "B", "C", "D", "E"}
+	for i, name := range names {
+		props := map[string]any{}
+		for j := 0; j < n; j++ {
+			if i+1 < len(names) {
+				props[fmt.Sprintf("p%d", j)] = map[string]any{"$ref": "#/$defs/" + names[i+1]}
+			} else {
+				props[fmt.Sprintf("p%d", j)] = map[string]any{"type": "string"}
+			}
+		}
+		defs[name] = map[string]any{"type": "object", "properties": props}
+	}
+	raw, err := json.Marshal(map[string]any{"$defs": defs, "$ref": "#/$defs/A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	out, _ := sanitizeGeminiSchema(raw)
+	runtime.ReadMemStats(&after)
+
+	const maxOut = 1 << 20 // 1 MiB of output for 4 KiB of input is already generous
+	if len(out) > maxOut {
+		t.Errorf("%d bytes of input produced %d bytes of output (cap %d)", len(raw), len(out), maxOut)
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 64<<20 {
+		t.Errorf("sanitising allocated %d MiB", grew>>20)
+	}
+	// Whatever it elides, the result must still be a schema Gemini can read.
+	var check map[string]any
+	if err := json.Unmarshal(out, &check); err != nil {
+		t.Fatalf("output is not an object: %v", err)
 	}
 }

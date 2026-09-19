@@ -538,7 +538,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 			ing.progress(ctx, docID, progressChunked+(100-progressChunked)*end/len(chunks), nil)
 		}
 	}
-	if err := ing.store.ReplaceDocumentChunks(ctx, doc, chunks); err != nil {
+	if err := ing.store.ReplaceDocumentChunks(ctx, doc, chunks, ing.owner); err != nil {
 		return 0, fmt.Errorf("store chunks: %w", err)
 	}
 	ing.log.Info("document ingested", "doc", docID, "file", doc.Filename, "chunks", len(chunks),
@@ -556,7 +556,10 @@ const (
 // progress records ingestion progress; a failed write only costs the
 // dashboard a stale number, so it is logged and otherwise ignored.
 func (ing *Ingester) progress(ctx context.Context, docID int64, percent int, pages *int) {
-	if err := ing.store.SetDocumentProgress(ctx, docID, percent, pages); err != nil {
+	if err := ing.store.SetDocumentProgress(ctx, docID, percent, pages, ing.owner); err != nil {
+		// ErrNotFound here means the lease is gone and the row belongs to
+		// another replica now; the job is about to end anyway, so this only
+		// notes why the number stopped moving.
 		ing.log.Warn("record ingest progress", "doc", docID, "err", err)
 	}
 }

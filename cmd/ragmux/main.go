@@ -185,13 +185,25 @@ func run(cfg config.Config) error {
 	httpClient := &http.Client{Transport: transport, CheckRedirect: netguard.CheckRedirect(3)}
 	log.Info("upstream policy", "allow_private_upstreams", cfg.AllowPrivateUpstreams,
 		"private_upstream_allowlist", len(cfg.PrivateUpstreamAllowlist))
-	// Image fetching shares the hardened client on purpose. An image URL is
-	// chosen by the API client rather than by an operator, so it needs the
-	// same private-address and redirect policy a provider base URL gets.
+	// Image fetching gets its own client, with the private-address filter
+	// applied unconditionally.
+	//
+	// It cannot share the provider client. ALLOW_PRIVATE_UPSTREAMS and
+	// PRIVATE_UPSTREAM_ALLOWLIST short-circuit that filter entirely, and they
+	// exist for a base URL an editor typed -- the documented way to reach a
+	// local Ollama is to allowlist its host. An image URL arrives from
+	// whoever holds an API key, so inheriting that exemption would hand every
+	// key holder a GET against the internal network on the exact deployments
+	// the documentation tells operators to build. Same transport settings,
+	// narrower policy.
+	imageTransport := transport.Clone()
+	imageTransport.Proxy = nil
+	imageTransport.DialContext = netguard.SafeDialContext(dialer, false, nil)
+	imageClient := &http.Client{Transport: imageTransport, CheckRedirect: netguard.CheckRedirect(3)}
 	var images *provider.ImageFetcher
 	if cfg.ImageFetch {
 		images = &provider.ImageFetcher{
-			Client:        httpClient,
+			Client:        imageClient,
 			MaxBytes:      cfg.ImageFetchMaxBytes,
 			Timeout:       cfg.ImageFetchTimeout,
 			MaxPerRequest: cfg.ImageFetchMaxPerRequest,

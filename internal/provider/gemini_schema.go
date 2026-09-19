@@ -25,7 +25,12 @@ const (
 	// geminiSchemaMaxDepth bounds $ref inlining. A schema nested deeper than
 	// this is recursive far more often than it is genuinely deep.
 	geminiSchemaMaxDepth = 8
-	geminiSchemaElided   = "(recursive schema elided)"
+	// geminiSchemaMaxNodes caps the whole walk. A hand-written tool schema
+	// runs to tens of nodes; hundreds is already unusual. Past this the rest
+	// of the tree is elided rather than expanded.
+	geminiSchemaMaxNodes  = 4096
+	geminiSchemaElided    = "(recursive schema elided)"
+	geminiSchemaTruncated = "(schema too large; elided)"
 )
 
 // geminiSchemaScalars travel through with their value unchanged.
@@ -45,7 +50,8 @@ var geminiSchemaFormats = map[string]map[string]bool{
 // sanitizeGeminiSchema rewrites a JSON Schema into the subset Gemini accepts
 // and reports the keywords it had to drop, for one debug line per request.
 func sanitizeGeminiSchema(raw json.RawMessage) (json.RawMessage, []string) {
-	w := &geminiSchemaWalk{defs: map[string]json.RawMessage{}, dropped: map[string]bool{}}
+	w := &geminiSchemaWalk{defs: map[string]json.RawMessage{}, dropped: map[string]bool{},
+		budget: geminiSchemaMaxNodes}
 	node := w.node(raw, 0, nil)
 	if len(node) == 0 {
 		node = map[string]any{"type": "object"}
@@ -72,6 +78,14 @@ type geminiSchemaWalk struct {
 	// $ref deeper in the tree still resolves against an ancestor's table.
 	defs    map[string]json.RawMessage
 	dropped map[string]bool
+	// budget is what is left of geminiSchemaMaxNodes. The depth cap bounds
+	// how deep the walk goes but says nothing about how wide it gets, and a
+	// tool schema arrives from the client: a chain of differently named
+	// definitions defeats the per-branch visited set, because each name is
+	// new on its own branch, so every level multiplies by the number of
+	// properties. A few kilobytes of input reached a gigabyte of output
+	// before this counter existed.
+	budget int
 }
 
 // node sanitises one schema node. visited holds the $ref names already
@@ -81,6 +95,11 @@ func (w *geminiSchemaWalk) node(raw json.RawMessage, depth int, visited map[stri
 	if depth > geminiSchemaMaxDepth {
 		return geminiElidedNode()
 	}
+	if w.budget <= 0 {
+		w.drop("(truncated)")
+		return geminiTruncatedNode()
+	}
+	w.budget--
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(raw, &obj) != nil || obj == nil {
 		// A boolean schema (draft "true"/"false") or anything else that is not
@@ -319,4 +338,11 @@ func (w *geminiSchemaWalk) droppedKeywords() []string {
 
 func geminiElidedNode() map[string]any {
 	return map[string]any{"type": "string", "description": geminiSchemaElided}
+}
+
+// geminiTruncatedNode stands in for a subtree the node budget cut off. It is
+// a valid schema, so the tool still reaches the model with the shape it did
+// manage to describe.
+func geminiTruncatedNode() map[string]any {
+	return map[string]any{"type": "string", "description": geminiSchemaTruncated}
 }

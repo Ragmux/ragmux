@@ -315,11 +315,17 @@ vision-capable provider as they are. Remote ones depend on the provider:
 | `gemini` | Files API and `gs://` URIs are forwarded as `fileData`; anything else is fetched by the gateway and inlined |
 | `ollama` | fetched by the gateway and inlined — Ollama accepts nothing else |
 
-The gateway's own fetch (`IMAGE_FETCH`, on by default) uses the **same** HTTP client as
-provider calls, so the SSRF dialer and the redirect policy of
-[Private upstreams](configuration.md#private-upstreams) apply to image hosts too: an
-image URL pointing at a private address is refused with the same message a private
-`base_url` gets, and a redirect to another host is not followed. On top of that:
+The gateway's own fetch (`IMAGE_FETCH`, on by default) goes out over the same hardened
+transport as provider calls but under a **stricter** policy: an image URL that resolves to
+a loopback, link-local or private address is refused, and a redirect to another host is
+not followed.
+
+The difference matters. `ALLOW_PRIVATE_UPSTREAMS` and `PRIVATE_UPSTREAM_ALLOWLIST` lift
+the private-address check for provider calls — allowlisting a host is the documented way
+to reach a local Ollama — but they **do not apply to image fetching**. A `base_url` is
+typed by an editor; an image URL arrives from whoever holds an API key, so letting it
+inherit that exemption would turn every allowlisted deployment into a way for a key holder
+to probe the internal network. On top of that:
 
 - `GET` only, with `Accept: image/*`, and only `http`/`https` URLs.
 - The response's own `Content-Type` decides — `image/png`, `image/jpeg`, `image/gif` or

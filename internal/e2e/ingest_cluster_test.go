@@ -226,3 +226,41 @@ func TestAttemptCapStopsACrashLoop(t *testing.T) {
 		t.Errorf("exhausted document: status=%s error=%q", d.Status, d.Error)
 	}
 }
+
+// A worker whose lease expired must stop writing to the row. Another replica
+// owns it now, and the old worker's chunks would replace what the new owner
+// wrote and mark the document ready with content a job behind.
+func TestWritesAreRefusedAfterTheLeaseIsTakenOver(t *testing.T) {
+	ctx := context.Background()
+	a, b, ragStoreID := ingestFixture(t)
+	id := seedDocuments(t, a, ragStoreID, 1)[0]
+
+	claimed, err := a.ClaimDocument(ctx, "replica-a", 300*time.Millisecond, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := b.ClaimDocument(ctx, "replica-b", time.Minute, 5); err != nil {
+		t.Fatalf("the expired lease should be claimable: %v", err)
+	}
+
+	if err := a.SetDocumentProgress(ctx, id, 50, nil, "replica-a"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("progress write by the old owner: %v, want ErrNotFound", err)
+	}
+	err = a.ReplaceDocumentChunks(ctx, claimed, []*store.Chunk{
+		{Index: 0, Content: "stale", Embedding: []float32{1, 0, 0}}}, "replica-a")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("chunk write by the old owner: %v, want ErrNotFound", err)
+	}
+	doc, err := b.GetDocument(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Status == store.DocReady {
+		t.Error("the old owner marked a document it no longer owns ready")
+	}
+	// The replica that does own it is unaffected.
+	if err := b.SetDocumentProgress(ctx, id, 50, nil, "replica-b"); err != nil {
+		t.Errorf("progress write by the current owner: %v", err)
+	}
+}

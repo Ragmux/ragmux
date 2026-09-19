@@ -117,7 +117,7 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 
 // ReplaceDocumentChunks atomically swaps a document's chunks and embeddings
 // and marks it ready. All chunks must share the store's embedding width.
-func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks []*Chunk) error {
+func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks []*Chunk, owner string) error {
 	if len(chunks) == 0 {
 		return fmt.Errorf("no chunks to store")
 	}
@@ -195,9 +195,22 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, "UPDATE documents SET status=$1, error='', chunk_count=$2, progress_percent=100, updated_at=now() WHERE id=$3",
-		DocReady, len(chunks), doc.ID); err != nil {
+	// The same ownership check the progress write makes, and here it also
+	// protects the chunk rewrite above: this runs in the transaction that
+	// deleted the old chunks, so a worker whose lease expired mid-job rolls
+	// its own work back instead of replacing what the new owner wrote.
+	q := "UPDATE documents SET status=$1, error='', chunk_count=$2, progress_percent=100, updated_at=now() WHERE id=$3"
+	args := []any{DocReady, len(chunks), doc.ID}
+	if owner != "" {
+		args = append(args, owner)
+		q += fmt.Sprintf(" AND claimed_by=$%d AND status='processing'", len(args))
+	}
+	tag, err := tx.Exec(ctx, q, args...)
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 0 && owner != "" {
+		return ErrNotFound
 	}
 	return tx.Commit(ctx)
 }

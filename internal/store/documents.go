@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -252,14 +253,32 @@ func (s *Store) FailExhaustedDocuments(ctx context.Context, maxAttempts int) (in
 
 // SetDocumentProgress records ingestion progress (clamped to 0..100). With
 // pageCount set the page count is stored as well.
-func (s *Store) SetDocumentProgress(ctx context.Context, id int64, percent int, pageCount *int) error {
+// owner, when set, restricts the write to the replica still holding the
+// claim: a worker whose lease expired must not keep writing to a row another
+// replica has taken over. ErrNotFound reports exactly that. An empty owner
+// skips the check, for callers that never claimed the row.
+func (s *Store) SetDocumentProgress(ctx context.Context, id int64, percent int, pageCount *int, owner string) error {
 	percent = max(0, min(100, percent))
+	q := "UPDATE documents SET progress_percent=$1"
+	args := []any{int16(percent)}
 	if pageCount != nil {
-		_, err := s.pool.Exec(ctx, "UPDATE documents SET progress_percent=$1, page_count=$2 WHERE id=$3", int16(percent), *pageCount, id)
+		q += ", page_count=$2"
+		args = append(args, *pageCount)
+	}
+	args = append(args, id)
+	q += fmt.Sprintf(" WHERE id=$%d", len(args))
+	if owner != "" {
+		args = append(args, owner)
+		q += fmt.Sprintf(" AND claimed_by=$%d AND status='processing'", len(args))
+	}
+	tag, err := s.pool.Exec(ctx, q, args...)
+	if err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, "UPDATE documents SET progress_percent=$1 WHERE id=$2", int16(percent), id)
-	return err
+	if tag.RowsAffected() == 0 && owner != "" {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DeleteDocument removes the document; chunks and embeddings cascade.

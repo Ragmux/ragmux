@@ -42,6 +42,17 @@ func (s *Store) verifySecretKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Only seal a database that has no canary once this key is known to be
+	// the right one, which means asking the credentials that are already
+	// there. Sealing unconditionally inverts the whole check on an upgrade:
+	// a database written before this table existed has credentials but no
+	// canary, so starting it once with the wrong key would mint a canary
+	// saying the wrong key is right -- the boot succeeds, every provider
+	// call fails, and the correct key is then refused for good, rotate-key
+	// included, because that opens the store too.
+	if err := s.canaryPrecondition(ctx); err != nil {
+		return err
+	}
 	if _, err := s.pool.Exec(ctx, `INSERT INTO instance_settings (key, value) VALUES ($1, $2)
 		ON CONFLICT (key) DO NOTHING`, settingSecretKeyCanary, sealed); err != nil {
 		return fmt.Errorf("write secret key canary: %w", err)
@@ -56,6 +67,41 @@ func (s *Store) verifySecretKey(ctx context.Context) error {
 		return fmt.Errorf("%w (key source: %s): the canary stored in instance_settings does not decrypt. "+
 			"Start with the original key, or run \"ragmux rotate-key\" with it in the environment to move the "+
 			"database to a new one. See docs/scaling.md#secret-key", ErrSecretKeyMismatch, s.SecretKeySource)
+	}
+	return nil
+}
+
+// canaryPrecondition decides whether this key may seal a database that has
+// no canary yet. A database with no stored credential cannot contradict any
+// key, so the first one to arrive is adopted. Otherwise the key has to open
+// one of them, and a key that cannot is reported as the mismatch it is
+// rather than written down as the truth.
+func (s *Store) canaryPrecondition(ctx context.Context) error {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM instance_settings WHERE key = $1)",
+		settingSecretKeyCanary).Scan(&exists); err != nil {
+		return fmt.Errorf("read secret key canary: %w", err)
+	}
+	if exists {
+		return nil // the stored canary is the authority; verify against it.
+	}
+	var id int64
+	var enc []byte
+	var version int16
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, api_key_enc, key_version FROM model_connections ORDER BY id LIMIT 1").
+		Scan(&id, &enc, &version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // nothing encrypted yet; this key becomes the database's.
+	}
+	if err != nil {
+		return fmt.Errorf("read a stored credential to check the key: %w", err)
+	}
+	if _, err := s.decryptKey(id, version, enc); err != nil {
+		return fmt.Errorf("%w (key source: %s): this database already holds provider credentials "+
+			"this key cannot open, and it has no canary yet, so the key is not being recorded. "+
+			"Start with the key those credentials were written with. See docs/scaling.md#secret-key",
+			ErrSecretKeyMismatch, s.SecretKeySource)
 	}
 	return nil
 }

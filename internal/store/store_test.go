@@ -180,7 +180,7 @@ func TestVectorSearchOrderingAndDistances(t *testing.T) {
 		{Index: 2, Content: "near x", Embedding: []float32{0.9, 0.1, 0, 0}},
 		{Index: 3, Content: "z axis", Embedding: []float32{0, 0, 1, 0}},
 	}
-	if err := s.ReplaceDocumentChunks(ctx, doc, chunks); err != nil {
+	if err := s.ReplaceDocumentChunks(ctx, doc, chunks, ""); err != nil {
 		t.Fatalf("replace chunks: %v", err)
 	}
 	rr, err := s.GetRAGStore(ctx, r.ID)
@@ -214,7 +214,7 @@ func TestVectorSearchOrderingAndDistances(t *testing.T) {
 	}
 
 	// Re-ingesting replaces rather than duplicates.
-	if err := s.ReplaceDocumentChunks(ctx, doc, chunks[:2]); err != nil {
+	if err := s.ReplaceDocumentChunks(ctx, doc, chunks[:2], ""); err != nil {
 		t.Fatal(err)
 	}
 	if rr, _ = s.GetRAGStore(ctx, r.ID); rr.ChunkCount != 2 {
@@ -484,7 +484,7 @@ func TestBackupInfoCountsVectorTablesAndDocumentBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReplaceDocumentChunks(ctx, doc, []*store.Chunk{{Index: 0, Content: "hello", Embedding: []float32{1, 0, 0}}}); err != nil {
+	if err := s.ReplaceDocumentChunks(ctx, doc, []*store.Chunk{{Index: 0, Content: "hello", Embedding: []float32{1, 0, 0}}}, ""); err != nil {
 		t.Fatal(err)
 	}
 	info, err := s.BackupInfo(ctx)
@@ -680,5 +680,71 @@ func TestStoreUsageAndQuotaFields(t *testing.T) {
 	r.MaxBytes = -1
 	if _, err := s.UpdateRAGStore(ctx, r); err == nil {
 		t.Error("negative max_bytes should violate the check constraint")
+	}
+}
+
+// A database written before instance_settings existed has credentials but no
+// canary. Opening it once with the wrong key must not record that key as the
+// database's: doing so inverts the check for good, because the correct key is
+// then refused and rotate-key opens the store too, so it is refused with it.
+func TestCanaryIsNotSealedByAKeyThatCannotOpenExistingCredentials(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	s := testdb.OpenWith(t, cfg)
+	if _, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "o", ProviderType: "openai",
+		APIKey: "sk-secret-123456", ModelName: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	// Roll the database back to what an upgrade finds: credentials, no canary.
+	if _, err := s.DB().Exec(ctx, "DELETE FROM instance_settings WHERE key = 'secret_key_canary'"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	wrong := cfg
+	wrong.SecretKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := store.Open(ctx, wrong, quiet); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Fatalf("the wrong key should be refused, got %v", err)
+	}
+
+	// The refusal must have left nothing behind: the real key still opens it.
+	s2, err := store.Open(ctx, cfg, quiet)
+	if err != nil {
+		t.Fatalf("the original key was locked out by the refused attempt: %v", err)
+	}
+	defer s2.Close()
+	list, err := s2.ListConnections(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("connections: %v %d", err, len(list))
+	}
+	// ... and it is the one now recorded, so the wrong key is refused from here on.
+	if _, err := store.Open(ctx, wrong, quiet); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("after a good open the wrong key should still be refused, got %v", err)
+	}
+}
+
+// A database with nothing encrypted yet cannot contradict any key, so the
+// first one to arrive is adopted -- that is what makes a fresh install work
+// without SECRET_KEY set.
+func TestCanaryAdoptsTheFirstKeyOnAnEmptyDatabase(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	s := testdb.OpenWith(t, cfg)
+	if _, err := s.DB().Exec(ctx, "DELETE FROM instance_settings WHERE key = 'secret_key_canary'"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	other := cfg
+	other.SecretKeyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s2, err := store.Open(ctx, other, quiet)
+	if err != nil {
+		t.Fatalf("an empty database should adopt the key it is opened with: %v", err)
+	}
+	s2.Close()
+	if _, err := store.Open(ctx, cfg, quiet); !errors.Is(err, store.ErrSecretKeyMismatch) {
+		t.Errorf("once adopted, a different key must be refused, got %v", err)
 	}
 }
