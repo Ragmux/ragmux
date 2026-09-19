@@ -165,7 +165,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": 10, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}`: `needs_setup` is `true` while the `users` table is empty; the next three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role); `has_connections` and `has_projects` are two `EXISTS` probes the first-run wizard uses to resume at the right step after a reload |
+| GET | `/setup` | — | `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}`: `needs_setup` is `true` while the `users` table is empty; the next three let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role); `has_connections` and `has_projects` are two `EXISTS` probes the first-run wizard uses to resume at the right step after a reload. `N` is the applied migration version, whatever this build has reached |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
@@ -632,13 +632,14 @@ lockout ends (empty when the lockout is disabled).
 
 ### System
 
-`GET /system` (viewer):
+`GET /system` (viewer), with sample values — `migrations_version` and `version` are
+whatever the running build reports:
 
 ```json
-{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": 8, "size_bytes": 8787635},
+{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
- "version": "0.3.0"}
+ "version": "0.4.0"}
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the

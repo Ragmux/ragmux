@@ -33,14 +33,15 @@ secret manager (or your deployment's env store) *and* in the backup bundle, encr
 at rest or in a separate location from the dumps. `scripts/backup.sh` can write it next
 to the dump with `INCLUDE_SECRET_KEY=1` (see below).
 
-`GET /admin/api/system` reports what a backup will contain:
+`GET /admin/api/system` reports what a backup will contain, with sample values —
+`migrations_version` and `version` are whatever the running build reports:
 
 ```json
 {
   "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
-  "database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": 4, "size_bytes": 8787635},
+  "database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
   "secret_key_source": "env",
-  "version": "0.2.0"
+  "version": "0.4.0"
 }
 ```
 
