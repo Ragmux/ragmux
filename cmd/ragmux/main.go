@@ -192,6 +192,31 @@ func run(cfg config.Config) error {
 		log.Warn("resume ingestion", "err", err)
 	}
 	retriever := rag.NewRetriever(st, embedders)
+	retriever.Log = log
+	// Rerankers resolves a store's rerank backend to a reranker. The API
+	// backends read their credentials from the model connection the store
+	// points at, so they go through the same decrypting Store lookup and the
+	// same hardened outbound client as every other upstream call.
+	retriever.Rerankers = func(ctx context.Context, rs *store.RAGStore) (rag.Reranker, error) {
+		if rs.RerankBackend == "" || rs.RerankBackend == store.RerankLLM {
+			return &rag.LLMReranker{}, nil
+		}
+		if rs.RerankConnectionID == nil {
+			// The connection was deleted (ON DELETE SET NULL). Reranking is
+			// skipped and logged, exactly like a reranker that fails.
+			return nil, fmt.Errorf("%w: rag store %d has rerank_backend %q without a connection",
+				rag.ErrRerankUnavailable, rs.ID, rs.RerankBackend)
+		}
+		conn, err := st.GetConnection(ctx, *rs.RerankConnectionID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: rerank connection %d: %v", rag.ErrRerankUnavailable, *rs.RerankConnectionID, err)
+		}
+		client, err := provider.NewReranker(provCfg(conn))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", rag.ErrRerankUnavailable, err)
+		}
+		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client}, nil
+	}
 
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",
 		TrustProxy: cfg.TrustProxyHeaders}

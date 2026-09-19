@@ -336,7 +336,7 @@ const ICON = {
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12m0 0 4-4m-4 4-4-4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>',
 };
 
-const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], users: [], keys: [], system: null, sessionExp: null,
+const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], searchBackends: [], users: [], keys: [], system: null, sessionExp: null,
   overview: { window: '24h' }, openStore: null, openProject: null, users_filter: { q: '', role: 'all' },
   keys_filter: { q: '', kind: 'all', mine: true }, setupStep: 0,
   playground: { key: '', system: '', stream: true, sources: true, msgs: [], last: null } };
@@ -359,12 +359,23 @@ const ragName = id => id ? ((state.rag.find(r => r.id === id) || {}).name || '#'
 const userName = id => (state.users.find(u => u.id === id) || {}).username || '#' + id;
 const projectName = id => (state.projects.find(p => p.id === id) || {}).name || '#' + id;
 const ptype = t => state.providerTypes.find(x => x.type === t) || {};
+// What an adapter can do with a provider type. cohere_rerank / voyage_rerank
+// can neither chat nor embed, so every connection picker filters on this
+// rather than listing state.models wholesale.
+const pcaps = t => ptype(t).capabilities || {};
+const chatModels = () => state.models.filter(m => pcaps(m.provider_type).chat);
+const rerankModels = () => state.models.filter(m => pcaps(m.provider_type).rerank);
+const connOpts = list => list.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` }));
 const PROVIDER_LETTER = { openai: 'O', anthropic: 'A', gemini: 'G', ollama: 'L', deepseek: 'D', custom_openai: 'C' };
 const providerBadge = (type, cls = '') => `<div class="provider p-${esc(type)} ${cls}" aria-hidden="true">${PROVIDER_LETTER[type] || (type || '?')[0].toUpperCase()}</div>`;
 // Compact "2 rpm · 10k tpm · 1M/day" summary of a project's non-zero limits.
 const limitSummary = p => [p.rate_limit_rpm ? `${fmtK(p.rate_limit_rpm)} rpm` : '', p.rate_limit_tpm ? `${fmtK(p.rate_limit_tpm)} tpm` : '', p.budget_daily_tokens ? `${fmtK(p.budget_daily_tokens)}/day` : '', p.budget_monthly_tokens ? `${fmtK(p.budget_monthly_tokens)}/month` : ''].filter(Boolean).join(' · ') || 'unlimited';
 // "hybrid (english) · rerank 15 · dist ≤ 0.6" summary of a store's retrieval settings.
-const retrievalSummary = r => [r.search_mode === 'vector' ? 'vector' : `hybrid (${r.fts_config || 'simple'})`, r.rerank ? `rerank ${r.rerank_candidates}` : '', r.max_distance ? `dist ≤ ${r.max_distance}` : ''].filter(Boolean).join(' · ');
+const retrievalSummary = r => [r.search_mode === 'vector' ? 'vector' : `hybrid (${r.search_backend === 'pg_search' ? 'bm25' : r.fts_config || 'simple'})`, r.rerank ? `rerank ${r.rerank_backend || 'llm'} ${r.rerank_candidates}` : '', r.max_distance ? `dist ≤ ${r.max_distance}` : ''].filter(Boolean).join(' · ');
+// Options for the search-backend picker; what this server cannot run is
+// listed but disabled, because saving it would be rejected with a 400.
+const backendOpts = () => (state.searchBackends.length ? state.searchBackends : [{ id: 'pgvector', available: true }])
+  .map(b => ({ value: b.id, label: b.id === 'pg_search' ? 'pg_search — ParadeDB BM25' : 'pgvector — PostgreSQL full-text', disabled: !b.available, hint: b.reason }));
 
 let toastTimer;
 function toast(msg, ms = 3500, cls = '') {
@@ -402,7 +413,7 @@ function field(name, label, inner, hint = '') {
 }
 const input = (name, val = '', attrs = '') => `<INPUT class="input" name="${name}" value="${esc(val)}" ${attrs}>`;
 const textarea = (name, val = '', attrs = '') => `<TEXTAREA class="input" name="${name}" ${attrs}>${esc(val)}</TEXTAREA>`;
-const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${name}" ${attrs}>${opts.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(val) ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</SELECT>`;
+const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${name}" ${attrs}>${opts.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(val) ? 'selected' : ''} ${o.disabled ? 'disabled' : ''} ${o.hint ? `title="${esc(o.hint)}"` : ''}>${esc(o.label)}${o.disabled ? ' (unavailable here)' : ''}</option>`).join('')}</SELECT>`;
 const toggle = (name, checked, label, hint = '') => `<label class="toggle"><span><span class="dim">${esc(label)}</span>${hint ? `<div class="hint">${hint}</div>` : ''}</span><input type="checkbox" name="${name}" ${checked ? 'checked' : ''}><span class="switch" aria-hidden="true"></span></label>`;
 const checklist = (name, opts, vals = [], empty = 'Nothing to choose from.') => `<div class="checklist">${opts.map(o => `<label class="check"><input type="checkbox" name="${name}" value="${esc(o.value)}" ${vals.map(String).includes(String(o.value)) ? 'checked' : ''}>${esc(o.label)}</label>`).join('') || `<div class="hint" style="padding:6px 10px">${esc(empty)}</div>`}</div>`;
 const twoCol = (a, b) => `<div class="row" style="align-items:flex-start"><div class="grow">${a}</div><div class="grow">${b}</div></div>`;
@@ -502,7 +513,8 @@ function updateSession() {
 }
 setInterval(() => { if (state.user) updateSession(); }, 30000);
 async function loadAll() {
-  [state.models, state.rag, state.projects, state.providerTypes] = await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types')]);
+  [state.models, state.rag, state.projects, state.providerTypes, state.searchBackends] =
+    await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types'), api('/search-backends').catch(() => [])]);
   // Admins get the full list (badge, actor filter); editors the active users for member pickers; viewers nothing.
   state.users = can('admin') ? await api('/users').catch(() => []) : can('editor') ? await api('/users/lite').catch(() => []) : [];
   loadSystem();
@@ -589,7 +601,9 @@ async function finishWizard() {
 }
 // Step 2: a model connection, created through the ordinary editor endpoint.
 function renderSetupModel() {
-  const types = state.providerTypes.map(t => ({ value: t.type, label: t.label }));
+  // Chat-capable types only: the next wizard step creates a project, and a
+  // rerank-only connection cannot back one.
+  const types = state.providerTypes.filter(t => (t.capabilities || {}).chat).map(t => ({ value: t.type, label: t.label }));
   setupCard(2, 'setupModelForm', 'Connect a model',
     'Ragmux proxies to your provider with a credential sealed in the database. You can add more connections later under <strong>Models</strong>.', `
     ${field('name', 'Name', input('name', 'default', 'required placeholder="e.g. openai-gpt4o"'))}
@@ -622,7 +636,7 @@ function renderSetupModel() {
 }
 // Step 3: a project, which is what mints the first client key.
 function renderSetupProject() {
-  const models = state.models.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` }));
+  const models = connOpts(chatModels());
   setupCard(3, 'setupProjectForm', 'Create your first project',
     'A project ties a client key to a model connection and, later, a RAG store. Its key is shown once — this is the credential your applications use.', `
     ${field('name', 'Project name', input('name', 'default', 'required'))}
@@ -776,7 +790,7 @@ async function renderOverview() {
 // ---------------------------------------------------------------------------
 // models
 // ---------------------------------------------------------------------------
-const capsLine = t => [t.supports_embeddings ? 'chat + embeddings' : 'chat', t.supports_tools ? 'tools' : ''].filter(Boolean).join(', ');
+const capsLine = t => { const c = t.capabilities || {}; return c.rerank && !c.chat ? 'reranking only' : [c.embeddings ? 'chat + embeddings' : 'chat', c.tools ? 'tools' : ''].filter(Boolean).join(', '); };
 const testPill = m => m.last_test_ok === true ? `<span class="pill ok" title="tested ${esc(fmtDate(m.last_test_at))}">ok · ${fmtN(m.last_test_latency_ms)} ms</span>` : m.last_test_ok === false ? `<span class="pill err" title="${esc(m.last_test_error)}">failed</span>` : '<span class="pill">untested</span>';
 const hostOf = (url, t) => { if (!url) return `${(t.default_base_url || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '') || 'provider default'} (default)`; return url; };
 function renderModels() {
@@ -787,7 +801,7 @@ function renderModels() {
       <div class="row" style="align-items:flex-start">${providerBadge(m.provider_type)}<div class="grow"><div style="font-weight:600;font-size:15px" class="ellip">${esc(m.name)}</div><div class="hint">${esc(t.label || m.provider_type)} · ${capsLine(t)}</div></div><div class="row wrap" style="gap:6px;justify-content:flex-end">${m.private_upstream ? '<span class="pill warn">private upstream</span>' : ''}${testPill(m)}</div></div>
       <div class="kv"><span class="k">model</span><span class="mono ellip">${esc(m.model_name)}</span><span class="k">base URL</span><span class="mono dim ellip" title="${esc(m.base_url || t.default_base_url)}">${esc(hostOf(m.base_url, t))}</span><span class="k">key</span><span class="mono dim">${esc(m.api_key_masked || '— none')}</span></div>
       ${m.last_test_ok === false && m.last_test_error ? `<div class="hint ellip" title="${esc(m.last_test_error)}">last test: ${esc(m.last_test_error)}</div>` : ''}
-      ${w ? `<div class="row wrap" style="gap:8px;margin-top:2px"><button class="btn sm" data-test="${m.id}">Test chat</button>${t.supports_embeddings ? `<button class="btn sm" data-testemb="${m.id}">Test embed</button>` : ''}<span class="grow"></span><button class="btn sm ghost" data-edit="${m.id}">Edit</button><button class="btn sm ghost danger" data-del="${m.id}">Delete</button></div>` : ''}</div>`; }).join('')}
+      ${w ? `<div class="row wrap" style="gap:8px;margin-top:2px">${(t.capabilities || {}).chat ? `<button class="btn sm" data-test="${m.id}">Test chat</button>` : ''}${t.supports_embeddings ? `<button class="btn sm" data-testemb="${m.id}">Test embed</button>` : ''}<span class="grow"></span><button class="btn sm ghost" data-edit="${m.id}">Edit</button><button class="btn sm ghost danger" data-del="${m.id}">Delete</button></div>` : ''}</div>`; }).join('')}
       ${w ? `<div class="empty stack" style="align-items:center;justify-content:center;gap:10px"><div class="dim" style="font-weight:500">Add DeepSeek, Mistral or any OpenAI-compatible endpoint</div><div class="hint">custom_openai connections run through the same SSRF guard and redaction layer</div><button class="btn sm" data-add>${ICON.plus} New connection</button></div>` : (state.models.length ? '' : '<div class="empty">No connections yet.</div>')}</div>`;
   if (w) { $('#addModel').onclick = () => modelForm(); on(app, '[data-add]', 'click', () => modelForm()); }
   on(app, '[data-edit]', 'click', b => modelForm(modelById(Number(b.dataset.edit))));
@@ -839,7 +853,7 @@ function renderRAG() {
     <div class="split"><section class="stack" style="gap:10px" id="storeList">
       ${state.rag.map(r => { const m = modelById(r.embedding_connection_id) || {}; const qp = quotaPct(r); return `<button class="card tight store-card ${r.id === state.openStore ? 'sel' : ''}" data-open="${r.id}" aria-pressed="${r.id === state.openStore}">
         <div class="row between"><div style="font-weight:600" class="ellip">${esc(r.name)}</div><span class="pill ${r.search_mode === 'vector' ? '' : 'ok'}">${r.search_mode === 'vector' ? 'vector' : 'hybrid'}</span></div>
-        <div class="hint" style="margin-top:4px">${esc(m.name || '#' + r.embedding_connection_id)}${r.dimensions ? ` · ${r.dimensions}d` : ''}${r.search_mode !== 'vector' ? ` · ${esc(r.fts_config || 'simple')}` : ''}</div>
+        <div class="hint" style="margin-top:4px">${esc(m.name || '#' + r.embedding_connection_id)}${r.dimensions ? ` · ${r.dimensions}d` : ''}${r.search_mode !== 'vector' ? ` · ${esc(r.search_backend === 'pg_search' ? 'bm25' : r.fts_config || 'simple')}` : ''}</div>
         <div class="row mono" style="margin-top:12px;gap:14px;font-size:12px"><span><span style="color:var(--tx)">${fmtN(r.document_count)}</span> <span class="muted">docs</span></span><span><span style="color:var(--tx)">${fmtN(r.chunk_count)}</span> <span class="muted">chunks</span></span>${r.rerank ? `<span class="muted">rerank ${r.rerank_candidates}</span>` : ''}${r.max_distance ? `<span class="muted">dist ≤ ${r.max_distance}</span>` : ''}</div>
         <div style="margin-top:10px">${meter(qp, r.max_documents || r.max_bytes ? '' : 'mint')}</div><div class="hint" style="margin-top:4px">${quotaLine(r)}</div></button>`; }).join('') || `<div class="empty">No RAG stores yet.${emb.length ? '' : ' Add an embedding-capable model connection first.'}</div>`}</section>
     <section class="stack" style="gap:16px" id="storePanel"></section></div>`;
@@ -854,14 +868,16 @@ function storeForm(r) {
     ${field('embedding_connection_id', 'Embedding model connection', select('embedding_connection_id', emb.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), r ? r.embedding_connection_id : undefined, r && r.chunk_count ? 'disabled' : ''), r && r.chunk_count ? 'Locked while the store has chunks.' : '')}
     ${twoCol(field('chunk_size', 'Chunk size (chars)', input('chunk_size', r ? r.chunk_size : 1000, 'type=number min=200 max=20000')), field('chunk_overlap', 'Chunk overlap', input('chunk_overlap', r ? r.chunk_overlap : 200, 'type=number min=0')))}
     ${twoCol(field('top_k', 'Top-k', input('top_k', r ? r.top_k : 5, 'type=number min=1 max=50')), field('search_mode', 'Search mode', select('search_mode', [{ value: 'hybrid', label: 'hybrid — vector + full-text (RRF)' }, { value: 'vector', label: 'vector only' }], r ? r.search_mode : 'hybrid')))}
+    ${field('search_backend', 'Search backend', select('search_backend', backendOpts(), r ? r.search_backend || 'pgvector' : 'pgvector'), 'Who answers the lexical half of a hybrid search. <code>pg_search</code> needs the ParadeDB extension; switching needs no reprocessing and ignores the full-text config below.')}
     ${toggle('contextual_chunks', r ? r.contextual_chunks : true, 'Contextual chunks', 'Embed filename and section with each chunk (changing this needs a reprocess).')}
     ${field('fts_config', 'Full-text query config', input('fts_config', r ? r.fts_config || 'simple' : 'simple', 'placeholder=simple'), 'Postgres text search configuration for hybrid queries: <code>simple</code> (no stemming), <code>english</code>, <code>turkish</code>, <code>german</code>… Chunks are always indexed with <code>simple</code>.')}
-    ${toggle('rerank', !!(r && r.rerank), 'Rerank with the project chat model', 'Sends the candidates to the chat model on every request (extra latency and tokens).')}
+    ${toggle('rerank', !!(r && r.rerank), 'Rerank the candidates', 'Reorders the candidates on every request (extra latency, and tokens or rerank-API calls).')}
+    ${twoCol(field('rerank_backend', 'Rerank backend', select('rerank_backend', [{ value: 'llm', label: 'llm — the project chat model' }, { value: 'cohere', label: 'cohere — Cohere Rerank API' }, { value: 'voyage', label: 'voyage — Voyage Rerank API' }], r ? r.rerank_backend || 'llm' : 'llm')), field('rerank_connection_id', 'Rerank connection', select('rerank_connection_id', [{ value: 0, label: '— none (llm backend) —' }, ...connOpts(rerankModels())], r ? r.rerank_connection_id || 0 : 0), rerankModels().length ? 'Required by the cohere and voyage backends.' : 'Add a <code>cohere_rerank</code> or <code>voyage_rerank</code> connection under Models first.'))}
     ${twoCol(field('rerank_candidates', 'Rerank candidates', input('rerank_candidates', r ? r.rerank_candidates : 15, 'type=number min=1 max=100')), field('max_distance', 'Max distance (0 = off)', input('max_distance', r ? r.max_distance : 0, 'type=number min=0 max=2 step=0.01')))}
     ${twoCol(field('max_documents', 'Max documents (0 = ∞)', input('max_documents', r ? r.max_documents : 0, 'type=number min=0 step=1')), field('max_mb', 'Max size MB (0 = ∞)', input('max_mb', r && r.max_bytes ? Math.ceil(r.max_bytes / 1048576) : 0, 'type=number min=0 step=1')))}
     <p class="hint">Upload quotas for this store; an instance-wide ceiling (MAX_DOCUMENTS_PER_STORE / MAX_BYTES_PER_STORE_MB) may apply on top. Max distance drops passages whose cosine distance to the query exceeds it.</p>`,
-    onSubmit: async d => { const body = { name: d.name, embedding_connection_id: Number(d.embedding_connection_id || (r && r.embedding_connection_id)), chunk_size: Number(d.chunk_size), chunk_overlap: Number(d.chunk_overlap), top_k: Number(d.top_k), search_mode: d.search_mode, fts_config: d.fts_config,
-        contextual_chunks: d.contextual_chunks, rerank: d.rerank, rerank_candidates: Number(d.rerank_candidates) || 15, max_distance: Number(d.max_distance) || 0, max_documents: Number(d.max_documents) || 0, max_bytes: (Number(d.max_mb) || 0) * 1048576 };
+    onSubmit: async d => { const body = { name: d.name, embedding_connection_id: Number(d.embedding_connection_id || (r && r.embedding_connection_id)), chunk_size: Number(d.chunk_size), chunk_overlap: Number(d.chunk_overlap), top_k: Number(d.top_k), search_mode: d.search_mode, search_backend: d.search_backend, fts_config: d.fts_config,
+        contextual_chunks: d.contextual_chunks, rerank: d.rerank, rerank_backend: d.rerank_backend, rerank_connection_id: Number(d.rerank_connection_id) || null, rerank_candidates: Number(d.rerank_candidates) || 15, max_distance: Number(d.max_distance) || 0, max_documents: Number(d.max_documents) || 0, max_bytes: (Number(d.max_mb) || 0) * 1048576 };
       const res = r ? await api('/rag-stores/' + r.id, { method: 'PUT', body }) : await api('/rag-stores', { method: 'POST', body });
       toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3000, 'ok');
       if (!r && res && res.id) state.openStore = res.id; await loadAll(); render(); } });
@@ -873,6 +889,7 @@ async function renderStorePanel() {
   let docs = []; try { docs = await api(`/rag-stores/${r.id}/documents`); } catch (e) { toast(e.message, 5000, 'err'); }
   if (state.openStore !== r.id) return;
   const rt = panel.dataset.mode || r.search_mode || 'hybrid'; const rr = panel.dataset.rerank ? panel.dataset.rerank === '1' : !!r.rerank;
+  const rb = panel.dataset.backend || r.search_backend || 'pgvector';
   const hitsHtml = panel.dataset.hits || '';
   panel.innerHTML = `<div class="card stack" style="gap:14px">
       <div class="card-head m0"><div><h2>${esc(r.name)} · documents</h2><div class="hint">chunk ${r.chunk_size} / overlap ${r.chunk_overlap} · contextual chunks ${r.contextual_chunks ? 'on' : 'off'} · top-k ${r.top_k} · ${esc(retrievalSummary(r))}</div></div>
@@ -880,7 +897,7 @@ async function renderStorePanel() {
       ${w ? `<button type="button" class="drop" id="dropzone">${ICON.upload}<span class="dim">Drop PDF, DOCX, HTML, Markdown or text here, or click to choose</span></button>` : ''}
       <div class="tbl"><table><thead><tr><th>Document</th><th>Size</th><th>Chunks</th><th>Status</th><th>Added</th>${w ? '<th></th>' : ''}</tr></thead><tbody>
       ${docs.map(d => `<tr><td><div class="ellip" style="font-weight:500;max-width:340px">${esc(d.filename)}</div><div class="hint mono">${esc(d.mime || '')}${d.page_count ? ` · ${fmtN(d.page_count)} page${d.page_count === 1 ? '' : 's'}` : ''}</div>${d.error ? `<div class="hint ellip" style="max-width:340px" title="${esc(d.error)}">${esc(d.error)}</div>` : ''}</td><td class="mono nowrap">${fmtBytes(d.size_bytes)}</td><td class="mono">${d.chunk_count ? fmtN(d.chunk_count) : '—'}</td><td>${docStatus(d)}</td><td class="mono muted nowrap" title="${esc(fmtDate(d.created_at))}">${fmtDay(d.created_at)}</td>${w ? `<td class="right nowrap"><button class="btn sm ghost" data-re="${d.id}">Reprocess</button> <button class="btn sm ghost danger" data-del="${d.id}">Delete</button></td>` : ''}</tr>`).join('') || `<tr><td colspan="6" class="muted">No documents yet.${w ? ' Upload PDF, DOCX, HTML, TXT or Markdown files.' : ''}</td></tr>`}</tbody></table></div></div>
-    <div class="card stack" style="gap:12px"><div class="card-head m0"><h2>Test retrieval</h2><div class="row"><div class="tabs" role="tablist" aria-label="Search mode"><button class="tab" role="tab" data-mode="hybrid" aria-selected="${rt === 'hybrid'}">hybrid</button><button class="tab" role="tab" data-mode="vector" aria-selected="${rt === 'vector'}">vector</button></div><button class="tab" id="rerankToggle" aria-pressed="${rr}" style="border:1px solid var(--line)">rerank</button></div></div>
+    <div class="card stack" style="gap:12px"><div class="card-head m0"><h2>Test retrieval</h2><div class="row"><div class="tabs" role="tablist" aria-label="Search mode"><button class="tab" role="tab" data-mode="hybrid" aria-selected="${rt === 'hybrid'}">hybrid</button><button class="tab" role="tab" data-mode="vector" aria-selected="${rt === 'vector'}">vector</button></div><label for="backendSel" class="sr">Search backend</label>${select('backend', backendOpts(), rb, 'id=backendSel style="width:auto;padding:6px 10px"')}<button class="tab" id="rerankToggle" aria-pressed="${rr}" style="border:1px solid var(--line)">rerank</button></div></div>
       <form class="row" id="srch"><div class="search grow">${ICON.search}<label for="q" class="sr">Query</label><input id="q" class="input" name="q" placeholder="Ask something that should be in the documents…" autocomplete="off"></div><button class="btn primary">Search</button></form>
       <div id="hits">${hitsHtml}</div></div>`;
   const refresh = async () => { await loadAll(); if (state.tab === 'rag') { render(); } };
@@ -899,12 +916,13 @@ async function renderStorePanel() {
   }
   on(panel, '[data-mode]', 'click', b => { panel.dataset.mode = b.dataset.mode; $$('[data-mode]', panel).forEach(x => x.setAttribute('aria-selected', x === b)); });
   $('#rerankToggle').onclick = b => { const el = b.currentTarget; const v = el.getAttribute('aria-pressed') !== 'true'; el.setAttribute('aria-pressed', v); panel.dataset.rerank = v ? '1' : '0'; };
+  $('#backendSel').onchange = e => { panel.dataset.backend = e.target.value; };
   $('#srch').onsubmit = async e => { e.preventDefault(); const q = $('#q').value.trim(); if (!q) return; const hits = $('#hits'); hits.innerHTML = '<p class="hint">Searching…</p>';
-    try { const res = await api(`/rag-stores/${r.id}/search`, { method: 'POST', body: { query: q, mode: panel.dataset.mode || rt, rerank: panel.dataset.rerank ? panel.dataset.rerank === '1' : rr } });
+    try { const res = await api(`/rag-stores/${r.id}/search`, { method: 'POST', body: { query: q, mode: panel.dataset.mode || rt, backend: panel.dataset.backend || rb, rerank: panel.dataset.rerank ? panel.dataset.rerank === '1' : rr } });
       const maxS = Math.max(1e-9, ...res.hits.map(h => h.score)); const where = h => [h.section, h.page ? `p.${h.page}` : ''].filter(Boolean).join(' · ');
-      hits.innerHTML = `<div class="hint">${res.hits.length} hit${res.hits.length === 1 ? '' : 's'} in ${fmtN(res.latency_ms)} ms · ${esc(res.mode)}${res.retrieval_latency_ms != null ? ` · retrieval ${fmtN(res.retrieval_latency_ms)} ms` : ''}${res.reranked ? ` · rerank ${res.rerank_latency_ms != null ? fmtN(res.rerank_latency_ms) + ' ms' : 'on'}` : ''}</div>` +
+      hits.innerHTML = `<div class="hint">${res.hits.length} hit${res.hits.length === 1 ? '' : 's'} in ${fmtN(res.latency_ms)} ms · ${esc(res.mode)}${res.mode === 'vector' ? '' : ` · ${esc(res.backend || 'pgvector')}${res.backend === 'pg_search' ? ' (fts_config ignored)' : ''}`}${res.retrieval_latency_ms != null ? ` · retrieval ${fmtN(res.retrieval_latency_ms)} ms` : ''}${res.reranked ? ` · rerank ${esc(res.rerank_backend || 'llm')} ${res.rerank_latency_ms != null ? fmtN(res.rerank_latency_ms) + ' ms' : 'on'}` : res.rerank_fallback ? ` · rerank ${esc(res.rerank_backend || 'llm')} skipped` : ''}</div>` +
         res.hits.map((h, i) => `<div class="hit"><div class="n">[${i + 1}]</div><div><div class="row wrap" style="gap:8px;margin-bottom:4px"><span style="font-weight:500">${esc(h.filename)}</span>${where(h) ? `<span class="pill">${esc(where(h))}</span>` : ''}<span class="hint">chunk ${h.index}</span></div><pre>${esc(h.content)}</pre></div>
-          <div class="score"><div class="row between"><span>${res.mode === 'vector' ? 'score' : 'rrf'}</span><span style="color:var(--tx)">${Number(h.score).toFixed(4)}</span></div><div class="meter mint"><i style="width:${pct(h.score, maxS)}%"></i></div><div class="row between"><span>vec #${h.vector_rank || '—'} · fts #${h.fts_rank || '—'}</span><span>d ${Number(h.distance).toFixed(2)}</span></div></div></div>`).join('');
+          <div class="score"><div class="row between"><span>${res.mode === 'vector' ? 'score' : 'rrf'}</span><span style="color:var(--tx)">${Number(h.score).toFixed(4)}</span></div><div class="meter mint"><i style="width:${pct(h.score, maxS)}%"></i></div><div class="row between"><span>vec #${h.vector_rank || '—'} · fts #${h.fts_rank || '—'}${h.lex_score ? ` · bm25 ${Number(h.lex_score).toFixed(2)}` : ''}</span><span>d ${Number(h.distance).toFixed(2)}</span></div></div></div>`).join('');
       panel.dataset.hits = hits.innerHTML; }
     catch (err) { hits.innerHTML = `<p class="hint">Error: ${esc(err.message)}</p>`; } };
   clearTimeout(pollTimer);
@@ -935,7 +953,7 @@ function renderProjects() {
 function projectForm(p) {
   drawer({ eyebrow: p ? 'Edit' : 'New', title: 'Project', submitLabel: p ? 'Save project' : 'Create project', body: `
     ${field('name', 'Name', input('name', p ? p.name : '', 'required'))}
-    ${field('model_connection_id', 'Model connection', select('model_connection_id', state.models.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), p ? p.model_connection_id : undefined))}
+    ${field('model_connection_id', 'Model connection', select('model_connection_id', connOpts(chatModels()), p ? p.model_connection_id : undefined))}
     ${field('rag_store_id', 'RAG store (optional)', select('rag_store_id', [{ value: 0, label: '— none —' }, ...state.rag.map(r => ({ value: r.id, label: r.name }))], p ? p.rag_store_id || 0 : 0))}
     ${field('system_prompt', 'Project system prompt', textarea('system_prompt', p ? p.system_prompt : ''), 'Optional; prepended to every request.')}
     ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', p ? p.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', p ? p.rate_limit_tpm : 0, 'type=number min=0 step=1')))}

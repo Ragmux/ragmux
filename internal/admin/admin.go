@@ -124,6 +124,7 @@ func (a *Admin) authenticated(r chi.Router) {
 	r.Post("/api/me/password", a.changePassword)
 
 	read.Get("/api/provider-types", a.providerTypes)
+	read.Get("/api/search-backends", a.searchBackends)
 
 	// Model connections: viewers may read, editors mutate and test (a
 	// test spends provider quota and is audited as a write).
@@ -518,6 +519,8 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", true},
 		{"ollama", "Ollama", "http://localhost:11434", false},
 		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", false},
+		{"cohere_rerank", "Cohere Rerank (reranking only)", "https://api.cohere.com", true},
+		{"voyage_rerank", "Voyage Rerank (reranking only)", "https://api.voyageai.com", true},
 	}
 	out := make([]pt, 0, len(types))
 	for _, t := range types {
@@ -525,6 +528,23 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 		out = append(out, pt{Type: t.typ, Label: t.label, DefaultURL: t.url,
 			Embeddings: caps.Embeddings, NeedsKey: t.needsKey,
 			Tools: caps.Tools, Streaming: caps.Streaming, Capabilities: caps})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// searchBackends reports which lexical search backends this server can run,
+// so the dashboard can disable what a save would reject instead of offering
+// it and failing on submit.
+func (a *Admin) searchBackends(w http.ResponseWriter, r *http.Request) {
+	type backend struct {
+		ID        string `json:"id"`
+		Available bool   `json:"available"`
+		Reason    string `json:"reason"`
+	}
+	out := make([]backend, 0, len(store.SearchBackendNames))
+	for _, id := range store.SearchBackendNames {
+		out = append(out, backend{ID: id, Available: a.Store.SearchBackendAvailable(id),
+			Reason: a.Store.SearchBackendReason(id)})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -823,9 +843,12 @@ type ragInput struct {
 	ChunkOverlap          int      `json:"chunk_overlap"`
 	TopK                  int      `json:"top_k"`
 	SearchMode            string   `json:"search_mode"`
+	SearchBackend         string   `json:"search_backend"`
 	FTSConfig             string   `json:"fts_config"`
 	Rerank                bool     `json:"rerank"`
 	RerankCandidates      int      `json:"rerank_candidates"`
+	RerankBackend         string   `json:"rerank_backend"`
+	RerankConnectionID    *int64   `json:"rerank_connection_id"`
 	MaxDistance           *float64 `json:"max_distance"`
 	// ContextualChunks defaults to true when omitted.
 	ContextualChunks *bool `json:"contextual_chunks"`
@@ -859,6 +882,19 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	if in.SearchMode != store.SearchVector && in.SearchMode != store.SearchHybrid {
 		return errors.New("search_mode must be \"vector\" or \"hybrid\"")
 	}
+	if in.SearchBackend == "" {
+		in.SearchBackend = store.BackendPgvector
+	}
+	if !store.IsValidSearchBackend(in.SearchBackend) {
+		return fmt.Errorf("search_backend must be one of %s", strings.Join(store.SearchBackendNames, ", "))
+	}
+	// Rejected on write, tolerated on read: a store saved here can always
+	// run, while a row that arrived another way (a dump restored onto a
+	// plain PostgreSQL) degrades to pgvector instead of failing searches.
+	if !a.Store.SearchBackendAvailable(in.SearchBackend) {
+		return fmt.Errorf("search_backend %q cannot be used here: %s (see docs/rag.md#search-backends)",
+			in.SearchBackend, a.Store.SearchBackendReason(in.SearchBackend))
+	}
 	in.FTSConfig = strings.ToLower(strings.TrimSpace(in.FTSConfig))
 	if in.FTSConfig == "" {
 		in.FTSConfig = "simple"
@@ -873,6 +909,9 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	}
 	if in.RerankCandidates > 100 {
 		return errors.New("rerank_candidates must be between 1 and 100")
+	}
+	if err := a.validateRerank(r, in); err != nil {
+		return err
 	}
 	if in.MaxDistance == nil {
 		in.MaxDistance = new(float64)
@@ -900,10 +939,43 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	return nil
 }
 
+// validateRerank checks the rerank backend and the connection it needs.
+//
+// The pairing is enforced here rather than by a CHECK constraint: the column
+// is ON DELETE SET NULL so deleting a rerank connection does not cascade
+// into the store, and a CHECK would turn that SET NULL into a foreign-key
+// failure on the operator's DELETE. See migration 0012.
+func (a *Admin) validateRerank(r *http.Request, in *ragInput) error {
+	if in.RerankBackend == "" {
+		in.RerankBackend = store.RerankLLM
+	}
+	if !store.IsValidRerankBackend(in.RerankBackend) {
+		return fmt.Errorf("rerank_backend must be one of %s", strings.Join(store.RerankBackends, ", "))
+	}
+	want := store.RerankConnectionType(in.RerankBackend)
+	if want == "" {
+		in.RerankConnectionID = nil
+		return nil
+	}
+	if in.RerankConnectionID == nil || *in.RerankConnectionID == 0 {
+		return fmt.Errorf("rerank_backend %q needs a rerank_connection_id pointing at a %s connection", in.RerankBackend, want)
+	}
+	conn, err := a.Store.GetConnection(r.Context(), *in.RerankConnectionID)
+	if err != nil {
+		return errors.New("rerank_connection_id does not reference an existing model connection")
+	}
+	if conn.ProviderType != want {
+		return fmt.Errorf("cannot use connection %q for reranking: it is a %s connection", conn.Name, conn.ProviderType)
+	}
+	return nil
+}
+
 func (in *ragInput) toStore(id int64) *store.RAGStore {
 	return &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
 		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK,
-		SearchMode: in.SearchMode, FTSConfig: in.FTSConfig, Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
+		SearchMode: in.SearchMode, SearchBackend: in.SearchBackend, FTSConfig: in.FTSConfig,
+		Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
+		RerankBackend: in.RerankBackend, RerankConnectionID: in.RerankConnectionID,
 		MaxDistance: *in.MaxDistance, ContextualChunks: *in.ContextualChunks,
 		MaxDocuments: in.MaxDocuments, MaxBytes: in.MaxBytes}
 }
@@ -1026,6 +1098,11 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	}
 	// Chunking and embedding-text settings only take effect when documents
 	// are processed again; tell the caller when that is worth doing.
+	//
+	// search_backend is deliberately absent: both backends derive the
+	// lexical side from chunks.content, so switching costs an index build
+	// at most, never a re-embed. Listing it here would send operators
+	// through hours of embedding calls for nothing.
 	reprocess := rs.ChunkCount > 0 && (before.ChunkSize != rs.ChunkSize || before.ChunkOverlap != rs.ChunkOverlap ||
 		before.ContextualChunks != rs.ContextualChunks)
 	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess})
@@ -1086,11 +1163,14 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 	}
 	// Overrides let the dashboard try settings before saving them.
 	var in struct {
-		Query       string   `json:"query"`
-		TopK        int      `json:"top_k"`
-		Mode        string   `json:"mode"`
-		Rerank      *bool    `json:"rerank"`
-		MaxDistance *float64 `json:"max_distance"`
+		Query              string   `json:"query"`
+		TopK               int      `json:"top_k"`
+		Mode               string   `json:"mode"`
+		Backend            string   `json:"backend"`
+		Rerank             *bool    `json:"rerank"`
+		RerankBackend      string   `json:"rerank_backend"`
+		RerankConnectionID *int64   `json:"rerank_connection_id"`
+		MaxDistance        *float64 `json:"max_distance"`
 	}
 	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Query) == "" {
 		writeErr(w, http.StatusBadRequest, "query is required")
@@ -1103,8 +1183,32 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		}
 		rs.SearchMode = in.Mode
 	}
+	// The overrides cover every retrieval setting the store carries so two
+	// configurations can be compared on the same query before either is
+	// saved; that comparison is what makes these settings usable at all.
+	if in.Backend != "" {
+		if !store.IsValidSearchBackend(in.Backend) {
+			writeErr(w, http.StatusBadRequest, "backend must be one of "+strings.Join(store.SearchBackendNames, ", "))
+			return
+		}
+		rs.SearchBackend = in.Backend
+	}
 	if in.Rerank != nil {
 		rs.Rerank = *in.Rerank
+	}
+	if in.RerankBackend != "" {
+		if !store.IsValidRerankBackend(in.RerankBackend) {
+			writeErr(w, http.StatusBadRequest, "rerank_backend must be one of "+strings.Join(store.RerankBackends, ", "))
+			return
+		}
+		rs.RerankBackend = in.RerankBackend
+	}
+	if in.RerankConnectionID != nil {
+		if *in.RerankConnectionID == 0 {
+			rs.RerankConnectionID = nil
+		} else {
+			rs.RerankConnectionID = in.RerankConnectionID
+		}
 	}
 	// top_k is clamped to the store's own bounds; 0 means "use the store's
 	// top_k", which validateRAG already keeps within 1..50.
@@ -1121,11 +1225,12 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		}
 		rs.MaxDistance = *in.MaxDistance
 	}
-	// Reranking uses the chat model of a project linked to this store; the
-	// embedding connection cannot chat.
+	// The llm rerank backend uses the chat model of a project linked to this
+	// store; the embedding connection cannot chat. The API backends carry
+	// their own connection and need none of this.
 	var prov provider.Provider
 	model := ""
-	if rs.Rerank {
+	if rs.Rerank && rs.RerankBackend != store.RerankCohere && rs.RerankBackend != store.RerankVoyage {
 		if conn, err := a.rerankConnection(r, rs.ID); err == nil {
 			if p, err := a.Providers(conn); err == nil {
 				prov, model = p, conn.ModelName
@@ -1138,8 +1243,13 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "reranked": res.Reranked,
-		"latency_ms": time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
+	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "backend": res.Backend,
+		// fts_config is echoed because the pg_search backend ignores it: the
+		// index is global and tokenised once, so the setting is inert there.
+		// Returning it makes that visible instead of surprising.
+		"fts_config": rs.FTSConfig, "reranked": res.Reranked, "rerank_backend": res.RerankBackend,
+		"rerank_fallback": res.RerankFallback,
+		"latency_ms":      time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
 		"rerank_latency_ms": res.RerankLatencyMS})
 }
 
@@ -1348,8 +1458,15 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	if strings.TrimSpace(in.Name) == "" {
 		return errors.New("name is required")
 	}
-	if _, err := a.Store.GetConnection(r.Context(), in.ModelConnectionID); err != nil {
+	conn, err := a.Store.GetConnection(r.Context(), in.ModelConnectionID)
+	if err != nil {
 		return errors.New("model_connection_id does not reference an existing model connection")
+	}
+	// Rerank-only connection types exist since 0.4 and cannot chat. Caught
+	// here so the mistake is a 400 when the project is saved rather than a
+	// 502 on the first request that uses it.
+	if !provider.SupportsChat(conn.ProviderType) {
+		return fmt.Errorf("provider %q cannot be used for chat", conn.ProviderType)
 	}
 	if in.RAGStoreID != nil {
 		if *in.RAGStoreID == 0 {
