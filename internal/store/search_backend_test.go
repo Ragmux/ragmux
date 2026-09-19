@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/ragmux/ragmux/internal/bm25"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/testdb"
 )
@@ -207,7 +208,7 @@ func TestPgSearchHybridSearch(t *testing.T) {
 // pg_search does support, and a code that is merely absent fails exactly the
 // way "en_stem" did.
 func TestPgSearchStemmingTokenizerAnswersWithBM25(t *testing.T) {
-	for _, code := range store.PgSearchStemmerCodes() {
+	for _, code := range bm25.StemmerCodes() {
 		t.Run(code, func(t *testing.T) {
 			ctx := context.Background()
 			cfg := testdb.Config(t)

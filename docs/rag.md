@@ -141,7 +141,7 @@ the fusion and every field of a hit are the same either way.
 | Query parsing | `websearch_to_tsquery(fts_config, …)`, words OR-ed | `paradedb.match`, which tokenises and OR-s the terms itself |
 | `fts_config` | used | **ignored** |
 | Requirement | none | the `pg_search` extension |
-| `lex_score` on a hit | `0` | the raw BM25 score |
+| `lex_score` on a hit | **absent** from the JSON | the raw BM25 score |
 
 `ts_rank_cd` is a term-density score, not BM25: it has no document-length normalisation
 and no inverse document frequency, so a long chunk that happens to repeat a word can
@@ -169,7 +169,7 @@ ar cs da de el en es fi fr hu it nl no pl pt ro ru sv ta tr
 which is the set of Snowball stemmers `pg_search` 0.25.9 accepted when each was tried
 against a live server. Other `pg_search` builds may know more or fewer; a code this build
 does not carry is **refused at startup** rather than left to fail on every search, so a
-version that adds one needs the table in `internal/store/search_pgsearch.go` extended.
+version that adds one needs the table in `internal/bm25/analyser.go` extended.
 Stemming makes the lexical leg match `ranking` for a query of `rank`, at the cost of
 matching words the pgvector path would not, so the two backends stop being word-for-word
 comparable.
@@ -212,7 +212,8 @@ if no store wants it any more).
 That intermediate query is **degraded, not failed**. It returns hits and the response
 names `pgvector` as the backend that ran, but its lexical half is `ts_rank_cd` over
 `chunks.tsv` rather than BM25, so the ranking is the one that store would have had on the
-`pgvector` backend all along and `lex_score` comes back `0` — the pgvector path does not
+`pgvector` backend all along and `lex_score` is **absent from the hit** (the field is
+`omitempty`, so a client testing `hit.lex_score === 0` reads `undefined`) — the pgvector path does not
 expose a lexical score, because `ts_rank_cd` is not comparable with BM25. Expect one such
 search whenever the index is dropped, including when it is dropped only to change
 `PG_SEARCH_TOKENIZER`.

@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ragmux/ragmux/internal/bm25"
 )
 
 // pgSearchBackend answers the lexical half with ParadeDB's BM25 index. The
@@ -58,83 +59,6 @@ func (s *Store) pgSearchTokenizer() string {
 	return s.pgSearchTok
 }
 
-// pgSearchStemmers maps the "<iso639-1>_stem" analyser names -- the spelling
-// ParadeDB used for stemming tokenizers, and the one this project has always
-// documented -- onto the shape pg_search accepts today: the "default"
-// tokenizer carrying a Snowball "stemmer" field.
-//
-// pg_search dropped the "en_stem" tokenizer *type* somewhere before 0.25 and
-// rejects it outright ("unknown tokenizer type: en_stem"), which made the one
-// stemming value the documentation named turn every pg_search store into a
-// permanent pgvector fallback. Translating here keeps the documented setting
-// working and keeps the language name out of operator hands: only the ISO
-// code is matched, and the interpolated Snowball name comes from this table,
-// never from the environment.
-//
-// The twenty languages are the ones pg_search 0.25.9 accepted when each was
-// tried against a live server on 2026-09-19. A language pg_search has no
-// Snowball stemmer for (Catalan, Hindi, Indonesian, Serbian, Ukrainian, ...)
-// has no entry rather than a nearby substitute, and ValidatePgSearchTokenizer
-// turns the missing entry into a startup error.
-var pgSearchStemmers = map[string]string{
-	"ar": "Arabic", "cs": "Czech", "da": "Danish", "de": "German",
-	"el": "Greek", "en": "English", "es": "Spanish", "fi": "Finnish",
-	"fr": "French", "hu": "Hungarian", "it": "Italian", "nl": "Dutch",
-	"no": "Norwegian", "pl": "Polish", "pt": "Portuguese", "ro": "Romanian",
-	"ru": "Russian", "sv": "Swedish", "ta": "Tamil", "tr": "Turkish",
-}
-
-// PgSearchStemmerCodes lists the "<code>_stem" analysers this build supports,
-// sorted, for error messages and documentation.
-func PgSearchStemmerCodes() []string {
-	codes := make([]string, 0, len(pgSearchStemmers))
-	for code := range pgSearchStemmers {
-		codes = append(codes, code)
-	}
-	sort.Strings(codes)
-	return codes
-}
-
-// ValidatePgSearchTokenizer rejects a PG_SEARCH_TOKENIZER that names a
-// stemming analyser this build cannot translate.
-//
-// Only "<code>_stem" names are checked. Everything else is a tokenizer type,
-// and the set of those is pg_search's to define -- a wrong one still costs a
-// warning and a fallback on first search. A stemmer code is different: the
-// language has to come from the table above, so an unknown one can never do
-// anything but fail, and failing at startup beats failing invisibly on every
-// search for the life of the process.
-func ValidatePgSearchTokenizer(tok string) error {
-	code, ok := strings.CutSuffix(tok, "_stem")
-	if !ok {
-		return nil
-	}
-	if _, known := pgSearchStemmers[code]; known {
-		return nil
-	}
-	return fmt.Errorf("pg_search has no stemmer for %q: supported stemming analysers are %s",
-		tok, strings.Join(PgSearchStemmerCodes(), "_stem, ")+"_stem")
-}
-
-// bm25TokenizerJSON renders the configured analyser as the JSON object
-// pg_search expects inside text_fields.
-//
-// Anything that is not a recognised "<iso>_stem" name is passed through as a
-// tokenizer type unchanged: config.Load has already bounded it to
-// [a-z][a-z0-9_]* so it cannot break out of the literal, an unknown *stemmer*
-// was refused at startup by ValidatePgSearchTokenizer, and an unknown type is
-// rejected by pg_search at index build, where the caller turns it into the
-// usual "could not be prepared" warning and falls back to pgvector.
-func (s *Store) bm25TokenizerJSON() string {
-	tok := s.pgSearchTokenizer()
-	if code, ok := strings.CutSuffix(tok, "_stem"); ok {
-		if lang, known := pgSearchStemmers[code]; known {
-			return fmt.Sprintf(`{"type":"default","stemmer":%q}`, lang)
-		}
-	}
-	return fmt.Sprintf(`{"type":%q}`, tok)
-}
-
 // bm25IndexDDL builds the CREATE INDEX statement for the global BM25 index.
 //
 // One global index, not one partial index per store. A per-store partial
@@ -148,7 +72,7 @@ func (s *Store) bm25IndexDDL() string {
 USING bm25 (id, content, rag_store_id, document_id)
 WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":%s,"record":"position"}}',
       numeric_fields = '{"rag_store_id":{"fast":true},"document_id":{"fast":true}}')`,
-		bm25Index, s.bm25TokenizerJSON())
+		bm25Index, bm25.TokenizerJSON(s.pgSearchTokenizer()))
 }
 
 // bm25BuildLockWait bounds how long a search waits for another replica's
@@ -306,10 +230,7 @@ func bm25IndexTokenizer(ctx context.Context, tx pgx.Tx) (string, error) {
 //
 // The name returned is the one an operator writes in PG_SEARCH_TOKENIZER,
 // not the one in the JSON, because the caller compares it against exactly
-// that. They differ for stemming: "en_stem" is stored as the "default"
-// tokenizer carrying "stemmer":"English" (see pgSearchStemmers), so reading
-// the type alone would report every stemming index as drifted from the
-// setting that built it.
+// that; bm25.TokenizerName does that translation.
 //
 // An empty result means "could not tell", never "no tokenizer": the value
 // only ever reaches a log line, so a reloptions shape a future ParadeDB
@@ -323,24 +244,16 @@ func tokenizerFromReloptions(opts []string) string {
 			continue
 		}
 		var fields map[string]struct {
-			Tokenizer struct {
-				Type    string `json:"type"`
-				Stemmer string `json:"stemmer"`
-			} `json:"tokenizer"`
+			Tokenizer json.RawMessage `json:"tokenizer"`
 		}
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(o, prefix)), &fields); err != nil {
 			return ""
 		}
-		tok := fields["content"].Tokenizer
-		if tok.Stemmer == "" {
-			return tok.Type
+		raw := fields["content"].Tokenizer
+		if len(raw) == 0 {
+			return ""
 		}
-		for code, lang := range pgSearchStemmers {
-			if lang == tok.Stemmer {
-				return code + "_stem"
-			}
-		}
-		return ""
+		return bm25.TokenizerName(raw)
 	}
 	return ""
 }

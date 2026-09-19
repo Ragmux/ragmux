@@ -83,8 +83,7 @@ All notable changes to Ragmux are documented here. The format follows
   every row in `chunks`, inside that HTTP request. The build takes a `SHARE` lock, so
   ingest writes to `chunks` block until it finishes, and it is not `CONCURRENTLY`: if the
   client gives up, the build is rolled back and the next request starts over. On a large
-  corpus that is minutes. Build it ahead of the upgrade instead, without blocking writes —
-  the statement must match what the gateway would create, or it will be treated as drift:
+  corpus that is minutes. Build it ahead of the upgrade instead, without blocking writes:
 
   ```sql
   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_bm25 ON chunks
@@ -96,6 +95,22 @@ All notable changes to Ragmux are documented here. The format follows
   Substitute the Snowball language for the code you run (`cs` → `Czech`, `tr` → `Turkish`,
   …), or `{"type":"default"}` with no `stemmer` for the default analyser. Installations on
   the default tokenizer already have the index and are unaffected.
+
+  `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so send it on its own
+  — not through `psql -1`, and not from a migration tool that wraps each step in one.
+
+  **Copy the statement exactly.** The gateway only ever checks the analyser: it compares
+  `text_fields.content.tokenizer` against `PG_SEARCH_TOKENIZER` and warns when they differ.
+  Nothing compares `key_field` or `numeric_fields`, so an index built here without
+  `numeric_fields` is accepted in silence, answers queries, and keeps `rag_store_id` off
+  the fast-field path for good — `CREATE INDEX IF NOT EXISTS` will never replace it. The
+  check is deliberately that narrow: it exists to explain a setting that looks applied and
+  is not, and comparing whole reloptions would warn on cosmetic JSON differences a future
+  ParadeDB might render. Verify instead, and drop and rebuild if it does not match:
+
+  ```sql
+  SELECT unnest(reloptions) FROM pg_class WHERE relname = 'idx_chunks_bm25';
+  ```
 - **A dump from a ParadeDB server needs a TOC filter to restore onto a plain pgvector
   one.** Dropping `idx_chunks_bm25` first is not enough; see
   [Backup and restore](docs/backup-restore.md#restoring-a-paradedb-dump-onto-a-plain-pgvector-server).

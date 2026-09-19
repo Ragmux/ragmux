@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ragmux/ragmux/internal/store"
+	"github.com/ragmux/ragmux/internal/bm25"
 )
 
 // Config holds every tunable the gateway reads at startup.
@@ -240,7 +240,7 @@ func Load() (Config, error) {
 		// Caught here it is a startup error; left alone it would be a warning
 		// on every search and a store silently stuck on the pgvector
 		// fallback for the life of the process.
-		if err := store.ValidatePgSearchTokenizer(v); err != nil {
+		if err := bm25.ValidateTokenizer(v); err != nil {
 			return c, fmt.Errorf("invalid PG_SEARCH_TOKENIZER: %w", err)
 		}
 		c.PgSearchTokenizer = v
