@@ -46,14 +46,15 @@ const (
 // nowhere near this file. Handing out a fresh slice each time costs one tiny
 // allocation on a path that already talks to the database.
 
-// DefaultGatewayScopes is what a gateway key gets when none are given.
-func DefaultGatewayScopes() []string { return []string{ScopeChat, ScopeModels} }
-
-// GatewayScopes and ManagementScopes list the valid scopes per kind.
+// GatewayScopes lists the scopes a gateway key may carry.
 func GatewayScopes() []string { return []string{ScopeChat, ScopeModels} }
 
 // ManagementScopes lists the scopes a management key may carry.
 func ManagementScopes() []string { return []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeKeys} }
+
+// DefaultGatewayScopes is what a gateway key gets when none are given: every
+// scope a gateway key can hold, since there are only the two.
+func DefaultGatewayScopes() []string { return GatewayScopes() }
 
 // ValidScopes returns the scopes a key of this kind may carry.
 func ValidScopes(kind string) []string {

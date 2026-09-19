@@ -57,6 +57,14 @@ All notable changes to Ragmux are documented here. The format follows
   chunk could break. **If you read token counts off a stream, set `include_usage`**; the
   request log, budgets and cost estimate are unaffected either way, because the gateway
   still asks its upstream for the counts.
+- **`METRICS_ENABLED` rejects values that are neither `true` nor `false`.** It was
+  compared against `"true"` and everything else silently meant off, so `METRICS_ENABLED=1`
+  or `=yes` started a gateway whose `/metrics` answered `404` and was discovered from a
+  scrape target that never came up. `TRACING_ENABLED` already refused what it did not
+  understand; metrics now match it. **Upgrade note:** an installation setting anything but
+  `true`, `false` or nothing will fail to start until the value is corrected — the error
+  names the variable and the two values it accepts. Metrics were already off in every such
+  installation, so fixing the value is a no-op unless `true` was what was meant.
 
 ### Fixed
 - A document whose file type is unsupported no longer quotes the rejected extension into
@@ -114,6 +122,17 @@ All notable changes to Ragmux are documented here. The format follows
 - **A dump from a ParadeDB server needs a TOC filter to restore onto a plain pgvector
   one.** Dropping `idx_chunks_bm25` first is not enough; see
   [Backup and restore](docs/backup-restore.md#restoring-a-paradedb-dump-onto-a-plain-pgvector-server).
+
+### Security
+- `GET /admin/api/setup` stops describing the installation once setup is done. The
+  endpoint is unauthenticated by design, and it used to answer in full whether or not
+  setup was still pending, handing an anonymous request the migrations version, the
+  PostgreSQL role, where `SECRET_KEY` came from and — since the wizard landed —
+  `has_connections` and `has_projects`. No one field is an opening; together they are a
+  free reconnaissance call on an internet-facing install. **Once any user exists the
+  response is `{"needs_setup": false}` and nothing else.** While setup is still pending
+  nothing changes: the wizard's first screen gets everything it shows. The dashboard now
+  resumes a reloaded wizard from its own stored step instead of from this endpoint.
 
 ## [0.4.0] — 2026-09-19
 
