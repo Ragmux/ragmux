@@ -54,50 +54,98 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 
 ## Quick start
 
+Nothing to clone — one container with the gateway and its own PostgreSQL 17 + pgvector
+server inside:
+
 ```bash
-docker compose up -d
+docker run -d --name ragmux \
+  -p 127.0.0.1:8765:8765 \
+  -e SECRET_KEY="$(openssl rand -hex 32)" \
+  -v ragmux-data:/data \
+  ragmux/ragmux:latest
 ```
 
-That starts one container with the gateway and its own PostgreSQL 17 + pgvector server
-(`ghcr.io/ragmux/ragmux`, built from `Dockerfile.aio`; state lives in the `ragmux-data`
-volume). Open <http://localhost:8765/admin/> (the port is published on loopback only;
-put a TLS-terminating reverse proxy in front for network access, see
-[Configuration](docs/configuration.md#behind-a-reverse-proxy)). On a fresh database the
-dashboard asks you to **create the first administrator** (username and a password of at
-least 12 characters); that form only works while no user exists. For unattended installs
-set `ADMIN_USER` / `ADMIN_PASSWORD` in `.env` instead and the account is created on
-first start (see [Configuration](docs/configuration.md#environment-variables)).
+Open <http://localhost:8765/admin/>. On a fresh database the dashboard asks you to
+**create the first administrator** (username and a password of at least 12 characters);
+that form only works while no user exists. For unattended installs pass
+`-e ADMIN_USER=admin -e ADMIN_PASSWORD=...` instead and the account is created on first
+start (see [Configuration](docs/configuration.md#environment-variables)).
 
-Nothing in `.env` is required, but set `SECRET_KEY` before you add a provider: it
-encrypts the provider credentials, and without it the gateway generates a key file
-inside the volume that you then have to back up together with the database.
+Two things worth knowing about that command:
+
+- **`SECRET_KEY` encrypts the provider credentials.** Nothing is required to start, but
+  without it the gateway generates `/data/ragmux/secret.key` inside the volume, which you
+  then have to back up together with the database. Keep the key with your backups.
+- **The port is published on loopback only.** Put a TLS-terminating reverse proxy in
+  front for network access and set `TRUST_PROXY_HEADERS` / `SECURE_COOKIES`; see
+  [Configuration](docs/configuration.md#behind-a-reverse-proxy). Change the mapping to
+  `-p 8765:8765` only deliberately.
+
+Everything persistent is under `/data`: `/data/pg` is the PostgreSQL cluster (`PGDATA`)
+and `/data/ragmux` holds the `secret.key` fallback (`DATA_DIR`). That volume plus
+`SECRET_KEY` is the whole state. The embedded PostgreSQL has no TCP listener at all, so
+`8765` is the only port.
+
+Running models locally? Provider URLs on private networks (Ollama on the Docker host, a
+vLLM service on the same Docker network) are refused by default as an SSRF guard. Allow
+them by hostname before you add the connection — add
+`-e PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama` to the command above, or put
+the same variable in `.env` under Compose (or `ALLOW_PRIVATE_UPSTREAMS=true` on a trusted
+network — see [Configuration](docs/configuration.md#private-upstreams)).
+
+### Which image
+
+Three variants are published from every release:
+
+| Tag | What it is | Choose it when |
+|---|---|---|
+| `ragmux/ragmux:latest` | **All-in-one:** the gateway plus its own PostgreSQL 17 + pgvector in one container, supervised by a single entrypoint (`Dockerfile.aio`). | You want one container and no database to operate. The default, and the right answer for most installations. |
+| `ragmux/ragmux:latest-app` | **Gateway only**, on a distroless base, with no database inside; you point it at your own PostgreSQL with `DATABASE_URL` (`Dockerfile`). | You already run PostgreSQL (managed service, your own cluster, a separate container), or you want **several gateway replicas** against one database — the all-in-one image cannot be scaled that way. |
+| `ragmux/ragmux:latest-paradedb` | **All-in-one on ParadeDB:** same gateway and same data layout, but its PostgreSQL carries `pg_search` (BM25) as well as `pgvector` (`Dockerfile.aio.paradedb`). | You want the lexical half of hybrid retrieval answered by **BM25** instead of PostgreSQL full-text ranking. Swapping from the default all-in-one image needs no reprocessing. |
+
+The `-paradedb` image takes exactly the same command and the same volume layout as the
+default one. Images are published to **Docker Hub** (`ragmux/ragmux`) and, with identical
+tags, to the GitHub Container Registry as `ghcr.io/ragmux/ragmux` — either registry
+serves the same builds.
+
+**`latest` is for trying it out; pin a version in production.** The commands here use
+`latest` so they keep working as you read them, but a deployment you care about should
+name the release it was tested against (`ragmux/ragmux:<version>`), or better the
+manifest digest that `cosign verify` reports (`ragmux/ragmux@sha256:…`), which no later
+tag move can change. Images are signed from v0.3.1 onward; see
+[Verifying the container image](SECURITY.md#verifying-the-container-image).
+
+### Docker Compose
+
+Compose is the second way in, and the better one once you want more than the single
+container gives you: **your own PostgreSQL**, the **split layout** (the gateway next to a
+`pgvector/pgvector:pg17` service you can back up and upgrade on its own schedule), the
+**ParadeDB** variant, a **multi-replica** setup behind a load balancer, or the scheduled
+**backup** profile and the `scripts/` helpers. It works from a clone of the repository:
 
 ```bash
+git clone https://github.com/Ragmux/ragmux.git
+cd ragmux
 cp .env.example .env
 echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env   # keep it with your backups
 docker compose up -d
 ```
 
-Running models locally? Provider URLs on private networks (Ollama on the Docker host,
-a vLLM service in the same Compose network) are refused by default as an SSRF guard;
-allow them by hostname in `.env` before adding the connection:
+That is the same all-in-one image and the same `/data` volume as the `docker run` above,
+with `.env` as the one place configuration lives. The other files layer on top:
 
-```bash
-echo "PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama" >> .env
-```
+| File | What it runs |
+|---|---|
+| [`docker-compose.yml`](docker-compose.yml) | the default all-in-one container, plus a `backup` profile |
+| [`docker-compose.split.yml`](docker-compose.split.yml) | the gateway (`-app`) next to its own `pgvector/pgvector:pg17`; needs `SECRET_KEY`, `POSTGRES_PASSWORD` and `RAGMUX_DB_PASSWORD` in `.env` |
+| [`docker-compose.paradedb.yml`](docker-compose.paradedb.yml) | the split layout with ParadeDB in place of pgvector, for BM25 lexical retrieval |
+| [`docker-compose.scale.yml`](docker-compose.scale.yml) | an overlay on the split file: several gateway replicas behind nginx — see [Scaling](docs/scaling.md) |
+| [`docker-compose.otel.yml`](docker-compose.otel.yml) | an overlay adding an OpenTelemetry Collector — see [Observability](docs/observability.md) |
 
-(or `ALLOW_PRIVATE_UPSTREAMS=true` on a trusted network — see
-[Configuration](docs/configuration.md#private-upstreams)).
-
-**Separate or external database.** `docker-compose.split.yml` runs the gateway alone
-next to a `pgvector/pgvector:pg17` service (it needs `SECRET_KEY`, `POSTGRES_PASSWORD`
-and `RAGMUX_DB_PASSWORD` in `.env`):
-`docker compose -f docker-compose.split.yml up -d`. For your own PostgreSQL set
-`DATABASE_URL` and the default container skips its embedded server, or run the
-gateway-only distroless image `ghcr.io/ragmux/ragmux:latest-app` (`<version>-app`) with
-`DATABASE_URL` and `SECRET_KEY`. The two layouts, the `/data` volume and how to move
-between them are described in
-[Deployment layouts](docs/configuration.md#deployment-layouts).
+For a PostgreSQL you already operate, set `DATABASE_URL` and the default container skips
+its embedded server, or run the gateway-only `-app` image with `DATABASE_URL` and
+`SECRET_KEY`. The two layouts, the `/data` volume and how to move between them are
+described in [Deployment layouts](docs/configuration.md#deployment-layouts).
 
 **Where state lives.** With the default layout everything is in the `ragmux-data`
 volume (`/data/pg`: the database, `/data/ragmux`: the `secret.key` fallback) plus
