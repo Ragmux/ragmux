@@ -264,6 +264,17 @@ All notable changes to Ragmux are documented here. The format follows
   poll, on every replica, so there is nothing left to resume at start.
 
 ### Fixed
+- **Steps 2 and 3 of the first-run wizard did nothing when clicked.** The card template
+  rendered its primary button without a `type` attribute, so the `button[type=submit]`
+  lookup in both submit handlers — the attribute selector needs the attribute present,
+  not merely implied — found nothing and the handler threw on it before sending the
+  request. The drawer and modal helpers set the attribute, which is why the identical
+  pattern worked everywhere else and this stayed invisible. Every form the dashboard
+  renders now carries an explicit `type="submit"`, and a test walks the page asserting
+  that and that no `$('#id')` lookup names an id nothing sets.
+- Step 3 of the wizard no longer offers a project form it cannot submit: if the model
+  connections could not be loaded, the picker would be empty and the form would post a
+  null connection id. It now says so and offers a retry.
 - Ollama tool calls spread over several streaming lines were all given index `0` and
   merged by clients into one corrupt call; they are now numbered across the whole stream.
 - Browser clients could not read `x-ratelimit-*`, `x-ragmux-*` or `Retry-After`: the
