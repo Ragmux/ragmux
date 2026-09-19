@@ -245,11 +245,13 @@ Kept: `type`, `description`, `enum`, `items`, `properties`, `required`, `nullabl
 `float`/`double`/`int32`/`int64` on numbers.
 
 Kept means kept as the type Gemini's `Schema` declares, not kept as written: `description`
-and `pattern` must be strings, `nullable` a boolean, the bounds numbers, and `enum` an
+and `pattern` must be strings, `nullable` a boolean, `minimum`/`maximum` doubles,
+`minItems`/`maxItems`/`minLength`/`maxLength` **non-negative whole numbers** (they are
+`int64` there, so `{"minItems":1.5}` and `{"maxLength":1e30}` are dropped), and `enum` an
 array of strings, because `Schema.enum` is `repeated string`. A value of any other shape
 is dropped like an unknown keyword — `{"type":"integer","enum":[1,2,3]}` loses its `enum`,
-and so does an `enum` on a node that is not a string, rather than travelling to Gemini as
-something it rejects.
+and so does an `enum` on a node that is not a string, or on an `anyOf` node, rather than
+travelling to Gemini as something it rejects.
 
 Rewritten:
 

@@ -8,9 +8,9 @@ All notable changes to Ragmux are documented here. The format follows
 
 ### Added
 - **`IMAGE_FETCH_MAX_CONCURRENT`** (default `16`): image fetches the process runs at once,
-  and the image transport's per-host connection ceiling.
-  `IMAGE_FETCH_MAX_PER_REQUEST` bounds one request and nothing across them, so without
-  this a key holder could aim the gateway's own address at a host of their choosing. While
+  and the image transport's per-host connection ceiling. `IMAGE_FETCH_MAX_PER_REQUEST`
+  bounds one request and nothing across them, so without this a key holder could aim the
+  gateway's own address at a host of their choosing. While
   another project is queueing, no single one holds more than half the slots, so a tenant
   pointed at a slow image host cannot starve the rest; with nobody else waiting, one
   project still reaches the full value.
@@ -102,7 +102,16 @@ All notable changes to Ragmux are documented here. The format follows
   `{"description":{...}}` and an out-of-range bound lose that keyword instead of
   travelling to a rejection. `$ref` is matched on its full JSON Pointer, so two
   same-named definitions no longer collide and an external reference resolves to none of
-  them; the same schema now sanitises to the same bytes every time.
+  them; the same schema now sanitises to the same bytes every time. A malformed `required`
+  and an `anyOf`/`oneOf` that nothing survived in are now named in the per-tool `debug`
+  line rather than vanishing from it.
+- **Gemini's count bounds are held to `int64`.** `minItems`, `maxItems`, `minLength` and
+  `maxLength` are `int64` in Gemini's `Schema`, not doubles, so a fractional, negative or
+  oversized one (`{"minItems":1.5}`, `{"maxLength":1e30}`) is now dropped instead of
+  travelling to an `Invalid value at 'min_items'`.
+- **An `enum` on an `anyOf` node is dropped rather than typing the node.** A union is
+  typed by its branches, and `{"anyOf":[…],"enum":["a"]}` used to come out carrying
+  `"type":"string"` as well, contradicting every branch.
 - **A Gemini tool schema node with no `type` is given one**, inferred from the keywords
   that survived, because Gemini rejects an untyped node and took the whole tool down with
   it. The inference is lossy — a node carrying only `minimum`/`maximum` becomes `number`,

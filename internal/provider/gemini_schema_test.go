@@ -295,6 +295,41 @@ func TestGeminiSchemaSanitize(t *testing.T) {
 			want: `{"properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"],"type":"object"}`,
 		},
 		{
+			// Schema declares the count bounds as int64, not double, so a
+			// fractional or oversized one is as unusable as a non-numeric.
+			name:    "non-integer count bounds dropped",
+			in:      `{"type":"array","items":{"type":"string"},"minItems":1.5,"maxItems":2.7}`,
+			want:    `{"items":{"type":"string"},"type":"array"}`,
+			dropped: []string{"maxItems", "minItems"},
+		},
+		{
+			name:    "out-of-range and negative count bounds dropped",
+			in:      `{"type":"string","minLength":-4,"maxLength":1e30}`,
+			want:    `{"type":"string"}`,
+			dropped: []string{"maxLength", "minLength"},
+		},
+		{
+			name: "whole count bounds kept",
+			in:   `{"type":"string","minLength":0,"maxLength":128}`,
+			want: `{"maxLength":128,"minLength":0,"type":"string"}`,
+		},
+		{
+			// A union is typed by its branches; typing the node for an enum's
+			// sake would contradict all of them.
+			name:    "enum on a union dropped rather than typing it",
+			in:      `{"type":"object","properties":{"a":{"anyOf":[{"type":"string"},{"type":"integer"}],"enum":["x"]}}}`,
+			want:    `{"properties":{"a":{"anyOf":[{"type":"string"},{"type":"integer"}]}},"type":"object"}`,
+			dropped: []string{"enum"},
+		},
+		{
+			// Both used to vanish without reaching the one debug line that
+			// tells a tool author what the gateway could not carry.
+			name:    "malformed required and empty union are named",
+			in:      `{"type":"object","required":"a","properties":{"b":{"type":"string","anyOf":[]}}}`,
+			want:    `{"properties":{"b":{"type":"string"}},"type":"object"}`,
+			dropped: []string{"anyOf", "required"},
+		},
+		{
 			name:    "null exclusive bound dropped",
 			in:      `{"type":"object","properties":{"n":{"type":"number","exclusiveMinimum":null}}}`,
 			want:    `{"properties":{"n":{"type":"number"}},"type":"object"}`,

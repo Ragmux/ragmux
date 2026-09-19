@@ -54,6 +54,7 @@ const (
 	geminiScalarString geminiScalarKind = iota
 	geminiScalarStringList
 	geminiScalarNumber
+	geminiScalarInt
 	geminiScalarBool
 )
 
@@ -66,10 +67,14 @@ var geminiSchemaScalars = map[string]geminiScalarKind{
 	"nullable":    geminiScalarBool,
 	"minimum":     geminiScalarNumber,
 	"maximum":     geminiScalarNumber,
-	"minItems":    geminiScalarNumber,
-	"maxItems":    geminiScalarNumber,
-	"minLength":   geminiScalarNumber,
-	"maxLength":   geminiScalarNumber,
+	// Schema declares the four count bounds as int64, not double. Sharing the
+	// double path let {"minItems":1.5} and {"maxLength":1e30} through, which
+	// Gemini answers with "Invalid value at 'min_items'" -- the same class of
+	// forwarded-but-rejected value this file exists to stop.
+	"minItems":  geminiScalarInt,
+	"maxItems":  geminiScalarInt,
+	"minLength": geminiScalarInt,
+	"maxLength": geminiScalarInt,
 }
 
 // geminiSchemaFormats is the format whitelist per type; Gemini rejects any
@@ -110,10 +115,23 @@ func geminiScalar(kind geminiScalarKind, raw json.RawMessage) (any, bool) {
 		if json.Unmarshal(raw, &n) != nil || n == "" {
 			return nil, false
 		}
-		// Schema.minimum and its neighbours are doubles. json.Number checks
-		// the spelling and not the range, so 1e400 is a valid literal here
-		// and an overflow there; ParseFloat is what says it fits.
+		// Schema.minimum and maximum are doubles. json.Number checks the
+		// spelling and not the range, so 1e400 is a valid literal here and an
+		// overflow there; ParseFloat is what says it fits.
 		if _, err := strconv.ParseFloat(n.String(), 64); err != nil {
+			return nil, false
+		}
+		return n, true
+	case geminiScalarInt:
+		var n json.Number
+		if json.Unmarshal(raw, &n) != nil || n == "" {
+			return nil, false
+		}
+		// A count, so it has to be a whole non-negative number that fits an
+		// int64: Int64 refuses 1.5 and 1e30 alike, and a negative bound is
+		// not a count at all.
+		i, err := n.Int64()
+		if err != nil || i < 0 {
 			return nil, false
 		}
 		return n, true
@@ -269,15 +287,22 @@ func (w *geminiSchemaWalk) node(raw json.RawMessage, depth int, visited map[stri
 			}
 		case "required":
 			var req []string
-			if json.Unmarshal(v, &req) == nil && len(req) > 0 {
+			if json.Unmarshal(v, &req) != nil {
+				w.drop(k)
+				continue
+			}
+			if len(req) > 0 {
 				out["required"] = req
 			}
 		case "anyOf", "oneOf":
 			// oneOf's exclusivity has no equivalent; anyOf is the closest
 			// Gemini offers and a model rarely tells the difference.
-			if b := w.branches(v, depth, visited, path+"/"+k); len(b) > 0 {
-				out["anyOf"] = b
+			b := w.branches(v, depth, visited, path+"/"+k)
+			if len(b) == 0 {
+				w.drop(k)
+				continue
 			}
+			out["anyOf"] = b
 		case "const":
 			value, constType, ok := geminiConst(v)
 			switch {
@@ -336,10 +361,16 @@ func (w *geminiSchemaWalk) node(raw json.RawMessage, depth int, visited map[stri
 	// type it does have is what goes, because that contradiction would be the
 	// sanitiser's own invention rather than the client's.
 	if _, ok := out["enum"]; ok {
-		switch out["type"] {
-		case nil:
+		switch {
+		case out["anyOf"] != nil:
+			// A union is typed by its branches, and typing the node for the
+			// sake of an enum would contradict every one of them. The enum is
+			// what goes.
+			delete(out, "enum")
+			w.drop("enum")
+		case out["type"] == nil:
 			out["type"] = "string"
-		case "string":
+		case out["type"] == "string":
 		default:
 			delete(out, "enum")
 			w.drop("enum")
