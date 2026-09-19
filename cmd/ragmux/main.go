@@ -353,8 +353,8 @@ func run(cfg config.Config) error {
 	}
 
 	// Shutdown order: stop accepting HTTP and drain in-flight requests, let
-	// running ingestion jobs finish, stop the retention job, then the
-	// deferred st.Close releases the pool.
+	// running ingestion jobs finish, flush the spans both of them produced,
+	// stop the retention job, then the deferred st.Close releases the pool.
 	log.Info("shutting down: draining http")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
