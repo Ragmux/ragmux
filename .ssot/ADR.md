@@ -157,8 +157,18 @@ gateway kullanımına genişletiyordu.
 taşıyordu. Ücretli bir API'ye bakan bir `custom_openai` bağlantısı bu
 yüzden `cost_source:"builtin"` ile 0,00 USD raporluyordu; doküman ise
 "eşleşme yoksa `none`" diyordu. Catch-all'ı dosyadan çıkarmak yalnız yeni
-kurulumlara ulaşır — mevcut kurulumlarda satır `model_prices` tablosunda
-durmaya devam eder.
+kurulumlara ulaşır — satırı zaten almış bir veritabanında durmaya devam
+eder.
+
+**Öncül düzeltmesi (2026-09-19, karar sonrası ölçüldü):** bu karar
+"mevcut kurulumlar" varsayımıyla alındı ve varsayım yanlıştı. Son
+yayınlanan sürüm `v0.3.1`'de migration'lar `0009`'da bitiyor;
+`model_prices` tablosunu kuran `0011` ilk kez 0.4.0 ile çıkıyor. Yani
+**yayınlanmış hiçbir kurulumda** bu satır yok. Silme yalnız `v0.4`
+branch'inden bir ön-sürüm build'i koşmuş veritabanlarına dokunuyor —
+geliştirme ve test veritabanları. Karar korunuyor: migration yazıldı,
+test edildi, zararsız ve o veritabanlarını da temizliyor. Değişen tek
+şey, kararın gerekçesinin sunulduğu kadar geniş olmadığı.
 
 Uygulayan ajan bunu genel bir mekanizmayla çözmüştü: `Seed`, her
 yükseltmede shipped tablodan düşen ne varsa siler. Review bu mekanizmada
