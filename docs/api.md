@@ -453,12 +453,10 @@ The summary response (also used by `/projects/{id}/metrics`):
              "completion_tokens": 900, "cost_micros": 15400, "cost_usd": 0.0154}],
  "recent": [{"id": 991, "project_id": 3, "model_name": "claude-sonnet-4-5", "status_code": 200,
              "prompt_tokens": 420, "completion_tokens": 80, "estimated": false, "latency_ms": 910,
-             "streamed": true, "rag_used": true, "rag_hits": 3, "error": "",
-             "api_key_id": 7, "user_id": 4, "created_at": "…"}],
-
              "streamed": true, "rag_used": true, "rag_hits": 3, "cached_prompt_tokens": 200,
              "cache_write_tokens": 0, "cost_micros": 1860, "cost_usd": 0.00186,
-             "cost_source": "builtin", "error": "", "created_at": "…"}],
+             "cost_source": "builtin", "error": "", "api_key_id": 7, "user_id": 4,
+             "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
                "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70,
@@ -497,19 +495,18 @@ request logs, oldest first and at most 50 000 rows, as `text/csv` with a
 ```
 created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
 estimated, latency_ms, streamed, rag_used, rag_hits, error,
-cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source
+cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id
 ```
 
 New columns are appended at the end and existing ones never move, so an importer that
 reads by position keeps working. `cost_usd` is written with six decimals — the full
 precision of the stored micro-dollar integer, so a cheap request does not round to zero.
+`api_key_id` and `user_id` are empty for a request made with a project's default key,
+which has no owner; an empty cell says that where a `0` would read as user zero.
 
 Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
-
-The export does not yet carry `api_key_id` and `user_id`; read them from
-`GET /metrics/requests` in the meantime.
 
 ### Model prices
 
