@@ -13,6 +13,16 @@ import (
 // no pg_search and can never execute the statement they check. That is the
 // point: the query the gateway would send to ParadeDB is reviewed on every
 // commit even where it cannot be run.
+//
+// What they cannot show is that ParadeDB accepts the statement: the golden
+// files were generated from this code, so on their own they only prove it has
+// not changed. That gap was closed by hand on 2026-09-19 against a live
+// ParadeDB (pg_search 0.25.9, PostgreSQL 17.11): the statement PostgreSQL
+// logged for a real admin search matched hybrid_pgsearch.sql exactly, and
+// paradedb.boolean(must => ARRAY[...]) + paradedb.score(c.id) +
+// ROW_NUMBER() OVER (...) returned non-zero BM25 scores. The executable half
+// of that check lives in TestPgSearchHybridSearch, which runs wherever
+// TEST_DATABASE_URL points at a ParadeDB (make test-paradedb).
 
 func goldenSQL(t *testing.T, name string) string {
 	t.Helper()
@@ -152,9 +162,34 @@ func TestBM25IndexDDLUsesTheConfiguredTokenizer(t *testing.T) {
 		!strings.Contains(ddl, `"rag_store_id":{"fast":true}`) {
 		t.Errorf("index DDL:\n%s", ddl)
 	}
+	// A stemming analyser is spelled "<iso>_stem" by the operator but has to
+	// reach pg_search as the "default" tokenizer with a Snowball stemmer:
+	// "en_stem" as a tokenizer *type* is rejected outright by pg_search 0.25
+	// ("unknown tokenizer type: en_stem"), which used to leave every
+	// pg_search store permanently falling back to pgvector. Verified against
+	// a live ParadeDB pg_search 0.25.9 on 2026-09-19.
 	stemmed := &Store{pgSearchTok: "en_stem"}
-	if !strings.Contains(stemmed.bm25IndexDDL(), `"type":"en_stem"`) {
-		t.Errorf("tokenizer override ignored:\n%s", stemmed.bm25IndexDDL())
+	if got := stemmed.bm25TokenizerJSON(); got != `{"type":"default","stemmer":"English"}` {
+		t.Errorf("en_stem tokenizer = %s", got)
+	}
+	if strings.Contains(stemmed.bm25IndexDDL(), "en_stem") {
+		t.Errorf("the rejected tokenizer type reached the DDL:\n%s", stemmed.bm25IndexDDL())
+	}
+	if got := (&Store{pgSearchTok: "tr_stem"}).bm25TokenizerJSON(); got != `{"type":"default","stemmer":"Turkish"}` {
+		t.Errorf("tr_stem tokenizer = %s", got)
+	}
+	// A code with no Snowball stemmer in pg_search is not quietly mapped to
+	// another language: it stays a type and fails loudly at index build.
+	if got := (&Store{pgSearchTok: "hi_stem"}).bm25TokenizerJSON(); got != `{"type":"hi_stem"}` {
+		t.Errorf("unknown stemmer code = %s", got)
+	}
+	// Non-stemming analysers are still plain tokenizer types.
+	if got := (&Store{pgSearchTok: "whitespace"}).bm25TokenizerJSON(); got != `{"type":"whitespace"}` {
+		t.Errorf("whitespace tokenizer = %s", got)
+	}
+	// The reloption the drift check compares is the one the DDL writes.
+	if !strings.Contains(ddl, "text_fields = '"+s.bm25TextFields()+"'") {
+		t.Errorf("text_fields does not match the DDL:\n%s\n%s", s.bm25TextFields(), ddl)
 	}
 }
 

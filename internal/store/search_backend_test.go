@@ -193,3 +193,38 @@ func TestPgSearchHybridSearch(t *testing.T) {
 		}
 	}
 }
+
+// TestPgSearchStemmingTokenizerBuildsAndSearches is the regression for the
+// tokenizer the documentation has always named. "en_stem" is not a tokenizer
+// *type* pg_search knows -- it rejects the index DDL with "unknown tokenizer
+// type: en_stem" -- so setting PG_SEARCH_TOKENIZER to it used to make every
+// pg_search store fall back to pgvector for the life of the process, quietly
+// and permanently. Only a live server can catch that: the DDL is a string
+// until ParadeDB parses it.
+func TestPgSearchStemmingTokenizerBuildsAndSearches(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	cfg.PgSearchTokenizer = "en_stem"
+	s := testdb.OpenWith(t, cfg)
+	testdb.RequirePgSearch(t, s)
+
+	r := seedStore(t, ctx, s, "stemmed", store.BackendPgSearch)
+	q := []float32{1, 0, 0, 0}
+	hits, used, err := s.SearchWithBackend(ctx, r.ID, "zyxquux", q,
+		store.SearchOptions{Mode: store.SearchHybrid, Backend: store.BackendPgSearch, Candidates: 2})
+	if err != nil {
+		t.Fatalf("stemming tokenizer: %v", err)
+	}
+	if used != store.BackendPgSearch {
+		t.Fatalf("backend = %q, want pg_search: the index DDL was rejected and the search degraded", used)
+	}
+	var lexical *store.SearchHit
+	for i := range hits {
+		if hits[i].Index == 2 {
+			lexical = &hits[i]
+		}
+	}
+	if lexical == nil || lexical.LexScore <= 0 {
+		t.Fatalf("BM25 should still score under a stemming analyser: %+v", hits)
+	}
+}

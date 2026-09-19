@@ -57,6 +57,49 @@ func (s *Store) pgSearchTokenizer() string {
 	return s.pgSearchTok
 }
 
+// pgSearchStemmers maps the "<iso639-1>_stem" analyser names -- the spelling
+// ParadeDB used for stemming tokenizers, and the one this project has always
+// documented -- onto the shape pg_search accepts today: the "default"
+// tokenizer carrying a Snowball "stemmer" field.
+//
+// pg_search dropped the "en_stem" tokenizer *type* somewhere before 0.25 and
+// rejects it outright ("unknown tokenizer type: en_stem"), which made the one
+// stemming value the documentation named turn every pg_search store into a
+// permanent pgvector fallback. Translating here keeps the documented setting
+// working and keeps the language name out of operator hands: only the ISO
+// code is matched, and the interpolated Snowball name comes from this table,
+// never from the environment.
+//
+// The languages are exactly the Snowball set pg_search 0.25 accepts; codes
+// with no stemmer there (Hindi, Indonesian, Serbian, ...) are deliberately
+// absent so they surface as an error at index build rather than silently
+// stemming with the wrong language.
+var pgSearchStemmers = map[string]string{
+	"ar": "Arabic", "da": "Danish", "de": "German", "el": "Greek",
+	"en": "English", "es": "Spanish", "fi": "Finnish", "fr": "French",
+	"hu": "Hungarian", "it": "Italian", "nl": "Dutch", "no": "Norwegian",
+	"pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sv": "Swedish",
+	"ta": "Tamil", "tr": "Turkish",
+}
+
+// bm25TokenizerJSON renders the configured analyser as the JSON object
+// pg_search expects inside text_fields.
+//
+// Anything that is not a recognised "<iso>_stem" name is passed through as a
+// tokenizer type unchanged: config.Load has already bounded it to
+// [a-z][a-z0-9_]* so it cannot break out of the literal, and an unknown type
+// is rejected by pg_search at index build, where the caller turns it into the
+// usual "could not be prepared" warning and falls back to pgvector.
+func (s *Store) bm25TokenizerJSON() string {
+	tok := s.pgSearchTokenizer()
+	if code, ok := strings.CutSuffix(tok, "_stem"); ok {
+		if lang, known := pgSearchStemmers[code]; known {
+			return fmt.Sprintf(`{"type":"default","stemmer":%q}`, lang)
+		}
+	}
+	return fmt.Sprintf(`{"type":%q}`, tok)
+}
+
 // bm25IndexDDL builds the CREATE INDEX statement for the global BM25 index.
 //
 // One global index, not one partial index per store. A per-store partial
@@ -68,9 +111,9 @@ func (s *Store) pgSearchTokenizer() string {
 func (s *Store) bm25IndexDDL() string {
 	return fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON chunks
 USING bm25 (id, content, rag_store_id, document_id)
-WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":{"type":"%s"},"record":"position"}}',
+WITH (key_field = 'id', text_fields = '{"content":{"tokenizer":%s,"record":"position"}}',
       numeric_fields = '{"rag_store_id":{"fast":true},"document_id":{"fast":true}}')`,
-		bm25Index, s.pgSearchTokenizer())
+		bm25Index, s.bm25TokenizerJSON())
 }
 
 // bm25BuildLockWait bounds how long a search waits for another replica's
@@ -226,10 +269,18 @@ func bm25IndexTokenizer(ctx context.Context, tx pgx.Tx) (string, error) {
 // keeps text_fields as the JSON document bm25IndexDDL passed it, so the
 // analyser is at text_fields={"content":{"tokenizer":{"type":"<name>"}}}.
 //
+// The name returned is the one an operator writes in PG_SEARCH_TOKENIZER,
+// not the one in the JSON, because the caller compares it against exactly
+// that. They differ for stemming: "en_stem" is stored as the "default"
+// tokenizer carrying "stemmer":"English" (see pgSearchStemmers), so reading
+// the type alone would report every stemming index as drifted from the
+// setting that built it.
+//
 // An empty result means "could not tell", never "no tokenizer": the value
 // only ever reaches a log line, so a reloptions shape a future ParadeDB
-// renders differently degrades to saying nothing rather than to warning
-// about a drift that is not there.
+// renders differently -- or a stemmer language this build has no code for --
+// degrades to saying nothing rather than to warning about a drift that is
+// not there.
 func tokenizerFromReloptions(opts []string) string {
 	const prefix = "text_fields="
 	for _, o := range opts {
@@ -238,13 +289,23 @@ func tokenizerFromReloptions(opts []string) string {
 		}
 		var fields map[string]struct {
 			Tokenizer struct {
-				Type string `json:"type"`
+				Type    string `json:"type"`
+				Stemmer string `json:"stemmer"`
 			} `json:"tokenizer"`
 		}
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(o, prefix)), &fields); err != nil {
 			return ""
 		}
-		return fields["content"].Tokenizer.Type
+		tok := fields["content"].Tokenizer
+		if tok.Stemmer == "" {
+			return tok.Type
+		}
+		for code, lang := range pgSearchStemmers {
+			if lang == tok.Stemmer {
+				return code + "_stem"
+			}
+		}
+		return ""
 	}
 	return ""
 }
