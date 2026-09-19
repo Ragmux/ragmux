@@ -272,17 +272,20 @@ func (f *ImageFetcher) acquire(ctx context.Context, tenant string) (func(), erro
 				// nothing while another tenant is still queued, and that
 				// sibling would sleep out its whole wait next to a claim it
 				// had just regained.
-				//
-				// No test holds this. Reaching it needs a same-tenant
-				// acquirer to time out while another tenant is still
-				// queueing, which is not an interleaving a test can force,
-				// and narrowing this to wakeIfQueueEmpty passes the whole
-				// suite. It is here by argument, not by coverage.
+				// TestImageFetcherGiveUpWakesASiblingOutsideTheShare holds it.
 				f.broadcast()
 				f.mu.Unlock()
 				return nil, f.queueError(ctx)
 			}
 		}
+		// waiting counts every entitled acquirer, including this tenant's
+		// own, so a tenant whose sibling is queued will not take spare
+		// capacity even though ADR-005 only asks it to yield to *another*
+		// tenant. Stricter than the decision, and deliberately left that way:
+		// the counter would have to be per tenant to tell the two apart, and
+		// the cost is a moment, not a slot -- the sibling's own admission
+		// drives waiting to zero and wakeIfQueueEmpty releases this one
+		// immediately. A single-tenant burst still fills every slot.
 		if f.waiting == 0 {
 			select {
 			case f.sem <- struct{}{}:

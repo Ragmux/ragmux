@@ -551,16 +551,26 @@ func nothingStarts(t *testing.T, started <-chan string, why string) {
 // share is what happens once somebody is actually waiting.
 func waitForWaiters(t *testing.T, f *ImageFetcher, n int) {
 	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		f.mu.Lock()
-		got := f.waiting
-		f.mu.Unlock()
-		if got >= n {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	if !fetcherReaches(f, 5*time.Second, func() bool { return f.waiting >= n }) {
+		t.Fatalf("timed out waiting for %d entitled waiters", n)
 	}
-	t.Fatalf("timed out waiting for %d entitled waiters", n)
+}
+
+// fetcherReaches polls the fetcher's own counters until cond holds, which is
+// called with f.mu held. Reading the state beats sleeping on it: what these
+// tests are about is what a decision was made from.
+func fetcherReaches(f *ImageFetcher, d time.Duration, cond func() bool) bool {
+	for deadline := time.Now().Add(d); ; time.Sleep(200 * time.Microsecond) {
+		f.mu.Lock()
+		ok := cond()
+		f.mu.Unlock()
+		if ok {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
 }
 
 // MaxPerRequest bounds one request and nothing across them: a key holder who
@@ -825,6 +835,82 @@ func TestImageFetcherShareCountsTheQueue(t *testing.T) {
 	}
 }
 
+// Giving up returns a claim, and the sibling waiting on that claim has to be
+// told. The wake on this arm is unconditional, unlike the one on the arm that
+// takes a slot, and this is what says so.
+//
+// The observable is not a slot: the process is deliberately full, so nobody
+// gets one either way. It is the sibling's own bookkeeping. Parked outside its
+// share the sibling is counted nowhere; once the give-up arm hands the claim
+// back, it belongs in the entitled queue and has to re-register there now
+// rather than at the end of its queue wait. Narrow this arm's broadcast to
+// wakeIfQueueEmpty and the foreign waiter keeps f.waiting above zero, so no
+// wake is sent and the sibling sleeps.
+func TestImageFetcherGiveUpWakesASiblingOutsideTheShare(t *testing.T) {
+	const slots = 4 // a share of 2
+	for round := 0; round < 50; round++ {
+		f := &ImageFetcher{MaxConcurrent: slots, QueueWait: 5 * time.Second}
+		f.init()
+
+		// Fill the process, so an entitled acquirer parks on the semaphore
+		// instead of sailing through.
+		for i := 0; i < slots; i++ {
+			f.sem <- struct{}{}
+		}
+		f.mu.Lock()
+		f.inflight["noisy"] = 1 // one of the tenant's two claims
+		f.waiting = 1           // another tenant, queued for the whole round
+		f.mu.Unlock()
+
+		// The first sibling is inside the share, so it registers and parks on
+		// the full semaphore until its own short deadline runs out.
+		firstCtx, cancelFirst := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		first := make(chan struct{})
+		go func() {
+			defer close(first)
+			if _, err := f.acquire(firstCtx, "noisy"); err == nil {
+				t.Error("a slot came out of a full process")
+			}
+		}()
+		if !fetcherReaches(f, 2*time.Second, func() bool { return f.queued["noisy"] == 1 }) {
+			t.Fatalf("round %d: the first sibling never registered as entitled", round)
+		}
+
+		// The second reads one slot held and one claim queued, which is the
+		// whole share, so it parks outside it -- counted in neither table.
+		secondCtx, cancelSecond := context.WithCancel(context.Background())
+		second := make(chan struct{})
+		go func() {
+			defer close(second)
+			if _, err := f.acquire(secondCtx, "noisy"); err == nil {
+				t.Error("a slot came out of a full process")
+			}
+		}()
+		time.Sleep(2 * time.Millisecond)
+
+		// acquire has returned, so the give-up arm has run to completion and
+		// the claim is back.
+		<-first
+		cancelFirst()
+
+		// The second sibling is inside the share again and has to notice now,
+		// not in five seconds.
+		if !fetcherReaches(f, 200*time.Millisecond, func() bool { return f.queued["noisy"] == 1 }) {
+			f.mu.Lock()
+			queued, waiting := f.queued["noisy"], f.waiting
+			f.mu.Unlock()
+			t.Fatalf("round %d: the sibling slept through the give-up wake (queued=%d waiting=%d)",
+				round, queued, waiting)
+		}
+
+		cancelSecond()
+		<-second
+		for i := 0; i < slots; i++ {
+			<-f.sem
+		}
+	}
+}
+
 // A fetch that cannot get a slot in time is the gateway running out, not the
 // client getting something wrong and not the image host failing: 429, because
 // nothing is broken, rather than a 5xx that would report a fault.
@@ -858,12 +944,18 @@ func TestImageFetcherQueueSaturation(t *testing.T) {
 	if pe.RetryAfter != 7 {
 		t.Errorf("Retry-After = %d, want the fetch timeout in seconds", pe.RetryAfter)
 	}
-	// A giving-up acquirer leaves no waiter and no tenant entry behind.
+	// A giving-up acquirer leaves nothing behind. The queued claim matters
+	// most: it only ever goes down on the two arms of one select, and a claim
+	// stranded there is stranded for the life of the process. Once a tenant
+	// has leaked `share` of them it can never join the entitled queue again
+	// and is left scavenging whatever spare capacity appears -- a permanent
+	// 429 under contention, with every counter looking healthy.
 	f.mu.Lock()
-	waiting, tenants := f.waiting, len(f.inflight)
+	waiting, tenants, queued := f.waiting, len(f.inflight), len(f.queued)
 	f.mu.Unlock()
-	if waiting != 0 || tenants != 1 {
-		t.Errorf("after giving up: waiting = %d, tenants = %d", waiting, tenants)
+	if waiting != 0 || tenants != 1 || queued != 0 {
+		t.Errorf("after giving up: waiting = %d, tenants = %d, queued entries = %d",
+			waiting, tenants, queued)
 	}
 }
 
