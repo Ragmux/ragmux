@@ -394,21 +394,32 @@ func run(cfg config.Config) error {
 		}
 		traceCancel()
 		// Spans that end after this point cannot be exported and are counted
-		// instead. The count is logged as well as exported because a span
-		// dropped during shutdown is the case a scrape is least likely to
-		// catch, and some deployments do not scrape this process at all.
+		// instead. This log line, not the metric, is what reports that: the
+		// counter reaches its final value only here, microseconds before the
+		// endpoint that would serve it closes, so no realistic scrape
+		// interval catches the difference.
 		if n := tracer.Dropped(); n > 0 {
 			log.Warn("spans dropped; the export queue was full or the exporter had already stopped",
 				"spans", n)
 		}
 	}
-	// The metrics endpoint outlives the tracer on purpose: it is what serves
-	// the final scrape, and ragmux_tracing_spans_dropped_total only reaches
-	// its shutdown value once the exporter above has stopped.
+	// The metrics endpoint is closed last so that
+	// ragmux_tracing_spans_dropped_total has reached its final value while
+	// the endpoint still exists. A scrape is unlikely to land in the moment
+	// between the two -- the line logged above is what actually reports the
+	// count -- but closing the endpoint before the counter settles would
+	// have made the exported value wrong rather than merely missed.
+	//
+	// Its own budget, not shutCtx: by this point shutCtx has been alive
+	// through the HTTP drain, StopWithTimeout's 30 seconds and the tracer
+	// flush, so it is routinely expired here and Shutdown would abandon an
+	// in-flight scrape and log a deadline error on every clean shutdown.
 	if metricsSrv != nil {
-		if err := metricsSrv.Shutdown(shutCtx); err != nil {
+		metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := metricsSrv.Shutdown(metricsCtx); err != nil {
 			log.Warn("metrics shutdown", "err", err)
 		}
+		metricsCancel()
 	}
 	stopBackground()
 	<-janitorDone
