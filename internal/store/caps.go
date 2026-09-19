@@ -103,13 +103,29 @@ func pgSearchSmokeTest(ctx context.Context, conn *pgx.Conn) error {
 // The key is combined with the current schema, so two Ragmux instances
 // sharing one database in separate schemas elect their own leader (and so
 // tests, which are isolated by schema, do not fight over one lock).
+//
+// The hash is schema qualified and 64 bit wide on purpose. hashtext and
+// hashtextextended are both internal, undocumented functions, so leaving
+// them unqualified resolves them through search_path -- a schema earlier in
+// the path could define its own hashtext(text) and decide which replica
+// wins an election. hashtextextended (PostgreSQL 11+) fills the whole
+// bigint the advisory lock key actually is, where hashtext returns 32 bits
+// that then get widened.
+//
+// Changing the hash changes every key, so during a rolling deploy an old
+// and a new replica no longer share a lock: for the length of the deploy
+// both can win the same election. That is the outcome PgBouncer's
+// transaction mode already has (docs/scaling.md) and it is bounded the same
+// way -- the only caller left is the retention pass, whose every step is
+// idempotent.
 func (s *Store) TryAdvisoryLock(ctx context.Context, key int64) (func(), bool, error) {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	var scoped int64
-	if err := conn.QueryRow(ctx, "SELECT hashtext(current_schema() || ':' || $1)::bigint",
+	if err := conn.QueryRow(ctx,
+		"SELECT pg_catalog.hashtextextended(pg_catalog.current_schema() || ':' || $1, 0)",
 		strconv.FormatInt(key, 10)).Scan(&scoped); err != nil {
 		conn.Release()
 		return nil, false, err
