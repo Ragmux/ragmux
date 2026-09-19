@@ -198,6 +198,19 @@ usage fall back to the same character estimate.
 Minute rows are purged after two hours, day rows after 400 days and month rows after
 three years by the hourly retention job.
 
+### Budgets are counted in tokens, not money
+
+Ragmux 0.4 estimates what each request cost and shows it on the dashboard, but **cost is
+informational: no limit is enforced in money.** A project cannot be given a dollar
+budget, a request is never refused because a spend figure was reached, and the estimate
+never feeds `rate_limit_tpm`, `budget_daily_tokens` or `budget_monthly_tokens` — those
+stay token counters. To cap spend, cap tokens.
+
+The estimate comes from the [price table](api.md#model-prices), which ships current
+public list prices and is editable per model. It is not a bill: providers round,
+discount and change prices without telling the gateway, and a model with no matching
+price row is logged with `cost_source: "none"` and a cost of zero rather than a guess.
+
 ## Metrics and retention
 
 Every chat completion is written to `request_logs` with the status the client received
@@ -216,10 +229,17 @@ response was streamed and whether RAG context was injected. Prompts and completi
 not stored. Upstream error messages are stored and logged with anything that looks like
 an API key (`sk-…`, `sk-ant-…`, `AIza…`, `Bearer …`) replaced by `[redacted]`.
 
+Since 0.4 a row also carries `cached_prompt_tokens` and `cache_write_tokens` (the parts
+of `prompt_tokens` a provider cache served and wrote, see
+[Prompt caching](providers.md#prompt-caching)) plus the estimated `cost_micros` and the
+`cost_source` it came from. A `429` row costs nothing — nothing was sent upstream — and
+a `499` row keeps the cost of whatever the provider had already reported.
+
 `GET /admin/api/metrics/summary?window=24h` and `GET /admin/api/projects/{id}/metrics`
 return the window summary (requests, errors, tokens, average and p95 latency, RAG
-requests, `rate_limited`), the all-time summary, a 14-day daily series and the 50 most
-recent requests; the dashboard's overview and project pages are built on them.
+requests, `rate_limited`, estimated cost), the all-time summary, a 14-day daily series
+and the 50 most recent requests; the dashboard's overview and project pages are built on
+them.
 
 A retention job (the janitor in `internal/maintenance`) runs one minute after start and
 then hourly: request logs older than `LOG_RETENTION_DAYS` (default 90) and audit entries

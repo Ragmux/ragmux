@@ -326,21 +326,40 @@ The summary response (also used by `/projects/{id}/metrics`):
 
 ```json
 {"window": {"requests": 120, "errors": 3, "prompt_tokens": 51000, "completion_tokens": 9800,
-            "avg_latency_ms": 840.5, "p95_latency_ms": 2100, "rag_requests": 95, "rate_limited": 2},
+            "avg_latency_ms": 840.5, "p95_latency_ms": 2100, "rag_requests": 95, "rate_limited": 2,
+            "cost_micros": 184500, "cost_usd": 0.1845},
  "total":  {"…": "same fields over all time"},
- "daily":  [{"day": "2026-09-05", "requests": 10, "errors": 0, "prompt_tokens": 4000, "completion_tokens": 900}],
+ "daily":  [{"day": "2026-09-05", "requests": 10, "errors": 0, "prompt_tokens": 4000,
+             "completion_tokens": 900, "cost_micros": 15400, "cost_usd": 0.0154}],
  "recent": [{"id": 991, "project_id": 3, "model_name": "claude-sonnet-4-5", "status_code": 200,
              "prompt_tokens": 420, "completion_tokens": 80, "estimated": false, "latency_ms": 910,
-             "streamed": true, "rag_used": true, "rag_hits": 3, "error": "", "created_at": "…"}],
+             "streamed": true, "rag_used": true, "rag_hits": 3, "cached_prompt_tokens": 200,
+             "cache_write_tokens": 0, "cost_micros": 1860, "cost_usd": 0.00186,
+             "cost_source": "builtin", "error": "", "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
-               "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70}]}
+               "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70,
+               "cost_micros": 120000, "cost_usd": 0.12}]}
 ```
 
 `daily` covers the last `days` days (14 by default), `recent` the last 50 requests.
 `rag_hits` is the number of retrieved passages injected into that request (`0` when
 `rag_used` is false). Status semantics (`429`, `499`, `502`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
+
+Cost fields appear on the summary objects (`window`, `total`, `previous`), on each
+`daily` bucket, on each `projects` row and on each `recent` request:
+
+| Field | Meaning |
+|---|---|
+| `cost_micros` | the **estimated** cost in USD millionths; an integer, so sums are exact |
+| `cost_usd` | the same figure in dollars (`cost_micros / 1e6`) |
+| `cost_source` | on a request: `builtin` or `user` for the price row that matched, `none` when no row did (then the cost is `0`) |
+| `cached_prompt_tokens` | part of `prompt_tokens` that a provider cache served |
+| `cache_write_tokens` | part of `prompt_tokens` that was written into a provider cache (Anthropic only) |
+
+Cost is an estimate from the [price table](#model-prices), never a bill, and it is
+informational only — budgets are counted in tokens, not money.
 
 #### CSV export
 
@@ -351,12 +370,69 @@ request logs, oldest first and at most 50 000 rows, as `text/csv` with a
 
 ```
 created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
-estimated, latency_ms, streamed, rag_used, rag_hits, error
+estimated, latency_ms, streamed, rag_used, rag_hits, error,
+cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source
 ```
+
+New columns are appended at the end and existing ones never move, so an importer that
+reads by position keeps working. `cost_usd` is written with six decimals — the full
+precision of the stored micro-dollar integer, so a cheap request does not round to zero.
 
 Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
+
+### Model prices
+
+The price table turns the token counts of a finished request into the estimated
+`cost_micros` on its log row. **It is an estimate, not a bill**: providers round,
+discount and change prices without telling the gateway.
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 1, "unit": "per_million_tokens"}` |
+| POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
+| PUT | `/prices/{id}` | editor | Same body without `provider_type`/`model_pattern` (they are fixed); sets `source: "user"` → `{price}` |
+| DELETE | `/prices/{id}` | editor | `{"ok": true}`; `409 {"code":"builtin_price"}` for a built-in row — reset it instead |
+| POST | `/prices/{id}/reset` | editor | Restores the shipped values and marks the row built-in again → `{price}`; `409 {"code":"no_builtin_price"}` when the row has no shipped counterpart |
+
+Every mutation is audited as `price.create`, `price.update`, `price.delete` or
+`price.reset`, and drops the gateway's cached table so the next request is costed with
+the new numbers (it is otherwise re-read every 60 seconds).
+
+A row:
+
+```json
+{"id": 4, "provider_type": "anthropic", "model_pattern": "claude-sonnet-4-5*",
+ "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_write_per_mtok": 3.75,
+ "cache_read_per_mtok": 0.30, "currency": "USD", "source": "builtin",
+ "builtin_version": 1, "created_at": "…", "updated_at": "…"}
+```
+
+Prices are **per million tokens** and prices are between 0 and 100000. The two cache
+prices are **absolute prices, not multipliers** of `input_per_mtok` — every provider
+picks its own convention (Anthropic bills writes at 1.25x and reads at 0.1x, OpenAI does
+not bill writes at all and reads at 0.5x) — and both are nullable: `null` means the
+provider charges the input rate.
+
+**Matching.** A model name is resolved against the rows of its connection's provider
+type. An exact `model_pattern` wins; otherwise the pattern with the **longest literal
+prefix** (the text before its first `*`) that matches, ties going to the lowest `id`.
+`*` stands for any run of characters, `/` included, so `deepseek-ai/DeepSeek-V3*` works.
+Longest prefix is why `gpt-4o-mini*` beats `gpt-4o*` for `gpt-4o-mini-2024-07-18`. With
+no match the request is logged with `cost_micros: 0` and `cost_source: "none"` — a
+missing price is reported as missing, never guessed.
+
+**Built-in rows and upgrades.** The shipped table is seeded on every start.
+
+- Editing a built-in row flips its `source` to `"user"`, and **upgrades never touch a
+  `"user"` row again**.
+- An untouched built-in row is refreshed only when the shipped table's `version`
+  **increases**; a release that does not bump it changes nothing.
+- **Built-in rows cannot be deleted**, only edited or reset. That removes the "deleted
+  row resurrects on upgrade" problem without a tombstone column to remember it by.
+- `ollama` and `custom_openai` ship a `*` row at 0, so local models never report
+  phantom spend. Add your own row for a paid `custom_openai` endpoint.
 
 ### Users and audit log
 
@@ -473,6 +549,20 @@ Non-streaming responses are the provider's answer normalised to the OpenAI schem
 (`choices[].message`, `finish_reason`, `usage`). Streaming responses are
 `text/event-stream` with `data: {chunk}` lines and a final `data: [DONE]`; a failure
 after the stream has started is emitted as a `data: {"error": …}` event before `[DONE]`.
+
+`usage` carries OpenAI's breakdown objects whenever the provider reports them:
+
+```json
+"usage": {"prompt_tokens": 250, "completion_tokens": 500, "total_tokens": 750,
+          "prompt_tokens_details": {"cached_tokens": 200, "cache_creation_tokens": 40},
+          "completion_tokens_details": {"reasoning_tokens": 30}}
+```
+
+`prompt_tokens` always includes the cached and freshly written parts, on every provider,
+and `prompt_tokens + completion_tokens == total_tokens`. `cache_creation_tokens` has no
+OpenAI equivalent (OpenAI does not bill cache writes, Anthropic does). See
+[Prompt caching](providers.md#prompt-caching) for the per-provider mapping, including
+the accounting change for cached Anthropic requests.
 
 Response headers, only for limits the project has set:
 
