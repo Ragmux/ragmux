@@ -104,6 +104,37 @@ type Config struct {
 	// max_documents / max_bytes can only lower them.
 	MaxDocumentsPerStore int
 	MaxBytesPerStore     int64
+
+	// MetricsEnabled serves the Prometheus endpoint at all.
+	MetricsEnabled bool
+	// MetricsToken is the bearer token /metrics requires. It may only be
+	// empty when MetricsListen binds a loopback address.
+	MetricsToken string
+	// MetricsListen, when set, moves /metrics onto a second HTTP server on
+	// that address and keeps it off the main router entirely, so no
+	// reverse-proxy rule can expose it by accident.
+	MetricsListen string
+	// MetricsMaxSeries caps the registry's label combinations.
+	MetricsMaxSeries int
+
+	// TracingEnabled turns the OTLP exporter on. It defaults to true when
+	// an endpoint is configured; an explicit TRACING_ENABLED=false wins.
+	TracingEnabled bool
+	// TracingTrustIncoming honours a client's traceparent header. Off by
+	// default: a client that is trusted can pin every request into one
+	// trace and force the sampled flag on all of it.
+	TracingTrustIncoming bool
+	// OTLPEndpoint is the collector's OTLP/HTTP base URL (or the full
+	// traces URL).
+	OTLPEndpoint string
+	// OTLPHeaders are sent with every export request (auth for a vendor
+	// endpoint, usually nothing for a local Collector).
+	OTLPHeaders map[string]string
+	// ServiceName and ResourceAttrs describe this process to the collector.
+	ServiceName   string
+	ResourceAttrs map[string]string
+	// TraceSampleRatio is the head sampling probability for new traces.
+	TraceSampleRatio float64
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -362,7 +393,131 @@ func Load() (Config, error) {
 		}
 		c.MaxBytesPerStore = int64(n) << 20
 	}
+	if err := loadMetrics(&c); err != nil {
+		return c, err
+	}
+	if err := loadTracing(&c); err != nil {
+		return c, err
+	}
 	return c, nil
+}
+
+// loadMetrics reads the /metrics settings and refuses the one combination
+// that would publish per-project usage and spend to anyone who can reach the
+// port.
+func loadMetrics(c *Config) error {
+	c.MetricsEnabled = os.Getenv("METRICS_ENABLED") == "true"
+	token, err := envOrFile("METRICS_TOKEN")
+	if err != nil {
+		return err
+	}
+	c.MetricsToken = token
+	c.MetricsListen = strings.TrimSpace(os.Getenv("METRICS_LISTEN"))
+	c.MetricsMaxSeries = 5000
+	if v := os.Getenv("METRICS_MAX_SERIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return fmt.Errorf("invalid METRICS_MAX_SERIES %q", v)
+		}
+		c.MetricsMaxSeries = n
+	}
+	if c.MetricsListen != "" {
+		host, _, err := net.SplitHostPort(c.MetricsListen)
+		if err != nil {
+			return fmt.Errorf("invalid METRICS_LISTEN %q: expected host:port, e.g. 127.0.0.1:9090", c.MetricsListen)
+		}
+		if !c.MetricsEnabled {
+			return errors.New("METRICS_LISTEN is set but METRICS_ENABLED is not true; nothing would listen on it")
+		}
+		if c.MetricsToken == "" && !isLoopbackHost(host) {
+			return errors.New("METRICS_ENABLED without METRICS_TOKEN would publish per-project usage and spend " +
+				"unauthenticated; set METRICS_TOKEN or bind METRICS_LISTEN to a loopback address")
+		}
+		return nil
+	}
+	if c.MetricsEnabled && c.MetricsToken == "" {
+		return errors.New("METRICS_ENABLED without METRICS_TOKEN would publish per-project usage and spend " +
+			"unauthenticated; set METRICS_TOKEN or bind METRICS_LISTEN to a loopback address")
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether a METRICS_LISTEN host only accepts
+// connections from this machine. An empty host means every interface, which
+// is the opposite of loopback.
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// loadTracing reads the OTLP settings. The OTEL_* names are the ones the
+// OpenTelemetry specification defines, so a collector sidecar that already
+// injects them into the environment needs no Ragmux-specific variable.
+func loadTracing(c *Config) error {
+	c.OTLPEndpoint = strings.TrimSpace(env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))))
+	// Tracing follows the endpoint: configuring one is the act of turning it
+	// on. An explicit false always wins, so a sidecar that injects the
+	// OTEL_* variables can still be switched off with one setting.
+	c.TracingEnabled = c.OTLPEndpoint != ""
+	switch strings.TrimSpace(os.Getenv("TRACING_ENABLED")) {
+	case "true":
+		c.TracingEnabled = true
+	case "false":
+		c.TracingEnabled = false
+	case "":
+	default:
+		return fmt.Errorf("invalid TRACING_ENABLED %q (true or false)", os.Getenv("TRACING_ENABLED"))
+	}
+	if c.TracingEnabled && c.OTLPEndpoint == "" {
+		return errors.New("TRACING_ENABLED=true without OTEL_EXPORTER_OTLP_ENDPOINT " +
+			"(or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT); point it at an OpenTelemetry Collector, e.g. http://otel-collector:4318")
+	}
+	c.TracingTrustIncoming = os.Getenv("TRACING_TRUST_INCOMING") == "true"
+	c.ServiceName = env("OTEL_SERVICE_NAME", "ragmux")
+	var err error
+	if c.OTLPHeaders, err = parseKeyValues("OTEL_EXPORTER_OTLP_HEADERS", os.Getenv("OTEL_EXPORTER_OTLP_HEADERS")); err != nil {
+		return err
+	}
+	if c.ResourceAttrs, err = parseKeyValues("OTEL_RESOURCE_ATTRIBUTES", os.Getenv("OTEL_RESOURCE_ATTRIBUTES")); err != nil {
+		return err
+	}
+	c.TraceSampleRatio = 0.05
+	if v := strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER_ARG")); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			return fmt.Errorf("invalid OTEL_TRACES_SAMPLER_ARG %q (a ratio between 0 and 1)", v)
+		}
+		c.TraceSampleRatio = f
+	}
+	return nil
+}
+
+// parseKeyValues parses the "k=v,k2=v2" form both OTEL_EXPORTER_OTLP_HEADERS
+// and OTEL_RESOURCE_ATTRIBUTES use. A value may contain "=", so only the
+// first one separates.
+func parseKeyValues(name, raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(pair, "=")
+		k = strings.TrimSpace(k)
+		if !ok || k == "" {
+			return nil, fmt.Errorf("invalid %s entry %q (expected key=value)", name, pair)
+		}
+		out[k] = strings.TrimSpace(v)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // envOrFile returns the trimmed value of NAME, or the trimmed content of the
