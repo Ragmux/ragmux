@@ -1,5 +1,7 @@
 # Ragmux — self-hosted AI gateway
 
+[![Designed & Maintained with Tan](https://www.muhammetsafak.com.tr/badges/designed-maintained-with-tan.svg)](https://www.muhammetsafak.com.tr/en/tan/)
+
 <https://ragmux.com>
 
 Ragmux is a single-binary AI gateway written in Go. It sits between your applications
