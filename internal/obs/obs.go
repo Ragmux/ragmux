@@ -432,6 +432,11 @@ func (m *Metrics) RegisterStore(st *store.Store) {
 	m.registerPool(st.DB())
 	m.searchBackends.With(store.BackendPgvector).Set(1)
 	m.searchBackends.With(store.BackendPgSearch).Set(boolGauge(st.Caps().PgSearch))
+	// Unlabelled on purpose (ADR-002): the store ids are in the startup log.
+	m.reg.GaugeFunc("ragmux_rag_index_missing",
+		"RAG stores whose embedding width is above what pgvector can HNSW-index (2000); they are "+
+			"searched with an exact scan. Counted at startup, recounted when such a store is deleted or re-bound.",
+		func() float64 { return float64(st.RAGIndexMissing()) })
 
 	m.reg.CachedGaugeFunc("ragmux_documents",
 		"Documents by ingestion status; the pending count is the cluster's ingestion backlog. "+

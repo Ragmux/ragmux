@@ -74,11 +74,42 @@ type SearchOptions struct {
 // maxVectorDims is pgvector's limit for the vector type.
 const maxVectorDims = 16000
 
+// MaxIndexedVectorDims is the widest vector pgvector can put an HNSW index
+// on. A wider store cannot be indexed with the vector type at all; halfvec
+// support, which lifts the ceiling to 4000, is planned for v0.6.
+const MaxIndexedVectorDims = 2000
+
+// ErrVectorDimsUnsupported is returned when a store would be bound to an
+// embedding wider than MaxIndexedVectorDims for the first time.
+var ErrVectorDimsUnsupported = errors.New("embedding dimension not supported")
+
+// ErrEmbeddingConnectionChanged stops an ingest whose vectors were produced
+// by an embedding connection the store no longer uses: they would be written
+// next to vectors of another model, or with the wrong width.
+var ErrEmbeddingConnectionChanged = errors.New("embedding connection of the store changed during ingestion")
+
+// CheckVectorDims rejects an embedding width a new store cannot be bound to.
+// Stores that already carry a wider dimension keep working (see
+// ensureVecTable); this only guards the first assignment.
+func CheckVectorDims(dims int) error {
+	if dims > MaxIndexedVectorDims {
+		return fmt.Errorf("%w: the embedding model returns %d dimensions, but pgvector can index at most %d "+
+			"with the vector type; choose a model (or a dimensions setting) of %d or fewer -- halfvec support "+
+			"for wider models is planned for v0.6", ErrVectorDimsUnsupported, dims, MaxIndexedVectorDims, MaxIndexedVectorDims)
+	}
+	return nil
+}
+
 func vecTable(dims int) string { return fmt.Sprintf("chunk_embeddings_%d", dims) }
 
 // ensureVecTable creates the embedding table and its indexes for a dimension
 // if they do not exist yet. DDL is serialised with an advisory lock so
 // concurrent ingesters on several replicas do not race.
+//
+// Widths above MaxIndexedVectorDims get the table without the HNSW index,
+// which pgvector refuses to build for them: stores bound to such a model
+// before the limit was enforced keep working with an exact (sequential)
+// scan, and are reported at startup (see AuditRAGStores).
 func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 	if dims < 1 || dims > maxVectorDims {
 		return fmt.Errorf("embedding dimension %d out of range (1-%d)", dims, maxVectorDims)
@@ -101,9 +132,12 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 			rag_store_id BIGINT NOT NULL,
 			embedding    vector(%d) NOT NULL
 		)`, table, dims),
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_hnsw ON %s USING hnsw (embedding vector_cosine_ops)", table, table),
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_store ON %s (rag_store_id)", table, table),
 	}
+	if dims <= MaxIndexedVectorDims {
+		stmts = append(stmts,
+			fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_hnsw ON %s USING hnsw (embedding vector_cosine_ops)", table, table))
+	}
+	stmts = append(stmts, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_store ON %s (rag_store_id)", table, table))
 	for _, q := range stmts {
 		if _, err := tx.Exec(ctx, q); err != nil {
 			return err
@@ -117,8 +151,25 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 }
 
 // ReplaceDocumentChunks atomically swaps a document's chunks and embeddings
-// and marks it ready. All chunks must share the store's embedding width.
+// and marks it ready. All chunks must share the store's embedding width. It
+// does not check which embedding connection produced the vectors; ingestion
+// uses ReplaceDocumentChunksFrom.
 func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks []*Chunk, owner string) error {
+	return s.ReplaceDocumentChunksFrom(ctx, doc, 0, chunks, owner)
+}
+
+// ReplaceDocumentChunksFrom is ReplaceDocumentChunks for vectors produced by
+// the embedding connection embeddingConnID (0 skips the check). The store
+// row is locked for the length of the write, the same lock UpdateRAGStore
+// takes, so a connection change and an ingest are serialised: whichever
+// commits second sees the other's result. An ingest that loses that race
+// stops with ErrEmbeddingConnectionChanged instead of writing vectors of
+// the old model into the store.
+//
+// The first write also binds the store to the vectors' width; a width above
+// MaxIndexedVectorDims is refused there (ErrVectorDimsUnsupported).
+func (s *Store) ReplaceDocumentChunksFrom(ctx context.Context, doc *Document, embeddingConnID int64,
+	chunks []*Chunk, owner string) error {
 	if len(chunks) == 0 {
 		return fmt.Errorf("no chunks to store")
 	}
@@ -131,15 +182,14 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 			return fmt.Errorf("inconsistent embedding dimensions (%d vs %d)", len(c.Embedding), dims)
 		}
 	}
-	if err := s.SetRAGStoreDimensions(ctx, doc.RAGStoreID, dims); err != nil {
-		return err
-	}
+	// Unlocked pre-check, so a refused width or a stale ingest never gets
+	// as far as creating an embedding table. It is repeated under the lock.
 	r, err := s.GetRAGStore(ctx, doc.RAGStoreID)
 	if err != nil {
 		return err
 	}
-	if r.Dimensions != dims {
-		return fmt.Errorf("embedding dimension %d does not match store dimension %d", dims, r.Dimensions)
+	if err := checkStoreBinding(r.EmbeddingConnectionID, r.Dimensions, embeddingConnID, dims); err != nil {
+		return err
 	}
 	if err := s.ensureVecTable(ctx, dims); err != nil {
 		return fmt.Errorf("create embedding table: %w", err)
@@ -150,6 +200,21 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+
+	var curConn int64
+	var curDims int
+	if err := tx.QueryRow(ctx, "SELECT embedding_connection_id, dimensions FROM rag_stores WHERE id = $1 FOR NO KEY UPDATE",
+		doc.RAGStoreID).Scan(&curConn, &curDims); err != nil {
+		return scanErr(err)
+	}
+	if err := checkStoreBinding(curConn, curDims, embeddingConnID, dims); err != nil {
+		return err
+	}
+	if curDims == 0 {
+		if _, err := tx.Exec(ctx, "UPDATE rag_stores SET dimensions = $1 WHERE id = $2", dims, doc.RAGStoreID); err != nil {
+			return err
+		}
+	}
 
 	// Old embeddings go away through ON DELETE CASCADE.
 	if _, err := tx.Exec(ctx, "DELETE FROM chunks WHERE document_id = $1", doc.ID); err != nil {
@@ -214,6 +279,23 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 		return ErrNotFound
 	}
 	return tx.Commit(ctx)
+}
+
+// checkStoreBinding compares what a store is bound to (its embedding
+// connection and width, 0 = not bound yet) with the vectors about to be
+// written. wantConn 0 skips the connection check.
+func checkStoreBinding(storeConn int64, storeDims int, wantConn int64, dims int) error {
+	if wantConn != 0 && storeConn != wantConn {
+		return fmt.Errorf("%w: vectors were embedded with connection %d, the store now uses %d; "+
+			"reprocess the document", ErrEmbeddingConnectionChanged, wantConn, storeConn)
+	}
+	if storeDims == 0 {
+		return CheckVectorDims(dims)
+	}
+	if storeDims != dims {
+		return fmt.Errorf("embedding dimension %d does not match store dimension %d", dims, storeDims)
+	}
+	return nil
 }
 
 // SearchTopK returns the k nearest chunks in a store for a query vector,

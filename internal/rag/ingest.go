@@ -538,7 +538,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 			ing.progress(ctx, docID, progressChunked+(100-progressChunked)*end/len(chunks), nil)
 		}
 	}
-	if err := ing.store.ReplaceDocumentChunks(ctx, doc, chunks, ing.owner); err != nil {
+	if err := ing.store.ReplaceDocumentChunksFrom(ctx, doc, rs.EmbeddingConnectionID, chunks, ing.owner); err != nil {
 		return 0, fmt.Errorf("store chunks: %w", err)
 	}
 	ing.log.Info("document ingested", "doc", docID, "file", doc.Filename, "chunks", len(chunks),

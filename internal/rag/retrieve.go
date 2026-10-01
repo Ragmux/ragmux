@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -354,9 +355,32 @@ func LastUserQuery(msgs []provider.Message) string {
 	return ""
 }
 
-// InjectContext prepends the context block to the system prompt (creating
-// one when absent). It returns a copy; the input is not mutated.
+// InjectContext prepends a stable block -- the project system prompt -- to
+// the system prompt (creating one when absent). It returns a copy; the input
+// is not mutated.
+//
+// A string system prompt is extended in place. A parts-array system prompt
+// gets the block as a new leading text part and every client part -- with
+// its cache_control and any other field -- is relayed byte for byte, so a
+// client's prompt-caching breakpoint survives the injection.
 func InjectContext(msgs []provider.Message, contextBlock string) []provider.Message {
+	return inject(msgs, contextBlock, false)
+}
+
+// InjectRetrievedContext prepends a retrieved-passages block the way
+// InjectContext does, but strips cache_control from the client parts of the
+// message it lands in.
+//
+// The block changes with every query and sits in front of the client's
+// parts, so a breakpoint there would make Anthropic write a fresh cache
+// entry (billed above the plain input rate) on each request and never read
+// one back. Dropping the marker keeps the pre-0.4.2 cost; placing the block
+// after the client's cached prefix is the real fix and is left to v0.6-1.
+func InjectRetrievedContext(msgs []provider.Message, contextBlock string) []provider.Message {
+	return inject(msgs, contextBlock, true)
+}
+
+func inject(msgs []provider.Message, contextBlock string, dropCacheControl bool) []provider.Message {
 	if contextBlock == "" {
 		return msgs
 	}
@@ -364,7 +388,7 @@ func InjectContext(msgs []provider.Message, contextBlock string) []provider.Mess
 	injected := false
 	for _, m := range msgs {
 		if !injected && (m.Role == "system" || m.Role == "developer") {
-			m.Content = provider.TextContent(contextBlock + "\n\n" + m.Text())
+			m.Content = prependContext(m, contextBlock, dropCacheControl)
 			injected = true
 		}
 		out = append(out, m)
@@ -373,4 +397,48 @@ func InjectContext(msgs []provider.Message, contextBlock string) []provider.Mess
 		out = append([]provider.Message{{Role: "system", Content: provider.TextContent(contextBlock)}}, out...)
 	}
 	return out
+}
+
+// prependContext returns m's content with contextBlock in front of it. A
+// parts array keeps its parts behind a new text part -- untouched, or with
+// only their cache_control removed when dropCacheControl is set; anything
+// else is flattened to text as before.
+func prependContext(m provider.Message, contextBlock string, dropCacheControl bool) json.RawMessage {
+	var parts []json.RawMessage
+	if err := json.Unmarshal(m.Content, &parts); err == nil && parts != nil {
+		lead, _ := json.Marshal(struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{Type: "text", Text: contextBlock})
+		merged := make([]json.RawMessage, 0, len(parts)+1)
+		merged = append(merged, lead)
+		for _, p := range parts {
+			if dropCacheControl {
+				p = withoutCacheControl(p)
+			}
+			merged = append(merged, p)
+		}
+		if b, err := json.Marshal(merged); err == nil {
+			return b
+		}
+	}
+	return provider.TextContent(contextBlock + "\n\n" + m.Text())
+}
+
+// withoutCacheControl returns part without its cache_control field. A part
+// that has none, or is not a JSON object, is returned as it came.
+func withoutCacheControl(part json.RawMessage) json.RawMessage {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(part, &fields); err != nil {
+		return part
+	}
+	if _, ok := fields["cache_control"]; !ok {
+		return part
+	}
+	delete(fields, "cache_control")
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return part
+	}
+	return b
 }

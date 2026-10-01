@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -109,6 +111,31 @@ func keywordVec(s string) []float32 {
 	return v
 }
 
+// loopbackEmbeddingWidth is the RAG store save probe for tests: it embeds
+// through the mock upstreams on loopback and refuses anything else, so a
+// connection left at a provider's public default never reaches the network.
+// A refused probe is skipped by the admin, as an unreachable upstream is.
+func loopbackEmbeddingWidth(embedders func(*store.ModelConnection) (provider.Embedder, error)) func(context.Context, *store.ModelConnection) (int, error) {
+	return func(ctx context.Context, c *store.ModelConnection) (int, error) {
+		u, err := url.Parse(c.BaseURL)
+		if err != nil || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") {
+			return 0, fmt.Errorf("test probe: %q is not a loopback upstream", c.BaseURL)
+		}
+		emb, err := embedders(c)
+		if err != nil {
+			return 0, err
+		}
+		vecs, err := emb.Embed(ctx, []string{"ping"})
+		if err != nil {
+			return 0, err
+		}
+		if len(vecs) == 0 {
+			return 0, errors.New("no embedding")
+		}
+		return len(vecs[0]), nil
+	}
+}
+
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
 
 type env struct {
@@ -186,7 +213,8 @@ func newEnvOpts(t *testing.T, cfg store.OpenConfig, opts envOpts) *env {
 	// The mock upstreams listen on loopback, which the save-time base_url
 	// check would otherwise reject.
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
-		Limiter: auth.DefaultLoginLimiter(st), Usage: usage, ProviderConfig: provCfg, AllowPrivateUpstreams: true}
+		Limiter: auth.DefaultLoginLimiter(st), Usage: usage, ProviderConfig: provCfg, AllowPrivateUpstreams: true,
+		EmbeddingWidth: loopbackEmbeddingWidth(embedders)}
 	if tune != nil {
 		tune(adm)
 	}

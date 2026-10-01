@@ -320,6 +320,11 @@ a `system` message is inserted. The project's own `system_prompt` is injected th
 way, ahead of the context. The label carries only the parts that exist (file name,
 section, page).
 
+A system message sent as a parts array keeps its parts, with the context added as a new
+leading text part. Any `cache_control` on those parts is removed when passages are
+injected, because the per-query context in front of it could never be served from a
+prompt cache — see [Prompt caching](providers.md#request-side-cache_control).
+
 ### Prompt injection
 
 Retrieved passages come from uploaded documents, which may contain text written to
