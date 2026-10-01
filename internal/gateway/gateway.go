@@ -494,7 +494,8 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// the stable prefix most worth an Anthropic cache breakpoint, but the
 	// gateway does not mark one: a project-level cache_prompt flag needs a
 	// column, a migration and dashboard work of its own. Clients that mark
-	// their own content parts are relayed unchanged in the meantime.
+	// their own content parts are relayed unchanged in the meantime, except
+	// in the system message the RAG context lands in (see below).
 	if p.SystemPrompt != "" {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
@@ -520,7 +521,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
 				contextBlock = rag.FormatContext(hits)
-				req.Messages = rag.InjectContext(req.Messages, contextBlock)
+				// Drops the client's cache_control in that system message:
+				// a per-query prefix can never be read back from the cache.
+				req.Messages = rag.InjectRetrievedContext(req.Messages, contextBlock)
 				ragUsed, ragHits = true, len(hits)
 				sources = ragSources(hits)
 				w.Header().Set("x-ragmux-rag-sources", sourcesHeader(sources))

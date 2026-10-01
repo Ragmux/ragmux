@@ -508,6 +508,15 @@ been — a request that does not ask for caching is byte-identical to a 0.3.x on
 message has several marked parts the last marker wins, since Anthropic caches the prefix
 up to and including the marked block.
 
+**RAG context drops the system marker.** When a project's RAG store injects passages, the
+context block is prepended to the first `system`/`developer` message, and the
+`cache_control` on that message's parts is removed. The block changes with every query
+and comes first, so a breakpoint behind it would make Anthropic write a new cache entry
+(billed above the plain input rate) on each request and never read one back. The parts
+themselves and every other field are kept; markers on other messages, user content and
+tools are untouched, and a project `system_prompt` on its own does not drop anything.
+Placing the context after the client's cached prefix is planned for v0.6.
+
 **OpenAI, DeepSeek and `custom_openai`: nothing is sent.** Their caching is automatic and
 server-side; there is no request field to emit, so Ragmux emits none. A `cache_control` a
 client embeds rides along untouched (message content is relayed raw) and OpenAI ignores
