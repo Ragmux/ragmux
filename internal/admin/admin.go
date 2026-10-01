@@ -300,9 +300,6 @@ func badBody(w http.ResponseWriter, err error) {
 const (
 	maxUsernameLen      = 64
 	maxLoginPasswordLen = 1024
-	// maxPasswordLen is bcrypt's input limit; longer passwords are refused
-	// when set rather than silently truncated.
-	maxPasswordLen = 72
 )
 
 func (a *Admin) login(w http.ResponseWriter, r *http.Request) {

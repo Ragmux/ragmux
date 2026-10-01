@@ -82,8 +82,11 @@ replace the member set freely.
   deactivate or delete their own account (`400`).
 - `POST /admin/api/users/{id}/reset-password` sets a new password and revokes the user's
   sessions; `POST /admin/api/users/{id}/sessions/revoke` only signs the user out everywhere.
-- Passwords must be at least 8 characters and at most 72 bytes (bcrypt's input limit);
-  usernames at most 64.
+- Passwords must be at least 12 characters and at most 72 bytes (bcrypt's input limit);
+  usernames at most 64. The same rule applies everywhere a password is set: creating a
+  user, resetting or changing a password, the first-run setup, `ragmux reset-password`
+  and `ADMIN_PASSWORD`. Existing passwords are not re-checked; they keep working until
+  they are changed.
 - Changing your own password (`POST /admin/api/me/password`) signs out every other
   session of the account; the session that made the change stays valid.
 - `POST /admin/api/users` accepts `project_ids`; the memberships are written in the same

@@ -30,10 +30,6 @@ import (
 // golang.org/x/term, which is not in go.mod and is not worth a dependency
 // for one emergency command.
 
-// resetMinPasswordLen matches the first-run setup rather than the
-// dashboard's 8: an emergency admin reset should not mint a weak credential.
-const resetMinPasswordLen = 12
-
 // generatedPasswordLen is the length of a --generate password, in
 // store.GenerateSessionToken's alphabet.
 const generatedPasswordLen = 24
@@ -186,12 +182,11 @@ func resetPassword(args []string) int {
 }
 
 // checkResetPassword is the validation message for the new password, or "".
+// It is auth.ValidatePassword's, word for word, so the command and the
+// dashboard refuse the same password with the same sentence.
 func checkResetPassword(pw string) string {
-	switch {
-	case len(pw) < resetMinPasswordLen:
-		return fmt.Sprintf("the new password must be at least %d characters", resetMinPasswordLen)
-	case len(pw) > 72:
-		return "the new password must be at most 72 bytes (bcrypt's input limit)"
+	if err := auth.ValidatePassword(pw); err != nil {
+		return err.Error()
 	}
 	return ""
 }

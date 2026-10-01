@@ -26,6 +26,13 @@ func TestCheckResetPassword(t *testing.T) {
 			t.Errorf("checkResetPassword(%q) accepted = %v, want %v", pw, got, ok)
 		}
 	}
+	// The command and the dashboard refuse with the same sentence.
+	if got, want := checkResetPassword("elevenchars"), auth.ErrPasswordTooShort.Error(); got != want {
+		t.Errorf("11 characters: %q, want %q", got, want)
+	}
+	if got, want := checkResetPassword(strings.Repeat("a", 73)), auth.ErrPasswordTooLong.Error(); got != want {
+		t.Errorf("73 bytes: %q, want %q", got, want)
+	}
 }
 
 // runReset drives the subcommand against a test schema, feeding stdin from a
@@ -81,6 +88,9 @@ func TestResetPasswordCLI(t *testing.T) {
 		if got := runReset(t, cfg, "short\n", c.args...); got != c.want {
 			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
 		}
+	}
+	if got := runReset(t, cfg, "eleven-char\n", "ops", "--stdin"); got != 2 {
+		t.Errorf("11 characters: exit %d, want 2", got)
 	}
 
 	// An unknown account is exit 1 and creates nothing.

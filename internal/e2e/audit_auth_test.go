@@ -86,24 +86,24 @@ func TestAuditAndAuthHardening(t *testing.T) {
 	connID := int64(conn["id"].(float64))
 	proj := e.call("POST", "/admin/api/projects", map[string]any{"name": "P", "model_connection_id": connID}, "")
 	projID := int64(proj["project"].(map[string]any)["id"].(float64))
-	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "viewer", "password": "viewerpass", "project_ids": []int64{projID, 99999}}, ""); status(r) != 422 {
+	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "viewer", "password": "viewer-pass-1", "project_ids": []int64{projID, 99999}}, ""); status(r) != 422 {
 		t.Errorf("unknown project id: %v", r)
 	}
 	if r := e.call("GET", "/admin/api/users", nil, ""); len(r["_list"].([]any)) != 1 {
 		t.Errorf("failed create must not leave a user behind: %v", r)
 	}
-	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "viewer", "password": "viewerpass", "project_ids": []int64{projID}}, "")
+	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "viewer", "password": "viewer-pass-1", "project_ids": []int64{projID}}, "")
 	if status(vw) != 201 {
 		t.Fatalf("create viewer with projects: %v", vw)
 	}
-	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "Viewer", "password": "viewerpass"}, ""); status(r) != 409 || !strings.Contains(fmt.Sprint(errOf(r)["message"]), "case-insensitive") {
+	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "Viewer", "password": "viewer-pass-1"}, ""); status(r) != 409 || !strings.Contains(fmt.Sprint(errOf(r)["message"]), "case-insensitive") {
 		t.Errorf("case-insensitive duplicate: %v", r)
 	}
 	if r := e.call("GET", fmt.Sprintf("/admin/api/projects/%d/members", projID), nil, ""); len(r["_list"].([]any)) != 2 {
 		t.Errorf("project members after create: %v", r)
 	}
-	viewerTok := e.login("VIEWER", "viewerpass")
-	e.login("viewer", "viewerpass")
+	viewerTok := e.login("VIEWER", "viewer-pass-1")
+	e.login("viewer", "viewer-pass-1")
 	users := e.call("GET", "/admin/api/users", nil, "")["_list"].([]any)
 	stats := map[string]map[string]any{}
 	for _, u := range users {

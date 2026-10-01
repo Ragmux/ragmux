@@ -23,10 +23,6 @@ import (
 // typed once and should be unambiguous in logs and audit rows.
 var setupUsernamePattern = regexp.MustCompile(`^[a-z0-9._-]{3,64}$`)
 
-// setupMinPasswordLen is longer than the 8 characters user management
-// accepts: this password protects the whole installation from day one.
-const setupMinPasswordLen = 12
-
 // setupLimiterUser is the username under which failed setup attempts are
 // recorded: the per-address login budget applies to them (CheckAddress)
 // without touching any real account's counters.
@@ -118,14 +114,9 @@ func (a *Admin) setup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "username must be 3-64 characters of a-z, 0-9, '.', '_' or '-'")
 		return
 	}
-	if len(in.Password) < setupMinPasswordLen {
+	if msg := checkNewPassword(in.Password); msg != "" {
 		recordFailure()
-		writeErr(w, http.StatusBadRequest, "password must be at least 12 characters")
-		return
-	}
-	if len(in.Password) > maxPasswordLen {
-		recordFailure()
-		writeErr(w, http.StatusBadRequest, "password must be at most 72 bytes")
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	hash, err := auth.HashPassword(in.Password)

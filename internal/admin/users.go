@@ -15,14 +15,10 @@ import (
 // ---- users (admin only, except the lite listing) ----
 
 // checkNewPassword returns the validation message for a password being set,
-// or "" when it is acceptable: 8 characters at least, and at most bcrypt's
-// 72-byte input limit so nothing is silently truncated.
+// or "" when it is acceptable under auth.ValidatePassword.
 func checkNewPassword(pw string) string {
-	if len(pw) < 8 {
-		return "password must be at least 8 characters"
-	}
-	if len(pw) > maxPasswordLen {
-		return "password must be at most 72 bytes"
+	if err := auth.ValidatePassword(pw); err != nil {
+		return err.Error()
 	}
 	return ""
 }
