@@ -33,14 +33,10 @@ func (s *Store) CountFailedLoginAttemptsForPair(ctx context.Context, username, i
 	return n, err
 }
 
-// DeleteLoginAttemptsBefore purges attempts older than t and reports how
-// many rows were removed.
+// DeleteLoginAttemptsBefore purges attempts older than t batch by batch
+// and reports how many rows were removed.
 func (s *Store) DeleteLoginAttemptsBefore(ctx context.Context, t time.Time) (int64, error) {
-	tag, err := s.pool.Exec(ctx, "DELETE FROM login_attempts WHERE created_at < $1", t.UTC())
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
+	return s.deleteAllExpired(ctx, RetainLoginAttempts, t)
 }
 
 // OldestFailedLoginAttempt returns the time of the oldest failure for the
