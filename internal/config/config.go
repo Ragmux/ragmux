@@ -641,7 +641,7 @@ func envOrFile(name string) (string, error) {
 	if path == "" {
 		return "", nil
 	}
-	raw, err := os.ReadFile(filepath.Clean(path))
+	raw, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // G703: the operator names the secret file; reading it is the point
 	if err != nil {
 		return "", fmt.Errorf("read %s_FILE: %w", name, err)
 	}
