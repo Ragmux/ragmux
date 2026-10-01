@@ -309,6 +309,17 @@ type Provider interface {
 	ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error
 }
 
+// RequestWarner is implemented by adapters that forward a request although
+// they ignore part of it. The gateway relays each returned text to the client
+// as a Warning header (code 299), so the silent drop becomes visible without
+// failing a request that would otherwise succeed. Warning comes from RFC 7234;
+// RFC 9111 obsoleted it and deprecated the header, which is kept here for
+// visibility. It must be cheap and side-effect free: the gateway calls it
+// once per request, before any response byte is written.
+type RequestWarner interface {
+	RequestWarnings(req ChatRequest) []string
+}
+
 // Embedder produces vector embeddings.
 type Embedder interface {
 	Embed(ctx context.Context, inputs []string) ([][]float32, error)
@@ -325,6 +336,12 @@ type Error struct {
 	// header rather than a body field because that is what an HTTP client
 	// already knows how to honour.
 	RetryAfter int
+	// UpstreamRetryAfter is the upstream's own Retry-After value, relayed
+	// verbatim: either delay-seconds or an HTTP-date. It is only set when
+	// the value has one of those two shapes, and RetryAfter wins when both
+	// are present, because the gateway's own figure is the one it can vouch
+	// for.
+	UpstreamRetryAfter string
 }
 
 func (e *Error) Error() string {

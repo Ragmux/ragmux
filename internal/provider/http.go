@@ -117,7 +117,7 @@ func doJSON(ctx context.Context, cfg Config, op, url string, headers map[string]
 		return e
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		e := upstreamError(resp.StatusCode, raw, cfg.APIKey)
+		e := upstreamStatusError(cfg, resp, raw)
 		spanFailed(span, e.Type)
 		return e
 	}
@@ -161,7 +161,7 @@ func doStream(ctx context.Context, cfg Config, url string, headers map[string]st
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		cancel()
-		e := upstreamError(resp.StatusCode, raw, cfg.APIKey)
+		e := upstreamStatusError(cfg, resp, raw)
 		spanFailed(span, e.Type)
 		span.End()
 		return nil, e
@@ -373,10 +373,59 @@ func upstreamError(status int, raw []byte, secrets ...string) *Error {
 		e.Message = e.Message[:maxUpstreamMessage]
 	}
 	// Do not relay 5xx codes verbatim as our own; mark them as bad gateway.
-	if status >= 500 {
+	// 503 and 504 are the exceptions: they tell the client the upstream is
+	// overloaded or slow -- worth a retry, often with a Retry-After -- which
+	// a flat 502 would erase. Every other 5xx is the upstream misbehaving.
+	if status >= 500 && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
 		e.Status = http.StatusBadGateway
 	}
 	return e
+}
+
+// statusAnthropicOverloaded is Anthropic's own "overloaded" status. It is
+// not a registered code, but it means what 503 means.
+const statusAnthropicOverloaded = 529
+
+// upstreamStatusError builds the *Error for a non-2xx upstream response:
+// status mapping, message, and the upstream's Retry-After.
+func upstreamStatusError(cfg Config, resp *http.Response, raw []byte) *Error {
+	e := upstreamError(resp.StatusCode, raw, cfg.APIKey)
+	if cfg.ProviderType == "anthropic" && resp.StatusCode == statusAnthropicOverloaded {
+		// Overloaded, come back later: a 503, not a broken upstream.
+		e.Status = http.StatusServiceUnavailable
+	}
+	e.UpstreamRetryAfter = upstreamRetryAfter(resp.Header)
+	return e
+}
+
+// maxRetryAfter bounds the relayed header; an HTTP-date is 29 bytes.
+const maxRetryAfter = 64
+
+// upstreamRetryAfter returns the upstream's Retry-After header when it has
+// one of the two shapes RFC 9110 allows -- delay-seconds or an HTTP-date --
+// and "" otherwise. The value is relayed as it came, not converted: the
+// upstream knows which form it meant, and the client parses both.
+func upstreamRetryAfter(h http.Header) string {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" || len(v) > maxRetryAfter {
+		return ""
+	}
+	if isDigits(v) {
+		return v
+	}
+	if _, err := http.ParseTime(v); err == nil {
+		return v
+	}
+	return ""
+}
+
+func isDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 func chatID() string {

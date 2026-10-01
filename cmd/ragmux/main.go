@@ -753,7 +753,7 @@ func cors(origins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Expose-Headers",
 					"Retry-After, X-Request-Id, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, "+
 						"x-ratelimit-reset-requests, x-ragmux-budget-daily-remaining, x-ragmux-budget-monthly-remaining, "+
-						"x-ragmux-rag-hits, x-ragmux-rag-sources, x-ragmux-projects")
+						"x-ragmux-rag-hits, x-ragmux-rag-sources, x-ragmux-projects, Warning")
 				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 			if r.Method == http.MethodOptions {

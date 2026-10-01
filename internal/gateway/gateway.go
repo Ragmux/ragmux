@@ -582,6 +582,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Warnings go out before the first byte of either response shape; a
+	// stream's headers are only written once its first chunk arrives.
+	setRequestWarnings(w.Header(), prov, req)
+
 	if req.Stream {
 		g.stream(w, r, prov, conn, req, rec, obsv, promptChars)
 		return
@@ -600,12 +604,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		status, pe := providerError(err)
 		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		log.Warn("upstream error", "status", status, "msg", pe.Message)
-		w.Header().Set("Content-Type", "application/json")
-		if pe.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
-		}
-		w.WriteHeader(status)
-		_, _ = w.Write(pe.ErrorJSON())
+		writeProviderError(w, status, pe)
 		return
 	}
 	resp.Model = clientModel
@@ -827,12 +826,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		status, pe := providerError(err)
 		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
-		w.Header().Set("Content-Type", "application/json")
-		if pe.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
-		}
-		w.WriteHeader(status)
-		_, _ = w.Write(pe.ErrorJSON())
+		writeProviderError(w, status, pe)
 		return
 	}
 	sendHeaders()
@@ -910,6 +904,45 @@ func writeLimitError(w http.ResponseWriter, d limits.Decision) {
 	w.WriteHeader(http.StatusTooManyRequests)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
 		"message": msg, "type": typ, "code": d.Reason, "scope": d.Scope}})
+}
+
+// writeProviderError answers with a provider error in OpenAI's envelope,
+// carrying its retry hint as a Retry-After header.
+func writeProviderError(w http.ResponseWriter, status int, pe *provider.Error) {
+	w.Header().Set("Content-Type", "application/json")
+	setRetryAfter(w.Header(), pe)
+	w.WriteHeader(status)
+	_, _ = w.Write(pe.ErrorJSON())
+}
+
+// setRetryAfter writes the error's retry hint. The gateway's own figure
+// (RetryAfter, seconds) wins over the upstream's; the upstream's is relayed
+// verbatim, in whichever of the two RFC 9110 forms it came.
+func setRetryAfter(h http.Header, pe *provider.Error) {
+	switch {
+	case pe.RetryAfter > 0:
+		h.Set("Retry-After", strconv.Itoa(pe.RetryAfter))
+	case pe.UpstreamRetryAfter != "":
+		h.Set("Retry-After", pe.UpstreamRetryAfter)
+	}
+}
+
+// warnTextEscaper keeps a warning text inside its quoted-string.
+var warnTextEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+
+// setRequestWarnings adds one `Warning: 299 ragmux "<text>"` header per part
+// of the request the adapter forwards but ignores. 299 is RFC 7234's
+// "miscellaneous persistent warning"; RFC 9111 obsoleted that RFC and
+// deprecated the header, which is kept for visibility. The request still
+// succeeds.
+func setRequestWarnings(h http.Header, prov provider.Provider, req provider.ChatRequest) {
+	rw, ok := prov.(provider.RequestWarner)
+	if !ok {
+		return
+	}
+	for _, text := range rw.RequestWarnings(req) {
+		h.Add("Warning", `299 ragmux "`+warnTextEscaper.Replace(text)+`"`)
+	}
 }
 
 func providerError(err error) (int, *provider.Error) {
