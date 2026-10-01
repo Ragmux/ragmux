@@ -126,3 +126,35 @@ jobs:
           build-args: VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Reminder only, never a gate: ragmux.com's /docs pages are copies of files in
+  # this repo, made by its scripts/sync-docs.mjs. A PR that changes any of them
+  # leaves the site stale until someone runs `npm run sync-docs` there. The
+  # pathspec below mirrors the `source` entries of PAGES in that script (all of
+  # docs/, plus README.md, CHANGELOG.md and SECURITY.md); keep the two in step.
+  # Syncing automatically needs a cross-repo token and is planned for v0.5;
+  # until then this job just warns.
+  docs-sync-reminder:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Warn when site-synced files changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          synced=(docs/ README.md CHANGELOG.md SECURITY.md)
+          if ! changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- "${synced[@]}")"; then
+            echo "::notice::Could not diff against the base branch; skipping the docs sync reminder."
+            exit 0
+          fi
+          if [ -n "$changed" ]; then
+            echo "::warning title=Site docs sync::This PR changes files ragmux.com copies into /docs. Run \`npm run sync-docs\` in ragmux.com after it merges."
+            printf '%s\n' "$changed"
+          else
+            echo "No changes to files synced into ragmux.com."
+          fi
