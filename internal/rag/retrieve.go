@@ -181,7 +181,12 @@ func (r *Retriever) embedQuery(ctx context.Context, emb provider.Embedder, provi
 	// before SetAttributes can discard it. Unguarded that is one allocation
 	// per retrieval even when tracing is off.
 	if span.IsRecording() {
-		span.SetAttributes(tracing.String("gen_ai.system", providerType))
+		// gen_ai.system is deprecated in favour of gen_ai.provider.name;
+		// both are emitted until v0.5 drops it.
+		span.SetAttributes(
+			tracing.String("gen_ai.system", providerType),
+			tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(providerType)),
+		)
 	}
 	start := time.Now()
 	vecs, err := emb.Embed(ctx, []string{query})

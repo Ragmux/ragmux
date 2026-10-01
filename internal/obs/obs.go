@@ -32,6 +32,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/metrics"
 	"github.com/ragmux/ragmux/internal/store"
 )
@@ -49,6 +50,11 @@ var (
 	// on the scrape that finds the cache stale, so it gets its own budget
 	// rather than the scraper's patience.
 	documentQueryTimeout = 3 * time.Second
+	// budgetGaugeTTL and budgetQueryTimeout are the same trade for the
+	// budget ratio: one aggregate query at most every 30 s, bounded on its
+	// own.
+	budgetGaugeTTL     = 30 * time.Second
+	budgetQueryTimeout = 3 * time.Second
 )
 
 // Ingest job outcomes, the values of ragmux_ingest_jobs_total{outcome}.
@@ -96,6 +102,7 @@ type Metrics struct {
 	gwCost        *metrics.FloatCounterVec
 	gwErrors      *metrics.CounterVec
 	gwDisconnects *metrics.CounterVec
+	gwUnpriced    *metrics.CounterVec
 
 	limitsDenied *metrics.CounterVec
 
@@ -112,6 +119,8 @@ type Metrics struct {
 	ingestChunks    *metrics.CounterVec
 	ingestClaims    *metrics.CounterVec
 	ingestLeaseLost *metrics.CounterVec
+
+	retentionLastSuccess *metrics.GaugeVec
 }
 
 // New declares the metric set on reg.
@@ -159,6 +168,10 @@ func New(reg *metrics.Registry) *Metrics {
 		"project", "provider", "type")
 	m.gwDisconnects = reg.Counter("ragmux_gateway_client_disconnects_total",
 		"Chat completions the client abandoned before they finished (status 499).")
+	m.gwUnpriced = reg.Counter("ragmux_requests_unpriced_total",
+		"Successful chat completions whose model matched no price row, so their cost was recorded as zero. "+
+			"A rising rate means ragmux_gateway_cost_usd_total under-reports spend.",
+		"provider")
 
 	m.limitsDenied = reg.Counter("ragmux_limits_denied_total",
 		"Requests refused by a rate limit or a token budget, by project and deny reason.",
@@ -192,6 +205,13 @@ func New(reg *metrics.Registry) *Metrics {
 		"Dispatcher claim attempts by outcome.", "outcome")
 	m.ingestLeaseLost = reg.Counter("ragmux_ingest_lease_lost_total",
 		"Jobs abandoned because another replica took the document's lease.")
+
+	m.retentionLastSuccess = reg.Gauge("ragmux_retention_last_success_timestamp_seconds",
+		"Unix time of the last retention pass this replica completed without error; 0 until one has. "+
+			"Only the replica holding the retention leader lock runs a pass, so read it as max() across replicas.")
+	// Created now so the series reads 0 before the first pass rather than
+	// being absent, which an absent()-less alert would never see.
+	m.retentionLastSuccess.With()
 
 	return m
 }
@@ -237,6 +257,10 @@ type GatewayRequest struct {
 	ErrorType string
 	// ClientDisconnected reports the 499 path.
 	ClientDisconnected bool
+	// Unpriced reports that no price row matched the model, so CostUSD is
+	// zero for want of a price rather than because the request was free.
+	// It is only counted on a 2xx: a failed request has nothing to price.
+	Unpriced bool
 }
 
 // knownErrorTypes is the closed set ragmux_gateway_errors_total{type} is
@@ -308,6 +332,9 @@ func (m *Metrics) RecordGateway(r GatewayRequest) {
 	}
 	if r.ClientDisconnected {
 		m.gwDisconnects.With().Inc()
+	}
+	if r.Unpriced && r.Status >= 200 && r.Status < 300 {
+		m.gwUnpriced.With(r.Provider).Inc()
 	}
 }
 
@@ -420,11 +447,20 @@ func (m *Metrics) RecordIngestClaim(outcome string) {
 	m.ingestClaims.With(outcome).Inc()
 }
 
+// RetentionPassed records that a retention pass completed without error.
+func (m *Metrics) RetentionPassed(at time.Time) {
+	if m == nil {
+		return
+	}
+	m.retentionLastSuccess.With().Set(float64(at.Unix()))
+}
+
 // ---- scrape-time collectors ----
 
 // RegisterStore adds the collectors that read the database or the pool:
 // the connection pool gauges (free, no query), the detected search backends
-// (read once at Open) and the cached documents-by-status gauge.
+// (read once at Open), the cached documents-by-status gauge and the cached
+// budget-used ratio per project.
 func (m *Metrics) RegisterStore(st *store.Store) {
 	if m == nil || st == nil {
 		return
@@ -445,6 +481,19 @@ func (m *Metrics) RegisterStore(st *store.Store) {
 			ctx, cancel := context.WithTimeout(context.Background(), documentQueryTimeout)
 			defer cancel()
 			return st.DocumentStatusCounts(ctx)
+		})
+
+	// The project label is the numeric id of a project row, so it grows
+	// with the installation rather than with traffic; each id still takes
+	// a slot under the series cap (ADR-002) like any other new series.
+	m.reg.CappedCachedGaugeFunc("ragmux_budget_used_ratio",
+		"Share of the token budget used in the current UTC window, by project: the larger of day tokens over "+
+			"the daily budget and month tokens over the monthly budget. 1 means the budget is exhausted. "+
+			"Projects without a budget are absent. Cached for 30 s.",
+		"project", budgetGaugeTTL, func() (map[string]float64, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), budgetQueryTimeout)
+			defer cancel()
+			return st.BudgetUsedRatios(ctx, limits.Windows(time.Now()))
 		})
 }
 

@@ -49,6 +49,22 @@ exporters:
   #     authorization: "Bearer ${env:VENDOR_API_KEY}"
   #   compression: gzip
 
+  # --- Langfuse (OTLP/HTTP; cloud or self-hosted) ---
+  # Langfuse takes OTLP over HTTP only, at /api/public/otel. The header is
+  # Basic auth of "<public key>:<secret key>" base64-encoded; build it
+  # outside this file, e.g. LANGFUSE_AUTH=$(printf '%s' "pk-lf-...:sk-lf-..." | base64).
+  # Ragmux spans carry gen_ai.* attributes but no prompt or completion text.
+  # otlphttp/langfuse:
+  #   endpoint: https://cloud.langfuse.com/api/public/otel
+  #   headers:
+  #     authorization: "Basic ${env:LANGFUSE_AUTH}"
+
+  # --- Arize Phoenix (self-hosted; OTLP/HTTP on 6006, gRPC on 4317) ---
+  # otlphttp/phoenix:
+  #   endpoint: http://phoenix:6006
+  #   tls:
+  #     insecure: true
+
 service:
   pipelines:
     traces:

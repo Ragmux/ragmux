@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/store"
 )
 
@@ -54,6 +55,9 @@ type Janitor struct {
 	// are invisible to the ingestion claim, so the pass writes their final
 	// failed status; 0 skips the step.
 	IngestMaxAttempts int
+	// Metrics receives the time of every pass that finished without error,
+	// which is what the retention-lag alert reads; nil records nothing.
+	Metrics *obs.Metrics
 
 	// batchSize and batchPause override DefaultBatchSize and
 	// DefaultBatchPause when positive; tests set them.
@@ -291,6 +295,8 @@ func (j *Janitor) runLogged(ctx context.Context) {
 	rep, err := j.RunOnce(ctx)
 	if err != nil {
 		j.log().Warn("retention pass failed", "err", err)
+	} else if ctx.Err() == nil {
+		j.Metrics.RetentionPassed(time.Now())
 	}
 	j.log().Info("retention pass", "deleted", rep.Deleted(), "duration", time.Since(start),
 		"interrupted", ctx.Err() != nil,

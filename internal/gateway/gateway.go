@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -61,6 +62,64 @@ type requestObs struct {
 	upstream time.Duration
 	// ttft is the wait for a stream's first chunk; zero when none arrived.
 	ttft time.Duration
+	// responseModel is the model the upstream reported, recorded before the
+	// response is rewritten to the client's model string; empty until a
+	// response or a first chunk arrives. See noteResponseModel.
+	responseModel string
+	// finishReasons is the distinct set of finish reasons seen, each mapped
+	// onto the closed set in knownFinishReasons.
+	finishReasons []string
+}
+
+// maxResponseModelLen caps gen_ai.response.model. An upstream is not
+// trusted to keep its model string short.
+const maxResponseModelLen = 128
+
+// noteResponseModel records gen_ai.response.model once per request. The
+// value is the model the upstream reported, unless it is empty or merely
+// echoes the client's model string back: several adapters copy the request
+// model into the response, and that string is attacker-controlled, so the
+// connection's model name stands in for it.
+func (o *requestObs) noteResponseModel(upstream, clientModel, connModel string) {
+	if o.responseModel != "" {
+		return
+	}
+	m := upstream
+	if m == "" || (m == clientModel && clientModel != connModel) {
+		m = connModel
+	}
+	if len(m) > maxResponseModelLen {
+		// Cut on a rune boundary so the exported value stays valid UTF-8.
+		n := maxResponseModelLen
+		for n > 0 && !utf8.RuneStart(m[n]) {
+			n--
+		}
+		m = m[:n]
+	}
+	o.responseModel = m
+}
+
+// knownFinishReasons is the closed set gen_ai.response.finish_reasons may
+// carry; anything else an upstream sends is recorded as "other".
+var knownFinishReasons = map[string]bool{
+	"stop": true, "length": true, "tool_calls": true, "content_filter": true, "function_call": true,
+}
+
+// noteFinishReason adds one choice's finish reason to the distinct set.
+func (o *requestObs) noteFinishReason(reason *string) {
+	if reason == nil || *reason == "" {
+		return
+	}
+	r := *reason
+	if !knownFinishReasons[r] {
+		r = "other"
+	}
+	for _, have := range o.finishReasons {
+		if have == r {
+			return
+		}
+	}
+	o.finishReasons = append(o.finishReasons, r)
 }
 
 type ctxKey struct{}
@@ -570,15 +629,25 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			PromptTokens: rec.PromptTokens, CompletionTokens: rec.CompletionTokens,
 			Estimated: rec.Estimated, CostUSD: rec.CostUSD, ErrorType: obsv.errType,
 			ClientDisconnected: rec.StatusCode == statusClientClosed,
+			Unpriced:           rec.CostSource == store.CostSourceNone,
 		})
 		if span.IsRecording() {
 			span.SetAttributes(
 				tracing.Int64("ragmux.project.id", p.ID),
+				tracing.String("gen_ai.operation.name", "chat"),
+				tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(conn.ProviderType)),
 				tracing.String("gen_ai.request.model", conn.ModelName),
 				tracing.Bool("ragmux.stream", rec.Streamed),
 				tracing.Int("gen_ai.usage.input_tokens", rec.PromptTokens),
 				tracing.Int("gen_ai.usage.output_tokens", rec.CompletionTokens),
+				tracing.Int("gen_ai.usage.cache_read.input_tokens", rec.CachedPromptTokens),
 			)
+			if obsv.responseModel != "" {
+				span.SetAttributes(tracing.String("gen_ai.response.model", obsv.responseModel))
+			}
+			if len(obsv.finishReasons) > 0 {
+				span.SetAttributes(tracing.StringSlice("gen_ai.response.finish_reasons", obsv.finishReasons))
+			}
 			if rec.StatusCode < 500 {
 				span.SetStatusOK()
 			}
@@ -609,6 +678,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Warn("upstream error", "status", status, "msg", pe.Message)
 		writeProviderError(w, status, pe)
 		return
+	}
+	obsv.noteResponseModel(resp.Model, clientModel, conn.ModelName)
+	for i := range resp.Choices {
+		obsv.noteFinishReason(resp.Choices[i].FinishReason)
 	}
 	resp.Model = clientModel
 	fillUsage(rec, resp.Usage, promptChars, completionChars(resp))
@@ -785,6 +858,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		sm.Chunk()
 		if obsv.ttft == 0 {
 			obsv.ttft = time.Since(upstreamStart)
+		}
+		// Recorded before the client check so a disconnect does not hide
+		// what the upstream reported. req.Model is the client's string here.
+		obsv.noteResponseModel(chunk.Model, req.Model, conn.ModelName)
+		for i := range chunk.Choices {
+			obsv.noteFinishReason(chunk.Choices[i].FinishReason)
 		}
 		if clientGone {
 			continue // drain until the provider notices the cancellation
