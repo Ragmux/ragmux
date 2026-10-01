@@ -46,12 +46,14 @@ func (t *toolCallStream) Args(block int, partial string) json.RawMessage {
 // Whole is a complete call in a single delta, for providers that never split
 // arguments (Gemini, Ollama).
 func (t *toolCallStream) Whole(id, name, args string) json.RawMessage {
-	n := t.assign(noBlock)
-	c := toolCall{ID: id, Name: name, Arguments: args}.normalised()
-	b, _ := json.Marshal([]map[string]any{{
-		"index": n, "id": c.ID, "type": "function",
-		"function": map[string]string{"name": c.Name, "arguments": c.Arguments},
-	}})
+	return t.WholeCall(toolCall{ID: id, Name: name, Arguments: args})
+}
+
+// WholeCall is Whole for a call that may carry a provider signature.
+func (t *toolCallStream) WholeCall(c toolCall) json.RawMessage {
+	w := c.normalised().wire()
+	w["index"] = t.assign(noBlock)
+	b, _ := json.Marshal([]map[string]any{w})
 	return b
 }
 
@@ -76,6 +78,22 @@ type toolCall struct {
 	ID        string
 	Name      string
 	Arguments string
+	// Signature is the provider's opaque reasoning signature for the call,
+	// relayed to the client under toolCallSignatureField. Empty for every
+	// provider but Gemini.
+	Signature string
+}
+
+// wire renders the call in OpenAI's shape, without the streaming index.
+func (c toolCall) wire() map[string]any {
+	w := map[string]any{
+		"id": c.ID, "type": "function",
+		"function": map[string]string{"name": c.Name, "arguments": c.Arguments},
+	}
+	if c.Signature != "" {
+		w[toolCallSignatureField] = c.Signature
+	}
+	return w
 }
 
 // normalised fills in what OpenAI clients require but providers omit: an id
@@ -104,11 +122,7 @@ func toolCallsJSON(calls []toolCall) json.RawMessage {
 	}
 	out := make([]map[string]any, len(calls))
 	for i, c := range calls {
-		c = c.normalised()
-		out[i] = map[string]any{
-			"id": c.ID, "type": "function",
-			"function": map[string]string{"name": c.Name, "arguments": c.Arguments},
-		}
+		out[i] = c.normalised().wire()
 	}
 	b, _ := json.Marshal(out)
 	return b

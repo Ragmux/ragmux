@@ -42,6 +42,7 @@ func (p *openAICompat) headers() map[string]string {
 
 func (p *openAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	req.Model = p.cfg.Model
+	req.Messages = stripToolCallSignatures(req.Messages)
 	req.Stream = false
 	req.StreamOptions = nil
 	var out ChatResponse
@@ -65,6 +66,7 @@ func (p *openAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 
 func (p *openAICompat) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
 	req.Model = p.cfg.Model
+	req.Messages = stripToolCallSignatures(req.Messages)
 	req.Stream = true
 	// Ask for usage in the final chunk; providers that do not understand this
 	// field generally ignore it.

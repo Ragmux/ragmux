@@ -1,0 +1,27 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {"name": "get_weather", "args": {"city": "Ankara"}},
+            "thoughtSignature": "CiQB0e2Kb7xQm1v3fJ0yR8nA4sL2pT6uW9eZ5cH3kD1gV7oN0qYSWgHR7YpuX2q9eL4mC8vB1nK6sT3wJ0aF5dG7hE2iU9oP4rQ1yZ8xC3vN6bM0lK2jH5gF8dS1aW4eR7tY0uI3oP6=="
+          },
+          {
+            "functionCall": {"name": "get_time", "args": {"tz": "Europe/Istanbul"}}
+          }
+        ]
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 42,
+    "candidatesTokenCount": 18,
+    "thoughtsTokenCount": 64,
+    "totalTokenCount": 124
+  },
+  "modelVersion": "gemini-3-pro-preview"
+}
