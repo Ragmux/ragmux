@@ -358,12 +358,8 @@ func (s *Store) DeleteUserSessionsExcept(ctx context.Context, userID int64, toke
 	return err
 }
 
-// PurgeExpiredSessions removes sessions that expired before t and reports
-// how many rows were removed.
+// PurgeExpiredSessions removes sessions that expired by t batch by batch
+// and reports how many rows were removed.
 func (s *Store) PurgeExpiredSessions(ctx context.Context, t time.Time) (int64, error) {
-	tag, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE expires_at <= $1", t.UTC())
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
+	return s.deleteAllExpired(ctx, RetainSessions, t)
 }

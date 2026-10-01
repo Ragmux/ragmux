@@ -296,13 +296,7 @@ func (s *Store) DeleteAPIKey(ctx context.Context, id int64) error {
 // on request_logs.api_key_id safe: attribution is never erased, the row just
 // outlives the key it names.
 func (s *Store) PurgeRetiredAPIKeys(ctx context.Context, cutoff time.Time) (int64, error) {
-	res, err := s.pool.Exec(ctx, `DELETE FROM api_keys
-		WHERE (revoked_at < $1 OR expires_at < $1)
-		  AND NOT EXISTS (SELECT 1 FROM request_logs WHERE api_key_id = api_keys.id)`, cutoff.UTC())
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected(), nil
+	return s.deleteAllExpired(ctx, RetainAPIKeys, cutoff)
 }
 
 // TouchAPIKeyUsed stamps last_used_at at most once a minute per key, so the
