@@ -39,8 +39,8 @@ const (
 	codeError Code = 2
 )
 
-// Attr is one span attribute. Value must be a string, int64, float64 or bool;
-// anything else is dropped at export time. The mapping for richer types is
+// Attr is one span attribute. Value must be a string, int64, float64, bool or
+// []string; anything else is dropped at export time. The mapping for richer types is
 // not worth hand-writing for the handful of attributes this repository sets.
 type Attr struct {
 	Key   string
@@ -61,6 +61,29 @@ func Float(k string, v float64) Attr { return Attr{Key: k, Value: v} }
 
 // Bool builds a boolean attribute.
 func Bool(k string, v bool) Attr { return Attr{Key: k, Value: v} }
+
+// StringSlice builds a string array attribute. The slice is copied, so the
+// caller may reuse it after the call.
+func StringSlice(k string, v []string) Attr {
+	return Attr{Key: k, Value: append([]string(nil), v...)}
+}
+
+// GenAIProviderName maps a model connection's provider_type to the
+// OpenTelemetry GenAI semantic-convention value of gen_ai.provider.name.
+// The well-known providers get their registered value; any other type
+// (ollama, custom_openai, voyage_rerank) passes through unchanged, which is
+// still a bounded set because provider_type is validated against a fixed
+// list when the connection is created.
+func GenAIProviderName(providerType string) string {
+	switch providerType {
+	case "gemini":
+		return "gcp.gemini"
+	case "cohere_rerank":
+		return "cohere"
+	default:
+		return providerType
+	}
+}
 
 // Span is one unit of work.
 //

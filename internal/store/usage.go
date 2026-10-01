@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strconv"
 	"time"
 )
 
@@ -113,4 +114,37 @@ func (s *Store) MinuteTokensSince(ctx context.Context, projectID int64, since ti
 	err := s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) FROM project_usage
 		WHERE project_id = $1 AND period = 'minute' AND period_start >= $2`, projectID, since.UTC()).Scan(&n)
 	return n, err
+}
+
+// BudgetUsedRatios reports, for every project with a daily or monthly token
+// budget, the larger of day tokens over the daily budget and month tokens
+// over the monthly budget in the windows w. The key is the project id in
+// decimal, which is what ragmux_budget_used_ratio{project} carries. A
+// project without any budget is left out: its ratio is undefined, not zero.
+// One query, whatever the number of projects.
+func (s *Store) BudgetUsedRatios(ctx context.Context, w UsageWindows) (map[string]float64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT p.id,
+			GREATEST(
+				CASE WHEN p.budget_daily_tokens > 0
+					THEN COALESCE(d.prompt_tokens + d.completion_tokens, 0)::float8 / p.budget_daily_tokens END,
+				CASE WHEN p.budget_monthly_tokens > 0
+					THEN COALESCE(m.prompt_tokens + m.completion_tokens, 0)::float8 / p.budget_monthly_tokens END)
+		FROM projects p
+		LEFT JOIN project_usage d ON d.project_id = p.id AND d.period = 'day' AND d.period_start = $1
+		LEFT JOIN project_usage m ON m.project_id = p.id AND m.period = 'month' AND m.period_start = $2
+		WHERE p.budget_daily_tokens > 0 OR p.budget_monthly_tokens > 0`, w.Day, w.Month)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]float64{}
+	for rows.Next() {
+		var id int64
+		var ratio float64
+		if err := rows.Scan(&id, &ratio); err != nil {
+			return nil, err
+		}
+		out[strconv.FormatInt(id, 10)] = ratio
+	}
+	return out, rows.Err()
 }

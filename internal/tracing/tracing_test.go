@@ -525,3 +525,37 @@ func TestRecordErrorSetsStatus(t *testing.T) {
 		t.Errorf("status message = %v", st["message"])
 	}
 }
+
+func TestOTLPStringSliceIsAnArrayValue(t *testing.T) {
+	c := newCollector(t)
+	tr := newTracer(t, c, Config{})
+	reasons := []string{"stop", "length"}
+	_, s := tr.Start(context.Background(), "gateway.chat_completion", KindInternal)
+	s.SetAttributes(StringSlice("gen_ai.response.finish_reasons", reasons))
+	reasons[0] = "mutated"
+	s.End()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = tr.Shutdown(ctx)
+
+	raw := strings.Join(c.raw, "")
+	want := `"key":"gen_ai.response.finish_reasons","value":{"arrayValue":{"values":[{"stringValue":"stop"},{"stringValue":"length"}]}}`
+	if !strings.Contains(raw, want) {
+		t.Errorf("string slice not encoded as an OTLP arrayValue (or not copied):\n%s", raw)
+	}
+}
+
+func TestGenAIProviderName(t *testing.T) {
+	cases := map[string]string{
+		"openai":        "openai",
+		"anthropic":     "anthropic",
+		"gemini":        "gcp.gemini",
+		"cohere_rerank": "cohere",
+		"ollama":        "ollama",
+	}
+	for in, want := range cases {
+		if got := GenAIProviderName(in); got != want {
+			t.Errorf("GenAIProviderName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

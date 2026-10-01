@@ -363,3 +363,48 @@ func TestCounterFuncIsTypedAsACounter(t *testing.T) {
 		t.Errorf("value missing:\n%s", got)
 	}
 }
+
+func TestCappedCachedGaugeHonoursTheSeriesCap(t *testing.T) {
+	var reported []string
+	r := New(Options{MaxSeries: 2})
+	r.OnSeriesDropped = func(metric string, _ uint64) {
+		reported = append(reported, metric)
+	}
+	r.CappedCachedGaugeFunc("ragmux_budget_used_ratio", "Budget.", "project", 0,
+		func() (map[string]float64, error) {
+			return map[string]float64{"1": 0.5, "2": 0.25, "3": 0.75}, nil
+		})
+	got := r.Text()
+	if n := strings.Count(got, "ragmux_budget_used_ratio{"); n != 2 {
+		t.Fatalf("exported %d budget series, want 2 under MaxSeries=2:\n%s", n, got)
+	}
+	if r.Dropped() != 1 {
+		t.Fatalf("Dropped() = %d, want 1", r.Dropped())
+	}
+	if len(reported) == 0 || reported[0] != "ragmux_budget_used_ratio" {
+		t.Fatalf("OnSeriesDropped reports = %v", reported)
+	}
+	// A refused value is asked for again on every refresh and counted again,
+	// exactly as a vector family counts each With() it refuses.
+	_ = r.Text()
+	if r.Dropped() != 2 {
+		t.Fatalf("Dropped() after second scrape = %d, want 2", r.Dropped())
+	}
+	if !strings.Contains(got, "# TYPE ragmux_budget_used_ratio gauge") {
+		t.Fatalf("budget gauge has the wrong type:\n%s", got)
+	}
+}
+
+func TestUncappedCachedGaugeIgnoresTheCap(t *testing.T) {
+	r := New(Options{MaxSeries: 1})
+	r.CachedGaugeFunc("ragmux_documents", "Documents.", "status", 0,
+		func() (map[string]float64, error) {
+			return map[string]float64{"ready": 1, "pending": 2, "failed": 3}, nil
+		})
+	if n := strings.Count(r.Text(), "ragmux_documents{"); n != 3 {
+		t.Fatalf("exported %d document series, want all 3 (fixed set, not capped)", n)
+	}
+	if r.Dropped() != 0 {
+		t.Fatalf("Dropped() = %d, want 0", r.Dropped())
+	}
+}

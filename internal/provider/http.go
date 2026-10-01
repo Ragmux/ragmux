@@ -212,6 +212,19 @@ func (s *streamBody) Close() error {
 	return s.body.Close()
 }
 
+// genAIOperation maps an upstream call kind to its GenAI semconv
+// gen_ai.operation.name. Reranking has no registered value, so it gets none.
+func genAIOperation(op string) string {
+	switch op {
+	case opChat:
+		return "chat"
+	case opEmbed:
+		return "embeddings"
+	default:
+		return ""
+	}
+}
+
 // doRequest posts one upstream call. It is the only place in the process
 // that writes traceparent outbound: every chat, embed, stream and rerank
 // call funnels through here, so propagation is one code path rather than
@@ -225,8 +238,14 @@ func doRequest(ctx context.Context, cfg Config, op, url string, headers map[stri
 	if span.IsRecording() {
 		span.SetAttributes(
 			tracing.String("server.address", hostOf(url)),
+			// gen_ai.system is the pre-1.37 semconv name and is deprecated;
+			// both are emitted until v0.5 drops it.
 			tracing.String("gen_ai.system", cfg.ProviderType),
+			tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(cfg.ProviderType)),
 		)
+		if name := genAIOperation(op); name != "" {
+			span.SetAttributes(tracing.String("gen_ai.operation.name", name))
+		}
 	}
 	var rdr io.Reader
 	if body != nil {

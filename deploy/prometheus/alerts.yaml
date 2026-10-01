@@ -1,0 +1,124 @@
+# Prometheus alerting rules for Ragmux.
+#
+# Load it from prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/ragmux-alerts.yaml
+#
+# Validate with: promtool check rules deploy/prometheus/alerts.yaml
+#
+# The rules assume Ragmux is scraped under job="ragmux"; change the job
+# matcher in RagmuxDown if your scrape config names it differently. Every
+# other expression reads ragmux_* series only. Thresholds are starting
+# points: tune them to your traffic before paging anyone on them.
+#
+# Database-backed values (ragmux_documents, ragmux_budget_used_ratio) are the
+# same on every replica, so they are read with max() rather than summed.
+
+groups:
+  - name: ragmux-availability
+    rules:
+      - alert: RagmuxDown
+        expr: up{job="ragmux"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ragmux target {{ $labels.instance }} cannot be scraped"
+          description: "Prometheus has not reached /metrics on {{ $labels.instance }} for 2 minutes."
+
+      - alert: RagmuxNotReady
+        # /readyz answers 503 when the database is unreachable or the schema
+        # is behind the binary. This needs something probing /readyz (a
+        # load balancer, Kubernetes or a compose healthcheck); the probe's
+        # responses are what this counts.
+        expr: sum by (instance) (rate(ragmux_http_requests_total{route="/readyz",status="503"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ragmux {{ $labels.instance }} reports not ready"
+          description: "/readyz has been answering 503 on {{ $labels.instance }} for 5 minutes."
+
+  - name: ragmux-errors
+    rules:
+      - alert: RagmuxHigh5xxRate
+        expr: |
+          sum(rate(ragmux_http_requests_total{status=~"5.."}[5m]))
+            / sum(rate(ragmux_http_requests_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of Ragmux HTTP responses are 5xx"
+          description: "5xx share over the last 5 minutes is {{ $value | humanizePercentage }}."
+
+      - alert: RagmuxUpstreamErrorRate
+        # ragmux_gateway_errors_total counts chat completions that failed at
+        # the provider; the denominator is every chat completion.
+        expr: |
+          sum(rate(ragmux_gateway_errors_total[5m]))
+            / sum(rate(ragmux_gateway_requests_total[5m])) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 10% of chat completions fail upstream"
+          description: >-
+            Upstream error share is {{ $value | humanizePercentage }}. Break it down with
+            sum by (provider, type) (rate(ragmux_gateway_errors_total[5m])).
+
+  - name: ragmux-ingestion
+    rules:
+      - alert: RagmuxIngestBacklogStuck
+        # There is no per-document queue age metric; a backlog that has not
+        # moved for 30 minutes stands in for it. Documents are pending and
+        # no ingestion job has finished in any outcome on any replica.
+        expr: |
+          max(ragmux_documents{status="pending"}) > 0
+            and on ()
+          (sum(increase(ragmux_ingest_jobs_total[30m])) or vector(0)) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ragmux ingestion backlog is not draining"
+          description: >-
+            {{ $value }} documents are pending and no ingestion job has finished in 30 minutes.
+            Check that a replica runs ingestion workers and that the embedding provider answers.
+
+  - name: ragmux-capacity
+    rules:
+      - alert: RagmuxMetricSeriesDropped
+        # ADR-002: the series cap has no eviction. Once it is full, every new
+        # legitimate series (a project or model added today) is refused from
+        # then on. Raise METRICS_MAX_SERIES or reduce cardinality.
+        expr: increase(ragmux_metrics_series_dropped_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ragmux {{ $labels.instance }} is dropping new metric series"
+          description: "The series cap is full; new series are refused. Raise METRICS_MAX_SERIES or reduce cardinality."
+
+      - alert: RagmuxBudgetNearlyExhausted
+        expr: max by (project) (ragmux_budget_used_ratio) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Project {{ $labels.project }} has used over 90% of its token budget"
+          description: "Budget used ratio is {{ $value | humanizePercentage }}; requests are refused at 100%."
+
+  - name: ragmux-maintenance
+    rules:
+      - alert: RagmuxRetentionLagging
+        # The retention pass runs hourly on whichever replica holds the
+        # leader lock. Three missed passes means request logs and audit
+        # entries are piling up past their retention window.
+        expr: time() - max(ragmux_retention_last_success_timestamp_seconds) > 3 * 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ragmux retention has not completed a pass in over 3 hours"
+          description: "Look for 'retention pass failed' and 'retention leader lock' in the gateway log."

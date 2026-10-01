@@ -351,7 +351,7 @@ func run(cfg config.Config) error {
 
 	janitor := &maintenance.Janitor{Store: st, Limiter: usage, Log: log,
 		RequestLogDays: cfg.LogRetentionDays, AuditDays: cfg.AuditRetentionDays,
-		IngestMaxAttempts: cfg.IngestMaxAttempts}
+		IngestMaxAttempts: cfg.IngestMaxAttempts, Metrics: met}
 	janitorDone := make(chan struct{})
 	go func() {
 		defer close(janitorDone)

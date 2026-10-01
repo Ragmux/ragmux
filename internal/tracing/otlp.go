@@ -275,10 +275,18 @@ type otlpKeyValue struct {
 }
 
 type otlpValue struct {
-	StringValue *string  `json:"stringValue,omitempty"`
-	IntValue    *string  `json:"intValue,omitempty"`
-	DoubleValue *float64 `json:"doubleValue,omitempty"`
-	BoolValue   *bool    `json:"boolValue,omitempty"`
+	StringValue *string    `json:"stringValue,omitempty"`
+	IntValue    *string    `json:"intValue,omitempty"`
+	DoubleValue *float64   `json:"doubleValue,omitempty"`
+	BoolValue   *bool      `json:"boolValue,omitempty"`
+	ArrayValue  *otlpArray `json:"arrayValue,omitempty"`
+}
+
+// otlpArray is the OTLP AnyValue array form. Only string elements are ever
+// built: the one array attribute this repository sets is a list of finish
+// reasons.
+type otlpArray struct {
+	Values []otlpValue `json:"values"`
 }
 
 func buildPayload(res []Attr, spans []*Span) otlpPayload {
@@ -327,6 +335,12 @@ func attrsToOTLP(attrs []Attr) []otlpKeyValue {
 			kv.Value.DoubleValue = &v
 		case bool:
 			kv.Value.BoolValue = &v
+		case []string:
+			arr := &otlpArray{Values: make([]otlpValue, len(v))}
+			for i := range v {
+				arr.Values[i].StringValue = &v[i]
+			}
+			kv.Value.ArrayValue = arr
 		default:
 			// An unsupported type is dropped rather than guessed at.
 			continue

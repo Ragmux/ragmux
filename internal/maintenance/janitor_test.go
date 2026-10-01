@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/metrics"
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/testdb"
 )
@@ -540,5 +543,28 @@ func TestRunLoggedReportsTotals(t *testing.T) {
 	}
 	if d, ok := pass["duration"].(float64); !ok || d <= 0 {
 		t.Errorf("duration = %v, want a positive value", pass["duration"])
+	}
+}
+
+// Only a pass that ran to the end moves the retention timestamp the
+// RagmuxRetentionLagging alert reads; an interrupted one leaves it alone.
+func TestRunLoggedRecordsRetentionSuccess(t *testing.T) {
+	const series = "ragmux_retention_last_success_timestamp_seconds "
+	f := seed(t)
+	reg := metrics.New(metrics.Options{})
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365,
+		Log: slog.New(slog.NewJSONHandler(io.Discard, nil)), Metrics: obs.New(reg)}
+
+	cancelled, cancel := context.WithCancel(f.ctx)
+	cancel()
+	j.runLogged(cancelled)
+	if !strings.Contains(reg.Text(), series+"0\n") {
+		t.Fatalf("an interrupted pass set the retention timestamp:\n%s", reg.Text())
+	}
+
+	j.runLogged(f.ctx)
+	text := reg.Text()
+	if !strings.Contains(text, series) || strings.Contains(text, series+"0\n") {
+		t.Fatalf("a completed pass did not set the retention timestamp:\n%s", text)
 	}
 }

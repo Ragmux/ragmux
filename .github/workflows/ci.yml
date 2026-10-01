@@ -90,6 +90,20 @@ jobs:
           TEST_DATABASE_URL: postgres://ragmux:ragmux@localhost:5432/ragmux_test?sslmode=disable
         run: go test -race -count=1 ./...
 
+  # promtool ships inside the Prometheus image; running it from there keeps
+  # its version pinned without a separate download step.
+  alert-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: promtool check rules
+        run: |
+          docker run --rm --network none \
+            -v "$PWD/deploy/prometheus:/rules:ro" \
+            --entrypoint /bin/promtool \
+            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
+            check rules /rules/alerts.yaml
+
   docker:
     runs-on: ubuntu-latest
     needs: test

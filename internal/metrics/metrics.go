@@ -429,28 +429,65 @@ type cachedGaugeVec struct {
 	ttl        time.Duration
 	f          func() (map[string]float64, error)
 
+	// reg is set when the family's label values count against the
+	// registry's series cap; see CappedCachedGaugeFunc.
+	reg *Registry
+
 	mu       sync.Mutex
 	vals     map[string]float64
 	loadedAt time.Time
 	lastErr  error
+	// admitted holds the label values that already hold a series slot.
+	// Like every other family, a slot is never given back.
+	admitted map[string]struct{}
 }
 
 // CachedGaugeFunc registers a single-label gauge family whose values come
 // from f, refreshed at most once per ttl. f runs inline on the scrape that
 // finds the cache stale, so it must have its own timeout.
+//
+// The label values do not count against the series cap. Use it only for a
+// label drawn from a small fixed set, such as a status enum.
 func (r *Registry) CachedGaugeFunc(name, help, label string, ttl time.Duration, f func() (map[string]float64, error)) {
+	r.cachedGaugeFunc(name, help, label, ttl, f, false)
+}
+
+// CappedCachedGaugeFunc is CachedGaugeFunc for a label whose value set grows
+// with the installation, such as a project id. Each new label value takes a
+// slot under the registry's series cap exactly as a new series of a vector
+// family does: once the cap is full a new value is dropped, counted in
+// ragmux_metrics_series_dropped_total and reported through OnSeriesDropped.
+func (r *Registry) CappedCachedGaugeFunc(name, help, label string, ttl time.Duration, f func() (map[string]float64, error)) {
+	r.cachedGaugeFunc(name, help, label, ttl, f, true)
+}
+
+func (r *Registry) cachedGaugeFunc(name, help, label string, ttl time.Duration, f func() (map[string]float64, error), capped bool) {
 	if !namePattern.MatchString(label) {
 		panic(fmt.Sprintf("metrics: invalid label name %q on metric %q", label, name))
 	}
 	c := &cachedGaugeVec{name: name, help: help, label: label, ttl: ttl, f: f}
+	if capped {
+		c.reg = r
+		c.admitted = map[string]struct{}{}
+	}
 	r.register(name, []string{label}, c)
 }
 
 func (c *cachedGaugeVec) load() map[string]float64 {
+	vals, report := c.refresh()
+	// OnSeriesDropped logs; it runs outside c.mu for the reason admitSeries
+	// gives.
+	if report != nil {
+		report()
+	}
+	return vals
+}
+
+func (c *cachedGaugeVec) refresh() (map[string]float64, func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.vals != nil && time.Since(c.loadedAt) < c.ttl {
-		return c.vals
+		return c.vals, nil
 	}
 	vals, err := c.f()
 	c.loadedAt = time.Now()
@@ -459,9 +496,26 @@ func (c *cachedGaugeVec) load() map[string]float64 {
 		// reach the database should read stale rather than report zero, which
 		// an alert would read as "the backlog drained".
 		c.lastErr = err
-		return c.vals
+		return c.vals, nil
+	}
+	var report func()
+	if c.reg != nil {
+		for k := range vals {
+			if _, ok := c.admitted[k]; ok {
+				continue
+			}
+			admitted, r := c.reg.admitSeries(c.name)
+			if !admitted {
+				delete(vals, k)
+				if r != nil {
+					report = r
+				}
+				continue
+			}
+			c.admitted[k] = struct{}{}
+		}
 	}
 	c.lastErr = nil
 	c.vals = vals
-	return vals
+	return vals, report
 }
