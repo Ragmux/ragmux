@@ -154,6 +154,11 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   `max_completion_tokens` the gateway uses **4096**.
 - `temperature`, `top_p` and `stop` are mapped; `n`, `response_format`, `user` and unknown
   fields are dropped.
+- `response_format` of type `json_schema` or `json_object` is not an error: the request is
+  still sent, without it, so the model is not held to the schema. The response carries
+  `Warning: 299 ragmux "response_format is not supported for anthropic connections;
+  ignored"` (set before the first byte, so streams have it too) and the gateway logs the
+  event at info level with the format type only. Ask for JSON in the prompt instead.
 - Consecutive messages with the same role are merged, as the Messages API requires.
 - Tools: OpenAI `tools[].function` definitions become Anthropic `tools` (`input_schema`
   from `parameters`, `{"type":"object","properties":{}}` when absent); `tool_choice`
@@ -167,7 +172,9 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   `source.type: url` needs the images inlined instead; that is the one constant
   `anthropicInlineImages` in `internal/provider/images.go`.
 - Finish reasons: `end_turn`/`stop_sequence` → `stop`, `max_tokens` → `length`,
-  `tool_use` → `tool_calls`. Usage is mapped to `prompt_tokens`/`completion_tokens`,
+  `tool_use` → `tool_calls`, `refusal` → `content_filter`,
+  `model_context_window_exceeded` → `length`; any other `stop_reason` (`pause_turn`, a
+  value Anthropic adds later) → `stop`, logged at warn level with the value. Usage is mapped to `prompt_tokens`/`completion_tokens`,
   including on streams; see [Prompt caching](#prompt-caching) for how the cache
   counters are folded in.
 
@@ -526,8 +533,12 @@ model name with `owned_by` set to the provider type.
 
 ## Error relay and redaction
 
-Provider errors are relayed with the upstream status and message (cut to 512
-characters) in the OpenAI error envelope. Transport failures are never relayed verbatim:
+Provider errors are relayed with the upstream message (cut to 512 characters) in the
+OpenAI error envelope. A `4xx` keeps its status, and so do `503` and `504`, which tell
+the client to come back later; Anthropic's `529 overloaded` means the same and becomes
+`503`. Every other upstream `5xx` becomes `502`. The upstream's
+`Retry-After` (delay seconds or an HTTP date) is passed on unchanged; a value in neither
+form is dropped. The gateway's own `429`s set their own `Retry-After` instead. Transport failures are never relayed verbatim:
 they become `502 upstream_error` with one of `upstream unreachable`, `upstream TLS
 handshake failed`, `upstream returned a non-HTTP response`, `upstream redirect
 rejected: …`, the private-address message from

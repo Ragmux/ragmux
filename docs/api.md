@@ -769,9 +769,10 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
+| `Warning` | `299 ragmux "<text>"` when the connection accepted the request but ignored part of it — today only `response_format` (`json_schema`/`json_object`) on an Anthropic connection. Set before the first byte, so a stream carries it too. See [Anthropic](providers.md#anthropic) |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
-`Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`) and
+`Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and
 accepts `X-Ragmux-Project` in `Access-Control-Allow-Headers`, but a cross-origin page
 sees no response header outside the CORS safelist unless the request went through CORS
 at all.
@@ -786,9 +787,10 @@ Status codes:
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
-| `4xx`/`5xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted) |
+| `4xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted). A `Retry-After` the provider sent (seconds or an HTTP date) is passed through unchanged; a malformed one is dropped |
+| `503` / `504` | the provider answered `503` or `504` (or, on an Anthropic connection, `529 overloaded`, which becomes `503`): the status is kept, because both say "retry later" rather than "broken", with the provider's message and its `Retry-After`, if any |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
-| `502` | transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
+| `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
 
 ### `GET /v1/models` and `GET /v1/models/{id}`

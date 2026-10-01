@@ -387,7 +387,7 @@ anything you deploy. From v0.3.1 on all of them are signed with cosign; see
   gateway answers preflight `OPTIONS` requests itself with
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS` and
   `Access-Control-Allow-Headers: Authorization, Content-Type, X-Ragmux-Project`. The
-  rate-limit, budget, RAG and `Retry-After` headers are listed in
+  rate-limit, budget, RAG, `Retry-After` and `Warning` headers are listed in
   `Access-Control-Expose-Headers`, without which browser JavaScript cannot read any of
   them. With `CORS_ORIGINS` empty (the default) no preflight is ever answered, which is
   also what keeps a management key in an `Authorization` header unforgeable from a
