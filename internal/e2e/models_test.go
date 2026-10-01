@@ -65,8 +65,8 @@ func TestConnectionTests(t *testing.T) {
 		t.Errorf("bad scheme: %v", r)
 	}
 	// Viewers cannot test.
-	e.call("POST", "/admin/api/users", map[string]any{"username": "viewer", "password": "password123", "role": "viewer"}, "")
-	if r := e.call("POST", "/admin/api/models/test", body, e.login("viewer", "password123")); r["_status"] != float64(403) {
+	e.call("POST", "/admin/api/users", map[string]any{"username": "viewer", "password": "viewer-pass-1", "role": "viewer"}, "")
+	if r := e.call("POST", "/admin/api/models/test", body, e.login("viewer", "viewer-pass-1")); r["_status"] != float64(403) {
 		t.Errorf("viewer test: %v", r)
 	}
 

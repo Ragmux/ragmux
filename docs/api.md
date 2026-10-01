@@ -179,7 +179,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
-| POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
+| POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: at least 12 characters and at most 72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
 case setup is already complete (see [Configuration](configuration.md#environment-variables)).
@@ -199,7 +199,7 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
-| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
+| POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
 
 ### Model connections
@@ -598,11 +598,11 @@ already knows.
 |---|---|---|---|
 | GET | `/users/lite` | editor | Active users as `[{id, username, role}]` (for member pickers) |
 | GET | `/users` | admin | All users, each with `project_count` (memberships) and `active_sessions` (unexpired sessions) |
-| POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password 8+ characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
+| POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password at least 12 characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
 | DELETE | `/users/{id}` | admin | Delete → `{"ok": true}` |
-| POST | `/users/{id}/reset-password` | admin | `{new_password}`; revokes the user's sessions |
+| POST | `/users/{id}/reset-password` | admin | `{new_password}` (at least 12 characters, at most 72 bytes); revokes the user's sessions |
 | POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
 | GET | `/audit` | admin | Audit entries, newest first, with the total for the filter |
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |

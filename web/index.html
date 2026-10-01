@@ -451,8 +451,18 @@ function strengthScore(pw) {
 }
 const STRENGTH = ['', 'Weak', 'Fair', 'Strong', 'Very strong'];
 const strengthMeter = id => `<div class="strength" data-score="0" id="${id}"><i></i><i></i><i></i><i></i></div><div class="hint" id="${id}-t">Minimum length applies; longer and mixed is better.</div>`;
+// The server counts the minimum in characters (code points) and the maximum in
+// bytes (bcrypt's 72), while minlength/maxlength count UTF-16 units; mirror the
+// server so emoji or non-Latin passwords are caught before the request.
+const PASSWORD_MAX_BYTES = 72;
 function bindStrength(inputEl, id, min) {
-  const upd = () => { const v = inputEl.value; const s = strengthScore(v); $('#' + id).dataset.score = s; $(`#${id}-t`).textContent = v ? `${STRENGTH[s] || 'Weak'} · ${v.length} characters${v.length < min ? ` (minimum ${min})` : ''}` : `Minimum ${min} characters; longer and mixed is better.`; };
+  const upd = () => {
+    const v = inputEl.value; const n = [...v].length; const s = strengthScore(v);
+    const tooLong = new TextEncoder().encode(v).length > PASSWORD_MAX_BYTES;
+    inputEl.setCustomValidity(v && n < min ? `Use at least ${min} characters.` : tooLong ? `Use at most ${PASSWORD_MAX_BYTES} bytes.` : '');
+    $('#' + id).dataset.score = s;
+    $(`#${id}-t`).textContent = v ? `${STRENGTH[s] || 'Weak'} · ${n} characters${n < min ? ` (minimum ${min})` : tooLong ? ` (maximum ${PASSWORD_MAX_BYTES} bytes)` : ''}` : `Minimum ${min} characters; longer and mixed is better.`;
+  };
   inputEl.addEventListener('input', upd); upd();
 }
 const formData = form => { const d = Object.fromEntries(new FormData(form).entries()); for (const cb of $$('input[type=checkbox]', form)) d[cb.name] = cb.checked; return d; };
@@ -555,10 +565,10 @@ $('#btnLogout').onclick = async () => { try { await api('/logout', { method: 'PO
 $('#btnPassword').onclick = () => {
   const form = drawer({ eyebrow: 'Account', title: 'Change password', submitLabel: 'Change password', body: `
     ${field('current_password', 'Current password', input('current_password', '', 'type=password required autocomplete=current-password'))}
-    ${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=8 maxlength=72 autocomplete=new-password'), strengthMeter('pwm'))}
+    ${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('pwm'))}
     <p class="hint">Every other session of your account is signed out.</p>`,
     onSubmit: async d => { await api('/me/password', { method: 'POST', body: { current_password: d.current_password, new_password: d.new_password } }); toast('Password changed', 3500, 'ok'); } });
-  bindStrength($('[name=new_password]', form), 'pwm', 8);
+  bindStrength($('[name=new_password]', form), 'pwm', 12);
 };
 
 // ---------------------------------------------------------------------------
@@ -1344,18 +1354,18 @@ async function renderUsers() {
   on(app, '[data-role-filter]', 'click', b => { f.role = b.dataset.roleFilter; renderUsers(); });
   $('#addUser').onclick = () => { const form = drawer({ eyebrow: 'New', title: 'User', submitLabel: 'Create user', body: `
       ${field('username', 'Username', input('username', '', 'required autocomplete=off autocapitalize=none spellcheck=false maxlength=64'), 'Up to 64 characters; matched case-insensitively at sign-in.')}
-      ${field('password', 'Password', input('password', '', 'type=password required minlength=8 maxlength=72 autocomplete=new-password'), strengthMeter('upw'))}
+      ${field('password', 'Password', input('password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('upw'))}
       ${roleCards('viewer')}
       <div class="field"><span class="field"><label>Add to projects</label></span>${checklist('project_ids', state.projects.map(p => ({ value: p.id, label: p.name })), [], 'No projects yet.')}</div>`,
       onSubmit: async (d, fm) => { const project_ids = checkedValues(fm, 'project_ids'); await api('/users', { method: 'POST', body: { username: d.username, password: d.password, role: d.role, ...(project_ids.length ? { project_ids } : {}) } }); toast('User created', 3000, 'ok'); await reload(); } });
-    bindStrength($('[name=password]', form), 'upw', 8); };
+    bindStrength($('[name=password]', form), 'upw', 12); };
   on(app, '[data-edit]', 'click', b => { const u = users.find(x => x.id == b.dataset.edit);
     drawer({ eyebrow: 'Edit', title: u.username, submitLabel: 'Save', body: `${roleCards(u.role)}${toggle('is_active', u.is_active, 'Active', 'Inactive users cannot sign in and lose their sessions.')}`,
       onSubmit: async d => { await api('/users/' + u.id, { method: 'PUT', body: { role: d.role, is_active: d.is_active } }); toast('Saved', 3000, 'ok'); if (u.id === state.user.id) state.user = await api('/me'); await reload(); } }); });
   on(app, '[data-reset]', 'click', b => { const u = users.find(x => x.id == b.dataset.reset);
-    const form = drawer({ eyebrow: 'Reset password', title: u.username, submitLabel: 'Reset password', body: `${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=8 maxlength=72 autocomplete=new-password'), strengthMeter('rpw'))}<p class="hint">All sessions of this user are revoked.</p>`,
+    const form = drawer({ eyebrow: 'Reset password', title: u.username, submitLabel: 'Reset password', body: `${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('rpw'))}<p class="hint">All sessions of this user are revoked.</p>`,
       onSubmit: async d => { await api(`/users/${u.id}/reset-password`, { method: 'POST', body: { new_password: d.new_password } }); toast('Password reset', 3000, 'ok'); } });
-    bindStrength($('[name=new_password]', form), 'rpw', 8); });
+    bindStrength($('[name=new_password]', form), 'rpw', 12); });
   on(app, '[data-revoke]', 'click', async b => { if (!await confirmDialog('Sign this user out everywhere?', { label: 'Revoke sessions' })) return; try { await api(`/users/${b.dataset.revoke}/sessions/revoke`, { method: 'POST' }); toast('Sessions revoked', 3000, 'ok'); renderUsers(); } catch (e) { toast(e.message, 5000, 'err'); } });
   on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this user? Their sessions and project memberships are removed; audit entries keep the username.', { label: 'Delete user' })) return; try { await api('/users/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); await reload(); } catch (e) { toast(e.message, 5000, 'err'); } });
 }

@@ -463,17 +463,17 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 	adminID := int64(me["id"].(float64))
 
 	// Admin creates an editor and a viewer.
-	ed := e.call("POST", "/admin/api/users", map[string]any{"username": "ed", "password": "editorpass", "role": "editor"}, "")
-	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewerpass", "role": "viewer"}, "")
+	ed := e.call("POST", "/admin/api/users", map[string]any{"username": "ed", "password": "editor-pass-1", "role": "editor"}, "")
+	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewer-pass-1", "role": "viewer"}, "")
 	if status(ed) != 201 || status(vw) != 201 || ed["role"] != "editor" || vw["role"] != "viewer" {
 		t.Fatalf("create users: %v %v", ed, vw)
 	}
 	editorID, viewerID := int64(ed["id"].(float64)), int64(vw["id"].(float64))
-	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "bad", "password": "x", "role": "owner"}, ""); status(r) != 400 {
+	if r := e.call("POST", "/admin/api/users", map[string]any{"username": "bad", "password": "a-valid-password", "role": "owner"}, ""); status(r) != 400 {
 		t.Errorf("bad role/password should be rejected: %v", r)
 	}
-	editorTok := e.login("ed", "editorpass")
-	viewerTok := e.login("vw", "viewerpass")
+	editorTok := e.login("ed", "editor-pass-1")
+	viewerTok := e.login("vw", "viewer-pass-1")
 	if r := e.call("GET", "/admin/api/me", nil, editorTok); r["role"] != "editor" || r["last_login_at"] == nil {
 		t.Errorf("editor /me: %v", r)
 	}
@@ -570,12 +570,12 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 			t.Fatalf("attempt %d: %v", i+1, r)
 		}
 	}
-	r6, hdr := e.callRaw("POST", "/admin/api/login", map[string]string{"username": "vw", "password": "viewerpass"}, "x")
+	r6, hdr := e.callRaw("POST", "/admin/api/login", map[string]string{"username": "vw", "password": "viewer-pass-1"}, "x")
 	if status(r6) != 429 || r6["error"].(map[string]any)["type"] != "rate_limited" || hdr.Get("Retry-After") != "60" {
 		t.Errorf("6th login should be rate limited: %v %v", r6, hdr)
 	}
 	// Other users from the same address are still fine below the IP budget.
-	e.login("ed", "editorpass")
+	e.login("ed", "editor-pass-1")
 
 	// Audit log.
 	audit := e.call("GET", "/admin/api/audit?limit=200", nil, "")["entries"].([]any)
@@ -608,7 +608,7 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 	if r := e.call("GET", "/admin/api/me", nil, editorTok); status(r) != 401 {
 		t.Errorf("deactivated session should be rejected: %v", r)
 	}
-	if r := e.call("POST", "/admin/api/login", map[string]string{"username": "ed", "password": "editorpass"}, "x"); status(r) != 401 {
+	if r := e.call("POST", "/admin/api/login", map[string]string{"username": "ed", "password": "editor-pass-1"}, "x"); status(r) != 401 {
 		t.Errorf("deactivated login: %v", r)
 	}
 	if r := e.call("PUT", fmt.Sprintf("/admin/api/users/%d", editorID), map[string]any{"is_active": true}, ""); status(r) != 200 {
@@ -616,14 +616,14 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 	}
 
 	// Reset password revokes sessions; the new password works.
-	editorTok = e.login("ed", "editorpass")
-	if r := e.call("POST", fmt.Sprintf("/admin/api/users/%d/reset-password", editorID), map[string]any{"new_password": "newpass123"}, ""); status(r) != 200 {
+	editorTok = e.login("ed", "editor-pass-1")
+	if r := e.call("POST", fmt.Sprintf("/admin/api/users/%d/reset-password", editorID), map[string]any{"new_password": "new-pass-1234"}, ""); status(r) != 200 {
 		t.Fatalf("reset password: %v", r)
 	}
 	if r := e.call("GET", "/admin/api/me", nil, editorTok); status(r) != 401 {
 		t.Errorf("session should be revoked after password reset: %v", r)
 	}
-	editorTok = e.login("ed", "newpass123")
+	editorTok = e.login("ed", "new-pass-1234")
 	if r := e.call("POST", fmt.Sprintf("/admin/api/users/%d/sessions/revoke", editorID), nil, ""); status(r) != 200 {
 		t.Fatalf("revoke sessions: %v", r)
 	}
@@ -641,9 +641,9 @@ func TestRolesRateLimitAndAudit(t *testing.T) {
 	if r := e.call("DELETE", fmt.Sprintf("/admin/api/users/%d", adminID), nil, ""); status(r) != 400 {
 		t.Errorf("deleting yourself: %v", r)
 	}
-	a2 := e.call("POST", "/admin/api/users", map[string]any{"username": "admin2", "password": "adminpass2", "role": "admin"}, "")
+	a2 := e.call("POST", "/admin/api/users", map[string]any{"username": "admin2", "password": "admin-pass-22", "role": "admin"}, "")
 	admin2ID := int64(a2["id"].(float64))
-	admin2Tok := e.login("admin2", "adminpass2")
+	admin2Tok := e.login("admin2", "admin-pass-22")
 	if r := e.call("PUT", fmt.Sprintf("/admin/api/users/%d", adminID), map[string]any{"role": "editor"}, admin2Tok); status(r) != 200 || r["role"] != "editor" {
 		t.Errorf("demoting one of two admins: %v", r)
 	}
@@ -1101,7 +1101,7 @@ func TestLoginSurfaceAndSessions(t *testing.T) {
 
 	// Changing the password keeps the current session and drops the others.
 	other := e.login("admin", "password123")
-	if r := e.call("POST", "/admin/api/me/password", map[string]any{"current_password": "password123", "new_password": "password456"}, ""); status(r) != 200 {
+	if r := e.call("POST", "/admin/api/me/password", map[string]any{"current_password": "password123", "new_password": "password4567"}, ""); status(r) != 200 {
 		t.Fatalf("change password: %v", r)
 	}
 	if r := e.call("GET", "/admin/api/me", nil, ""); status(r) != 200 {
@@ -1261,9 +1261,9 @@ func TestMetricsExportAndSummaryOptions(t *testing.T) {
 	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
 	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "m", "provider_type": "ollama", "model_name": "x"}, "")
 	connID := int64(conn["id"].(float64))
-	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewerpass", "role": "viewer"}, "")
+	vw := e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewer-pass-1", "role": "viewer"}, "")
 	viewerID := int64(vw["id"].(float64))
-	viewerTok := e.login("vw", "viewerpass")
+	viewerTok := e.login("vw", "viewer-pass-1")
 	pa := e.call("POST", "/admin/api/projects", map[string]any{"name": "alpha", "model_connection_id": connID, "member_user_ids": []int64{viewerID}}, "")
 	idA := int64(pa["project"].(map[string]any)["id"].(float64))
 	pb := e.call("POST", "/admin/api/projects", map[string]any{"name": "beta", "model_connection_id": connID}, "")

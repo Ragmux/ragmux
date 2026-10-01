@@ -71,7 +71,9 @@ Open <http://localhost:8765/admin/>. On a fresh database the dashboard asks you 
 **create the first administrator** (username and a password of at least 12 characters);
 that form only works while no user exists. For unattended installs pass
 `-e ADMIN_USER=admin -e ADMIN_PASSWORD=...` instead and the account is created on first
-start (see [Configuration](docs/configuration.md#environment-variables)).
+start. `ADMIN_PASSWORD` follows the same rule (at least 12 characters, at most 72 bytes);
+on an empty database a shorter one stops the start with an error (see
+[Configuration](docs/configuration.md#environment-variables)).
 
 Two things worth knowing about that command:
 

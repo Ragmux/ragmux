@@ -453,17 +453,31 @@ func run(cfg config.Config) error {
 // bootstrapAdmin pre-creates the first user from ADMIN_USER/ADMIN_PASSWORD
 // when the users table is empty (unattended installs). Without a password
 // nothing is created: the dashboard offers the first-run setup instead.
+//
+// ADMIN_PASSWORD must pass auth.ValidatePassword. On an empty table a weak
+// one stops the start, since it would become the installation's only
+// credential. Once users exist the variable is unused, so a weak value only
+// earns a warning; the password itself is never logged.
 func bootstrapAdmin(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) error {
 	n, err := st.CountUsers(ctx)
 	if err != nil {
 		return err
 	}
 	if n > 0 {
+		if cfg.AdminPassword != "" {
+			if err := auth.ValidatePassword(cfg.AdminPassword); err != nil {
+				log.Warn("ADMIN_PASSWORD does not meet the password policy; it is ignored because users already exist",
+					"reason", err.Error())
+			}
+		}
 		return nil
 	}
 	if cfg.AdminPassword == "" {
 		log.Info("no users yet: open /admin/ to create the first administrator")
 		return nil
+	}
+	if err := auth.ValidatePassword(cfg.AdminPassword); err != nil {
+		return fmt.Errorf("ADMIN_PASSWORD: %w; set a stronger one or unset it and use the first-run setup at /admin/", err)
 	}
 	hash, err := auth.HashPassword(cfg.AdminPassword)
 	if err != nil {

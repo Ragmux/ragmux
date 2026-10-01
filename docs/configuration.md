@@ -16,7 +16,7 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `DATA_DIR` | `/app/data` | Only used for the `secret.key` fallback when `SECRET_KEY` is unset. The all-in-one image sets it to `/data/ragmux` inside its volume. |
 | `PORT` | `8765` | HTTP listen port (`1`-`65535`). Also read by `-healthcheck`. |
 | `ADMIN_USER` | `admin` | Username of the administrator pre-created on first start when `ADMIN_PASSWORD` is set and the `users` table is empty. Ignored otherwise. |
-| `ADMIN_PASSWORD` | *(none)* | Set it for unattended installs: the account is created once with this password and the log says `admin user created from ADMIN_PASSWORD`. When unset, nothing is created; the log says `no users yet: open /admin/ to create the first administrator` and the dashboard shows the first-run setup form (see [`/setup`](api.md#first-run-setup)) until the first account exists. |
+| `ADMIN_PASSWORD` | *(none)* | Set it for unattended installs: the account is created once with this password and the log says `admin user created from ADMIN_PASSWORD`. When unset, nothing is created; the log says `no users yet: open /admin/ to create the first administrator` and the dashboard shows the first-run setup form (see [`/setup`](api.md#first-run-setup)) until the first account exists. The value must meet the password policy (at least 12 characters, at most 72 bytes): **on an empty `users` table a shorter or longer one stops the start** with an `ADMIN_PASSWORD: password must be …` error. Once users exist the variable is unused, and a non-compliant value only logs a warning (the password itself is never logged). |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are JSON lines on stdout; unknown values fall back to `info`. |
 | `CORS_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call the API (`*` allows all). Unset means no CORS headers at all. |
 | `SESSION_TTL` | `24h` | Dashboard session lifetime (Go duration such as `12h`, `30m`). |
@@ -141,9 +141,7 @@ Exactly one of `--generate` and `--stdin` is required. There is deliberately **n
 `--password` flag and no interactive prompt**: a flag value lands in `ps` output and the
 shell history, and a no-echo prompt would need `golang.org/x/term`, which is not a
 dependency of this project and is not worth adding for one emergency command. The
-minimum length is 12 characters (the first-run setup's floor, not the dashboard's 8 — an
-emergency admin reset should not create a weak credential) and the maximum is bcrypt's
-72 bytes.
+password policy is the dashboard's: at least 12 characters and at most bcrypt's 72 bytes.
 
 ```bash
 # print a fresh password
