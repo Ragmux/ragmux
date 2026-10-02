@@ -239,7 +239,7 @@ func doRequest(ctx context.Context, cfg Config, op, url string, headers map[stri
 		span.SetAttributes(
 			tracing.String("server.address", hostOf(url)),
 			// gen_ai.system is the pre-1.37 semconv name and is deprecated;
-			// both are emitted until v0.5 drops it.
+			// both are emitted until a later release drops it.
 			tracing.String("gen_ai.system", cfg.ProviderType),
 			tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(cfg.ProviderType)),
 		)

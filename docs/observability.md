@@ -425,9 +425,10 @@ decision rather than a by-product.
 The `gen_ai.*` names follow the OpenTelemetry GenAI semantic conventions:
 
 - **`gen_ai.provider.name` replaces `gen_ai.system`.** Both are emitted in 0.4.2 so a
-  dashboard can move over; `gen_ai.system` is removed in 0.5. The value is the provider
-  type with two names mapped to the convention's own: `gemini` becomes `gcp.gemini` and
-  `cohere_rerank` becomes `cohere`. Every other type passes through unchanged.
+  dashboard can move over; `gen_ai.system` is removed in a later release. The value is the
+  provider type with two names mapped to the convention's own: `gemini` becomes
+  `gcp.gemini` and `cohere_rerank` becomes `cohere`. Every other type passes through
+  unchanged.
 - **`gen_ai.response.model` is the model the upstream says answered**, which can be a
   dated snapshot of the one requested. Adapters that echo the requested model back fall
   back to the connection's model name. The value is cut at 128 bytes.
