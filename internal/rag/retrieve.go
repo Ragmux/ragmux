@@ -182,7 +182,7 @@ func (r *Retriever) embedQuery(ctx context.Context, emb provider.Embedder, provi
 	// per retrieval even when tracing is off.
 	if span.IsRecording() {
 		// gen_ai.system is deprecated in favour of gen_ai.provider.name;
-		// both are emitted until v0.5 drops it.
+		// both are emitted until a later release drops it.
 		span.SetAttributes(
 			tracing.String("gen_ai.system", providerType),
 			tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(providerType)),

@@ -231,7 +231,7 @@ func TestChatSpanCarriesGenAIAttributes(t *testing.T) {
 				t.Errorf("provider.chat gen_ai.provider.name = %s", got)
 			}
 			if got := s.attr("gen_ai.system"); got != `{"stringValue":"custom_openai"}` {
-				t.Errorf("provider.chat must keep the deprecated gen_ai.system until 0.5; got %s", got)
+				t.Errorf("provider.chat must keep the deprecated gen_ai.system until it is removed; got %s", got)
 			}
 			if got := s.attr("gen_ai.operation.name"); got != `{"stringValue":"chat"}` {
 				t.Errorf("provider.chat gen_ai.operation.name = %s", got)

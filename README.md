@@ -310,6 +310,9 @@ Not in this release: an import tool for 0.1 (pre-PostgreSQL) databases, OCR for 
 PDFs, SSO / OIDC login, cost-denominated budgets, and a cache breakpoint on the gateway's
 own system prompt and RAG context block.
 
+The direction after this release is in [ROADMAP.md](ROADMAP.md); to help, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 Ragmux is free software licensed under the **GNU Affero General Public License v3.0 or
