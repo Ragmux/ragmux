@@ -330,6 +330,8 @@ the API or the database schema is different. Upgrading is optional.
   `EMBEDDED_POSTGRES=false`) skips the embedded server; `PG_SHARED_BUFFERS` tunes it;
   `ragmux-aio postgres-only` runs Postgres alone for maintenance. Documented in
   [Deployment layouts](docs/configuration.md#deployment-layouts).
+  *Superseded by [0.4.1](#041--2026-09-19): Docker Hub (`ragmux/ragmux`) is the primary
+  registry; the `ghcr.io` names above remain as a mirror with identical tags.*
 - `scripts/backup.sh` and `scripts/restore.sh` detect the Compose layout (`LAYOUT=auto|split|aio`):
   in the all-in-one layout they run `pg_dump`/`pg_restore` inside the `ragmux` container as
   `postgres` over the socket, and the restore goes through a one-off `postgres-only` container

@@ -286,18 +286,27 @@ retrieval semantics are explained in [Retrieval (RAG)](rag.md)):
 ```json
 {"name": "handbook", "embedding_connection_id": 2,
  "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
- "search_mode": "hybrid", "fts_config": "simple",
- "rerank": false, "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true,
+ "search_mode": "hybrid", "search_backend": "pgvector", "fts_config": "simple",
+ "rerank": false, "rerank_backend": "llm", "rerank_connection_id": null,
+ "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true,
  "max_documents": 0, "max_bytes": 0}
 ```
 
 Validation: `chunk_size` 200-20000, `chunk_overlap` ≥ 0 and smaller than `chunk_size`,
-`top_k` ≤ 50, `search_mode` `vector` or `hybrid`, `fts_config` must exist in
-`pg_ts_config`, `rerank_candidates` 1-100, `max_distance` 0-2, `max_documents` and
-`max_bytes` ≥ 0 (`0` = unlimited, see [Quotas](rag.md#quotas)). The embedding
-connection must be of a type that supports embeddings and cannot be changed while the
-store has chunks (`400`). Responses carry the usage the quotas are checked against:
-`document_count` and `bytes_used`.
+`top_k` ≤ 50, `search_mode` `vector` or `hybrid`, `search_backend` `pgvector` or
+`pg_search` (`400` when this server cannot run it, see
+[Search backends](rag.md#search-backends)), `fts_config` must exist in `pg_ts_config`
+(anything but `simple` is accepted and, on the `pgvector` backend, logged as a warning,
+see [Search modes](rag.md#search-modes)), `rerank_backend` `llm`, `cohere` or `voyage`
+(`cohere` and `voyage` need a `rerank_connection_id` of the matching `cohere_rerank` /
+`voyage_rerank` type; `llm` takes none), `rerank_candidates` 1-100, `max_distance` 0-2,
+`max_documents` and `max_bytes` ≥ 0 (`0` = unlimited, see
+[Unlimited (`0`)](configuration.md#zero-means-unlimited)). The embedding
+connection must be of a type that supports embeddings, must produce vectors of at most
+2000 dimensions (`400` when the probe at save time can tell; otherwise the first ingest
+fails the document, see [Embedding width](rag.md#embedding-width)) and
+cannot be changed while the store has chunks (`400`). Responses carry the usage the
+quotas are checked against: `document_count` and `bytes_used`.
 
 Documents look like
 
@@ -325,18 +334,22 @@ Search request and response:
 POST /admin/api/rag-stores/1/search
 {"query": "vacation policy", "top_k": 3, "mode": "hybrid", "rerank": true, "max_distance": 0.6}
 
-{"mode": "hybrid", "reranked": true, "latency_ms": 412,
+{"mode": "hybrid", "backend": "pgvector", "fts_config": "simple",
+ "reranked": true, "rerank_backend": "llm", "rerank_fallback": false, "latency_ms": 412,
  "retrieval_latency_ms": 180, "rerank_latency_ms": 230,
  "hits": [{"chunk_id": 8, "document_id": 2, "filename": "handbook.pdf", "index": 3,
            "section": "Leave > Vacation", "page": 12, "content": "…",
            "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2}]}
 ```
 
-Everything but `query` is optional and overrides the store setting for this call only;
-`top_k` is clamped to 1-50 (`0` or absent uses the store's `top_k`). `latency_ms` is the
-whole call, `retrieval_latency_ms` covers embedding the query and the database search,
-and `rerank_latency_ms` the reranker (`null` when reranking is off or no chat connection
-is available for it).
+Everything but `query` is optional and overrides the store setting for this call only
+(`mode`, `backend`, `rerank`, `rerank_backend`, `rerank_connection_id`, `max_distance`
+and `top_k`; the full list and the meaning of the response fields are in
+[Search endpoint](rag.md#search-endpoint)); `top_k` is clamped to 1-50 (`0` or absent
+uses the store's `top_k`). `latency_ms` is the whole call, `retrieval_latency_ms` covers
+embedding the query and the database search, and `rerank_latency_ms` the reranker
+(`null` only when `rerank` is off; when reranking was requested but skipped, a number,
+often `0`, and `rerank_fallback: true`).
 A `502` is returned when the embedding call fails.
 
 ### Projects
@@ -364,7 +377,8 @@ Project body:
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
 ```
 
-`rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited.
+`rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
+[Zero means unlimited](configuration.md#zero-means-unlimited)).
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
 project object contains `api_key_prefix` (the first characters of the key for
 identification), `member_ids` and the limit fields; the full key is never returned
@@ -654,7 +668,7 @@ whatever the running build reports:
 {"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
- "version": "0.4.0"}
+ "version": "<x.y.z>"}
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
@@ -664,8 +678,9 @@ editors and viewers receive the `database` object without those two keys.
 
 ## Health
 
-`GET /healthz` pings the database and answers `200 {"status":"ok","version":"0.2.0"}`
-or `503 db unavailable` (plain text). No authentication.
+`GET /healthz` pings the database and answers `200 {"status":"ok","version":"<x.y.z>"}`
+(the version of the running build) or `503 db unavailable` (plain text). No
+authentication.
 
 ## Client API (`/v1`)
 
@@ -781,7 +796,7 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a translation error such as tools on a Gemini connection, or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
+| `400` | malformed JSON, missing `messages`, a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `413` | body larger than 4 MiB |
