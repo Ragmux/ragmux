@@ -22,11 +22,27 @@ listed in the [API reference](api.md#rag-stores-and-documents).
 | `rerank_candidates` | `15` | Candidates sent to the reranker (1-100) |
 | `max_distance` | `0` | Cosine distance cut-off (0-2, `0` = off) |
 | `contextual_chunks` | `true` | Prefix the file name and section to the text that is embedded |
-| `max_documents` | `0` | Upload quota: documents the store may hold (`0` = unlimited) |
-| `max_bytes` | `0` | Upload quota: sum of uploaded file sizes in bytes (`0` = unlimited) |
+| `max_documents` | `0` | Upload quota: documents the store may hold (`0` = unlimited, see [Zero means unlimited](configuration.md#zero-means-unlimited)) |
+| `max_bytes` | `0` | Upload quota: sum of uploaded file sizes in bytes (`0` = unlimited, see [Zero means unlimited](configuration.md#zero-means-unlimited)) |
 
 Each embedding width gets its own `chunk_embeddings_<dims>` table with an HNSW cosine
 index, created on the first ingest; the store records its `dimensions` at that point.
+
+### Embedding width
+
+pgvector's `vector` type can be HNSW-indexed up to **2000** dimensions. A store whose
+embedding model returns more is refused with `400` when it is created (or its
+embedding connection is changed) when the probe of the embedding model succeeds. If the
+model cannot be reached at that moment the store is saved anyway, and the check happens at
+the first ingest instead: upload still answers `202`, and the document ends up `failed`
+with an `error` that names the width the model returned and the limit. Choose a model, or
+a `dimensions` setting on the model, of 2000 or fewer. Support for wider models through
+`halfvec` is planned for v0.6.
+
+A store that already holds wider vectors keeps working, without an index: searches fall
+back to an exact scan, which is correct but slows down as the store grows. Ragmux logs
+those stores at startup and reports how many there are in the unlabelled gauge
+`ragmux_rag_index_missing` (see [Observability](observability.md#the-metric-set)).
 
 ### Quotas
 
@@ -121,6 +137,10 @@ selects the configuration used to parse the *query* (`websearch_to_tsquery`), wh
 difference when it drops stop words or stems: with `english`, "policies" is looked up as
 `polici` — which will not match an index built with `simple`. Keep `fts_config = simple`
 unless you know your corpus benefits; any configuration listed in `pg_ts_config` is accepted.
+On the `pgvector` backend, any value other than `simple` is accepted but logged as a
+warning at startup and whenever the store is saved (the `pg_search` backend does not log
+it), because a stemmed query can miss chunks indexed with `simple`; an
+indexing language per store is planned for v0.6.
 
 `websearch_to_tsquery` ANDs all words, so a natural-language question would only match
 chunks containing every word. Ragmux therefore OR-s the words of a plain query
@@ -254,7 +274,12 @@ on the next restart.
 ### Distance cut-off
 
 `max_distance` (0-2, default 0 = off) drops every candidate whose cosine distance to the
-query exceeds it, in both modes and before reranking. Use it to keep unrelated passages out
+query exceeds it, in both modes and before reranking. In `hybrid` mode the cut-off is
+applied **after** the two lists have been fused: the vector and full-text top-N are
+ranked and scored first, then fused hits further away than `max_distance` are removed —
+including a hit the full-text side found that the vector side ranked low. The scores and
+ranks of the hits that stay are therefore the same with or without the cut-off, and a
+search can return fewer than `top_k` hits, or none. Use it to keep unrelated passages out
 of the prompt when a question has no answer in the store; the right value depends on the
 embedding model (try the dashboard's search test: it shows the distance of every hit).
 
@@ -317,8 +342,15 @@ Use the following retrieved context to answer the user's request. If the context
 
 and prepended to the first `system` (or `developer`) message; when the request has none,
 a `system` message is inserted. The project's own `system_prompt` is injected the same
-way, ahead of the context. The label carries only the parts that exist (file name,
-section, page).
+way, but first, so the retrieved context ends up in front of it. The system message the
+upstream receives therefore reads, top to bottom: the retrieved context, the project
+`system_prompt`, then the client's own system text. The label carries only the parts
+that exist (file name, section, page).
+
+A system message sent as a parts array keeps its parts, with the context added as a new
+leading text part. Any `cache_control` on those parts is removed when passages are
+injected, because the per-query context in front of it could never be served from a
+prompt cache — see [Prompt caching](providers.md#request-side-cache_control).
 
 ### Prompt injection
 

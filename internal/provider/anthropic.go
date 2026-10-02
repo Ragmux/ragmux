@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -247,7 +248,46 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 	if len(out.Messages) == 0 {
 		return out, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "messages must contain at least one user message"}
 	}
+	if rf := ignoredResponseFormat(req); rf != "" {
+		// The request is still forwarded: the Messages API has no
+		// response_format, and failing a request that would otherwise
+		// succeed is worse than answering in prose. The client learns of
+		// the drop through the Warning header (RequestWarnings).
+		cfg.logger().Info("response_format ignored", "provider", "anthropic", "response_format", rf)
+	}
 	return out, nil
+}
+
+// anthropicResponseFormatWarning is the Warning text for a dropped
+// response_format. The gateway wraps it as `299 ragmux "<text>"`.
+const anthropicResponseFormatWarning = "response_format is not supported for anthropic connections; ignored"
+
+// ignoredResponseFormat returns the response_format type the adapter drops,
+// or "" when there is nothing to drop. Only the JSON modes count: "text" is
+// what the Messages API does anyway.
+func ignoredResponseFormat(req ChatRequest) string {
+	if len(req.ResponseFormat) == 0 {
+		return ""
+	}
+	var rf struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(req.ResponseFormat, &rf) != nil {
+		return ""
+	}
+	switch rf.Type {
+	case "json_schema", "json_object":
+		return rf.Type
+	}
+	return ""
+}
+
+// RequestWarnings implements RequestWarner.
+func (p *anthropic) RequestWarnings(req ChatRequest) []string {
+	if ignoredResponseFormat(req) != "" {
+		return []string{anthropicResponseFormatWarning}
+	}
+	return nil
 }
 
 // appendAnthropic merges consecutive same-role messages, which the Messages
@@ -329,18 +369,33 @@ func openAIPartsToAnthropic(images *imageBudget, raw json.RawMessage) ([]anthrop
 	return out, nil
 }
 
-func anthropicFinish(stop string) *string {
+// maxLoggedStopReason bounds an unknown stop_reason in the log line; the
+// value comes from the upstream and is not otherwise trusted.
+const maxLoggedStopReason = 64
+
+// anthropicFinish maps a stop_reason to an OpenAI finish_reason. A value it
+// does not know becomes "stop" -- OpenAI clients switch on a closed set, and
+// an unfamiliar string there breaks them -- and is logged at Warn so a new
+// upstream reason is noticed. The log line carries only the value, never
+// content.
+func anthropicFinish(log *slog.Logger, stop string) *string {
 	switch stop {
 	case "end_turn", "stop_sequence":
 		return strPtr("stop")
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
 		return strPtr("length")
+	case "refusal":
+		return strPtr("content_filter")
 	case "tool_use":
 		return strPtr("tool_calls")
 	case "":
 		return nil
 	}
-	return strPtr(stop)
+	if len(stop) > maxLoggedStopReason {
+		stop = stop[:maxLoggedStopReason]
+	}
+	log.Warn("unknown stop_reason mapped to stop", "provider", "anthropic", "stop_reason", stop)
+	return strPtr("stop")
 }
 
 func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
@@ -369,7 +424,7 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 	}
 	return &ChatResponse{
 		ID: id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
-		Choices: []Choice{{Index: 0, Message: msg, FinishReason: anthropicFinish(ar.StopReason)}},
+		Choices: []Choice{{Index: 0, Message: msg, FinishReason: anthropicFinish(p.cfg.logger(), ar.StopReason)}},
 		Usage:   ar.Usage.usage(),
 	}, nil
 }
@@ -480,7 +535,7 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				return true
 			}
 			usage.merge(md.Usage)
-			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: anthropicFinish(md.Delta.StopReason)}}})
+			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: anthropicFinish(p.cfg.logger(), md.Delta.StopReason)}}})
 		case "message_stop":
 			// Final usage-only chunk, mirroring OpenAI's include_usage behaviour.
 			return emit(StreamChunk{Choices: []StreamChoice{}, Usage: usage.usage()})

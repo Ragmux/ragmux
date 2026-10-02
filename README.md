@@ -71,7 +71,9 @@ Open <http://localhost:8765/admin/>. On a fresh database the dashboard asks you 
 **create the first administrator** (username and a password of at least 12 characters);
 that form only works while no user exists. For unattended installs pass
 `-e ADMIN_USER=admin -e ADMIN_PASSWORD=...` instead and the account is created on first
-start (see [Configuration](docs/configuration.md#environment-variables)).
+start. `ADMIN_PASSWORD` follows the same rule (at least 12 characters, at most 72 bytes);
+on an empty database a shorter one stops the start with an error (see
+[Configuration](docs/configuration.md#environment-variables)).
 
 Two things worth knowing about that command:
 
@@ -307,6 +309,9 @@ docker/postgres-init/ ragmux_app role and vector extension SQL shared by both la
 Not in this release: an import tool for 0.1 (pre-PostgreSQL) databases, OCR for scanned
 PDFs, SSO / OIDC login, cost-denominated budgets, and a cache breakpoint on the gateway's
 own system prompt and RAG context block.
+
+The direction after this release is in [ROADMAP.md](ROADMAP.md); to help, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

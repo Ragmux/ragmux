@@ -90,6 +90,20 @@ jobs:
           TEST_DATABASE_URL: postgres://ragmux:ragmux@localhost:5432/ragmux_test?sslmode=disable
         run: go test -race -count=1 ./...
 
+  # promtool ships inside the Prometheus image; running it from there keeps
+  # its version pinned without a separate download step.
+  alert-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: promtool check rules
+        run: |
+          docker run --rm --network none \
+            -v "$PWD/deploy/prometheus:/rules:ro" \
+            --entrypoint /bin/promtool \
+            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
+            check rules /rules/alerts.yaml
+
   docker:
     runs-on: ubuntu-latest
     needs: test
@@ -126,3 +140,123 @@ jobs:
           build-args: VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Turkish case folding (İ/i, I/ı) depends on the database's LC_CTYPE, and the
+  # two layouts do not share one: the all-in-one image runs initdb with
+  # C.UTF-8 (docker/aio/entrypoint.sh), the split layout runs the -app image
+  # against the official pgvector/pgvector:pg17 image, which initialises with
+  # en_US.UTF-8. The gateway itself folds nothing -- the -app image is a static
+  # Go binary with no locale data -- so the comparison that matters is between
+  # the two PostgreSQL servers, and that is what this job runs: the same test
+  # against each, then a diff of the lexemes each produced. The test asserts
+  # the expected behaviour on its own; the diff catches a difference between
+  # the images even where both happen to pass.
+  locale:
+    runs-on: ubuntu-latest
+    # After docker, so the all-in-one build below reads a gha cache that job
+    # has just written instead of paying for a cold build on every PR.
+    needs: docker
+    services:
+      postgres:
+        # The PostgreSQL of the split layout (docker-compose.split.yml).
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: ragmux
+          POSTGRES_PASSWORD: ragmux
+          POSTGRES_DB: ragmux_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ragmux -d ragmux_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build all-in-one image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.aio
+          push: false
+          load: true
+          tags: ragmux/ragmux:ci-locale
+          build-args: VERSION=${{ github.sha }}
+          cache-from: type=gha
+      # The all-in-one image opens no TCP listener, so its unix socket
+      # directory is mounted on the runner instead. postgres-only mode starts
+      # the embedded server, creates the ragmux database and the vector
+      # extension, and runs no gateway.
+      - name: Start all-in-one PostgreSQL
+        run: |
+          mkdir -m 0755 "$RUNNER_TEMP/aio-sock"
+          docker run -d --name aio-pg -v "$RUNNER_TEMP/aio-sock:/var/run/postgresql" \
+            ragmux/ragmux:ci-locale postgres-only
+          for _ in $(seq 1 120); do
+            if docker logs aio-pg 2>&1 | grep -q 'postgres ready'; then exit 0; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' aio-pg)" != true ]; then break; fi
+            sleep 0.5
+          done
+          docker logs aio-pg
+          exit 1
+      - name: Full-text test against the all-in-one image
+        env:
+          TEST_DATABASE_URL: postgres://postgres@/ragmux?host=${{ runner.temp }}/aio-sock&sslmode=disable
+          RAGMUX_LOCALE_REPORT: ${{ runner.temp }}/locale-aio.tsv
+        run: go test -race -count=1 -v -run 'TestFullTextTurkishCaseFolding' ./internal/store/
+      - name: Full-text test against the split layout's PostgreSQL
+        if: ${{ !cancelled() }}
+        env:
+          TEST_DATABASE_URL: postgres://ragmux:ragmux@localhost:5432/ragmux_test?sslmode=disable
+          RAGMUX_LOCALE_REPORT: ${{ runner.temp }}/locale-app.tsv
+        run: go test -race -count=1 -v -run 'TestFullTextTurkishCaseFolding' ./internal/store/
+      - name: Compare the two servers
+        if: ${{ !cancelled() }}
+        run: |
+          for f in aio app; do
+            echo "== $f =="
+            cat "$RUNNER_TEMP/locale-$f.tsv"
+          done
+          if diff -u "$RUNNER_TEMP/locale-aio.tsv" "$RUNNER_TEMP/locale-app.tsv"; then
+            echo "Both images fold Turkish text identically."
+          else
+            echo "::error title=Locale drift::The all-in-one and split-layout PostgreSQL servers fold Turkish text differently."
+            exit 1
+          fi
+      - name: Stop all-in-one PostgreSQL
+        if: always()
+        run: docker rm -f aio-pg >/dev/null 2>&1 || true
+
+  # Reminder only, never a gate: ragmux.com's /docs pages are copies of files in
+  # this repo, made by its scripts/sync-docs.mjs. A PR that changes any of them
+  # leaves the site stale until someone runs `npm run sync-docs` there. The
+  # pathspec below mirrors the `source` entries of PAGES in that script (all of
+  # docs/, plus README.md, CHANGELOG.md and SECURITY.md); keep the two in step.
+  # Syncing automatically needs a cross-repo token and is planned for v0.5;
+  # until then this job just warns.
+  docs-sync-reminder:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Warn when site-synced files changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          synced=(docs/ README.md CHANGELOG.md SECURITY.md)
+          if ! changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- "${synced[@]}")"; then
+            echo "::notice::Could not diff against the base branch; skipping the docs sync reminder."
+            exit 0
+          fi
+          if [ -n "$changed" ]; then
+            echo "::warning title=Site docs sync::This PR changes files ragmux.com copies into /docs. Run \`npm run sync-docs\` in ragmux.com after it merges."
+            printf '%s\n' "$changed"
+          else
+            echo "No changes to files synced into ragmux.com."
+          fi

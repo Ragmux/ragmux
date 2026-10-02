@@ -36,9 +36,9 @@ func TestModelPricesCRUD(t *testing.T) {
 	if _, err := pricing.Seed(ctx, e.store.DB(), slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
 		t.Fatal(err)
 	}
-	e.call("POST", "/admin/api/users", map[string]any{"username": "ed", "password": "editorpass", "role": "editor"}, "")
-	e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewerpass", "role": "viewer"}, "")
-	editor, viewer := e.login("ed", "editorpass"), e.login("vw", "viewerpass")
+	e.call("POST", "/admin/api/users", map[string]any{"username": "ed", "password": "editor-pass-1", "role": "editor"}, "")
+	e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewer-pass-1", "role": "viewer"}, "")
+	editor, viewer := e.login("ed", "editor-pass-1"), e.login("vw", "viewer-pass-1")
 
 	list := e.call("GET", "/admin/api/prices", nil, viewer)
 	if status(list) != 200 {

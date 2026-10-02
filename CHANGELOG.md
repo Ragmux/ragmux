@@ -4,7 +4,92 @@ All notable changes to Ragmux are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.2] — 2026-10-02
+
+Bug fixes, observability and documentation. No schema change.
+
+### Added
+- **Gemini tool calls keep their `thoughtSignature`.** Gemini 3 thinking models expect the
+  signature on a tool-calling turn to come back with the next request, and a request
+  that dropped it could be answered with `400`. The signature now travels to the client as
+  an opaque `tool_calls[].ragmux_signature` field (streamed and non-streamed alike) and is
+  written back onto the `functionCall` part when the client sends the turn again. It is
+  stripped for every non-Gemini upstream, including a fallback, so it never reaches OpenAI,
+  Anthropic or Ollama. A client that rebuilds tool calls by hand has to copy the field;
+  see [Providers](docs/providers.md).
+- **Gemini `response_format: json_schema` is forwarded** as `generationConfig.responseSchema`
+  after the schema is reduced to the subset Gemini accepts. Dropped keys are logged at
+  debug level; a schema that is left with no properties falls back to JSON mode alone.
+- **Upstream `Retry-After` is passed on.** A delay in seconds or an HTTP date reaches the
+  client on non-streaming errors and on errors before a stream starts; a malformed value is
+  dropped.
+- **Anthropic connections no longer drop `response_format` silently.** `json_schema` and
+  `json_object` are still ignored, but the response now carries
+  `Warning: 299 ragmux "response_format is not supported for anthropic connections; ignored"`
+  (streams included) and the event is logged at info level. `Warning` is listed in
+  `Access-Control-Expose-Headers` so browser clients can read it. Full support is planned
+  for v0.7.
+- **GenAI span attributes.** Chat completion spans carry `gen_ai.operation.name`,
+  `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`,
+  `gen_ai.response.finish_reasons` and `gen_ai.usage.cache_read.input_tokens`; provider and
+  RAG embedding spans carry `gen_ai.provider.name`. No prompt or completion text is exported.
+- **New metrics:** `ragmux_requests_unpriced_total{provider}` (successful completions with
+  no matching price row), `ragmux_budget_used_ratio{project}` (the share of the tightest
+  token budget used, inside the series cap), `ragmux_retention_last_success_timestamp_seconds`
+  and `ragmux_rag_index_missing` (RAG stores whose vector index could not be built).
+- **`deploy/prometheus/alerts.yaml`:** alerting rules for availability, error rates,
+  ingestion backlog, dropped metric series, budget exhaustion and retention lag, checked
+  with promtool in CI.
+- `otel-collector.yaml` ships commented exporter examples for Langfuse and Arize Phoenix.
+
+### Changed
+- **Upstream `503` and `504` are relayed as themselves** instead of being turned into `502`,
+  so a client can tell "overloaded or slow, retry later" from "broken". Every other upstream
+  `5xx` is still `502`. Anthropic's `529 overloaded` is relayed as `503`, with the upstream's
+  `Retry-After`.
+- **Anthropic `stop_reason` mapping.** `refusal` now maps to `finish_reason: "content_filter"`
+  and `model_context_window_exceeded` to `length`. Any other unknown value maps to `stop`
+  and is logged at warn level. These used to be relayed verbatim, outside the set OpenAI
+  clients switch on.
+- **RAG stores refuse embedding models wider than 2000 dimensions** — pgvector's HNSW limit
+  for the `vector` type — both at the first ingest and when a store is created or edited in
+  the admin (`400`). A store that is already wider keeps working, without an index; it is
+  logged at startup and counted by `ragmux_rag_index_missing`. `halfvec` support is planned
+  for v0.6.
+- **A `fts_config` other than `simple` logs a warning** at startup and on save: the stored
+  full-text column is always built with `simple`, so the setting only changes how queries
+  are parsed until a per-store indexing language lands in v0.6.
+- **One password rule everywhere a password is set:** at least 12 characters and at most
+  72 bytes. User creation, password reset and password change in the dashboard and the admin
+  API previously accepted 8 characters, and the dashboard forms now enforce the same minimum.
+  Existing passwords are not re-checked.
+- **A non-compliant `ADMIN_PASSWORD` stops the start** when the `users` table is empty; when
+  users already exist it only logs a warning.
+- **Retention deletes run in batches** of 5000 rows per statement, 50 ms apart, and stop
+  cleanly on shutdown. The retention log line reports the total rows deleted and the pass
+  duration.
+
+### Deprecated
+- The `gen_ai.system` span attribute is superseded by `gen_ai.provider.name`. Both are
+  emitted in this release so a dashboard can move over; `gen_ai.system` is removed in a
+  later release.
+
+### Fixed
+- **RAG context injection no longer flattens a system message sent as content parts.** The
+  parts and their extra fields are kept and the context becomes a new leading part. A
+  project `system_prompt` keeps the client's `cache_control`; when retrieved passages are
+  injected, `cache_control` on that system message is deliberately dropped, because the
+  per-query prefix could never be read from Anthropic's prompt cache (placement fix planned
+  for v0.6).
+- **Changing a RAG store's embedding connection resets its dimension**, and an ingest that
+  races the change with the old model now fails instead of writing vectors of the wrong size.
+- **Documentation that had drifted from the code.** The `/healthz` example no longer shows a
+  fixed `0.2.0`; the RAG store and search fields in the API reference match the admin API;
+  the claim that unknown fields are "passed through" to the upstream is corrected; the system
+  message injection order and the point where `max_distance` applies are stated the same way
+  on every page; `0` meaning "unlimited" is explained in one place; and
+  `docs/observability.md` no longer lists the tracing export metrics as gauges (they are
+  counters).
 
 ## [0.4.1] — 2026-09-19
 
@@ -330,6 +415,8 @@ the API or the database schema is different. Upgrading is optional.
   `EMBEDDED_POSTGRES=false`) skips the embedded server; `PG_SHARED_BUFFERS` tunes it;
   `ragmux-aio postgres-only` runs Postgres alone for maintenance. Documented in
   [Deployment layouts](docs/configuration.md#deployment-layouts).
+  *Superseded by [0.4.1](#041--2026-09-19): Docker Hub (`ragmux/ragmux`) is the primary
+  registry; the `ghcr.io` names above remain as a mirror with identical tags.*
 - `scripts/backup.sh` and `scripts/restore.sh` detect the Compose layout (`LAYOUT=auto|split|aio`):
   in the all-in-one layout they run `pg_dump`/`pg_restore` inside the `ragmux` container as
   `postgres` over the socket, and the restore goes through a one-off `postgres-only` container
@@ -676,7 +763,11 @@ Initial release: single-container gateway with SQLite + sqlite-vec, OpenAI-compa
 for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over PDF/TXT/MD,
 projects with `sk-proj-` keys, metrics and an embedded dashboard.
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.1...HEAD
+No git tag was created for this release, so there is no release page for it. The first
+tagged release is [0.2.0](https://github.com/ragmux/ragmux/releases/tag/v0.2.0).
+
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/ragmux/ragmux/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ragmux/ragmux/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ragmux/ragmux/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ragmux/ragmux/releases/tag/v0.3.1
@@ -685,4 +776,3 @@ projects with `sk-proj-` keys, metrics and an embedded dashboard.
 [0.2.2]: https://github.com/ragmux/ragmux/releases/tag/v0.2.2
 [0.2.1]: https://github.com/ragmux/ragmux/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ragmux/ragmux/releases/tag/v0.2.0
-[0.1.0]: https://github.com/ragmux/ragmux/releases/tag/v0.1.0

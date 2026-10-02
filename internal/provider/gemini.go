@@ -37,6 +37,10 @@ type geminiPart struct {
 	FileData         *geminiFileData         `json:"fileData,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	// ThoughtSignature is the opaque token a thinking model attaches to a
+	// part. On a functionCall part it has to come back verbatim on the next
+	// turn, or Gemini 3 rejects the tool round with a 400.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 }
 
 // Gemini correlates tool calls by function name; there are no call ids in
@@ -167,14 +171,7 @@ func translateGemini(ctx context.Context, cfg Config, req ChatRequest) (geminiRe
 	if stops := req.StopSequences(); len(stops) > 0 {
 		gc["stopSequences"] = stops
 	}
-	if len(req.ResponseFormat) > 0 {
-		var rf struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(req.ResponseFormat, &rf) == nil && strings.HasPrefix(rf.Type, "json") {
-			gc["responseMimeType"] = "application/json"
-		}
-	}
+	geminiResponseFormat(cfg, req.ResponseFormat, gc)
 	if len(gc) > 0 {
 		out.GenerationConfig = gc
 	}
@@ -183,6 +180,55 @@ func translateGemini(ctx context.Context, cfg Config, req ChatRequest) (geminiRe
 		return out, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "messages must contain at least one user message"}
 	}
 	return out, nil
+}
+
+// geminiResponseFormat maps response_format onto generationConfig. Both JSON
+// modes set the MIME type; json_schema also forwards the schema as
+// responseSchema, sanitised like a tool schema because the field takes the
+// same OpenAPI subset and rejects unknown keywords the same way.
+func geminiResponseFormat(cfg Config, raw json.RawMessage, gc map[string]any) {
+	if len(raw) == 0 {
+		return
+	}
+	var rf struct {
+		Type       string `json:"type"`
+		JSONSchema struct {
+			Name   string          `json:"name"`
+			Schema json.RawMessage `json:"schema"`
+		} `json:"json_schema"`
+	}
+	if json.Unmarshal(raw, &rf) != nil || !strings.HasPrefix(rf.Type, "json") {
+		return
+	}
+	gc["responseMimeType"] = "application/json"
+	if rf.Type != "json_schema" || len(rf.JSONSchema.Schema) == 0 || string(rf.JSONSchema.Schema) == "null" {
+		return
+	}
+	schema, dropped := sanitizeGeminiSchema(rf.JSONSchema.Schema)
+	if len(dropped) > 0 {
+		cfg.logger().Debug("response schema keywords dropped for gemini", "provider", "gemini",
+			"schema", rf.JSONSchema.Name, "dropped", dropped)
+	}
+	if geminiResponseSchemaEmpty(schema) {
+		// Nothing constrains the shape any more, and Gemini rejects an
+		// object schema without properties; plain JSON mode is what is left.
+		return
+	}
+	gc["responseSchema"] = schema
+}
+
+// geminiResponseSchemaEmpty reports an object schema with no properties.
+// Unlike function parameters, a response schema may be rooted at any type,
+// so an array or enum root is a real constraint and is kept.
+func geminiResponseSchemaEmpty(raw json.RawMessage) bool {
+	var obj struct {
+		Type       string                     `json:"type"`
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return true
+	}
+	return obj.Type == "object" && len(obj.Properties) == 0
 }
 
 // translateGeminiTools fills in functionDeclarations and toolConfig. A tool
@@ -263,7 +309,8 @@ func geminiToolChoice(raw json.RawMessage) *geminiToolConfig {
 	return nil
 }
 
-// geminiToolCallParts turns assistant tool_calls into functionCall parts.
+// geminiToolCallParts turns assistant tool_calls into functionCall parts,
+// putting back the thoughtSignature the gateway relayed on each call.
 func geminiToolCallParts(raw json.RawMessage) []geminiPart {
 	if len(raw) == 0 {
 		return nil
@@ -274,6 +321,8 @@ func geminiToolCallParts(raw json.RawMessage) []geminiPart {
 			Name      string `json:"name"`
 			Arguments string `json:"arguments"`
 		} `json:"function"`
+		// Must match toolCallSignatureField.
+		Signature string `json:"ragmux_signature"`
 	}
 	if json.Unmarshal(raw, &calls) != nil {
 		return nil
@@ -284,7 +333,8 @@ func geminiToolCallParts(raw json.RawMessage) []geminiPart {
 		if !json.Valid(args) || !strings.HasPrefix(strings.TrimSpace(c.Function.Arguments), "{") {
 			args = json.RawMessage("{}")
 		}
-		parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: c.Function.Name, Args: args}})
+		parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{Name: c.Function.Name, Args: args},
+			ThoughtSignature: c.Signature})
 	}
 	return parts
 }
@@ -400,15 +450,59 @@ func geminiText(c geminiContent) string {
 	return b.String()
 }
 
-// geminiToolCalls collects the functionCall parts of one candidate.
+// geminiToolCalls collects the functionCall parts of one candidate, each with
+// the signature Gemini put on its part. Under parallel calling only the first
+// call is signed; the rest relay none and get none back.
 func geminiToolCalls(c geminiContent) []toolCall {
+	var sigs geminiSignatures
+	return sigs.collect(c)
+}
+
+// geminiSignatures carries a turn's thoughtSignature onto its first
+// functionCall. Gemini documents the signature on that call's own part, but a
+// signature-only part (no functionCall, no content) before or after it,
+// possibly in an earlier stream chunk, must not be lost: without it the
+// follow-up turn is rejected. A part with content keeps its signature, which
+// belongs to that content. A call's own signature always wins; only the first
+// call of the turn ever receives a borrowed one. One value spans one response
+// or stream.
+type geminiSignatures struct {
+	pending  string // signature seen before the turn's first call
+	seenCall bool
+}
+
+func (s *geminiSignatures) collect(c geminiContent) []toolCall {
 	var calls []toolCall
+	first := -1 // index in calls of the turn's first call, if it is in c
 	for _, p := range c.Parts {
-		if p.FunctionCall != nil {
-			calls = append(calls, toolCall{Name: p.FunctionCall.Name, Arguments: string(p.FunctionCall.Args)})
+		if p.FunctionCall == nil {
+			switch {
+			case !geminiSignatureOnly(p):
+			case !s.seenCall:
+				s.pending = p.ThoughtSignature
+			case first >= 0 && calls[first].Signature == "":
+				calls[first].Signature = p.ThoughtSignature
+			}
+			continue
 		}
+		call := toolCall{Name: p.FunctionCall.Name, Arguments: string(p.FunctionCall.Args), Signature: p.ThoughtSignature}
+		if !s.seenCall {
+			s.seenCall, first = true, len(calls)
+			if call.Signature == "" {
+				call.Signature = s.pending
+			}
+			s.pending = ""
+		}
+		calls = append(calls, call)
 	}
 	return calls
+}
+
+// geminiSignatureOnly reports whether p carries a thoughtSignature and
+// nothing else, so the signature has no content of its own to belong to.
+func geminiSignatureOnly(p geminiPart) bool {
+	return p.ThoughtSignature != "" && p.Text == "" && p.FunctionCall == nil && p.FunctionResponse == nil &&
+		p.InlineData == nil && p.FileData == nil
 }
 
 func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
@@ -456,6 +550,7 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 	usage := &Usage{}
 	sentRole := false
 	var tools toolCallStream
+	var sigs geminiSignatures
 	emit := func(c StreamChunk) bool {
 		c.ID, c.Object, c.Created, c.Model = id, "chat.completion.chunk", created, req.Model
 		select {
@@ -475,7 +570,7 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 		}
 		for _, c := range gr.Candidates {
 			text := geminiText(c.Content)
-			calls := geminiToolCalls(c.Content)
+			calls := sigs.collect(c.Content)
 			delta := Delta{Content: strPtr(text)}
 			if !sentRole {
 				delta.Role = "assistant"
@@ -490,7 +585,7 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 			// A functionCall always arrives complete inside one chunk, so each
 			// one is a single whole delta; Gemini never streams arguments.
 			for _, call := range calls {
-				delta.ToolCalls = tools.Whole("", call.Name, call.Arguments)
+				delta.ToolCalls = tools.WholeCall(call)
 				if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}}) {
 					return false
 				}

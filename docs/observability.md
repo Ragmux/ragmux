@@ -96,6 +96,25 @@ scrape_configs:
 With `METRICS_LISTEN=127.0.0.1:9090`, point the target at `127.0.0.1:9090` and drop the
 `authorization` block.
 
+### Alert rules
+
+[`deploy/prometheus/alerts.yaml`](../deploy/prometheus/alerts.yaml) is a ready set of
+Prometheus rules built on the metrics below: scrape target down, `/readyz` failing, a high
+`5xx` rate, a high upstream error rate, a stuck ingestion backlog, metric series being
+dropped at `METRICS_MAX_SERIES`, a project close to its token budget, and the retention
+job lagging. Load it next to the scrape configuration:
+
+```yaml
+# prometheus.yml
+rule_files:
+  - /etc/prometheus/ragmux-alerts.yaml
+```
+
+The rules assume the job is named `ragmux`, as in the scrape configuration above; change
+the `job` matcher of `RagmuxDown` if yours differs. The thresholds are starting points —
+tune them to your traffic before paging anyone on them. The file can be checked with
+`promtool check rules deploy/prometheus/alerts.yaml`.
+
 ### The metric set
 
 Every name is prefixed `ragmux_`. Durations are seconds, as Prometheus expects.
@@ -126,6 +145,7 @@ which the success, error, mid-stream-failure and client-disconnect paths all rea
 | `ragmux_gateway_cost_usd_total` | counter (float) | `project`, `model` | Estimated spend, from the same price table the request log uses. |
 | `ragmux_gateway_errors_total` | counter | `project`, `provider`, `type` | `type` is the provider error type, a bounded set. |
 | `ragmux_gateway_client_disconnects_total` | counter | — | Completions the client abandoned (status 499). |
+| `ragmux_requests_unpriced_total` | counter | `provider` | Successful completions whose model has no entry in the price table, so their spend is missing from `cost_usd_total` and the request log. `provider` is the provider type, a fixed set. |
 
 `tokens_estimated_total` is a separate metric rather than a `estimated="true"` label on
 `tokens_total` on purpose: a token series that silently mixes estimated and reported
@@ -137,6 +157,7 @@ counts is a trap for anyone doing cost maths. Divide the estimated request count
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `ragmux_limits_denied_total` | counter | `project`, `reason` | `reason` is `rate_limit_rpm`, `rate_limit_tpm`, `budget_daily` or `budget_monthly`. |
+| `ragmux_budget_used_ratio` | gauge | `project` | Tokens used over the token budget, for projects that have one: the larger of the daily and the monthly ratio, so `1` means the project is about to be refused. Read from the database at most every 30 s; the same on every replica. Projects without a budget have no series. New projects count against `METRICS_MAX_SERIES` like any other series. |
 
 The denied request itself is still counted by `ragmux_http_requests_total` with
 `status="429"`.
@@ -152,6 +173,7 @@ The denied request itself is still counted by `ragmux_http_requests_total` with
 | `ragmux_rag_searches_total` | counter | `store`, `used` | `used` is the backend that **actually answered**. |
 | `ragmux_rag_hits_total` | counter | `store` | Passages returned. |
 | `ragmux_search_backend_available` | gauge | `backend` | `1` when this server can answer with that backend. |
+| `ragmux_rag_index_missing` | gauge | — | RAG stores whose embedding width is above 2000 dimensions, which pgvector cannot HNSW-index; they are searched with an exact scan (see [Embedding width](rag.md#embedding-width)). Counted at startup and recounted when such a store is deleted or re-bound. |
 
 `used` differs from the store's configured `search_backend` when the configured one is
 not available on this server and the search fell back to pgvector. Comparing the two is
@@ -199,11 +221,9 @@ values rather than zero: an alert would read a zero as "the backlog drained".
 | `ragmux_process_start_time_seconds` | gauge | Process start, Unix seconds. |
 | `ragmux_go_goroutines`, `ragmux_go_memstats_heap_inuse_bytes`, `ragmux_go_memstats_alloc_bytes_total`, `ragmux_go_gc_cycles_total` | gauge | Read through `runtime/metrics`, which does not stop the world. |
 | `ragmux_metrics_series_dropped_total` | counter | Label combinations refused at `METRICS_MAX_SERIES`. Drops are also logged at `error`, at most once a minute. Alert on `increase(...[1h]) > 0`: any value above zero means metrics are being lost. |
-| `ragmux_tracing_spans_dropped_total` | gauge | Spans discarded because the export queue was full. |
-| `ragmux_tracing_export_failures_total` | gauge | Export attempts abandoned after their one retry. |
-
-The two tracing counters are monotonic but are exported with `# TYPE gauge`: the registry
-has no counter-valued function collector. `rate()` over them behaves the same way.
+| `ragmux_tracing_spans_dropped_total` | counter | Spans discarded because the export queue was full. |
+| `ragmux_tracing_export_failures_total` | counter | Export attempts abandoned after their one retry. |
+| `ragmux_retention_last_success_timestamp_seconds` | gauge | Unix time of the last retention pass this replica completed without error; `0` until it has run one. Only the replica holding the leader lock runs the pass, so read it with `max()` across replicas. |
 
 ### Cardinality checklist
 
@@ -312,7 +332,7 @@ to whatever the repository happened to be at.
 `/readyz` answers `200`:
 
 ```json
-{"status":"ok","version":"0.4.0","migrations":N,"expected_migrations":N}
+{"status":"ok","version":"<x.y.z>","migrations":N,"expected_migrations":N}
 ```
 
 and `503` with `"status":"migrating"` while the applied version is **behind** the binary's:
@@ -330,7 +350,7 @@ working against the newer schema. It answers `200` and says so:
 ```json
 {
   "status": "ok",
-  "version": "0.4.0",
+  "version": "<x.y.z>",
   "migrations": N+1,
   "expected_migrations": N,
   "degraded": ["the database schema is at migration N+1, ahead of the N this binary embeds; this replica is running older code against a newer schema"]
@@ -355,7 +375,7 @@ condition into an outage. It is reported instead as an informational field along
 ```json
 {
   "status": "ok",
-  "version": "0.4.0",
+  "version": "<x.y.z>",
   "migrations": N,
   "expected_migrations": N,
   "degraded": ["pg_search is not installed on this server; 2 rag store(s) configured for it fall back to pgvector"]
@@ -395,12 +415,26 @@ decision rather than a by-product.
 | Span | Kind | Where | Attributes |
 |---|---|---|---|
 | `http.server` | Server | middleware after the request-id middleware | `http.request.method`, `http.route` (the chi pattern, read after the handler ran), `http.response.status_code`, `ragmux.request_id` |
-| `gateway.chat_completion` | Internal | the `/v1/chat/completions` handler | `ragmux.project.id`, `gen_ai.request.model`, `ragmux.stream`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
+| `gateway.chat_completion` | Internal | the `/v1/chat/completions` handler | `ragmux.project.id`, `gen_ai.operation.name` (`chat`), `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `ragmux.stream`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens` |
 | `rag.retrieve` | Internal | `Retriever.SearchWith` | `ragmux.rag.store_id`, `.mode`, `.backend`, `.top_k`, `.hits` |
-| `rag.embed_query` | Client | around the query embedding call | `gen_ai.system` |
+| `rag.embed_query` | Client | around the query embedding call | `gen_ai.provider.name`, `gen_ai.system` (deprecated) |
 | `rag.rerank` | Client | around the rerank call | `ragmux.rerank.backend`, `ragmux.rerank.fallback` |
-| `provider.chat` / `provider.embed` / `provider.rerank` | Client | `internal/provider/http.go`, `doRequest` / `doStream` | `server.address` (host only), `gen_ai.system`, `http.response.status_code`, `ragmux.stream.bytes` |
+| `provider.chat` / `provider.embed` / `provider.rerank` | Client | `internal/provider/http.go`, `doRequest` / `doStream` | `server.address` (host only), `gen_ai.provider.name`, `gen_ai.system` (deprecated), `gen_ai.operation.name` (`chat` or `embeddings`; absent on rerank), `http.response.status_code`, `ragmux.stream.bytes` |
 | `ingest.document` | Internal | the ingestion worker; its own trace root | `ragmux.document.id`, `.store_id`, `.chunks`, `.attempt` |
+
+The `gen_ai.*` names follow the OpenTelemetry GenAI semantic conventions:
+
+- **`gen_ai.provider.name` replaces `gen_ai.system`.** Both are emitted in 0.4.2 so a
+  dashboard can move over; `gen_ai.system` is removed in a later release. The value is the
+  provider type with two names mapped to the convention's own: `gemini` becomes
+  `gcp.gemini` and `cohere_rerank` becomes `cohere`. Every other type passes through
+  unchanged.
+- **`gen_ai.response.model` is the model the upstream says answered**, which can be a
+  dated snapshot of the one requested. Adapters that echo the requested model back fall
+  back to the connection's model name. The value is cut at 128 bytes.
+- **`gen_ai.response.finish_reasons` is a closed set**: `stop`, `length`, `tool_calls`,
+  `content_filter`, `function_call`, and `other` for anything else the upstream sends.
+  A stream reports every distinct reason it saw.
 
 Two details worth knowing:
 

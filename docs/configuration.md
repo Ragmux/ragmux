@@ -16,7 +16,7 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `DATA_DIR` | `/app/data` | Only used for the `secret.key` fallback when `SECRET_KEY` is unset. The all-in-one image sets it to `/data/ragmux` inside its volume. |
 | `PORT` | `8765` | HTTP listen port (`1`-`65535`). Also read by `-healthcheck`. |
 | `ADMIN_USER` | `admin` | Username of the administrator pre-created on first start when `ADMIN_PASSWORD` is set and the `users` table is empty. Ignored otherwise. |
-| `ADMIN_PASSWORD` | *(none)* | Set it for unattended installs: the account is created once with this password and the log says `admin user created from ADMIN_PASSWORD`. When unset, nothing is created; the log says `no users yet: open /admin/ to create the first administrator` and the dashboard shows the first-run setup form (see [`/setup`](api.md#first-run-setup)) until the first account exists. |
+| `ADMIN_PASSWORD` | *(none)* | Set it for unattended installs: the account is created once with this password and the log says `admin user created from ADMIN_PASSWORD`. When unset, nothing is created; the log says `no users yet: open /admin/ to create the first administrator` and the dashboard shows the first-run setup form (see [`/setup`](api.md#first-run-setup)) until the first account exists. The value must meet the password policy (at least 12 characters, at most 72 bytes): **on an empty `users` table a shorter or longer one stops the start** with an `ADMIN_PASSWORD: password must be …` error. Once users exist the variable is unused, and a non-compliant value only logs a warning (the password itself is never logged). |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs are JSON lines on stdout; unknown values fall back to `info`. |
 | `CORS_ORIGINS` | *(none)* | Comma-separated browser origins allowed to call the API (`*` allows all). Unset means no CORS headers at all. |
 | `SESSION_TTL` | `24h` | Dashboard session lifetime (Go duration such as `12h`, `30m`). |
@@ -69,6 +69,29 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 
 The integer variables from `LOGIN_RATE_LIMIT_PER_MIN` down accept `0` or any positive
 number; a negative or non-numeric value is a configuration error.
+
+## Zero means unlimited
+
+For the settings in the table below, `0` means **no limit** — it never means "nothing
+is allowed". Capping something therefore takes a
+small positive number; setting the value to `0` removes the cap. The other docs link here
+instead of restating it.
+
+| Setting | What `0` does |
+|---|---|
+| Project `rate_limit_rpm`, `rate_limit_tpm`, `budget_daily_tokens`, `budget_monthly_tokens`, and a key's sub-limits | The limit is not applied |
+| RAG store `max_documents`, `max_bytes` | The store sets no quota of its own |
+| `MAX_DOCUMENTS_PER_STORE`, `MAX_BYTES_PER_STORE_MB` | No instance-wide ceiling. When both a store quota and a ceiling are set, the smaller non-zero value wins |
+| `LOG_RETENTION_DAYS`, `AUDIT_RETENTION_DAYS` | Rows are kept forever |
+| `LOGIN_RATE_LIMIT_PER_MIN`, `LOGIN_USER_LIMIT_PER_MIN`, `LOGIN_LOCKOUT_FAILURES` | That login protection is switched off |
+
+Some neighbours read like this rule but are different. A RAG store's `max_distance` of
+`0` turns the distance cut-off off, and `IMAGE_CACHE_ENTRIES=0` disables the image cache.
+A `0` in a store's `top_k`, `rerank_candidates` or `chunk_size`, or in a search request's
+`top_k`, means "use the default" (the request's `top_k` falls back to the store's).
+Other settings require at least `1` and refuse to start with `0`: `MAX_UPLOAD_MB`,
+`METRICS_MAX_SERIES`, `IMAGE_FETCH_MAX_MB` and `IMAGE_CACHE_MAX_MB` among them; the
+[environment variables](#environment-variables) table states each minimum.
 
 Standard `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` variables are honoured for outbound
 provider calls (`http.ProxyFromEnvironment`) only when `ALLOW_PRIVATE_UPSTREAMS=true`:
@@ -141,9 +164,7 @@ Exactly one of `--generate` and `--stdin` is required. There is deliberately **n
 `--password` flag and no interactive prompt**: a flag value lands in `ps` output and the
 shell history, and a no-echo prompt would need `golang.org/x/term`, which is not a
 dependency of this project and is not worth adding for one emergency command. The
-minimum length is 12 characters (the first-run setup's floor, not the dashboard's 8 — an
-emergency admin reset should not create a weak credential) and the maximum is bcrypt's
-72 bytes.
+password policy is the dashboard's: at least 12 characters and at most bcrypt's 72 bytes.
 
 ```bash
 # print a fresh password
@@ -334,6 +355,24 @@ Three variants, `linux/amd64` and `linux/arm64`, built by the release workflow o
   `:latest-paradedb`): the all-in-one image whose PostgreSQL carries `pg_search` (BM25)
   as well as `pgvector` (`Dockerfile.aio.paradedb`).
 
+Compressed sizes of the `0.4.1` images as Docker Hub lists them for `linux/amd64`
+(read from the registry on 2026-10-01; later releases can differ): all-in-one about
+164 MB, `-app` about 6.5 MB, `-paradedb` about 372 MB. The `linux/arm64` builds are a few
+megabytes smaller. These are download sizes, not the space a running container uses: the
+database volume grows with your data.
+
+**A throwaway trial.** To look at the dashboard without keeping anything, run the
+all-in-one image with `--rm` and no volume; the container, its database and its
+generated `secret.key` disappear when it stops:
+
+```bash
+docker run --rm -p 127.0.0.1:8765:8765 ragmux/ragmux:latest
+```
+
+Anything you add (users, provider connections, documents) is lost with it. For data you
+want to keep, mount a volume at `/data` as in the
+[README quick start](../README.md#quick-start) and set `SECRET_KEY`.
+
 The primary registry is **Docker Hub**; the same images are published to the GitHub
 Container Registry as `ghcr.io/ragmux/ragmux` with identical tags, so either host serves
 the same builds. Which variant suits which installation is summarised in the
@@ -389,7 +428,7 @@ anything you deploy. From v0.3.1 on all of them are signed with cosign; see
   gateway answers preflight `OPTIONS` requests itself with
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS` and
   `Access-Control-Allow-Headers: Authorization, Content-Type, X-Ragmux-Project`. The
-  rate-limit, budget, RAG and `Retry-After` headers are listed in
+  rate-limit, budget, RAG, `Retry-After` and `Warning` headers are listed in
   `Access-Control-Expose-Headers`, without which browser JavaScript cannot read any of
   them. With `CORS_ORIGINS` empty (the default) no preflight is ever answered, which is
   also what keeps a management key in an `Authorization` header unforgeable from a

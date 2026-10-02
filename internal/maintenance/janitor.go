@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/store"
 )
 
@@ -31,6 +32,13 @@ const (
 	StartDelay = time.Minute
 	// DefaultInterval is the spacing between passes.
 	DefaultInterval = time.Hour
+	// DefaultBatchSize is how many rows one retention DELETE removes at
+	// most. Small batches keep each statement's locks, WAL burst and
+	// replication lag bounded however much has piled up.
+	DefaultBatchSize = 5000
+	// DefaultBatchPause is the wait between two batches of the same table,
+	// so a long backlog leaves room for the traffic around it.
+	DefaultBatchPause = 50 * time.Millisecond
 )
 
 // Janitor deletes rows that fell out of their retention window. Days values
@@ -47,6 +55,20 @@ type Janitor struct {
 	// are invisible to the ingestion claim, so the pass writes their final
 	// failed status; 0 skips the step.
 	IngestMaxAttempts int
+	// Metrics receives the time of every pass that finished without error,
+	// which is what the retention-lag alert reads; nil records nothing.
+	Metrics *obs.Metrics
+
+	// batchSize and batchPause override DefaultBatchSize and
+	// DefaultBatchPause when positive; tests set them.
+	batchSize  int
+	batchPause time.Duration
+	// wait sleeps d between batches and reports false when ctx ended
+	// first; nil uses a timer. Tests set it to cancel mid-loop.
+	wait func(ctx context.Context, d time.Duration) bool
+	// deleteBatch issues one bounded DELETE; nil uses
+	// Store.DeleteExpiredBatch. Tests set it to cancel mid-statement.
+	deleteBatch func(ctx context.Context, table store.RetentionTable, cutoff time.Time, limit int) (int64, error)
 }
 
 // Report counts the rows one pass removed.
@@ -63,6 +85,12 @@ type Report struct {
 	DocumentsFailed int64
 }
 
+// Deleted is the number of rows the pass removed across every table.
+// DocumentsFailed is an update, not a deletion, and is not counted.
+func (r Report) Deleted() int64 {
+	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys
+}
+
 func (j *Janitor) now() time.Time {
 	if j.Now != nil {
 		return j.Now().UTC()
@@ -77,44 +105,49 @@ func (j *Janitor) log() *slog.Logger {
 	return slog.Default()
 }
 
-// RunOnce performs a single retention pass. Every step is attempted even
-// when an earlier one fails; the errors are joined.
+// RunOnce performs a single retention pass. Unless ctx is cancelled, every
+// step is attempted even when an earlier one fails; the errors are joined.
+//
+// Rows are deleted in batches (see deleteBatched). When ctx is cancelled the
+// pass stops where it is and returns what it removed so far with a nil
+// error: every step is an idempotent "delete what expired before the
+// cutoff", so the next pass simply picks up the rest.
 func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 	var rep Report
 	var errs []error
 	now := j.now()
 
-	if j.RequestLogDays > 0 {
-		n, err := j.Store.DeleteRequestLogsBefore(ctx, now.AddDate(0, 0, -j.RequestLogDays))
-		if err != nil {
-			errs = append(errs, fmt.Errorf("request logs: %w", err))
+	steps := []struct {
+		table  store.RetentionTable
+		label  string
+		cutoff time.Time
+		skip   bool
+		into   *int64
+	}{
+		{store.RetainRequestLogs, "request logs", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.RequestLogs},
+		{store.RetainAuditLogs, "audit logs", now.AddDate(0, 0, -j.AuditDays), j.AuditDays <= 0, &rep.AuditLogs},
+		{store.RetainLoginAttempts, "login attempts", now.Add(-LoginAttemptRetention), false, &rep.LoginAttempts},
+		{store.RetainSessions, "sessions", now, false, &rep.Sessions},
+		{store.RetainAPIKeys, "api keys", now.Add(-APIKeyRetention), false, &rep.APIKeys},
+	}
+	for _, st := range steps {
+		if st.skip {
+			continue
 		}
-		rep.RequestLogs = n
-	}
-	if j.AuditDays > 0 {
-		n, err := j.Store.DeleteAuditLogsBefore(ctx, now.AddDate(0, 0, -j.AuditDays))
+		n, _, err := j.deleteBatched(ctx, st.table, st.cutoff)
+		*st.into = n
 		if err != nil {
-			errs = append(errs, fmt.Errorf("audit logs: %w", err))
+			errs = append(errs, fmt.Errorf("%s: %w", st.label, err))
 		}
-		rep.AuditLogs = n
+		if ctx.Err() != nil {
+			return rep, errors.Join(errs...)
+		}
 	}
-	n, err := j.Store.DeleteLoginAttemptsBefore(ctx, now.Add(-LoginAttemptRetention))
-	if err != nil {
-		errs = append(errs, fmt.Errorf("login attempts: %w", err))
-	}
-	rep.LoginAttempts = n
-	n, err = j.Store.PurgeExpiredSessions(ctx, now)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("sessions: %w", err))
-	}
-	rep.Sessions = n
-	n, err = j.Store.PurgeRetiredAPIKeys(ctx, now.Add(-APIKeyRetention))
-	if err != nil {
-		errs = append(errs, fmt.Errorf("api keys: %w", err))
-	}
-	rep.APIKeys = n
 	if j.Limiter != nil {
 		if err := j.Limiter.PurgeUsage(ctx); err != nil {
+			if ctx.Err() != nil {
+				return rep, errors.Join(errs...)
+			}
 			errs = append(errs, fmt.Errorf("usage counters: %w", err))
 		} else {
 			rep.UsagePurged = true
@@ -122,12 +155,77 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 	}
 	if j.IngestMaxAttempts > 0 {
 		n, err := j.Store.FailExhaustedDocuments(ctx, j.IngestMaxAttempts)
-		if err != nil {
+		if err != nil && ctx.Err() == nil {
 			errs = append(errs, fmt.Errorf("exhausted documents: %w", err))
 		}
 		rep.DocumentsFailed = n
 	}
 	return rep, errors.Join(errs...)
+}
+
+// deleteBatched removes every row of table that expired before cutoff, one
+// bounded DELETE at a time, pausing between batches. It stops when a batch
+// comes back short. It reports the rows removed and the statements issued.
+//
+// A cancelled ctx is not an error: the loop returns what it removed so far
+// and a nil error, and the remainder goes on the next pass.
+func (j *Janitor) deleteBatched(ctx context.Context, table store.RetentionTable, cutoff time.Time) (int64, int, error) {
+	size, pause := j.batching()
+	var total int64
+	batches := 0
+	for {
+		if ctx.Err() != nil {
+			return total, batches, nil
+		}
+		n, err := j.deleteOne(ctx, table, cutoff, size)
+		if err != nil {
+			if ctx.Err() != nil {
+				return total, batches, nil
+			}
+			return total, batches, err
+		}
+		total += n
+		batches++
+		if n < int64(size) {
+			return total, batches, nil
+		}
+		if !j.sleep(ctx, pause) {
+			return total, batches, nil
+		}
+	}
+}
+
+func (j *Janitor) deleteOne(ctx context.Context, table store.RetentionTable, cutoff time.Time, limit int) (int64, error) {
+	if j.deleteBatch != nil {
+		return j.deleteBatch(ctx, table, cutoff, limit)
+	}
+	return j.Store.DeleteExpiredBatch(ctx, table, cutoff, limit)
+}
+
+func (j *Janitor) batching() (int, time.Duration) {
+	size, pause := DefaultBatchSize, DefaultBatchPause
+	if j.batchSize > 0 {
+		size = j.batchSize
+	}
+	if j.batchPause > 0 {
+		pause = j.batchPause
+	}
+	return size, pause
+}
+
+// sleep waits d unless ctx ends first, and reports whether it waited.
+func (j *Janitor) sleep(ctx context.Context, d time.Duration) bool {
+	if j.wait != nil {
+		return j.wait(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // Run executes RunOnce StartDelay after it is called and then every interval
@@ -170,9 +268,9 @@ func (j *Janitor) Run(ctx context.Context, interval time.Duration) {
 // needs none of that and disappears the moment the connection does, which
 // is also how the rest of the codebase serialises cluster-wide work.
 //
-// Every step of the pass is an idempotent "DELETE ... WHERE created_at <
-// cutoff", so the lock saves duplicated work rather than protecting
-// correctness. That is why a connection pooler in transaction mode - where
+// Every step of the pass is an idempotent, batched "DELETE ... WHERE
+// created_at < cutoff", so the lock saves duplicated work rather than
+// protecting correctness. That is why a connection pooler in transaction mode - where
 // a session lock cannot be held and every replica sees the lock as free -
 // costs a duplicated pass and nothing else.
 func (j *Janitor) runLeader(ctx context.Context) bool {
@@ -193,14 +291,16 @@ func (j *Janitor) runLeader(ctx context.Context) bool {
 }
 
 func (j *Janitor) runLogged(ctx context.Context) {
+	start := time.Now()
 	rep, err := j.RunOnce(ctx)
 	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
 		j.log().Warn("retention pass failed", "err", err)
+	} else if ctx.Err() == nil {
+		j.Metrics.RetentionPassed(time.Now())
 	}
-	j.log().Info("retention pass", "request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
+	j.log().Info("retention pass", "deleted", rep.Deleted(), "duration", time.Since(start),
+		"interrupted", ctx.Err() != nil,
+		"request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
 		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "api_keys", rep.APIKeys,
 		"usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
 }

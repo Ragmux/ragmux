@@ -73,6 +73,8 @@ type Store struct {
 	pgSearchTok string
 	// bm25Ready remembers that the ParadeDB index has been created.
 	bm25Ready atomic.Bool
+	// indexMissing counts stores without an HNSW index (see AuditRAGStores).
+	indexMissing atomic.Int64
 }
 
 // Open connects to PostgreSQL, ensures the vector extension exists, runs
@@ -140,6 +142,10 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 	if err := s.verifySecretKey(ctx); err != nil {
 		pool.Close()
 		return nil, err
+	}
+	// Warnings only: a failed audit must not keep the server down.
+	if _, err := s.AuditRAGStores(ctx); err != nil {
+		log.Warn("rag store audit failed", "err", err)
 	}
 	return s, nil
 }

@@ -64,6 +64,10 @@ type Admin struct {
 	// / max_bytes can only lower them. Checked on upload, not on reprocess.
 	MaxDocumentsPerStore int
 	MaxBytesPerStore     int64
+	// EmbeddingWidth reports how many dimensions a connection's embedding
+	// model returns; a RAG store save uses it to refuse a model pgvector
+	// cannot index. nil embeds one word through ProviderConfig.
+	EmbeddingWidth func(ctx context.Context, conn *store.ModelConnection) (int, error)
 }
 
 // Body read budgets. JSON handlers get a short one; login shorter still so a
@@ -300,9 +304,6 @@ func badBody(w http.ResponseWriter, err error) {
 const (
 	maxUsernameLen      = 64
 	maxLoginPasswordLen = 1024
-	// maxPasswordLen is bcrypt's input limit; longer passwords are refused
-	// when set rather than silently truncated.
-	maxPasswordLen = 72
 )
 
 func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
@@ -925,6 +926,10 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 	} else if !ok {
 		return fmt.Errorf("fts_config %q is not a text search configuration on this server", in.FTSConfig)
 	}
+	// Accepted as before; the operator is only told what it does not do.
+	if msg := store.FTSConfigWarning(in.FTSConfig, in.SearchBackend); msg != "" {
+		a.Log.Warn("rag store: "+msg, "store", in.Name, "fts_config", in.FTSConfig)
+	}
 	if in.RerankCandidates <= 0 {
 		in.RerankCandidates = 15
 	}
@@ -1073,6 +1078,10 @@ func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := a.checkEmbeddingDims(r.Context(), in.EmbeddingConnectionID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	rs, err := a.Store.CreateRAGStore(r.Context(), in.toStore(0))
 	if err != nil {
 		a.fail(w, err)
@@ -1108,6 +1117,15 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	connChanged := before.EmbeddingConnectionID != in.EmbeddingConnectionID
+	// A store with chunks cannot switch (UpdateRAGStore refuses it), so the
+	// probe -- a billed upstream call -- only runs when the switch can happen.
+	if connChanged && before.ChunkCount == 0 {
+		if err := a.checkEmbeddingDims(r.Context(), in.EmbeddingConnectionID); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	rs, err := a.Store.UpdateRAGStore(r.Context(), in.toStore(id))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1124,10 +1142,65 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	// lexical side from chunks.content, so switching costs an index build
 	// at most, never a re-embed. Listing it here would send operators
 	// through hours of embedding calls for nothing.
+	//
+	// A new embedding connection resets the store's dimension to 0 (bound
+	// again by the next ingest); documents already in the store -- failed
+	// or pending, since a store with chunks cannot switch -- need a
+	// reprocess to be embedded with the new model.
 	reprocess := rs.ChunkCount > 0 && (before.ChunkSize != rs.ChunkSize || before.ChunkOverlap != rs.ChunkOverlap ||
 		before.ContextualChunks != rs.ContextualChunks)
+	if connChanged && rs.DocumentCount > 0 {
+		reprocess = true
+	}
 	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess})
 	writeJSON(w, http.StatusOK, ragStoreResponse{RAGStore: rs, ReprocessRecommended: reprocess})
+}
+
+// embeddingProbeTimeout bounds the probe checkEmbeddingDims makes, so a slow
+// upstream delays a store save by seconds at most.
+const embeddingProbeTimeout = 10 * time.Second
+
+// checkEmbeddingDims asks for the width of the embedding model a store is
+// about to be bound to and refuses one wider than pgvector can index, so the
+// operator hears about it on save rather than from the first failed ingest.
+// The probe is best effort: if the upstream cannot be reached the save goes
+// ahead and the ingest-time check (store.CheckVectorDims) still applies.
+func (a *Admin) checkEmbeddingDims(ctx context.Context, connID int64) error {
+	conn, err := a.Store.GetConnection(ctx, connID)
+	if err != nil {
+		return nil // validateRAG already reported a missing connection
+	}
+	ctx, cancel := context.WithTimeout(ctx, embeddingProbeTimeout)
+	defer cancel()
+	width := a.EmbeddingWidth
+	if width == nil {
+		width = a.probeEmbeddingWidth
+	}
+	dims, err := width(ctx, conn)
+	if err != nil {
+		a.Log.Info("rag store: embedding width probe skipped", "connection_id", connID,
+			"err", provider.RedactWith(err.Error(), conn.APIKey))
+		return nil
+	}
+	return store.CheckVectorDims(dims)
+}
+
+// probeEmbeddingWidth embeds one word, the way the connection test does.
+func (a *Admin) probeEmbeddingWidth(ctx context.Context, conn *store.ModelConnection) (int, error) {
+	pc := a.providerConfig(conn)
+	pc.Timeout = embeddingProbeTimeout
+	emb, err := provider.NewEmbedder(pc)
+	if err != nil {
+		return 0, err
+	}
+	vecs, err := emb.Embed(ctx, []string{"ping"})
+	if err != nil {
+		return 0, err
+	}
+	if len(vecs) == 0 {
+		return 0, errors.New("upstream returned no embedding")
+	}
+	return len(vecs[0]), nil
 }
 
 // ragStoreResponse is a store plus the reprocess hint returned by updates.

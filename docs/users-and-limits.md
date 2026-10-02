@@ -38,9 +38,10 @@ What bounds that spend is never a role. It is:
 
 A user carries no limit of its own; limits live on the project and on the key.
 
-**To cap one user**, give their key a sub-limit. Note that `0` there means *unlimited*,
-not *nothing*, so capping means setting a small ceiling — setting it to zero removes the
-ceiling instead of applying one.
+**To cap one user**, give their key a sub-limit. Note that `0` there means *unlimited*
+([Zero means unlimited](configuration.md#zero-means-unlimited)), not *nothing*, so
+capping means setting a small ceiling — setting it to zero removes the ceiling instead
+of applying one.
 
 **To stop them outright**, revoke the key (`POST /admin/api/keys/{id}/revoke`), or
 deactivate the account (`PUT /admin/api/users/{id}` with `is_active: false`).
@@ -82,8 +83,11 @@ replace the member set freely.
   deactivate or delete their own account (`400`).
 - `POST /admin/api/users/{id}/reset-password` sets a new password and revokes the user's
   sessions; `POST /admin/api/users/{id}/sessions/revoke` only signs the user out everywhere.
-- Passwords must be at least 8 characters and at most 72 bytes (bcrypt's input limit);
-  usernames at most 64.
+- Passwords must be at least 12 characters and at most 72 bytes (bcrypt's input limit);
+  usernames at most 64. The same rule applies everywhere a password is set: creating a
+  user, resetting or changing a password, the first-run setup, `ragmux reset-password`
+  and `ADMIN_PASSWORD`. Existing passwords are not re-checked; they keep working until
+  they are changed.
 - Changing your own password (`POST /admin/api/me/password`) signs out every other
   session of the account; the session that made the change stays valid.
 - `POST /admin/api/users` accepts `project_ids`; the memberships are written in the same
@@ -279,7 +283,8 @@ or in the **Audit** dashboard tab, and download it as NDJSON with
 
 ## Rate limits and budgets
 
-Every project has four optional limits (`0` = unlimited), set at creation or with
+Every project has four optional limits (`0` = unlimited, see
+[Zero means unlimited](configuration.md#zero-means-unlimited)), set at creation or with
 `PUT /admin/api/projects/{id}` and shown in the dashboard's project form:
 
 | Field | Meaning |

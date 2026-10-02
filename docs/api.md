@@ -179,7 +179,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
-| POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: 12–72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
+| POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: at least 12 characters and at most 72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
 case setup is already complete (see [Configuration](configuration.md#environment-variables)).
@@ -199,7 +199,7 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
-| POST | `/me/password` | viewer | `{current_password, new_password}` (8+ characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
+| POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
 
 ### Model connections
@@ -286,18 +286,27 @@ retrieval semantics are explained in [Retrieval (RAG)](rag.md)):
 ```json
 {"name": "handbook", "embedding_connection_id": 2,
  "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
- "search_mode": "hybrid", "fts_config": "simple",
- "rerank": false, "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true,
+ "search_mode": "hybrid", "search_backend": "pgvector", "fts_config": "simple",
+ "rerank": false, "rerank_backend": "llm", "rerank_connection_id": null,
+ "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true,
  "max_documents": 0, "max_bytes": 0}
 ```
 
 Validation: `chunk_size` 200-20000, `chunk_overlap` ≥ 0 and smaller than `chunk_size`,
-`top_k` ≤ 50, `search_mode` `vector` or `hybrid`, `fts_config` must exist in
-`pg_ts_config`, `rerank_candidates` 1-100, `max_distance` 0-2, `max_documents` and
-`max_bytes` ≥ 0 (`0` = unlimited, see [Quotas](rag.md#quotas)). The embedding
-connection must be of a type that supports embeddings and cannot be changed while the
-store has chunks (`400`). Responses carry the usage the quotas are checked against:
-`document_count` and `bytes_used`.
+`top_k` ≤ 50, `search_mode` `vector` or `hybrid`, `search_backend` `pgvector` or
+`pg_search` (`400` when this server cannot run it, see
+[Search backends](rag.md#search-backends)), `fts_config` must exist in `pg_ts_config`
+(anything but `simple` is accepted and, on the `pgvector` backend, logged as a warning,
+see [Search modes](rag.md#search-modes)), `rerank_backend` `llm`, `cohere` or `voyage`
+(`cohere` and `voyage` need a `rerank_connection_id` of the matching `cohere_rerank` /
+`voyage_rerank` type; `llm` takes none), `rerank_candidates` 1-100, `max_distance` 0-2,
+`max_documents` and `max_bytes` ≥ 0 (`0` = unlimited, see
+[Unlimited (`0`)](configuration.md#zero-means-unlimited)). The embedding
+connection must be of a type that supports embeddings, must produce vectors of at most
+2000 dimensions (`400` when the probe at save time can tell; otherwise the first ingest
+fails the document, see [Embedding width](rag.md#embedding-width)) and
+cannot be changed while the store has chunks (`400`). Responses carry the usage the
+quotas are checked against: `document_count` and `bytes_used`.
 
 Documents look like
 
@@ -325,18 +334,22 @@ Search request and response:
 POST /admin/api/rag-stores/1/search
 {"query": "vacation policy", "top_k": 3, "mode": "hybrid", "rerank": true, "max_distance": 0.6}
 
-{"mode": "hybrid", "reranked": true, "latency_ms": 412,
+{"mode": "hybrid", "backend": "pgvector", "fts_config": "simple",
+ "reranked": true, "rerank_backend": "llm", "rerank_fallback": false, "latency_ms": 412,
  "retrieval_latency_ms": 180, "rerank_latency_ms": 230,
  "hits": [{"chunk_id": 8, "document_id": 2, "filename": "handbook.pdf", "index": 3,
            "section": "Leave > Vacation", "page": 12, "content": "…",
            "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2}]}
 ```
 
-Everything but `query` is optional and overrides the store setting for this call only;
-`top_k` is clamped to 1-50 (`0` or absent uses the store's `top_k`). `latency_ms` is the
-whole call, `retrieval_latency_ms` covers embedding the query and the database search,
-and `rerank_latency_ms` the reranker (`null` when reranking is off or no chat connection
-is available for it).
+Everything but `query` is optional and overrides the store setting for this call only
+(`mode`, `backend`, `rerank`, `rerank_backend`, `rerank_connection_id`, `max_distance`
+and `top_k`; the full list and the meaning of the response fields are in
+[Search endpoint](rag.md#search-endpoint)); `top_k` is clamped to 1-50 (`0` or absent
+uses the store's `top_k`). `latency_ms` is the whole call, `retrieval_latency_ms` covers
+embedding the query and the database search, and `rerank_latency_ms` the reranker
+(`null` only when `rerank` is off; when reranking was requested but skipped, a number,
+often `0`, and `rerank_fallback: true`).
 A `502` is returned when the embedding call fails.
 
 ### Projects
@@ -364,7 +377,8 @@ Project body:
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
 ```
 
-`rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited.
+`rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
+[Zero means unlimited](configuration.md#zero-means-unlimited)).
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
 project object contains `api_key_prefix` (the first characters of the key for
 identification), `member_ids` and the limit fields; the full key is never returned
@@ -598,11 +612,11 @@ already knows.
 |---|---|---|---|
 | GET | `/users/lite` | editor | Active users as `[{id, username, role}]` (for member pickers) |
 | GET | `/users` | admin | All users, each with `project_count` (memberships) and `active_sessions` (unexpired sessions) |
-| POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password 8+ characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
+| POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password at least 12 characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
 | DELETE | `/users/{id}` | admin | Delete → `{"ok": true}` |
-| POST | `/users/{id}/reset-password` | admin | `{new_password}`; revokes the user's sessions |
+| POST | `/users/{id}/reset-password` | admin | `{new_password}` (at least 12 characters, at most 72 bytes); revokes the user's sessions |
 | POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
 | GET | `/audit` | admin | Audit entries, newest first, with the total for the filter |
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
@@ -654,7 +668,7 @@ whatever the running build reports:
 {"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
- "version": "0.4.0"}
+ "version": "<x.y.z>"}
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
@@ -664,8 +678,9 @@ editors and viewers receive the `database` object without those two keys.
 
 ## Health
 
-`GET /healthz` pings the database and answers `200 {"status":"ok","version":"0.2.0"}`
-or `503 db unavailable` (plain text). No authentication.
+`GET /healthz` pings the database and answers `200 {"status":"ok","version":"<x.y.z>"}`
+(the version of the running build) or `503 db unavailable` (plain text). No
+authentication.
 
 ## Client API (`/v1`)
 
@@ -769,9 +784,10 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
+| `Warning` | `299 ragmux "<text>"` when the connection accepted the request but ignored part of it — today only `response_format` (`json_schema`/`json_object`) on an Anthropic connection. Set before the first byte, so a stream carries it too. See [Anthropic](providers.md#anthropic) |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
-`Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`) and
+`Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and
 accepts `X-Ragmux-Project` in `Access-Control-Allow-Headers`, but a cross-origin page
 sees no response header outside the CORS safelist unless the request went through CORS
 at all.
@@ -780,15 +796,16 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a translation error such as tools on a Gemini connection, or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
+| `400` | malformed JSON, missing `messages`, a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
-| `4xx`/`5xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted) |
+| `4xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted). A `Retry-After` the provider sent (seconds or an HTTP date) is passed through unchanged; a malformed one is dropped |
+| `503` / `504` | the provider answered `503` or `504` (or, on an Anthropic connection, `529 overloaded`, which becomes `503`): the status is kept, because both say "retry later" rather than "broken", with the provider's message and its `Retry-After`, if any |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
-| `502` | transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
+| `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
 
 ### `GET /v1/models` and `GET /v1/models/{id}`

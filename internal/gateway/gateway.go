@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -61,6 +62,64 @@ type requestObs struct {
 	upstream time.Duration
 	// ttft is the wait for a stream's first chunk; zero when none arrived.
 	ttft time.Duration
+	// responseModel is the model the upstream reported, recorded before the
+	// response is rewritten to the client's model string; empty until a
+	// response or a first chunk arrives. See noteResponseModel.
+	responseModel string
+	// finishReasons is the distinct set of finish reasons seen, each mapped
+	// onto the closed set in knownFinishReasons.
+	finishReasons []string
+}
+
+// maxResponseModelLen caps gen_ai.response.model. An upstream is not
+// trusted to keep its model string short.
+const maxResponseModelLen = 128
+
+// noteResponseModel records gen_ai.response.model once per request. The
+// value is the model the upstream reported, unless it is empty or merely
+// echoes the client's model string back: several adapters copy the request
+// model into the response, and that string is attacker-controlled, so the
+// connection's model name stands in for it.
+func (o *requestObs) noteResponseModel(upstream, clientModel, connModel string) {
+	if o.responseModel != "" {
+		return
+	}
+	m := upstream
+	if m == "" || (m == clientModel && clientModel != connModel) {
+		m = connModel
+	}
+	if len(m) > maxResponseModelLen {
+		// Cut on a rune boundary so the exported value stays valid UTF-8.
+		n := maxResponseModelLen
+		for n > 0 && !utf8.RuneStart(m[n]) {
+			n--
+		}
+		m = m[:n]
+	}
+	o.responseModel = m
+}
+
+// knownFinishReasons is the closed set gen_ai.response.finish_reasons may
+// carry; anything else an upstream sends is recorded as "other".
+var knownFinishReasons = map[string]bool{
+	"stop": true, "length": true, "tool_calls": true, "content_filter": true, "function_call": true,
+}
+
+// noteFinishReason adds one choice's finish reason to the distinct set.
+func (o *requestObs) noteFinishReason(reason *string) {
+	if reason == nil || *reason == "" {
+		return
+	}
+	r := *reason
+	if !knownFinishReasons[r] {
+		r = "other"
+	}
+	for _, have := range o.finishReasons {
+		if have == r {
+			return
+		}
+	}
+	o.finishReasons = append(o.finishReasons, r)
 }
 
 type ctxKey struct{}
@@ -494,7 +553,8 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// the stable prefix most worth an Anthropic cache breakpoint, but the
 	// gateway does not mark one: a project-level cache_prompt flag needs a
 	// column, a migration and dashboard work of its own. Clients that mark
-	// their own content parts are relayed unchanged in the meantime.
+	// their own content parts are relayed unchanged in the meantime, except
+	// in the system message the RAG context lands in (see below).
 	if p.SystemPrompt != "" {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
@@ -520,7 +580,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
 				contextBlock = rag.FormatContext(hits)
-				req.Messages = rag.InjectContext(req.Messages, contextBlock)
+				// Drops the client's cache_control in that system message:
+				// a per-query prefix can never be read back from the cache.
+				req.Messages = rag.InjectRetrievedContext(req.Messages, contextBlock)
 				ragUsed, ragHits = true, len(hits)
 				sources = ragSources(hits)
 				w.Header().Set("x-ragmux-rag-sources", sourcesHeader(sources))
@@ -567,20 +629,34 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			PromptTokens: rec.PromptTokens, CompletionTokens: rec.CompletionTokens,
 			Estimated: rec.Estimated, CostUSD: rec.CostUSD, ErrorType: obsv.errType,
 			ClientDisconnected: rec.StatusCode == statusClientClosed,
+			Unpriced:           rec.CostSource == store.CostSourceNone,
 		})
 		if span.IsRecording() {
 			span.SetAttributes(
 				tracing.Int64("ragmux.project.id", p.ID),
+				tracing.String("gen_ai.operation.name", "chat"),
+				tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(conn.ProviderType)),
 				tracing.String("gen_ai.request.model", conn.ModelName),
 				tracing.Bool("ragmux.stream", rec.Streamed),
 				tracing.Int("gen_ai.usage.input_tokens", rec.PromptTokens),
 				tracing.Int("gen_ai.usage.output_tokens", rec.CompletionTokens),
+				tracing.Int("gen_ai.usage.cache_read.input_tokens", rec.CachedPromptTokens),
 			)
+			if obsv.responseModel != "" {
+				span.SetAttributes(tracing.String("gen_ai.response.model", obsv.responseModel))
+			}
+			if len(obsv.finishReasons) > 0 {
+				span.SetAttributes(tracing.StringSlice("gen_ai.response.finish_reasons", obsv.finishReasons))
+			}
 			if rec.StatusCode < 500 {
 				span.SetStatusOK()
 			}
 		}
 	}()
+
+	// Warnings go out before the first byte of either response shape; a
+	// stream's headers are only written once its first chunk arrives.
+	setRequestWarnings(w.Header(), prov, req)
 
 	if req.Stream {
 		g.stream(w, r, prov, conn, req, rec, obsv, promptChars)
@@ -600,13 +676,12 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		status, pe := providerError(err)
 		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		log.Warn("upstream error", "status", status, "msg", pe.Message)
-		w.Header().Set("Content-Type", "application/json")
-		if pe.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
-		}
-		w.WriteHeader(status)
-		_, _ = w.Write(pe.ErrorJSON())
+		writeProviderError(w, status, pe)
 		return
+	}
+	obsv.noteResponseModel(resp.Model, clientModel, conn.ModelName)
+	for i := range resp.Choices {
+		obsv.noteFinishReason(resp.Choices[i].FinishReason)
 	}
 	resp.Model = clientModel
 	fillUsage(rec, resp.Usage, promptChars, completionChars(resp))
@@ -784,6 +859,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		if obsv.ttft == 0 {
 			obsv.ttft = time.Since(upstreamStart)
 		}
+		// Recorded before the client check so a disconnect does not hide
+		// what the upstream reported. req.Model is the client's string here.
+		obsv.noteResponseModel(chunk.Model, req.Model, conn.ModelName)
+		for i := range chunk.Choices {
+			obsv.noteFinishReason(chunk.Choices[i].FinishReason)
+		}
 		if clientGone {
 			continue // drain until the provider notices the cancellation
 		}
@@ -827,12 +908,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		status, pe := providerError(err)
 		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
 		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
-		w.Header().Set("Content-Type", "application/json")
-		if pe.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(pe.RetryAfter))
-		}
-		w.WriteHeader(status)
-		_, _ = w.Write(pe.ErrorJSON())
+		writeProviderError(w, status, pe)
 		return
 	}
 	sendHeaders()
@@ -910,6 +986,45 @@ func writeLimitError(w http.ResponseWriter, d limits.Decision) {
 	w.WriteHeader(http.StatusTooManyRequests)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
 		"message": msg, "type": typ, "code": d.Reason, "scope": d.Scope}})
+}
+
+// writeProviderError answers with a provider error in OpenAI's envelope,
+// carrying its retry hint as a Retry-After header.
+func writeProviderError(w http.ResponseWriter, status int, pe *provider.Error) {
+	w.Header().Set("Content-Type", "application/json")
+	setRetryAfter(w.Header(), pe)
+	w.WriteHeader(status)
+	_, _ = w.Write(pe.ErrorJSON())
+}
+
+// setRetryAfter writes the error's retry hint. The gateway's own figure
+// (RetryAfter, seconds) wins over the upstream's; the upstream's is relayed
+// verbatim, in whichever of the two RFC 9110 forms it came.
+func setRetryAfter(h http.Header, pe *provider.Error) {
+	switch {
+	case pe.RetryAfter > 0:
+		h.Set("Retry-After", strconv.Itoa(pe.RetryAfter))
+	case pe.UpstreamRetryAfter != "":
+		h.Set("Retry-After", pe.UpstreamRetryAfter)
+	}
+}
+
+// warnTextEscaper keeps a warning text inside its quoted-string.
+var warnTextEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+
+// setRequestWarnings adds one `Warning: 299 ragmux "<text>"` header per part
+// of the request the adapter forwards but ignores. 299 is RFC 7234's
+// "miscellaneous persistent warning"; RFC 9111 obsoleted that RFC and
+// deprecated the header, which is kept for visibility. The request still
+// succeeds.
+func setRequestWarnings(h http.Header, prov provider.Provider, req provider.ChatRequest) {
+	rw, ok := prov.(provider.RequestWarner)
+	if !ok {
+		return
+	}
+	for _, text := range rw.RequestWarnings(req) {
+		h.Add("Warning", `299 ragmux "`+warnTextEscaper.Replace(text)+`"`)
+	}
 }
 
 func providerError(err error) (int, *provider.Error) {

@@ -117,7 +117,25 @@ answered without reranking and the reason is logged.
 The client request is forwarded as-is apart from `model` (replaced by the connection's
 model name), `stream` (set by the gateway) and `stream_options` (set to
 `{"include_usage": true}` on streams so token counts are recorded; removed on
-non-streaming calls). Responses and SSE chunks are relayed in the OpenAI schema.
+non-streaming calls).
+
+Top-level request fields travel as sent (see
+[Request field passthrough](#request-field-passthrough-extra)), but inside `messages` only
+`role`, `content`, `name`, `tool_calls` and `tool_call_id` are kept; the **response** is
+rewritten as well. Replies and SSE chunks are
+decoded into the gateway's own OpenAI-shaped structures and written back out, so only the
+fields it knows come through:
+
+- top level: `id`, `object`, `created`, `model`, `choices` and `usage` (with
+  `prompt_tokens_details` and `completion_tokens_details`);
+- per choice: `index`, `finish_reason` and a `message` (a `delta` on streams) holding
+  `role`, `content` and `tool_calls`.
+
+Anything else the upstream adds is **not** forwarded: `reasoning_content`, `refusal`,
+`annotations`, `logprobs` and `system_fingerprint` are all dropped, even when the request
+asked for them (`logprobs: true` reaches the upstream, as the passthrough below says, and
+its answer does not come back). A client that needs one of them cannot get it through the
+gateway in this release.
 
 What the gateway asks the upstream for is not what it passes on: the usage-only trailer
 chunk reaches the client only when the client itself sent
@@ -138,8 +156,9 @@ surfaced back to the client. See [Prompt caching](#prompt-caching).
 `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `n`, `tools`,
 `tool_choice`, `response_format`, `stream_options`, `user`) and keeps every other
 top-level field verbatim. For OpenAI-compatible providers those extra fields are sent to
-the upstream unchanged, so provider-specific options (`seed`, `logprobs`, `reasoning_effort`,
-vLLM's `guided_json`, …) work without gateway support. For `ollama` a defined subset is
+the upstream unchanged, so provider-specific options (`seed`, a request-side `logprobs`,
+`reasoning_effort`, vLLM's `guided_json`, …) work without gateway support. For `ollama` a
+defined subset is
 mapped (below); `anthropic` and `gemini` ignore unknown fields.
 
 ## Anthropic
@@ -154,6 +173,11 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   `max_completion_tokens` the gateway uses **4096**.
 - `temperature`, `top_p` and `stop` are mapped; `n`, `response_format`, `user` and unknown
   fields are dropped.
+- `response_format` of type `json_schema` or `json_object` is not an error: the request is
+  still sent, without it, so the model is not held to the schema. The response carries
+  `Warning: 299 ragmux "response_format is not supported for anthropic connections;
+  ignored"` (set before the first byte, so streams have it too) and the gateway logs the
+  event at info level with the format type only. Ask for JSON in the prompt instead.
 - Consecutive messages with the same role are merged, as the Messages API requires.
 - Tools: OpenAI `tools[].function` definitions become Anthropic `tools` (`input_schema`
   from `parameters`, `{"type":"object","properties":{}}` when absent); `tool_choice`
@@ -167,7 +191,9 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   `source.type: url` needs the images inlined instead; that is the one constant
   `anthropicInlineImages` in `internal/provider/images.go`.
 - Finish reasons: `end_turn`/`stop_sequence` → `stop`, `max_tokens` → `length`,
-  `tool_use` → `tool_calls`. Usage is mapped to `prompt_tokens`/`completion_tokens`,
+  `tool_use` → `tool_calls`, `refusal` → `content_filter`,
+  `model_context_window_exceeded` → `length`; any other `stop_reason` (`pause_turn`, a
+  value Anthropic adds later) → `stop`, logged at warn level with the value. Usage is mapped to `prompt_tokens`/`completion_tokens`,
   including on streams; see [Prompt caching](#prompt-caching) for how the cache
   counters are folded in.
 
@@ -217,6 +243,25 @@ more work than elsewhere:
 - In streams a `functionCall` always arrives complete inside one chunk, so each call is
   emitted as one `tool_calls` delta carrying the index, id, name and arguments together.
   No argument fragments are invented.
+
+- **Thought signatures round-trip through the client.** A thinking model attaches an
+  opaque `thoughtSignature` to the function call it makes, and expects it back when the
+  tool result is sent. Ragmux relays it on each tool call as an extra field,
+  `ragmux_signature`, in the response (the JSON reply and the streamed delta alike), and
+  puts it back on the `functionCall` part when an assistant message carrying it comes in
+  on the next turn. A client that appends the assistant message to the history unchanged —
+  as the OpenAI SDKs do with the message object they received — sends it back without
+  doing anything. Under parallel calling only the first call carries a signature. The
+  field means nothing outside the connection that issued it: OpenAI-compatible connections
+  have it removed from the request before it is sent.
+
+  **Known limit.** A client that rebuilds the tool calls by hand — in a stream, collecting
+  `id`, `name` and `arguments` from the deltas and ignoring other fields — drops the
+  signature, and Gemini can then answer the next turn with a `400`. Such a `400` is
+  relayed as any other provider error (see [Error relay and
+  redaction](#error-relay-and-redaction)). Copy `ragmux_signature` along with the other
+  fields of each tool call. A signature that arrives in a stream chunk after the first
+  call's delta has already been sent is not relayed.
 
 **Known limit — tool-use tokens.** On a tool round Gemini also reports
 `usageMetadata.toolUsePromptTokenCount`, which Ragmux neither reads nor maps. Gemini's
@@ -501,6 +546,17 @@ been — a request that does not ask for caching is byte-identical to a 0.3.x on
 message has several marked parts the last marker wins, since Anthropic caches the prefix
 up to and including the marked block.
 
+**RAG context drops the system marker.** When a project's RAG store injects passages, the
+context block is prepended to the first `system`/`developer` message (in front of the
+project `system_prompt`, which is itself prepended to the client's own system text —
+see [Context injection](rag.md#context-injection)), and the
+`cache_control` on that message's parts is removed. The block changes with every query
+and comes first, so a breakpoint behind it would make Anthropic write a new cache entry
+(billed above the plain input rate) on each request and never read one back. The parts
+themselves and every other field are kept; markers on other messages, user content and
+tools are untouched, and a project `system_prompt` on its own does not drop anything.
+Placing the context after the client's cached prefix is planned for v0.6.
+
 **OpenAI, DeepSeek and `custom_openai`: nothing is sent.** Their caching is automatic and
 server-side; there is no request field to emit, so Ragmux emits none. A `cache_control` a
 client embeds rides along untouched (message content is relayed raw) and OpenAI ignores
@@ -526,8 +582,12 @@ model name with `owned_by` set to the provider type.
 
 ## Error relay and redaction
 
-Provider errors are relayed with the upstream status and message (cut to 512
-characters) in the OpenAI error envelope. Transport failures are never relayed verbatim:
+Provider errors are relayed with the upstream message (cut to 512 characters) in the
+OpenAI error envelope. A `4xx` keeps its status, and so do `503` and `504`, which tell
+the client to come back later; Anthropic's `529 overloaded` means the same and becomes
+`503`. Every other upstream `5xx` becomes `502`. The upstream's
+`Retry-After` (delay seconds or an HTTP date) is passed on unchanged; a value in neither
+form is dropped. The gateway's own `429`s set their own `Retry-After` instead. Transport failures are never relayed verbatim:
 they become `502 upstream_error` with one of `upstream unreachable`, `upstream TLS
 handshake failed`, `upstream returned a non-HTTP response`, `upstream redirect
 rejected: …`, the private-address message from

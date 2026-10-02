@@ -52,6 +52,55 @@ func contentText(raw json.RawMessage) string {
 	return ""
 }
 
+// toolCallSignatureField is the gateway's own extension on an OpenAI tool
+// call. It carries the opaque reasoning signature a provider attached to the
+// call (Gemini's thoughtSignature) out to the client and back on the next
+// turn, because thinking models reject a tool round whose signature went
+// missing. OpenAI clients ignore an unknown field; the value means nothing
+// outside the provider that issued it.
+const toolCallSignatureField = "ragmux_signature"
+
+// stripToolCallSignatures returns msgs with the signature extension removed
+// from every assistant tool call, for upstreams that speak the OpenAI wire
+// format and were never meant to see it. The caller's slice is left alone:
+// a fallback may still hand the same request to the provider that does want
+// the signature. A tool_calls value that does not decode is passed through
+// untouched; the upstream judges it as it would without the gateway.
+func stripToolCallSignatures(msgs []Message) []Message {
+	var out []Message
+	for i, m := range msgs {
+		if len(m.ToolCalls) == 0 {
+			continue
+		}
+		var calls []map[string]json.RawMessage
+		if json.Unmarshal(m.ToolCalls, &calls) != nil {
+			continue
+		}
+		changed := false
+		for _, c := range calls {
+			if _, ok := c[toolCallSignatureField]; ok {
+				delete(c, toolCallSignatureField)
+				changed = true
+			}
+		}
+		if !changed {
+			continue
+		}
+		b, err := json.Marshal(calls)
+		if err != nil {
+			continue
+		}
+		if out == nil {
+			out = append([]Message(nil), msgs...)
+		}
+		out[i].ToolCalls = b
+	}
+	if out == nil {
+		return msgs
+	}
+	return out
+}
+
 // TextContent builds a string content value.
 func TextContent(s string) json.RawMessage {
 	b, _ := json.Marshal(s)
@@ -309,6 +358,17 @@ type Provider interface {
 	ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error
 }
 
+// RequestWarner is implemented by adapters that forward a request although
+// they ignore part of it. The gateway relays each returned text to the client
+// as a Warning header (code 299), so the silent drop becomes visible without
+// failing a request that would otherwise succeed. Warning comes from RFC 7234;
+// RFC 9111 obsoleted it and deprecated the header, which is kept here for
+// visibility. It must be cheap and side-effect free: the gateway calls it
+// once per request, before any response byte is written.
+type RequestWarner interface {
+	RequestWarnings(req ChatRequest) []string
+}
+
 // Embedder produces vector embeddings.
 type Embedder interface {
 	Embed(ctx context.Context, inputs []string) ([][]float32, error)
@@ -325,6 +385,12 @@ type Error struct {
 	// header rather than a body field because that is what an HTTP client
 	// already knows how to honour.
 	RetryAfter int
+	// UpstreamRetryAfter is the upstream's own Retry-After value, relayed
+	// verbatim: either delay-seconds or an HTTP-date. It is only set when
+	// the value has one of those two shapes, and RetryAfter wins when both
+	// are present, because the gateway's own figure is the one it can vouch
+	// for.
+	UpstreamRetryAfter string
 }
 
 func (e *Error) Error() string {

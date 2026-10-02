@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -169,6 +170,57 @@ func TestBootstrapAdmin(t *testing.T) {
 	}
 	if n, _ := st.CountUsers(ctx); n != 1 {
 		t.Errorf("bootstrap on a populated table created users: %d", n)
+	}
+}
+
+// TestBootstrapAdminPasswordPolicy covers decision K-b: a weak ADMIN_PASSWORD
+// stops the start only when it would create the first account; once users
+// exist it is unused and only earns a warning that never carries the value.
+func TestBootstrapAdminPasswordPolicy(t *testing.T) {
+	ctx := context.Background()
+	const weak = "8-chars!"
+
+	// Empty table: the start is refused and nothing is created.
+	st := testdb.Open(t)
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	err := bootstrapAdmin(ctx, st, config.Config{AdminUser: "ops", AdminPassword: weak}, log)
+	if !errors.Is(err, auth.ErrPasswordTooShort) || !strings.Contains(err.Error(), "ADMIN_PASSWORD") {
+		t.Fatalf("weak ADMIN_PASSWORD on an empty table: %v", err)
+	}
+	if strings.Contains(err.Error(), weak) {
+		t.Errorf("the error carries the password: %v", err)
+	}
+	if n, _ := st.CountUsers(ctx); n != 0 {
+		t.Fatalf("a refused bootstrap created %d user(s)", n)
+	}
+	if err := bootstrapAdmin(ctx, st, config.Config{AdminUser: "ops", AdminPassword: strings.Repeat("p", 73)}, log); !errors.Is(err, auth.ErrPasswordTooLong) {
+		t.Errorf("73-byte ADMIN_PASSWORD on an empty table: %v", err)
+	}
+
+	// An admin exists: no error, one warning, and the password is not logged.
+	if err := bootstrapAdmin(ctx, st, config.Config{AdminUser: "ops", AdminPassword: "preset-password-1"}, log); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	if err := bootstrapAdmin(ctx, st, config.Config{AdminUser: "ops", AdminPassword: weak}, log); err != nil {
+		t.Fatalf("weak ADMIN_PASSWORD with an existing admin: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "ADMIN_PASSWORD") {
+		t.Errorf("no warning for a weak ADMIN_PASSWORD: %q", out)
+	}
+	if strings.Contains(out, weak) {
+		t.Errorf("the warning carries the password: %q", out)
+	}
+
+	// A compliant value with users present stays silent.
+	buf.Reset()
+	if err := bootstrapAdmin(ctx, st, config.Config{AdminUser: "ops", AdminPassword: "preset-password-1"}, log); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("warning for a compliant ADMIN_PASSWORD: %q", buf.String())
 	}
 }
 
