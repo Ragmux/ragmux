@@ -4,7 +4,7 @@ All notable changes to Ragmux are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.2] — 2026-10-02
 
 Bug fixes, observability and documentation. No schema change.
 
@@ -766,7 +766,8 @@ projects with `sk-proj-` keys, metrics and an embedded dashboard.
 No git tag was created for this release, so there is no release page for it. The first
 tagged release is [0.2.0](https://github.com/ragmux/ragmux/releases/tag/v0.2.0).
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/ragmux/ragmux/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ragmux/ragmux/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ragmux/ragmux/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ragmux/ragmux/releases/tag/v0.3.1
