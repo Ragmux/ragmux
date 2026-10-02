@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ---- runtime stage ---------------------------------------------------------
 # pg17: Debian with PostgreSQL 17, pg_search and vector; resolve a new digest
 # with `docker buildx imagetools inspect paradedb/paradedb:pg17`.
-FROM paradedb/paradedb:pg17@sha256:8da5d202fe31875af32a49e802ce17cfbc146b0672306f4109809efee1e6f916
+FROM paradedb/paradedb:pg17@sha256:78d65750f0f88a56548526201bcab9910f83b90fe929cdbf979890f3f80b0f95
 
 # shared_preload_libraries comes from the base image's postgresql.conf.sample,
 # which initdb copies into a fresh cluster. ParadeDB preloads pg_search,
