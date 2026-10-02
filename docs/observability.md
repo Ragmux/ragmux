@@ -96,6 +96,25 @@ scrape_configs:
 With `METRICS_LISTEN=127.0.0.1:9090`, point the target at `127.0.0.1:9090` and drop the
 `authorization` block.
 
+### Alert rules
+
+[`deploy/prometheus/alerts.yaml`](../deploy/prometheus/alerts.yaml) is a ready set of
+Prometheus rules built on the metrics below: scrape target down, `/readyz` failing, a high
+`5xx` rate, a high upstream error rate, a stuck ingestion backlog, metric series being
+dropped at `METRICS_MAX_SERIES`, a project close to its token budget, and the retention
+job lagging. Load it next to the scrape configuration:
+
+```yaml
+# prometheus.yml
+rule_files:
+  - /etc/prometheus/ragmux-alerts.yaml
+```
+
+The rules assume the job is named `ragmux`, as in the scrape configuration above; change
+the `job` matcher of `RagmuxDown` if yours differs. The thresholds are starting points —
+tune them to your traffic before paging anyone on them. The file can be checked with
+`promtool check rules deploy/prometheus/alerts.yaml`.
+
 ### The metric set
 
 Every name is prefixed `ragmux_`. Durations are seconds, as Prometheus expects.
@@ -154,6 +173,7 @@ The denied request itself is still counted by `ragmux_http_requests_total` with
 | `ragmux_rag_searches_total` | counter | `store`, `used` | `used` is the backend that **actually answered**. |
 | `ragmux_rag_hits_total` | counter | `store` | Passages returned. |
 | `ragmux_search_backend_available` | gauge | `backend` | `1` when this server can answer with that backend. |
+| `ragmux_rag_index_missing` | gauge | — | RAG stores whose embedding width is above 2000 dimensions, which pgvector cannot HNSW-index; they are searched with an exact scan (see [Embedding width](rag.md#embedding-width)). Counted at startup and recounted when such a store is deleted or re-bound. |
 
 `used` differs from the store's configured `search_backend` when the configured one is
 not available on this server and the search fell back to pgvector. Comparing the two is
@@ -312,7 +332,7 @@ to whatever the repository happened to be at.
 `/readyz` answers `200`:
 
 ```json
-{"status":"ok","version":"0.4.0","migrations":N,"expected_migrations":N}
+{"status":"ok","version":"<x.y.z>","migrations":N,"expected_migrations":N}
 ```
 
 and `503` with `"status":"migrating"` while the applied version is **behind** the binary's:
@@ -330,7 +350,7 @@ working against the newer schema. It answers `200` and says so:
 ```json
 {
   "status": "ok",
-  "version": "0.4.0",
+  "version": "<x.y.z>",
   "migrations": N+1,
   "expected_migrations": N,
   "degraded": ["the database schema is at migration N+1, ahead of the N this binary embeds; this replica is running older code against a newer schema"]
@@ -355,7 +375,7 @@ condition into an outage. It is reported instead as an informational field along
 ```json
 {
   "status": "ok",
-  "version": "0.4.0",
+  "version": "<x.y.z>",
   "migrations": N,
   "expected_migrations": N,
   "degraded": ["pg_search is not installed on this server; 2 rag store(s) configured for it fall back to pgvector"]

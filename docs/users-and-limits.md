@@ -38,9 +38,10 @@ What bounds that spend is never a role. It is:
 
 A user carries no limit of its own; limits live on the project and on the key.
 
-**To cap one user**, give their key a sub-limit. Note that `0` there means *unlimited*,
-not *nothing*, so capping means setting a small ceiling — setting it to zero removes the
-ceiling instead of applying one.
+**To cap one user**, give their key a sub-limit. Note that `0` there means *unlimited*
+([Zero means unlimited](configuration.md#zero-means-unlimited)), not *nothing*, so
+capping means setting a small ceiling — setting it to zero removes the ceiling instead
+of applying one.
 
 **To stop them outright**, revoke the key (`POST /admin/api/keys/{id}/revoke`), or
 deactivate the account (`PUT /admin/api/users/{id}` with `is_active: false`).
@@ -282,7 +283,8 @@ or in the **Audit** dashboard tab, and download it as NDJSON with
 
 ## Rate limits and budgets
 
-Every project has four optional limits (`0` = unlimited), set at creation or with
+Every project has four optional limits (`0` = unlimited, see
+[Zero means unlimited](configuration.md#zero-means-unlimited)), set at creation or with
 `PUT /admin/api/projects/{id}` and shown in the dashboard's project form:
 
 | Field | Meaning |

@@ -117,7 +117,25 @@ answered without reranking and the reason is logged.
 The client request is forwarded as-is apart from `model` (replaced by the connection's
 model name), `stream` (set by the gateway) and `stream_options` (set to
 `{"include_usage": true}` on streams so token counts are recorded; removed on
-non-streaming calls). Responses and SSE chunks are relayed in the OpenAI schema.
+non-streaming calls).
+
+Top-level request fields travel as sent (see
+[Request field passthrough](#request-field-passthrough-extra)), but inside `messages` only
+`role`, `content`, `name`, `tool_calls` and `tool_call_id` are kept; the **response** is
+rewritten as well. Replies and SSE chunks are
+decoded into the gateway's own OpenAI-shaped structures and written back out, so only the
+fields it knows come through:
+
+- top level: `id`, `object`, `created`, `model`, `choices` and `usage` (with
+  `prompt_tokens_details` and `completion_tokens_details`);
+- per choice: `index`, `finish_reason` and a `message` (a `delta` on streams) holding
+  `role`, `content` and `tool_calls`.
+
+Anything else the upstream adds is **not** forwarded: `reasoning_content`, `refusal`,
+`annotations`, `logprobs` and `system_fingerprint` are all dropped, even when the request
+asked for them (`logprobs: true` reaches the upstream, as the passthrough below says, and
+its answer does not come back). A client that needs one of them cannot get it through the
+gateway in this release.
 
 What the gateway asks the upstream for is not what it passes on: the usage-only trailer
 chunk reaches the client only when the client itself sent
@@ -138,8 +156,9 @@ surfaced back to the client. See [Prompt caching](#prompt-caching).
 `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `n`, `tools`,
 `tool_choice`, `response_format`, `stream_options`, `user`) and keeps every other
 top-level field verbatim. For OpenAI-compatible providers those extra fields are sent to
-the upstream unchanged, so provider-specific options (`seed`, `logprobs`, `reasoning_effort`,
-vLLM's `guided_json`, …) work without gateway support. For `ollama` a defined subset is
+the upstream unchanged, so provider-specific options (`seed`, a request-side `logprobs`,
+`reasoning_effort`, vLLM's `guided_json`, …) work without gateway support. For `ollama` a
+defined subset is
 mapped (below); `anthropic` and `gemini` ignore unknown fields.
 
 ## Anthropic
@@ -224,6 +243,25 @@ more work than elsewhere:
 - In streams a `functionCall` always arrives complete inside one chunk, so each call is
   emitted as one `tool_calls` delta carrying the index, id, name and arguments together.
   No argument fragments are invented.
+
+- **Thought signatures round-trip through the client.** A thinking model attaches an
+  opaque `thoughtSignature` to the function call it makes, and expects it back when the
+  tool result is sent. Ragmux relays it on each tool call as an extra field,
+  `ragmux_signature`, in the response (the JSON reply and the streamed delta alike), and
+  puts it back on the `functionCall` part when an assistant message carrying it comes in
+  on the next turn. A client that appends the assistant message to the history unchanged —
+  as the OpenAI SDKs do with the message object they received — sends it back without
+  doing anything. Under parallel calling only the first call carries a signature. The
+  field means nothing outside the connection that issued it: OpenAI-compatible connections
+  have it removed from the request before it is sent.
+
+  **Known limit.** A client that rebuilds the tool calls by hand — in a stream, collecting
+  `id`, `name` and `arguments` from the deltas and ignoring other fields — drops the
+  signature, and Gemini can then answer the next turn with a `400`. Such a `400` is
+  relayed as any other provider error (see [Error relay and
+  redaction](#error-relay-and-redaction)). Copy `ragmux_signature` along with the other
+  fields of each tool call. A signature that arrives in a stream chunk after the first
+  call's delta has already been sent is not relayed.
 
 **Known limit — tool-use tokens.** On a tool round Gemini also reports
 `usageMetadata.toolUsePromptTokenCount`, which Ragmux neither reads nor maps. Gemini's
@@ -509,7 +547,9 @@ message has several marked parts the last marker wins, since Anthropic caches th
 up to and including the marked block.
 
 **RAG context drops the system marker.** When a project's RAG store injects passages, the
-context block is prepended to the first `system`/`developer` message, and the
+context block is prepended to the first `system`/`developer` message (in front of the
+project `system_prompt`, which is itself prepended to the client's own system text —
+see [Context injection](rag.md#context-injection)), and the
 `cache_control` on that message's parts is removed. The block changes with every query
 and comes first, so a breakpoint behind it would make Anthropic write a new cache entry
 (billed above the plain input rate) on each request and never read one back. The parts
