@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: paradedb/paradedb:latest-pg17@sha256:8da5d202fe31875af32a49e802ce17cfbc146b0672306f4109809efee1e6f916
+        image: paradedb/paradedb:latest-pg17@sha256:78d65750f0f88a56548526201bcab9910f83b90fe929cdbf979890f3f80b0f95
         env:
           POSTGRES_USER: ragmux
           POSTGRES_PASSWORD: ragmux

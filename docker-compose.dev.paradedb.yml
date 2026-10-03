@@ -10,7 +10,7 @@ services:
   postgres:
     # Digest-pinned like docker-compose.paradedb.yml; resolve a new one with
     # `docker buildx imagetools inspect paradedb/paradedb:latest-pg17`.
-    image: paradedb/paradedb:latest-pg17@sha256:8da5d202fe31875af32a49e802ce17cfbc146b0672306f4109809efee1e6f916
+    image: paradedb/paradedb:latest-pg17@sha256:78d65750f0f88a56548526201bcab9910f83b90fe929cdbf979890f3f80b0f95
     ports:
       - "127.0.0.1:5434:5432"
     environment:

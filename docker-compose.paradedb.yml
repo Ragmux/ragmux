@@ -66,7 +66,7 @@ services:
     # nothing but this line changes against docker-compose.split.yml. Pinned
     # by digest like the base image in Dockerfile.aio; resolve a new one with
     # `docker buildx imagetools inspect paradedb/paradedb:latest-pg17`.
-    image: paradedb/paradedb:latest-pg17@sha256:8da5d202fe31875af32a49e802ce17cfbc146b0672306f4109809efee1e6f916
+    image: paradedb/paradedb:latest-pg17@sha256:78d65750f0f88a56548526201bcab9910f83b90fe929cdbf979890f3f80b0f95
     container_name: ragmux-postgres
     restart: unless-stopped
     environment:
