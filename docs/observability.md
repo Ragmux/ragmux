@@ -338,11 +338,11 @@ cost columns, a row identifies the request:
 | Column | Meaning |
 |---|---|
 | `request_id` | The `X-Request-Id` the response carried: the client's, when it sent a valid one, otherwise generated. Indexed, so `WHERE request_id = '…'` is a lookup. Rows written before it existed have `NULL` |
-| `endpoint` | Which `/v1` endpoint served it: `chat.completions` today |
+| `endpoint` | Which `/v1` endpoint served it: `chat.completions`, `embeddings`, `retrieve` or `rerank` |
 | `requested_model` | The `model` string the client sent — cut to 256 bytes when longer, NUL bytes removed; empty when it sent none. `model_name` is still the connection's real model. This is client-chosen text: it lives in the table and the dashboard, never in a metric label |
 | `route` | The name of the route that picked the connection. `NULL` for the implicit route and for projects without routes. Like `requested_model`, it lives in the table only, never in a metric label |
-| `attempt` | How many upstream attempts the request took; `1` for a call that went upstream, `NULL` for a denial that never did |
-| `fallback_from` | When a fallback served the request, the `connection_id` of the first target it started on. `NULL` otherwise |
+| `attempt` | How many upstream calls the request took in total, retries and fallbacks included; `1` for a call that went upstream once, `NULL` for a denial that never reached the upstream |
+| `fallback_from` | The `connection_id` of the first target, whenever the request moved past it to another target (also when no target answered; the row then records the last failure). `NULL` otherwise |
 
 `request_id` is a column, never a metric label (see the
 [cardinality checklist](#cardinality-checklist)). The columns are added by migrations

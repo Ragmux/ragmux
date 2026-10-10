@@ -112,6 +112,10 @@ All three prefixes keep the `sk-` head so secret scanners that watch for OpenAI-
 keys keep firing on a leak. The key is shown once at creation and only its first 15
 characters (`key_prefix`) are stored for identification, next to a SHA-256 hash.
 
+The **API keys** tab lists the scopes of the chosen kind as a checklist and refuses to save
+with none ticked, because an empty list would grant every scope. Editing a key keeps a
+scope the dashboard does not recognise, ticked, so saving does not silently drop it.
+
 **A key is never issued beyond its owner.** Scopes only ever narrow, grants are held at
 creation to what the owner can reach, and the owner is looked up on *every* request rather
 than copied onto the key. What that lookup can still take away, though, depends on the
@@ -316,7 +320,10 @@ Every project has four optional limits (`0` = unlimited, see
 
 Counters live in the `project_usage` table, so several gateway replicas share them. All
 windows are aligned to UTC boundaries (`date_trunc` of minute, day and month), not sliding.
-When a limit is hit `/v1/chat/completions` answers
+The limits cover every `/v1` call that spends tokens: chat completions, embeddings,
+retrieve and rerank. The tokens of an embeddings call count toward the project's limits, and
+the tokens of an LLM or API rerank are added to the request that ran it. When a limit is
+hit the endpoint answers
 
 ```json
 HTTP 429  Retry-After: 42
@@ -376,6 +383,12 @@ budget, a request is never refused because a spend figure was reached, and the e
 never feeds `rate_limit_tpm`, `budget_daily_tokens` or `budget_monthly_tokens` — those
 stay token counters. To cap spend, cap tokens.
 
+One known gap in the estimate: the tokens of an API reranker (`cohere_rerank`,
+`voyage_rerank`) count toward the limits above but are not priced, because those services
+bill by search unit, so they never enter `cost_micros`. The tokens of an LLM rerank inside
+`/v1/retrieve` are priced at the embedding connection's price. See
+[Rerank cost](rag.md#reranking).
+
 The estimate comes from the [price table](api.md#model-prices), which ships current
 public list prices and is editable per model. It is not a bill: providers round,
 discount and change prices without telling the gateway, and a model with no matching
@@ -383,8 +396,10 @@ price row is logged with `cost_source: "none"` and a cost of zero rather than a 
 
 ## Metrics and retention
 
-Every chat completion is written to `request_logs` with the status the client received
-plus two gateway-internal codes:
+Every `/v1` call that reaches the upstream or is turned away by a limit (chat completions,
+embeddings, retrieve and rerank) is written to `request_logs`, one row per request, with the
+status the client received plus two gateway-internal codes. The `endpoint` column tells the
+four apart; see [the request log](observability.md#the-request-log):
 
 | Status | Meaning |
 |---|---|

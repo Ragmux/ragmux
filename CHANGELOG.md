@@ -27,6 +27,13 @@ All notable changes to Ragmux are documented here. The format follows
   and `/admin/api` is unchanged. A value shaped like a credential is accepted, so it can
   reach your database and logs; see
   [Observability](docs/observability.md#cardinality-checklist).
+- **A project with routes treats `model` as a selector.** In a project that has a chat
+  route, the request's `model` has to be a route name, the project's default model name or
+  empty; anything else is `404 model_not_found` instead of being replaced by the connection's
+  model name and echoed back to the client.
+  `GET /v1/models` lists the project's route names and the implicit route. A project
+  without routes behaves exactly as in 0.4.x. See
+  [Routes](docs/api.md#routes) and [Providers](docs/providers.md#routing).
 
 ### Added
 - **OpenTelemetry GenAI span names and per-attempt spans.** The request span is now named
@@ -74,6 +81,42 @@ All notable changes to Ragmux are documented here. The format follows
   `fallback_from` (migrations `0016`, `0017`); see
   [the request log](docs/observability.md#the-request-log). `0017` builds its index
   `CONCURRENTLY`, outside a transaction. `requested_model` is cut to 256 bytes.
+- **Routes.** A project can hold named routes of 1 to 8 targets, each a model connection
+  with an optional upstream model name, a `weight` (1-1000) and a `priority` (0-100). A call
+  tries the targets by priority group, in weighted random order inside a group. Managed
+  through `/admin/api/projects/{id}/routes` (migration `0019`: `project_routes`,
+  `route_targets`); audit events `route.create`, `route.update` and `route.delete`. A
+  connection that a route target uses cannot be deleted (`409`). See
+  [Routes](docs/api.md#routes) and [Providers](docs/providers.md#routing).
+- **`POST /v1/embeddings`.** OpenAI-shaped embeddings endpoint (`float` and `base64`
+  encodings) behind scope `embeddings`, with `endpoint = embeddings` in the request log.
+  `model` resolves to a `kind = embeddings` route, else to the RAG store's embedding
+  connection, else `404 model_not_found`. See
+  [`POST /v1/embeddings`](docs/api.md#post-v1embeddings).
+- **`POST /v1/retrieve`.** Returns the chunks a RAG store would put in a chat prompt, with
+  scores, distances, metadata, the search mode and backend, rerank information and usage,
+  behind scope `retrieve`. It runs the store's own search settings. A `viewer` member's key
+  with the scope may call it, because `/v1` does not read roles. See
+  [`POST /v1/retrieve`](docs/api.md#post-v1retrieve).
+- **`ragmux_ingest_embed_tokens_total{source}`.** Embedding tokens spent by ingestion, split
+  into `reported` (the provider's count) and `estimated` (characters divided by 4). The
+  "document ingested" log line carries `embed_tokens`. Embedding calls of `/v1/embeddings`
+  and `/v1/retrieve` are logged in `request_logs` like any other request.
+- **Azure OpenAI.** Provider type `azure_openai` (chat, streaming and embeddings), with the
+  resource endpoint in `base_url`, the deployment in `model_name` and an optional
+  `api-version` query on the `base_url` (default `2024-10-21`). The key is sent as
+  `api-key` and is covered by `rotate-key`. See [Providers](docs/providers.md#azure-openai).
+- **Provider presets.** Mistral, xAI and Groq are offered as `custom_openai` presets through
+  `GET /admin/api/provider-presets`. A preset is a template for the form, not a stored
+  object, and carries no price. See [Providers](docs/providers.md#presets).
+- **Dashboard.** The project page has a route editor, the RAG store form filters the rerank
+  connection by backend, the connection form offers the presets and the Azure fields, and
+  the API key form lists the `embeddings`, `retrieve` and `rerank` scopes. A key edited in
+  the dashboard keeps the scopes it already had.
+- **Docs drift test.** `internal/admin/docs_drift_test.go` compares the JSON field names of
+  the admin API with `docs/api.md` in both directions, so a field added to the code
+  without a line in the docs, or left in the docs after it was removed, fails the build.
+  Fields left out on purpose are listed in the test with a reason each.
 
 ### Security
 - **Existing `chat` gateway keys gain the `embeddings`, `retrieve` and `rerank` scopes.**

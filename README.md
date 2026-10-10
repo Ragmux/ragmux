@@ -25,20 +25,32 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
 
 ## Features
 
-- **Providers:** `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` (native `/api/chat`)
-  and `custom_openai` for vLLM, LM Studio, LiteLLM or any OpenAI-compatible server.
+- **Providers:** `openai`, `azure_openai`, `anthropic`, `gemini`, `deepseek`, `ollama`
+  (native `/api/chat`) and `custom_openai` for vLLM, LM Studio, LiteLLM or any
+  OpenAI-compatible server, plus `cohere_rerank` and `voyage_rerank` for reranking. Ready-made
+  presets cover Mistral, xAI and Groq; see [Providers](docs/providers.md).
 - **OpenAI-compatible proxy:** `/v1/chat/completions` (JSON + SSE streaming) and
   `/v1/models`; works with the official SDKs by changing `base_url` and `api_key`.
   Anthropic and Gemini requests and streams are translated, tool calls included, and remote
   images are fetched for the providers that cannot follow a URL themselves.
+- **More `/v1` endpoints:** `POST /v1/embeddings`, `POST /v1/retrieve` (search a RAG store
+  without calling a model) and `POST /v1/rerank` (Cohere-shaped), each behind its own key
+  scope. See the [API reference](docs/api.md#client-api-v1).
+- **Routes, retry and fallback:** a project can define named routes whose targets are
+  ordered by priority and weight; the request's `model` then selects a route, and an unknown
+  name is `404 model_not_found`. A chat call that fails before the first byte is retried or
+  handed to the next target, and a connection that keeps failing is taken out of rotation by
+  a circuit breaker. See [Routing](docs/providers.md#routing) and
+  [Retry and fallback](docs/providers.md#retry-and-fallback).
 - **RAG stores:** PDF / DOCX / HTML / TXT / Markdown, section-aware chunking with contextual
   embeddings, hybrid search fusing pgvector with either Postgres full-text ranking or
   ParadeDB BM25, reranking by your own model or the Cohere / Voyage APIs, distance threshold.
 - **Projects:** one `sk-proj-…` key per project mapped to a model connection, a system prompt
   and an optional RAG store; provider credentials are encrypted at rest and never exposed.
 - **API keys:** per-user `sk-user-…` keys for `/v1` scoped to the projects you grant them and
-  `sk-mgmt-…` keys for the management API, both with scopes, expiry, revocation and optional
-  limits under the project's.
+  `sk-mgmt-…` keys for the management API, both with scopes (`/v1` keys: `chat`, `models`,
+  `embeddings`, `retrieve`, `rerank`), expiry, revocation and optional limits under the
+  project's.
 - **Users and roles:** `admin`, `editor`, `viewer`, project membership, login rate limiting
   with lockout, audit log of every management action, and `ragmux reset-password` when the
   last administrator is locked out.
@@ -48,11 +60,13 @@ client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
   token budgets shared across replicas, OpenAI-style `429` and `x-ratelimit-*` headers.
 - **Observability:** per-request logs (tokens, latency, status, streaming, RAG use, cost),
   summaries, daily series, configurable retention, an authenticated Prometheus `/metrics`
-  endpoint and OpenTelemetry traces over OTLP.
+  endpoint and OpenTelemetry traces over OTLP (HTTP/JSON, or gRPC on request) with GenAI
+  span names and one child span per upstream attempt.
 - **Scale:** run several replicas against one PostgreSQL — ingestion is claimed under a
   lease, the retention pass elects a leader, and streaming needs no session affinity.
-- **Dashboard:** embedded UI at `/admin/` for models, RAG stores, documents, projects,
-  metrics, users, audit log and a playground; everything is also a REST API.
+- **Dashboard:** embedded UI at `/admin/` for models, RAG stores, documents, projects and
+  their routes, API keys, metrics, users, audit log and a playground; everything is also a
+  REST API.
 
 ## Quick start
 
@@ -195,7 +209,8 @@ curl -s localhost:8765/admin/api/projects -H "$AUTH" -H 'Content-Type: applicati
 ```
 
 **5. Call it like OpenAI.** The `model` field is echoed back but the project decides the
-real model; retrieved passages are injected into the system prompt and counted in the
+real model (a project with [routes](docs/providers.md#routing) uses it to pick one);
+retrieved passages are injected into the system prompt and counted in the
 `x-ragmux-rag-hits` header.
 
 ```bash
@@ -227,11 +242,16 @@ form; afterwards a sign-in screen that reports remaining attempts and lockouts. 
   per day, traffic by project, budget watch with exhaustion forecasts, recent requests
   and a CSV export.
 - **Models:** connection cards with provider capabilities, last test result and private
-  upstream flag; the form can test a connection before saving it.
+  upstream flag; the form can test a connection before saving it, start from a preset and
+  takes an Azure OpenAI endpoint, deployment and API version.
 - **RAG stores:** quota meters, drag-and-drop upload, ingestion progress, per-document
-  reprocess and a retrieval tester (hybrid / vector, rerank, per-stage latencies).
+  reprocess and a retrieval tester (hybrid / vector, rerank, per-stage latencies); the rerank
+  connection list follows the chosen backend.
 - **Projects:** usage rings for the minute, day and month windows with reset countdowns,
-  budget forecast banner, members, key rotation and a project CSV export.
+  budget forecast banner, members, key rotation, a route editor (kind, up to eight targets
+  with model override, weight and priority) and a project CSV export.
+- **API keys:** mint and revoke your own `sk-user-…` and `sk-mgmt-…` keys with a scope
+  checklist, grants and limits.
 - **Playground:** real `/v1/chat/completions` calls with a project key, streaming or JSON,
   optional extra system prompt, RAG sources as citations and the response headers.
 - **Users** and **Audit log** (admins): role and failed-login tiles, filters, NDJSON export.
@@ -246,13 +266,13 @@ IBM Plex Sans, JetBrains Mono, all SIL OFL, `web/fonts/`) and runs under a stric
 | Page | Contents |
 |---|---|
 | [Configuration](docs/configuration.md) | every environment variable and default, `-healthcheck` / `-version` flags, Compose variables, reverse-proxy notes |
-| [API reference](docs/api.md) | authentication, roles per endpoint, request/response examples, error envelope, the `/v1` surface, `/healthz`, `/admin/api/system` |
+| [API reference](docs/api.md) | authentication, roles per endpoint, request/response examples, error envelope, routes, the `/v1` surface (chat, embeddings, retrieve, rerank, models), `/healthz`, `/admin/api/system` |
 | [Retrieval (RAG)](docs/rag.md) | supported formats, chunking and contextual chunks, hybrid search and `fts_config`, `max_distance`, reranking, context format |
 | [Users, roles and limits](docs/users-and-limits.md) | roles matrix, project membership, login protection, audit log, rate limits and budgets, metrics and retention |
-| [Providers](docs/providers.md) | provider types and endpoints, Anthropic / Gemini / Ollama translation details, request passthrough, model echo |
+| [Providers](docs/providers.md) | provider types and presets, Azure OpenAI, rerank providers, Anthropic / Gemini / Ollama translation details, request passthrough, model echo, routing, retry, fallback and the circuit breaker |
 | [Backup and restore](docs/backup-restore.md) | what to back up, `scripts/backup.sh` and `scripts/restore.sh`, scheduled backups, PITR, restore runbook |
 | [Scaling](docs/scaling.md) | running several replicas, what state is already shared, SECRET_KEY and connection pooling, leased ingestion, rolling restarts, Kubernetes notes |
-| [Observability](docs/observability.md) | `/metrics` and why it is authenticated, the metric table, the cardinality checklist, `/readyz` vs `/healthz`, tracing spans and sampling, running a Collector |
+| [Observability](docs/observability.md) | `/metrics` and why it is authenticated, the metric table, the cardinality checklist, `/readyz` vs `/healthz`, tracing spans (GenAI names, per-attempt spans) and sampling, exporting over gRPC, running a Collector |
 | [Changelog](CHANGELOG.md) | release notes |
 
 ## Security

@@ -310,6 +310,9 @@ hardened outbound path. The connection's `provider_type` must match the backend
 save with `cannot use connection "x" for reranking: it is a <type> connection`. See
 [Rerank providers](providers.md#rerank-providers-cohere_rerank-voyage_rerank).
 
+In the dashboard, the store form offers only the connections whose `provider_type` fits
+the chosen backend.
+
 **The fallback contract is the same for all three.** Passages the reranker omits are
 appended in their original order, so nothing is lost. Anything that goes wrong — a
 transport failure, a timeout, an unparseable reply, a rerank connection that was deleted,
@@ -339,6 +342,25 @@ reranker's tokens count toward limits and usage but are not priced: it bills by 
 unit, so pricing them at the chat or embedding model's rate would invent a cost. A
 `/v1/rerank` call is one row of its own with `endpoint = rerank`. See
 the [API reference](api.md#post-v1rerank).
+
+**Known limitations of rerank cost.** Three things about the price of a rerank are
+approximations, not a bill:
+
+- The tokens of an API reranker (`cohere`, `voyage`) are added to the request's token
+  totals, so they count toward `rate_limit_tpm`, the token budgets and the usage report,
+  but they never enter `cost_micros`. The provider charges per search unit, which the
+  gateway does not price. The real cost of those calls is on the provider's invoice.
+- On `POST /v1/retrieve` the row has no chat model. The tokens of an `llm` rerank are
+  therefore priced at the price of the store's embedding connection, the only connection
+  the row carries, although a chat model did the work. In a chat request the row's model
+  is the chat model, so the same rerank is priced at its own rate.
+- In a chat request on a project with routes, an `llm` rerank runs once, through the
+  first target's provider. If that target then fails and a fallback target answers, the
+  row is priced at the fallback target's model, so the rerank tokens are priced at a
+  model that did not do the rerank.
+
+None of these is corrected by the gateway; a deployment that needs exact figures for reranked
+retrieval should take them from the provider.
 
 ## Context injection
 

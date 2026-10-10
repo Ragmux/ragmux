@@ -200,8 +200,28 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
 | POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
-| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
+| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`chat`, `streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
 | GET | `/provider-presets` | viewer | Ready-made `custom_openai` setups for hosted OpenAI-compatible providers (Mistral, xAI, Groq), each with `id`, `label`, `provider_type`, `base_url`, suggested `models`, an optional `embedding_model` and `requires_api_key`. A preset is not stored: create the connection with `POST /models` using its `provider_type` and `base_url`. No preset carries a price — see [Presets](providers.md#presets) |
+
+`GET /provider-types` answers an array with one object per type:
+
+```json
+[{"type": "openai", "label": "OpenAI", "default_base_url": "https://api.openai.com/v1",
+  "supports_embeddings": true, "requires_api_key": true,
+  "supports_tools": true, "supports_streaming": true,
+  "capabilities": {"chat": true, "streaming": true, "embeddings": true, "tools": true,
+                   "tool_streaming": true, "vision": true, "remote_images": true,
+                   "prompt_caching": false, "cached_token_usage": true, "rerank": false}}]
+```
+
+`GET /provider-presets` answers an array:
+
+```json
+[{"id": "mistral", "label": "Mistral AI", "provider_type": "custom_openai",
+  "base_url": "https://api.mistral.ai/v1",
+  "models": ["mistral-large-latest", "mistral-small-latest"],
+  "embedding_model": "mistral-embed", "requires_api_key": true}]
+```
 
 ### Model connections
 
@@ -212,7 +232,7 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | GET | `/models/{id}` | viewer | Read one |
 | PUT | `/models/{id}` | editor | Update; an empty `api_key` keeps the stored key |
 | DELETE | `/models/{id}` | editor | Delete → `{"ok": true}`; `409` while a project, RAG store or route target uses it |
-| POST | `/models/{id}/test` | editor | `{"mode": "chat"}` (default) or `{"mode": "embedding"}`; spends provider quota, so it is a write; the outcome is recorded on the connection |
+| POST | `/models/{id}/test` | editor | `{mode?}`, where `mode` is `"chat"` (default) or `"embedding"`; spends provider quota, so it is a write; the outcome is recorded on the connection |
 | POST | `/models/test` | editor | Test an unsaved connection: the create body plus `mode` and optionally `connection_id` (reuse that connection's stored key when `api_key` is empty); nothing is recorded |
 
 Request body for create and update:
@@ -223,8 +243,14 @@ Request body for create and update:
 ```
 
 `provider_type` is one of `openai`, `anthropic`, `gemini`, `deepseek`, `ollama`,
-`custom_openai`; `base_url` must be an `http://` or `https://` URL with a host and
-without credentials, query string or fragment, and is required for `custom_openai`; a
+`custom_openai`, `azure_openai`, `cohere_rerank` or `voyage_rerank`. `azure_openai` needs
+a `base_url` (the resource endpoint, which may carry an `api-version` query parameter) and
+`model_name` is its deployment name, see [Azure OpenAI](providers.md#azure-openai); the
+two rerank types can serve only rerank targets and RAG store reranking, see
+[Rerank providers](providers.md#rerank-providers-cohere_rerank-voyage_rerank). `base_url`
+must be an `http://` or `https://` URL with a host and without credentials or fragment
+(and without a query string, except the `api-version` of `azure_openai`), and is required
+for `custom_openai` and `azure_openai`; a
 host that resolves only to private or local addresses is rejected with `400` unless
 allowed by `PRIVATE_UPSTREAM_ALLOWLIST` / `ALLOW_PRIVATE_UPSTREAMS` (see
 [Configuration](configuration.md#private-upstreams)). `model_name` may contain letters,
@@ -310,19 +336,38 @@ fails the document, see [Embedding width](rag.md#embedding-width)) and
 cannot be changed while the store has chunks (`400`). Responses carry the usage the
 quotas are checked against: `document_count` and `bytes_used`.
 
+A store as the API returns it:
+
+```json
+{"id": 1, "name": "handbook", "embedding_connection_id": 2,
+ "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
+ "search_mode": "hybrid", "search_backend": "pgvector", "fts_config": "simple",
+ "rerank": false, "rerank_candidates": 15, "rerank_backend": "llm", "rerank_connection_id": null,
+ "max_distance": 0, "contextual_chunks": true, "max_documents": 0, "max_bytes": 0,
+ "dimensions": 1536, "document_count": 3, "bytes_used": 3145728, "chunk_count": 126,
+ "created_at": "2026-09-18T10:00:00.000Z"}
+```
+
+`dimensions` is the width of the store's vectors (`0` until the first ingest), and
+`chunk_count` the number of chunks across its documents. `PUT` adds
+`reprocess_recommended` to the object: `true` when a changed setting only takes effect
+for documents after they are re-chunked or re-embedded.
+
 Documents look like
 
 ```json
 {"id": 7, "rag_store_id": 1, "filename": "handbook.pdf", "mime": "application/pdf",
  "size_bytes": 1048576, "status": "ready", "error": "", "chunk_count": 42,
- "page_count": 12, "progress_percent": 100, "created_at": "…", "updated_at": "…"}
+ "page_count": 12, "progress_percent": 100, "attempts": 1, "created_at": "…", "updated_at": "…"}
 ```
 
 with `status` moving `pending` → `processing` → `ready` (or `failed` with `error` set).
 `progress_percent` follows ingestion: `10` once parsed, `20` once chunked, then the share
 of embedding batches completed, `100` when ready; a failed document keeps the value it
 reached. `page_count` is the number of pages of a PDF and `null` for other formats (and
-until the document has been parsed).
+until the document has been parsed). `attempts` counts how often a replica claimed the
+document for ingestion since it was last queued; a document past the cap is skipped
+rather than retried forever.
 Accepted extensions: `.pdf`, `.docx`, `.html`, `.htm`, `.md`, `.markdown`, `.txt`; the
 request body is limited to `MAX_UPLOAD_MB`. Upload and reprocess answer
 `503 the ingestion backlog is full (MAX_PENDING_DOCUMENTS), retry later` when the queue
@@ -341,8 +386,12 @@ POST /admin/api/rag-stores/1/search
  "retrieval_latency_ms": 180, "rerank_latency_ms": 230,
  "hits": [{"chunk_id": 8, "document_id": 2, "filename": "handbook.pdf", "index": 3,
            "section": "Leave > Vacation", "page": 12, "content": "…",
-           "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2}]}
+           "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2,
+           "lex_score": 7.43}]}
 ```
+
+`lex_score` is the raw BM25 score under the `pg_search` backend and is absent under
+`pgvector` ([Search endpoint](rag.md#search-endpoint)).
 
 Everything but `query` is optional and overrides the store setting for this call only
 (`mode`, `backend`, `rerank`, `rerank_backend`, `rerank_connection_id`, `max_distance`
@@ -368,7 +417,7 @@ A `502` is returned when the embedding call fails.
 | DELETE | `/projects/{id}` | member + editor | Delete with its request logs → `{"ok": true}` |
 | POST | `/projects/{id}/rotate-key` | member + editor | New key → `{"project": …, "api_key": "sk-proj-…"}`; the old key stops working immediately |
 | GET | `/projects/{id}/members` | member | `[{id, username, role, added_at}]` |
-| PUT | `/projects/{id}/members` | member + editor | `{"user_ids": [1, 4]}` replaces the member set; an editor cannot remove themselves |
+| PUT | `/projects/{id}/members` | member + editor | `{user_ids}` (an array such as `[1, 4]`) replaces the member set; an editor cannot remove themselves |
 | GET | `/projects/{id}/metrics?window=24h` | member | Metrics for one project (see below; takes the same `compare`, `days` and `by_project` options as the summary) |
 | GET | `/projects/{id}/metrics.csv?window=24h` | member | The project's request logs in the window as a CSV download (see below) |
 | GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
@@ -385,9 +434,16 @@ Project body:
 `rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
 [Zero means unlimited](configuration.md#zero-means-unlimited)).
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
-project object contains `api_key_prefix` (the first characters of the key for
-identification), `member_ids` and the limit fields; the full key is never returned
-again.
+full key is never returned again. The project object:
+
+```json
+{"id": 3, "name": "support-bot", "model_connection_id": 1, "rag_store_id": 1,
+ "api_key_prefix": "sk-proj-ab12", "system_prompt": "You are the company support assistant.",
+ "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "member_ids": [4], "created_at": "…", "updated_at": "…"}
+```
+
+`api_key_prefix` holds the first characters of the key for identification.
 
 `GET /projects/{id}/usage`:
 
@@ -443,8 +499,24 @@ Route body:
 - Invalid input is `400`. The response lists `targets` ordered by `priority`, then `id`,
   each with `connection_name` and `provider_type` next to the stored fields.
 
+A route as the API returns it (`model` is `null` for a target that keeps the
+connection's model name):
+
+```json
+{"id": 5, "project_id": 3, "name": "smart", "kind": "chat", "strategy": "weighted",
+ "targets": [
+   {"id": 11, "connection_id": 1, "connection_name": "openai-main", "provider_type": "openai",
+    "model": "gpt-4.1", "weight": 3, "priority": 0},
+   {"id": 12, "connection_id": 2, "connection_name": "claude", "provider_type": "anthropic",
+    "model": null, "weight": 1, "priority": 0}],
+ "created_at": "…", "updated_at": "…"}
+```
+
 Candidate order for a call: groups by `priority` ascending; inside a group a weighted
-random order without replacement. A single target is called per request in this release.
+random order without replacement. The first candidate is called; a failure before the
+first byte is retried on it or hands the request to the next candidate, as
+[Retry and fallback](providers.md#retry-and-fallback) describes, and a connection whose
+circuit breaker is open is skipped.
 Deleting a project removes its routes; a connection that a route target still uses cannot
 be deleted (`409`). Create, update and delete are audited as `route.create`,
 `route.update` and `route.delete`. Route and target names are never metric labels.
@@ -537,7 +609,8 @@ The summary response (also used by `/projects/{id}/metrics`):
              "streamed": true, "rag_used": true, "rag_hits": 3, "cached_prompt_tokens": 200,
              "cache_write_tokens": 0, "cost_micros": 1860, "cost_usd": 0.00186,
              "cost_source": "builtin", "error": "", "api_key_id": 7, "user_id": 4,
-             "created_at": "…"}],
+             "request_id": "3f2a9c1e", "endpoint": "chat.completions", "requested_model": "smart",
+             "route": "smart", "attempt": 2, "fallback_from": 1, "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
                "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70,
@@ -548,7 +621,12 @@ The summary response (also used by `/projects/{id}/metrics`):
 `rag_hits` is the number of retrieved passages injected into that request (`0` when
 `rag_used` is false). `api_key_id` and `user_id` attribute the request to the user-owned
 key that made it and are `null` for a project's default key; the owner is denormalised so
-deleting the key later leaves `user_id` in place. Status semantics (`429`, `499`,
+deleting the key later leaves `user_id` in place. `request_id`, `endpoint`,
+`requested_model`, `route`, `attempt` and `fallback_from` identify how the request ran and
+are left out of a row when empty (always for rows written before migration `0016`);
+`attempt` is the number of upstream calls, `fallback_from` the connection id of the first
+target when the request moved to another one, and `route` is absent for the implicit
+route. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
 `502`, `503`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
@@ -588,6 +666,10 @@ which has no owner; an empty cell says that where a `0` would read as user zero.
 Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
+
+The CSV carries the columns above only: `request_id`, `endpoint`, `requested_model`,
+`route`, `attempt` and `fallback_from` are in the JSON log and the database, not in the
+export.
 
 ### Model prices
 
@@ -672,6 +754,14 @@ already knows.
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
 | GET | `/security/logins` | admin | Failed-login counters and active lockouts |
 
+`GET /users` answers an array of user objects with the two counters:
+
+```json
+[{"id": 1, "username": "admin", "role": "admin", "is_active": true,
+  "last_login_at": "2026-09-18T10:00:00Z", "created_at": "…",
+  "project_count": 2, "active_sessions": 1}]
+```
+
 `PUT`/`DELETE` on users refuse to demote, deactivate or delete the last active admin
 (`409`) and to deactivate or delete the caller's own account (`400`).
 
@@ -715,7 +805,7 @@ lockout ends (empty when the lockout is disabled).
 whatever the running build reports:
 
 ```json
-{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
+{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "pg_search_version": "", "migrations_version": N, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
  "version": "<x.y.z>"}
@@ -723,8 +813,10 @@ whatever the running build reports:
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
 bytes of uploaded files stored in the database, `secret_key_source` is `env` or `file`.
-`database.postgres_version` and `database.pgvector_version` are only returned to admins;
-editors and viewers receive the `database` object without those two keys.
+`database.pg_search_version` is the installed ParadeDB `pg_search` extension, empty when it
+is absent (see [Search backends](rag.md#search-backends)). `database.postgres_version`,
+`database.pgvector_version` and `database.pg_search_version` are only returned to admins;
+editors and viewers receive the `database` object without those three keys.
 
 ## Health
 
@@ -764,10 +856,14 @@ What happens to a request, in order:
    `x-ragmux-rag-hits: <n>` and, when passages were injected, `x-ragmux-rag-sources`
    listing them. Retrieval failures are logged and the request continues without
    context.
-4. The request is translated for the provider and sent. The `model` field is **not**
-   used for routing; the project's connection decides. The value you send is echoed
-   back in the response (`model` of the completion and every stream chunk); an empty
-   value is replaced with the connection's model name.
+4. The request is translated for the provider and sent. A project without chat
+   [routes](#routes) ignores `model` for selection: the project's connection decides.
+   Once a project has a chat route, `model` selects what runs and an unknown value is
+   `404 model_not_found` (see [`GET /v1/models`](#get-v1models-and-get-v1modelsid)). The
+   value you send is echoed back in the response (`model` of the completion and every
+   stream chunk); an empty value is replaced with the connection's model name.
+   A failure before the first byte can be retried and handed to the route's next target
+   ([Retry and fallback](providers.md#retry-and-fallback)).
 
 Non-streaming responses are the provider's answer normalised to the OpenAI schema
 (`choices[].message`, `finish_reason`, `usage`). Streaming responses are
@@ -850,6 +946,7 @@ Status codes:
 | `400` | malformed JSON, missing `messages`, a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
+| `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |

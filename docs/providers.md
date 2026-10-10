@@ -66,6 +66,10 @@ and a `model_name` of your choice, to `POST /admin/api/models`. The result is an
 provider serves works, and a provider that retires one does not break existing
 connections.
 
+In the dashboard the same list is the **Start from a preset** select on the new-connection
+form: picking one fills in the provider type, base URL and a model name, and nothing is
+saved until you press **Save connection**. The preset itself is never sent.
+
 Presets carry **no price**. `custom_openai` ships no built-in price rows, because the type
 names a URL rather than a vendor and a row keyed on it would price every self-hosted
 server like the hosted service. Add the models you use to the
@@ -81,6 +85,7 @@ type, because the translation exists — the model's own refusal is relayed as i
 
 | | `openai` | `anthropic` | `gemini` | `deepseek` | `ollama` | `custom_openai` | `azure_openai` |
 |---|---|---|---|---|---|---|---|
+| `chat` | yes | yes | yes | yes | yes | yes | yes |
 | `streaming` | yes | yes | yes | yes | yes | yes | yes |
 | `embeddings` | yes | no | yes | no | yes | yes | yes |
 | `tools` | yes | yes | yes | yes | yes | yes | yes |
@@ -92,7 +97,9 @@ type, because the translation exists — the model's own refusal is relayed as i
 | `rerank` | no | no | no | no | no | no | no |
 
 `cohere_rerank` and `voyage_rerank` sit outside that table: `rerank` is the only
-capability they have, and `chat` and `embeddings` are both `no`.
+capability they have, and `chat` and `embeddings` are both `no`. `chat` is what the
+dashboard's model picker filters on: a connection whose type has it can back a project
+or a chat route target.
 
 ¹ Tool calls still work in streams; they arrive as one complete delta per call instead of
 argument fragments, because that is how the upstream sends them — see
@@ -228,6 +235,10 @@ Without an `api-version` the gateway uses `2024-10-21`. Pass another one when a 
 you need (a newer model, a preview capability) requires it. The same connection can serve
 a RAG store's embeddings when its deployment is an embedding model; chat and embedding
 deployments are separate connections.
+
+The dashboard's connection form shows these settings under their Azure names (endpoint,
+**Deployment name**, **API version**) and joins them into `base_url` and `model_name` on
+save. Leave the API version blank to use the default.
 
 Validation on save: `base_url` is required and takes no credentials or fragment, and its
 only allowed query parameter is a single `api-version` (letters, digits, `.`, `_`, `-`);
@@ -684,6 +695,10 @@ echoes the client's value (for an empty `model`, the connection's model name). I
 value and `route` is the route name, empty for the implicit route. Routes of kind
 `embeddings` or `rerank` do not switch chat routing on.
 
+The project page has a route editor for all of this: a route's kind (`chat`, `embeddings`
+or `rerank`) and up to eight targets, each with its connection, optional `model`, `weight`
+and `priority`.
+
 ### Before your first chat route
 
 Without chat routes the gateway answers whatever `model` string a client sends (it echoes
@@ -735,6 +750,9 @@ the next target takes over, and when there is none the client gets the error wit
 Each attempt runs with what is left of it, and a wait that would use up the remainder is
 skipped, so the attempts of a non-streaming request never add up to more than
 `UPSTREAM_TIMEOUT`.
+A streaming attempt is held to what is left of the budget only until its first chunk
+arrives; once the stream is flowing `UPSTREAM_TIMEOUT` no longer limits it, and
+`STREAM_MAX_DURATION` and `STREAM_MAX_BYTES_MB` do.
 The rate-limit check, the system prompt and retrieval run once before the first attempt,
 and usage is recorded once.
 
