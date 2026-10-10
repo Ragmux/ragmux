@@ -340,7 +340,7 @@ const ICON = {
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12m0 0 4-4m-4 4-4-4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>',
 };
 
-const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], searchBackends: [], users: [], keys: [], system: null, sessionExp: null,
+const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], searchBackends: [], presets: [], users: [], keys: [], system: null, sessionExp: null,
   overview: { window: '24h' }, openStore: null, openProject: null, users_filter: { q: '', role: 'all' },
   keys_filter: { q: '', kind: 'all', mine: true },
   playground: { key: '', system: '', stream: true, sources: true, msgs: [], last: null } };
@@ -432,7 +432,8 @@ function field(name, label, inner, hint = '') {
 }
 const input = (name, val = '', attrs = '') => `<INPUT class="input" name="${name}" value="${esc(val)}" ${attrs}>`;
 const textarea = (name, val = '', attrs = '') => `<TEXTAREA class="input" name="${name}" ${attrs}>${esc(val)}</TEXTAREA>`;
-const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${name}" ${attrs}>${opts.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(val) ? 'selected' : ''} ${o.disabled ? 'disabled' : ''} ${o.hint ? `title="${esc(o.hint)}"` : ''}>${esc(o.label)}${o.disabled ? ' (unavailable here)' : ''}</option>`).join('')}</SELECT>`;
+const optionTags = (opts, val) => opts.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(val) ? 'selected' : ''} ${o.disabled ? 'disabled' : ''} ${o.hint ? `title="${esc(o.hint)}"` : ''}>${esc(o.label)}${o.disabled ? ' (unavailable here)' : ''}</option>`).join('');
+const select = (name, opts, val, attrs = '') => `<SELECT class="input" name="${name}" ${attrs}>${optionTags(opts, val)}</SELECT>`;
 const toggle = (name, checked, label, hint = '') => `<label class="toggle"><span><span class="dim">${esc(label)}</span>${hint ? `<div class="hint">${hint}</div>` : ''}</span><input type="checkbox" name="${name}" ${checked ? 'checked' : ''}><span class="switch" aria-hidden="true"></span></label>`;
 const checklist = (name, opts, vals = [], empty = 'Nothing to choose from.') => `<div class="checklist">${opts.map(o => `<label class="check"><input type="checkbox" name="${name}" value="${esc(o.value)}" ${vals.map(String).includes(String(o.value)) ? 'checked' : ''}>${esc(o.label)}</label>`).join('') || `<div class="hint" style="padding:6px 10px">${esc(empty)}</div>`}</div>`;
 const twoCol = (a, b) => `<div class="row" style="align-items:flex-start"><div class="grow">${a}</div><div class="grow">${b}</div></div>`;
@@ -543,8 +544,8 @@ function updateSession() {
 }
 setInterval(() => { if (state.user) updateSession(); }, 30000);
 async function loadAll() {
-  [state.models, state.rag, state.projects, state.providerTypes, state.searchBackends] =
-    await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types'), api('/search-backends').catch(() => [])]);
+  [state.models, state.rag, state.projects, state.providerTypes, state.searchBackends, state.presets] =
+    await Promise.all([api('/models'), api('/rag-stores'), api('/projects'), api('/provider-types'), api('/search-backends').catch(() => []), api('/provider-presets').catch(() => [])]);
   // Admins get the full list (badge, actor filter); editors the active users for member pickers; viewers nothing.
   state.users = can('admin') ? await api('/users').catch(() => []) : can('editor') ? await api('/users/lite').catch(() => []) : [];
   loadSystem();
@@ -862,27 +863,82 @@ function renderModels() {
   on(app, '[data-testemb]', 'click', b => test(b.dataset.testemb, 'embedding', b));
 }
 const testSummary = r => r.ok ? `OK in ${fmtN(r.latency_ms)} ms` + (r.reply ? `\nreply: ${r.reply}` : '') + (r.dimensions ? `\ndimensions: ${r.dimensions}` : '') : `Failed: ${r.error}`;
+// Azure OpenAI keeps its three coordinates in the generic connection fields:
+// base_url is the resource endpoint (optionally with ?api-version=), model_name
+// is the deployment. The form shows them under their Azure names and joins
+// them back, so the API sees exactly what an operator would have typed.
+const AZURE_DEFAULT_API_VERSION = '2024-10-21';
+function splitAzureUrl(raw) {
+  const i = (raw || '').indexOf('?');
+  if (i < 0) return { endpoint: raw || '', version: '' };
+  return { endpoint: raw.slice(0, i), version: new URLSearchParams(raw.slice(i + 1)).get('api-version') || '' };
+}
+function joinAzureUrl(endpoint, version) {
+  const e = (endpoint || '').trim().replace(/\/+$/, '');
+  const v = (version || '').trim();
+  return v ? `${e}?api-version=${encodeURIComponent(v)}` : e;
+}
+// connValues reads the effective connection fields out of the form, whichever
+// provider block is showing.
+function connValues(form) {
+  const d = formData(form);
+  if (d.provider_type === 'azure_openai') return { name: d.name, provider_type: d.provider_type, base_url: joinAzureUrl(d.az_endpoint, d.az_api_version), api_key: d.api_key, model_name: (d.az_deployment || '').trim() };
+  return { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name };
+}
 function modelForm(m) {
   const types = state.providerTypes.map(t => ({ value: t.type, label: t.label }));
+  const az = m && m.provider_type === 'azure_openai' ? splitAzureUrl(m.base_url) : { endpoint: '', version: '' };
+  const presets = state.presets || [];
   const form = drawer({ eyebrow: m ? 'Edit' : 'New', title: 'Connection', submitLabel: 'Save connection', extra: '<button type="button" class="btn" id="testFirst">Test first</button>', body: `
+    ${!m && presets.length ? field('preset_id', 'Start from a preset', select('preset_id', [{ value: '', label: '— none —' }, ...presets.map(p => ({ value: p.id, label: p.label }))], ''), 'Fills in the provider type, base URL and a model for an OpenAI-compatible service. Nothing is saved until you press Save connection.') : ''}
     ${field('name', 'Name', input('name', m ? m.name : '', 'required placeholder="e.g. openai-gpt4o"'))}
     ${field('provider_type', 'Provider type', select('provider_type', types, m ? m.provider_type : 'openai'))}
-    ${field('base_url', 'Base URL', input('base_url', m ? m.base_url : '', 'placeholder="https://…"'), '<span id="urlHint">Blank uses the provider default. Loopback and private ranges are refused unless allowed by PRIVATE_UPSTREAM_ALLOWLIST / ALLOW_PRIVATE_UPSTREAMS.</span>')}
+    <div id="genericBlock" class="stack" style="gap:inherit">
+      ${field('base_url', 'Base URL', input('base_url', m && m.provider_type !== 'azure_openai' ? m.base_url : '', 'placeholder="https://…"'), '<span id="urlHint">Blank uses the provider default. Loopback and private ranges are refused unless allowed by PRIVATE_UPSTREAM_ALLOWLIST / ALLOW_PRIVATE_UPSTREAMS.</span>')}
+    </div>
+    <div id="azureBlock" class="stack hidden" style="gap:inherit">
+      ${field('az_endpoint', 'Endpoint', input('az_endpoint', az.endpoint, 'type=url required placeholder="https://my-resource.openai.azure.com" autocomplete=off'), 'The Azure OpenAI resource endpoint. Loopback and private ranges are refused unless allowed by PRIVATE_UPSTREAM_ALLOWLIST / ALLOW_PRIVATE_UPSTREAMS.')}
+      ${field('az_deployment', 'Deployment name', input('az_deployment', m && m.provider_type === 'azure_openai' ? m.model_name : '', 'required maxlength=64 pattern="[A-Za-z0-9][A-Za-z0-9._\\-]*" placeholder="my-gpt-4o" autocomplete=off'), 'The deployment you created in Azure, not the underlying model name. Letters, digits, dot, underscore and hyphen.')}
+      ${field('az_api_version', 'API version', input('az_api_version', m && m.provider_type === 'azure_openai' ? az.version : AZURE_DEFAULT_API_VERSION, 'maxlength=32 pattern="[A-Za-z0-9][A-Za-z0-9._\\-]*" placeholder="' + AZURE_DEFAULT_API_VERSION + '" autocomplete=off'), `Blank lets the gateway use ${AZURE_DEFAULT_API_VERSION}.`)}
+    </div>
     ${field('api_key', m ? 'API key (blank = keep current)' : 'API key / token', input('api_key', '', 'type=password autocomplete=off'), 'Stored encrypted, bound to this connection id. Shown masked afterwards.')}
-    ${field('model_name', 'Target model name', input('model_name', m ? m.model_name : '', 'required placeholder="gpt-4o, claude-sonnet-4-5, qwen2.5:7b …"'))}
+    <div id="modelBlock">
+      ${field('model_name', 'Target model name', input('model_name', m && m.provider_type !== 'azure_openai' ? m.model_name : '', 'required list="presetModels" placeholder="gpt-4o, claude-sonnet-4-5, qwen2.5:7b …"'), '<span id="modelHint"></span>')}
+      <datalist id="presetModels"></datalist>
+    </div>
     <div class="card flat tight stack" style="background:var(--panel2);gap:6px" id="capCard"></div>
     <div id="testOut"></div>`,
-    onSubmit: async d => { const body = { name: d.name, provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name };
+    onSubmit: async (d, f) => { const { name, provider_type, base_url, api_key, model_name } = connValues(f); const body = { name, provider_type, base_url, api_key, model_name };
       if (m) await api('/models/' + m.id, { method: 'PUT', body }); else await api('/models', { method: 'POST', body }); toast('Saved', 3000, 'ok'); await loadAll(); render(); } });
-  const caps = () => { const t = ptype($('[name=provider_type]', form).value);
+  const typeSel = $('[name=provider_type]', form);
+  const caps = () => { const t = ptype(typeSel.value); const isAz = typeSel.value === 'azure_openai';
+    // A hidden block is also disabled, so its fields neither validate nor submit.
+    for (const [id, show] of [['genericBlock', !isAz], ['modelBlock', !isAz], ['azureBlock', isAz]]) { const b = $('#' + id, form); b.classList.toggle('hidden', !show); $$('input,select', b).forEach(el => { el.disabled = !show; }); }
     $('#capCard').innerHTML = `<div class="row between"><span class="dim">Embeddings</span><span class="pill ${t.supports_embeddings ? 'ok' : ''}">${t.supports_embeddings ? 'yes' : 'not supported'}</span></div><div class="row between"><span class="dim">Tool calling</span><span class="pill ${t.supports_tools ? 'ok' : ''}">${t.supports_tools ? 'yes' : 'no'}</span></div><div class="row between"><span class="dim">Streaming</span><span class="pill ${t.supports_streaming ? 'ok' : ''}">${t.supports_streaming ? 'SSE' : 'no'}</span></div><div class="row between"><span class="dim">API key</span><span class="pill">${t.requires_api_key ? 'required' : 'optional'}</span></div>`;
     $('#urlHint').textContent = `Default: ${t.default_base_url || 'none'}${t.type === 'custom_openai' ? ' — a base URL is required for custom_openai.' : '.'} Loopback and private ranges are refused unless allowed by PRIVATE_UPSTREAM_ALLOWLIST / ALLOW_PRIVATE_UPSTREAMS.`;
     $('[name=base_url]', form).placeholder = t.default_base_url || 'https://…'; };
-  $('[name=provider_type]', form).onchange = caps; caps();
+  typeSel.onchange = caps; caps();
+  // Picking a preset always sets the provider type and base URL; the name and
+  // the model are filled only while empty, so what the operator typed stays.
+  // The preset itself is never sent.
+  const presetSel = $('[name=preset_id]', form);
+  if (presetSel) presetSel.onchange = () => {
+    const p = presets.find(x => x.id === presetSel.value); const models = $('#presetModels', form); models.innerHTML = '';
+    if (!p) { $('#modelHint', form).textContent = ''; return; }
+    typeSel.value = p.provider_type; caps();
+    $('[name=base_url]', form).value = p.base_url;
+    const nm = $('[name=name]', form); if (!nm.value.trim()) nm.value = p.id;
+    models.innerHTML = (p.models || []).map(x => `<option value="${esc(x)}"></option>`).join('');
+    const mn = $('[name=model_name]', form); if (!mn.value.trim() && (p.models || []).length) mn.value = p.models[0];
+    $('#modelHint', form).textContent = `${p.label} models: ${(p.models || []).join(', ') || 'any'}${p.embedding_model ? `. Embeddings: ${p.embedding_model}.` : '.'}${p.requires_api_key ? ' An API key is required.' : ''}`;
+  };
   // "Test first" tries the form as typed; when editing with an empty key the
   // stored key of the connection is reused via connection_id.
-  $('#testFirst').onclick = async () => { const d = formData(form); const btn = $('#testFirst'); btn.disabled = true; const out = $('#testOut'); out.innerHTML = '<div class="note"><span class="hint">Testing…</span></div>';
-    try { const body = { provider_type: d.provider_type, base_url: d.base_url, api_key: d.api_key, model_name: d.model_name, mode: 'chat' }; if (m && !d.api_key) body.connection_id = m.id;
+  $('#testFirst').onclick = async () => {
+    // Only the fields the test sends are checked; the connection's name is not one of them.
+    for (const el of Array.from(form.elements)) if (el.name && el.name !== 'name' && el.reportValidity && !el.reportValidity()) return;
+    const c = connValues(form); const btn = $('#testFirst'); btn.disabled = true; const out = $('#testOut'); out.innerHTML = '<div class="note"><span class="hint">Testing…</span></div>';
+    try { const body = { provider_type: c.provider_type, base_url: c.base_url, api_key: c.api_key, model_name: c.model_name, mode: 'chat' }; if (m && !c.api_key) body.connection_id = m.id;
       const r = await api('/models/test', { method: 'POST', body }); out.innerHTML = `<div class="note ${r.ok ? 'ok' : 'err'}"><span class="pill ${r.ok ? 'ok' : 'err'}">${r.ok ? 'ok' : 'failed'} · ${fmtN(r.latency_ms)} ms</span><span class="hint" style="white-space:pre-wrap">${esc(r.ok ? (r.reply ? 'reply: ' + r.reply : 'reachable') : r.error)}</span></div>`; }
     catch (e) { out.innerHTML = `<div class="note err"><span class="hint">${esc(e.message)}</span></div>`; } finally { btn.disabled = false; } };
 }
@@ -911,9 +967,29 @@ function renderRAG() {
   on(app, '[data-open]', 'click', b => { state.openStore = Number(b.dataset.open); $$('[data-open]', app).forEach(x => { const sel = Number(x.dataset.open) === state.openStore; x.classList.toggle('sel', sel); x.setAttribute('aria-pressed', sel); }); renderStorePanel(); });
   if (state.openStore) renderStorePanel();
 }
+// Which connections can serve each rerank backend. The llm backend reranks
+// with a chat model; cohere and voyage need their own dedicated connection
+// type. Anything else is rejected by the server with a 400.
+const RERANK_CONN_TYPE = { cohere: 'cohere_rerank', voyage: 'voyage_rerank' };
+const rerankConnsFor = backend => RERANK_CONN_TYPE[backend] ? state.models.filter(m => m.provider_type === RERANK_CONN_TYPE[backend]) : chatModels();
+// Options for the rerank connection picker. The saved connection is kept as an
+// extra option when the list no longer offers it (an edit must not silently
+// drop it), but only while the backend is the one it was saved with.
+function rerankConnOpts(backend, savedId, keepSaved) {
+  const list = rerankConnsFor(backend);
+  const opts = [{ value: '', label: backend === 'llm' ? '— none (project chat model) —' : '— choose a connection —' }, ...connOpts(list)];
+  if (keepSaved && savedId && !list.some(m => m.id === savedId)) { const m = modelById(savedId); opts.push({ value: savedId, label: `${m ? `${m.name} (${m.provider_type} · ${m.model_name})` : `connection #${savedId}`} — currently saved` }); }
+  return opts;
+}
+function rerankConnHint(backend) {
+  if (backend === 'llm') return 'Optional. A chat connection to rerank with; blank uses the project chat model.';
+  const type = RERANK_CONN_TYPE[backend];
+  return rerankConnsFor(backend).length ? `Required: a <code>${type}</code> connection.` : `Required, and none exists yet. Add a <code>${type}</code> connection under Models first.`;
+}
 function storeForm(r) {
   const emb = embModels();
-  drawer({ eyebrow: r ? 'Edit' : 'New', title: 'RAG store', submitLabel: r ? 'Save store' : 'Create store', body: `
+  const savedBackend = r ? r.rerank_backend || 'llm' : 'llm'; const savedRerankConn = r ? r.rerank_connection_id || 0 : 0;
+  const form = drawer({ eyebrow: r ? 'Edit' : 'New', title: 'RAG store', submitLabel: r ? 'Save store' : 'Create store', body: `
     ${field('name', 'Name', input('name', r ? r.name : '', 'required'))}
     ${field('embedding_connection_id', 'Embedding model connection', select('embedding_connection_id', emb.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), r ? r.embedding_connection_id : undefined, r && r.chunk_count ? 'disabled' : ''), r && r.chunk_count ? 'Locked while the store has chunks.' : '')}
     ${twoCol(field('chunk_size', 'Chunk size (chars)', input('chunk_size', r ? r.chunk_size : 1000, 'type=number min=200 max=20000')), field('chunk_overlap', 'Chunk overlap', input('chunk_overlap', r ? r.chunk_overlap : 200, 'type=number min=0')))}
@@ -922,7 +998,7 @@ function storeForm(r) {
     ${toggle('contextual_chunks', r ? r.contextual_chunks : true, 'Contextual chunks', 'Embed filename and section with each chunk (changing this needs a reprocess).')}
     ${field('fts_config', 'Full-text query config', input('fts_config', r ? r.fts_config || 'simple' : 'simple', 'placeholder=simple'), 'Postgres text search configuration for hybrid queries: <code>simple</code> (no stemming), <code>english</code>, <code>turkish</code>, <code>german</code>… Chunks are always indexed with <code>simple</code>.')}
     ${toggle('rerank', !!(r && r.rerank), 'Rerank the candidates', 'Reorders the candidates on every request (extra latency, and tokens or rerank-API calls).')}
-    ${twoCol(field('rerank_backend', 'Rerank backend', select('rerank_backend', [{ value: 'llm', label: 'llm — the project chat model' }, { value: 'cohere', label: 'cohere — Cohere Rerank API' }, { value: 'voyage', label: 'voyage — Voyage Rerank API' }], r ? r.rerank_backend || 'llm' : 'llm')), field('rerank_connection_id', 'Rerank connection', select('rerank_connection_id', [{ value: 0, label: '— none (llm backend) —' }, ...connOpts(rerankModels())], r ? r.rerank_connection_id || 0 : 0), rerankModels().length ? 'Required by the cohere and voyage backends.' : 'Add a <code>cohere_rerank</code> or <code>voyage_rerank</code> connection under Models first.'))}
+    ${twoCol(field('rerank_backend', 'Rerank backend', select('rerank_backend', [{ value: 'llm', label: 'llm — the project chat model' }, { value: 'cohere', label: 'cohere — Cohere Rerank API' }, { value: 'voyage', label: 'voyage — Voyage Rerank API' }], savedBackend)), field('rerank_connection_id', 'Rerank connection', select('rerank_connection_id', rerankConnOpts(savedBackend, savedRerankConn, true), savedRerankConn || '', savedBackend === 'llm' ? '' : 'required'), `<span id="rerankConnHint">${rerankConnHint(savedBackend)}</span>`))}
     ${twoCol(field('rerank_candidates', 'Rerank candidates', input('rerank_candidates', r ? r.rerank_candidates : 15, 'type=number min=1 max=100')), field('max_distance', 'Max distance (0 = off)', input('max_distance', r ? r.max_distance : 0, 'type=number min=0 max=2 step=0.01')))}
     ${twoCol(field('max_documents', 'Max documents (0 = ∞)', input('max_documents', r ? r.max_documents : 0, 'type=number min=0 step=1')), field('max_mb', 'Max size MB (0 = ∞)', input('max_mb', r && r.max_bytes ? Math.ceil(r.max_bytes / 1048576) : 0, 'type=number min=0 step=1')))}
     <p class="hint">Upload quotas for this store; an instance-wide ceiling (MAX_DOCUMENTS_PER_STORE / MAX_BYTES_PER_STORE_MB) may apply on top. Max distance drops passages whose cosine distance to the query exceeds it.</p>`,
@@ -931,6 +1007,13 @@ function storeForm(r) {
       const res = r ? await api('/rag-stores/' + r.id, { method: 'PUT', body }) : await api('/rag-stores', { method: 'POST', body });
       toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3000, 'ok');
       if (!r && res && res.id) state.openStore = res.id; await loadAll(); render(); } });
+  // The connection list follows the backend. Changing the backend clears the
+  // choice (the server rejects a connection of the wrong type); going back to
+  // the saved backend restores the saved connection.
+  const backendSel = $('[name=rerank_backend]', form); const connSel = $('[name=rerank_connection_id]', form);
+  backendSel.onchange = () => { const b = backendSel.value; const same = b === savedBackend;
+    connSel.innerHTML = optionTags(rerankConnOpts(b, savedRerankConn, same), same && savedRerankConn ? savedRerankConn : '');
+    connSel.required = b !== 'llm'; $('#rerankConnHint', form).innerHTML = rerankConnHint(b); };
 }
 const docStatus = d => d.status === 'processing' || d.status === 'pending' ? `<span class="pill warn">${d.status}${d.progress_percent != null ? ` · ${d.progress_percent}%` : ''}</span>` : d.status === 'failed' ? `<span class="pill err" title="${esc(d.error)}">failed</span>` : '<span class="pill ok">ready</span>';
 async function renderStorePanel() {
@@ -1041,6 +1124,92 @@ function showSecret({ title, key, kind = 'gateway', projects = [] }) {
 function showKey(p, key) {
   showSecret({ title: `API key for ${p.name}`, key, kind: 'gateway', projects: [p.name] });
 }
+// ---------------------------------------------------------------------------
+// routes (per project)
+// ---------------------------------------------------------------------------
+const ROUTE_KINDS = [{ value: 'chat', label: 'chat — chat completions' }, { value: 'embeddings', label: 'embeddings — POST /v1/embeddings' }, { value: 'rerank', label: 'rerank — POST /v1/rerank' }];
+const MAX_ROUTE_TARGETS = 8;
+// A route target must be a connection whose provider can serve the route's
+// kind; the server refuses anything else, so the picker only lists these.
+const connsForRouteKind = kind => kind === 'embeddings' ? state.models.filter(m => pcaps(m.provider_type).embeddings) : kind === 'rerank' ? rerankModels() : chatModels();
+const routeTargetLine = t => `<div class="mono" style="font-size:12.5px"><span>${esc(t.connection_name || '#' + t.connection_id)}</span>${t.model ? ` <span class="dim">→ ${esc(t.model)}</span>` : ''} <span class="muted" title="weight ${t.weight}, priority ${t.priority}">w${t.weight} · p${t.priority}</span></div>`;
+async function renderRoutes(projectId) {
+  const card = $('#routesCard'); if (!card) return; const w = can('editor');
+  const head = (actions = '') => `<div class="card-head"><div><h2>Routes</h2><div class="hint">The request's <code>model</code> picks a route; it spreads calls over its targets by priority, then weight.</div></div><div class="row wrap">${actions}</div></div>`;
+  card.innerHTML = head() + '<div class="hint" role="status">Loading routes…</div>';
+  let routes;
+  try { routes = await api(`/projects/${projectId}/routes`); }
+  catch (e) {
+    if (state.openProject !== projectId || $('#routesCard') !== card) return;
+    card.innerHTML = head() + `<div class="note err" role="alert"><span class="hint">Could not load routes: ${esc(e.message)}</span><span class="grow"></span><button class="btn sm" id="routesRetry">Retry</button></div>`;
+    $('#routesRetry').onclick = () => renderRoutes(projectId); return;
+  }
+  if (state.openProject !== projectId || $('#routesCard') !== card) return;
+  routes = routes || [];
+  card.innerHTML = head(w ? `<button class="btn sm primary" id="addRoute">${ICON.plus} Add route</button>` : '') +
+    `<div class="tbl"><table><thead><tr><th>Name</th><th>Kind</th><th>Strategy</th><th>Targets</th>${w ? '<th><span class="sr">Actions</span></th>' : ''}</tr></thead><tbody>
+    ${routes.map(r => `<tr><td style="font-weight:500">${esc(r.name)}</td><td><span class="pill">${esc(r.kind)}</span></td><td class="mono muted">${esc(r.strategy)}</td><td>${(r.targets || []).map(routeTargetLine).join('') || '<span class="muted">—</span>'}</td>${w ? `<td class="right nowrap"><button class="btn sm ghost" data-redit="${r.id}" aria-label="Edit route ${esc(r.name)}">Edit</button> <button class="btn sm ghost danger" data-rdel="${r.id}" aria-label="Delete route ${esc(r.name)}">Delete</button></td>` : ''}</tr>`).join('') || `<tr><td colspan="${w ? 5 : 4}" class="muted">No routes yet. Without chat routes the project answers whatever <code>model</code> a client sends.</td></tr>`}</tbody></table></div>`;
+  const reload = () => renderRoutes(projectId);
+  if (w) {
+    $('#addRoute').onclick = () => routeForm(projectId, null, routes, reload);
+    on(card, '[data-redit]', 'click', b => routeForm(projectId, routes.find(r => r.id == b.dataset.redit), routes, reload));
+    on(card, '[data-rdel]', 'click', async b => { const r = routes.find(x => x.id == b.dataset.rdel); if (!r) return;
+      if (!await confirmDialog(`Delete route "${r.name}"? Clients that send its name as the model stop resolving to it.`, { label: 'Delete route' })) return;
+      try { await api(`/projects/${projectId}/routes/${r.id}`, { method: 'DELETE' }); toast('Route deleted', 3000, 'ok'); reload(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  }
+}
+function routeForm(projectId, route, routes, onSaved) {
+  const hasChatRoute = routes.some(r => r.kind === 'chat');
+  const savedTargets = route ? route.targets || [] : [];
+  let kind = route ? route.kind : 'chat';
+  let rows = savedTargets.length ? savedTargets.map(t => ({ conn: t.connection_id, model: t.model || '', weight: t.weight, priority: t.priority })) : [{ conn: '', model: '', weight: 1, priority: 0 }];
+  const targetRow = (r, i) => {
+    const list = connsForRouteKind(kind);
+    // The saved connection stays selectable while its kind is unchanged, so an
+    // edit never silently swaps it; the server has the last word on validity.
+    const opts = [{ value: '', label: '— choose a connection —' }, ...connOpts(list)];
+    if (r.conn && !list.some(m => String(m.id) === String(r.conn))) { const m = state.models.find(x => String(x.id) === String(r.conn)); opts.push({ value: r.conn, label: `${m ? `${m.name} (${m.provider_type})` : `connection #${r.conn}`} — currently saved` }); }
+    return `<div class="card flat tight stack" role="group" aria-label="Target ${i + 1}" style="background:var(--panel2);gap:12px" data-row>
+      <div class="row between"><strong>Target ${i + 1}</strong><button type="button" class="btn sm ghost danger" data-rm ${rows.length <= 1 ? 'disabled' : ''} aria-label="Remove target ${i + 1}">Remove</button></div>
+      ${field('t_conn', 'Connection', select('t_conn', opts, r.conn, 'required data-f=conn'))}
+      ${field('t_model', 'Upstream model (optional)', input('t_model', r.model, 'data-f=model maxlength=256 autocomplete=off placeholder="blank = the connection\'s own model"'), 'Replaces the connection\'s model name for calls through this target.')}
+      ${twoCol(field('t_weight', 'Weight (1–1000)', input('t_weight', r.weight, 'type=number min=1 max=1000 step=1 required data-f=weight')), field('t_priority', 'Priority (0–100)', input('t_priority', r.priority, 'type=number min=0 max=100 step=1 required data-f=priority'), 'Lower runs first.'))}
+    </div>`;
+  };
+  const form = drawer({ eyebrow: route ? 'Edit' : 'New', title: route ? `Route · ${route.name}` : 'Route', submitLabel: route ? 'Save route' : 'Create route', body: `
+    ${field('name', 'Name', input('name', route ? route.name : '', 'required maxlength=256 autocomplete=off placeholder="e.g. smart"'), 'Unique within the project. For chat routes this is the <code>model</code> a client sends.')}
+    ${field('kind', 'Kind', select('kind', ROUTE_KINDS, kind))}
+    <div class="note warn hidden" id="rtFirstChat"><span class="hint">The first chat route ends the "any model string works" behaviour: a <code>model</code> that is neither a route name nor the default connection's model name gets <code>404 model_not_found</code>. Check what your clients send first.</span></div>
+    <div class="note warn hidden" id="rtNoConn" role="status"><span class="hint"></span></div>
+    <div class="stack" style="gap:12px" id="rtTargets"></div>
+    <div class="row between"><span class="hint" id="rtCount"></span><button type="button" class="btn sm" id="rtAdd">${ICON.plus} Add target</button></div>`,
+    onSubmit: async (d, f) => {
+      readRows();
+      const body = { name: d.name.trim(), kind, strategy: 'weighted', targets: rows.map(r => ({ connection_id: Number(r.conn), model: r.model.trim() || null, weight: Number(r.weight), priority: Number(r.priority) })) };
+      // A failure throws; drawer() shows it once as a toast and keeps the form open.
+      if (route) await api(`/projects/${projectId}/routes/${route.id}`, { method: 'PUT', body }); else await api(`/projects/${projectId}/routes`, { method: 'POST', body });
+      toast('Route saved', 3000, 'ok'); onSaved();
+    } });
+  const box = $('#rtTargets', form);
+  function readRows() { rows = $$('[data-row]', box).map(el => ({ conn: $('[data-f=conn]', el).value, model: $('[data-f=model]', el).value, weight: $('[data-f=weight]', el).value, priority: $('[data-f=priority]', el).value })); }
+  function paint(focusIdx) {
+    box.innerHTML = rows.map(targetRow).join('');
+    $('#rtCount', form).textContent = `${rows.length} of ${MAX_ROUTE_TARGETS} targets`;
+    $('#rtAdd', form).disabled = rows.length >= MAX_ROUTE_TARGETS;
+    const none = connsForRouteKind(kind).length === 0;
+    const nc = $('#rtNoConn', form); nc.classList.toggle('hidden', !none); $('.hint', nc).textContent = `No connection can serve ${kind} routes yet. Add ${kind === 'rerank' ? 'a cohere_rerank or voyage_rerank' : kind === 'embeddings' ? 'an embeddings-capable' : 'a chat-capable'} connection under Models first.`;
+    $('#rtFirstChat', form).classList.toggle('hidden', !(kind === 'chat' && !hasChatRoute && !(route && route.kind === 'chat')));
+    on(box, '[data-rm]', 'click', b => { readRows(); const i = $$('[data-rm]', box).indexOf(b); rows.splice(i, 1); paint(Math.max(0, i - 1)); });
+    if (focusIdx != null) { const el = $$('[data-f=conn]', box)[focusIdx]; if (el) el.focus(); }
+  }
+  $('[name=kind]', form).onchange = e => { readRows(); kind = e.target.value;
+    // A connection that cannot serve the new kind is cleared, not carried over.
+    rows = rows.map(r => connsForRouteKind(kind).some(m => String(m.id) === String(r.conn)) || (route && route.kind === kind && savedTargets.some(t => String(t.connection_id) === String(r.conn))) ? r : { ...r, conn: '' });
+    paint(); };
+  $('#rtAdd', form).onclick = () => { readRows(); if (rows.length >= MAX_ROUTE_TARGETS) return; rows.push({ conn: '', model: '', weight: 1, priority: 0 }); paint(rows.length - 1); };
+  paint();
+}
+
 async function projectPanel() {
   const id = state.openProject; const panel = $('#projPanel'); const p = state.projects.find(x => x.id === id); if (!p || !panel) return;
   panel.innerHTML = '<div class="card">Loading…</div>'; clearInterval(ringTimer);
@@ -1063,9 +1232,11 @@ async function projectPanel() {
       <div class="stat"><div class="l">Tokens 24h · p / c</div><div class="v" style="font-size:22px">${fmtK(win.prompt_tokens)} / ${fmtK(win.completion_tokens)}</div><div class="d">${fmtN(win.rag_requests)} RAG-augmented</div></div>
       <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(win.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(win.p95_latency_ms)} ms</div></div>
       <div class="stat" title="Estimated from the price table; not a bill"><div class="l">Spend 24h (est.)</div><div class="v">${fmtUSD(win.cost_usd)}</div><div class="d">${fmtUSD(t.cost_usd)} all time · ${fmtN(t.requests)} requests</div></div></div>
+    <div class="card" id="routesCard"></div>
     <div class="card"><div class="card-head"><h2>Recent</h2><span class="hint">last 50 · newest first</span></div>
       <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th title="Estimated from the price table">$ (est.)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
       ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}${r.cached_prompt_tokens ? ` <span class="pill info" title="prompt tokens served from the provider cache">cache ${fmtK(r.cached_prompt_tokens)}</span>` : ''}</td><td class="mono ${r.cost_source === 'none' ? 'muted' : ''}" title="${r.cost_source === 'none' ? 'no price for this model' : 'estimated · ' + esc(r.cost_source) + ' price'}">${r.cost_source === 'none' ? '—' : fmtUSD(r.cost_usd)}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
+  renderRoutes(id);
   // Live countdown on the reset labels; the minute ring is refetched when its window rolls over.
   const resets = { minute: u.minute.resets_at, day: u.day.resets_at, month: u.month.resets_at };
   ringTimer = setInterval(() => { if (state.tab !== 'projects' || state.openProject !== id) { clearInterval(ringTimer); return; }
@@ -1169,8 +1340,8 @@ function keyStatus(k) {
 }
 const keyLastUsed = k => k.last_used_at ? `${fmtDur(Date.now() - new Date(k.last_used_at))} ago` : 'never';
 const keyKindPill = k => `<span class="pill ${k.kind === 'management' ? 'violet' : 'info'}">${esc(k.kind)}</span>`;
-const SCOPE_HINTS = { chat: 'POST /v1/chat/completions', models: 'GET /v1/models', read: 'every listing', write: 'the editor routes', admin: 'users and the audit log', keys: 'minting api keys' };
-const scopesFor = kind => kind === 'management' ? ['read', 'write', 'admin', 'keys'] : ['chat', 'models'];
+const SCOPE_HINTS = { chat: 'POST /v1/chat/completions', models: 'GET /v1/models', embeddings: 'POST /v1/embeddings', retrieve: 'POST /v1/retrieve', rerank: 'POST /v1/rerank', read: 'every listing', write: 'the editor routes', admin: 'users and the audit log', keys: 'minting api keys' };
+const scopesFor = kind => kind === 'management' ? ['read', 'write', 'admin', 'keys'] : ['chat', 'models', 'embeddings', 'retrieve', 'rerank'];
 const EXPIRY_CHOICES = [{ value: '', label: 'never expires' }, { value: '30', label: 'in 30 days' }, { value: '90', label: 'in 90 days' }, { value: '365', label: 'in a year' }];
 const expiryISO = days => days ? new Date(Date.now() + Number(days) * 86400e3).toISOString() : '';
 
@@ -1239,7 +1410,10 @@ function keyForm(k) {
       <p class="hint">0 = unlimited. These sit under the project's own limits, against separate counters: the tighter of the two decides and the <code>429</code> says which with <code>"scope"</code>.</p></div>`,
     onSubmit: async (d, fm) => {
       const kd = editing ? k.kind : d.kind;
-      const body = { kind: kd, name: d.name, scopes: checkedStrings(fm, 'scopes') };
+      const scopes = checkedStrings(fm, 'scopes');
+      // An empty list would make the server grant every scope, so refuse it here.
+      if (!scopes.length) throw new Error('Pick at least one scope.');
+      const body = { kind: kd, name: d.name, scopes };
       if (!editing && can('admin') && Number(d.user_id) !== state.user.id) body.user_id = Number(d.user_id);
       body.expires_at = d.expires === 'keep' ? (k.expires_at || '') : expiryISO(d.expires);
       if (kd === 'gateway') {
@@ -1256,7 +1430,10 @@ function keyForm(k) {
   const paint = () => {
     const kd = editing ? kind : $('[name=kind]', form).value;
     const chosen = k ? k.scopes || [] : scopesFor(kd);
-    $('#scopeList').innerHTML = checklist('scopes', scopesFor(kd).map(s => ({ value: s, label: `${s} — ${SCOPE_HINTS[s]}` })), chosen);
+    // A scope this dashboard does not know is listed too, checked, so saving
+    // an edit never drops what the key already had.
+    const known = scopesFor(kd); const extra = (k ? k.scopes || [] : []).filter(s => !known.includes(s));
+    $('#scopeList').innerHTML = checklist('scopes', [...known, ...extra].map(s => ({ value: s, label: `${s} — ${SCOPE_HINTS[s] || 'not recognised by this dashboard; kept as is'}` })), chosen);
     $('#gatewayBox').classList.toggle('hidden', kd !== 'gateway');
     // The owner is looked up on every request either way, but only /admin/api
     // intersects the role. Saying "the role is checked as well" on a gateway
