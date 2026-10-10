@@ -289,7 +289,9 @@ func run(cfg config.Config) error {
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
 		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer,
-		UpstreamTimeout: cfg.UpstreamTimeout, MaxRetries: cfg.UpstreamMaxRetries}
+		UpstreamTimeout: cfg.UpstreamTimeout, MaxRetries: cfg.UpstreamMaxRetries,
+		Breakers: gateway.NewBreakers(cfg.BreakerFailureThreshold, cfg.BreakerOpenDuration, log)}
+	met.RegisterBreakers(gw.Breakers.Snapshot)
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
 		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,

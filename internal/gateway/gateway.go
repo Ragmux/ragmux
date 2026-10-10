@@ -64,6 +64,9 @@ type Gateway struct {
 	// Sleep waits between a failed attempt and its retry. Nil uses a timer;
 	// tests inject one that records the wait instead of taking it.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Breakers holds the per-connection circuit breakers (ADR-020); nil
+	// disables them.
+	Breakers *Breakers
 }
 
 // requestObs collects the facts about one chat completion that the request

@@ -281,3 +281,35 @@ func TestLoadUpstreamMaxRetries(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadBreakerSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BreakerFailureThreshold != 5 || c.BreakerOpenDuration != 30*time.Second {
+		t.Errorf("defaults = %d, %s, want 5, 30s", c.BreakerFailureThreshold, c.BreakerOpenDuration)
+	}
+
+	// 0 is the documented way to turn the breaker off, not an error.
+	t.Setenv("BREAKER_FAILURE_THRESHOLD", "0")
+	t.Setenv("BREAKER_OPEN_DURATION", "2m")
+	if c, err = Load(); err != nil || c.BreakerFailureThreshold != 0 || c.BreakerOpenDuration != 2*time.Minute {
+		t.Errorf("threshold 0, open 2m: %d, %s, %v", c.BreakerFailureThreshold, c.BreakerOpenDuration, err)
+	}
+	for _, bad := range []string{"-1", "five", "1.5"} {
+		t.Setenv("BREAKER_FAILURE_THRESHOLD", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("BREAKER_FAILURE_THRESHOLD=%q accepted", bad)
+		}
+	}
+	t.Setenv("BREAKER_FAILURE_THRESHOLD", "5")
+	for _, bad := range []string{"0", "-5s", "30", "soon"} {
+		t.Setenv("BREAKER_OPEN_DURATION", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("BREAKER_OPEN_DURATION=%q accepted", bad)
+		}
+	}
+}

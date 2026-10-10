@@ -147,6 +147,7 @@ which the success, error, mid-stream-failure and client-disconnect paths all rea
 | `ragmux_gateway_client_disconnects_total` | counter | — | Completions the client abandoned (status 499). |
 | `ragmux_upstream_retries_total` | counter | `reason` | Retries of the same target. `reason` is `dial`, `rate_limited`, `unavailable`, `server_error`, `timeout` or `target_config` and nothing else. |
 | `ragmux_upstream_fallbacks_total` | counter | `reason` | Moves to a route's next target, with the same closed `reason` set as the retries. |
+| `ragmux_upstream_breaker_state` | gauge | `connection` | Circuit breaker of a model connection on this replica: `0` closed, `1` open, `2` half-open. `connection` is the connection's configured name; it grows with the installation, not with traffic, and each name takes a slot under `METRICS_MAX_SERIES`. A connection appears once this replica has called it and disappears after an hour without traffic; with `BREAKER_FAILURE_THRESHOLD=0` no series is exported. |
 | `ragmux_requests_unpriced_total` | counter | `provider` | Successful completions whose model has no entry in the price table, so their spend is missing from `cost_usd_total` and the request log. `provider` is the provider type, a fixed set. |
 
 `tokens_estimated_total` is a separate metric rather than a `estimated="true"` label on

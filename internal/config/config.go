@@ -46,6 +46,13 @@ type Config struct {
 	// UpstreamMaxRetries is how many times the gateway repeats a failed call
 	// on the same target before moving on. 0 disables retries.
 	UpstreamMaxRetries int
+	// BreakerFailureThreshold is how many consecutive counted failures open
+	// the circuit breaker of a model connection on this replica. 0 disables
+	// the breaker.
+	BreakerFailureThreshold int
+	// BreakerOpenDuration is how long an open breaker skips its connection
+	// before one probe request is let through.
+	BreakerOpenDuration time.Duration
 	// IngestWorkers is the number of concurrent document ingestion jobs.
 	IngestWorkers int
 	// IngestLease is how long a replica owns a document it claimed without
@@ -194,6 +201,9 @@ func Load() (Config, error) {
 		IngestWorkers:      2,
 		MaxUploadBytes:     50 << 20,
 
+		BreakerFailureThreshold: 5,
+		BreakerOpenDuration:     30 * time.Second,
+
 		IngestLease:         2 * time.Minute,
 		IngestPollInterval:  5 * time.Second,
 		IngestMaxAttempts:   5,
@@ -282,6 +292,20 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid UPSTREAM_MAX_RETRIES %q (0 to %d)", v, MaxUpstreamRetries)
 		}
 		c.UpstreamMaxRetries = n
+	}
+	if v := os.Getenv("BREAKER_FAILURE_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return c, fmt.Errorf("invalid BREAKER_FAILURE_THRESHOLD %q (0 disables the breaker)", v)
+		}
+		c.BreakerFailureThreshold = n
+	}
+	if v := os.Getenv("BREAKER_OPEN_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return c, fmt.Errorf("invalid BREAKER_OPEN_DURATION %q (a positive duration such as 30s)", v)
+		}
+		c.BreakerOpenDuration = d
 	}
 	if v := os.Getenv("INGEST_WORKERS"); v != "" {
 		n, err := strconv.Atoi(v)

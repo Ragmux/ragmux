@@ -742,6 +742,40 @@ upstream that answers `2xx` and fails before it sends anything. After the respon
 went out the stream is never restarted or joined to another one: a cut stream ends the way
 it did before.
 
+**Circuit breaker.** A connection that keeps failing is taken out of the candidate list for
+a while, so retries and fallbacks do not spend the budget on a dead target. Every
+connection has its own breaker, held in memory by each replica; it is never written to the
+database, so replicas do not share it. A breaker has three states:
+
+- `closed`: calls pass and consecutive failures are counted. A success resets the count.
+- `open`: reached after `BREAKER_FAILURE_THRESHOLD` failures in a row (default `5`, `0`
+  turns breaking off). The connection is skipped for `BREAKER_OPEN_DURATION` (default
+  `30s`), and a target that opens in the middle of a request is not retried any more.
+- `half-open`: once the duration has passed, one call goes through as a probe. If it
+  succeeds the breaker closes; if it fails the breaker opens again for a full duration.
+  Other requests keep skipping the connection while the probe is in flight, and a probe
+  that ends in a way that says nothing about the upstream, such as a client that went
+  away, frees the slot for the next request.
+
+What counts as a failure is what the table above calls an upstream fault: the request
+never left (DNS, refused connection, TLS handshake), a reset after it was sent, `429`,
+`503` and `529`, other `5xx`, and `504` or a timeout. `401`, `403` and `404` do not count,
+although they still hand the request to the next target, and neither do other `4xx` or a
+client that went away. Such an attempt leaves the count where it was. The same holds for
+a stream: a client that leaves before or during it, or an upstream that fails after its
+first byte (the client already got a `200`), is neither a success nor a failure, so it
+neither resets the count nor closes a half-open breaker.
+
+An open connection is skipped when the route's targets are walked, so a request goes
+straight to the next healthy one. When every target of a route is open, the first one is
+called exactly once, without retries; there is no immediate `503`, so a recovered upstream
+is noticed by the first request that reaches it. A project without routes has one target
+and behaves as before. The state is per replica, so a fleet of `N` replicas sends up to `N`
+probes to a bad upstream, and a restart starts every breaker `closed`. Opening and closing
+are logged at `warn` and `info` level with the connection name, and
+`ragmux_upstream_breaker_state` reports the state per connection
+([Observability](observability.md#the-metric-set)).
+
 **What the client sees.** The error of the last attempt, in the format of
 [Error relay and redaction](#error-relay-and-redaction). A fallback that succeeds is
 invisible apart from the request log: one row per request, `attempt` is the number of

@@ -424,6 +424,25 @@ func (m *Metrics) RecordUpstreamFallback(reason string) {
 	m.upstreamFallbacks.With(reason).Inc()
 }
 
+// RegisterBreakers exports the state of the circuit breakers (ADR-020) as
+// ragmux_upstream_breaker_state{connection}: 0 closed, 1 open, 2 half-open.
+// snapshot returns the state by connection name and runs inline while a scrape
+// is built, so it must be cheap and in memory. The connection label is the
+// configured connection name -- owned by the control plane, not derived from
+// traffic, but it grows with the installation like the project label of the
+// budget gauge, so each new name takes a slot under the series cap (ADR-002).
+// A connection appears once this replica has called it.
+func (m *Metrics) RegisterBreakers(snapshot func() (map[string]float64, error)) {
+	if m == nil || snapshot == nil {
+		return
+	}
+	m.reg.CappedCachedGaugeFunc("ragmux_upstream_breaker_state",
+		"Circuit breaker state of a model connection on this replica: 0 closed, 1 open, 2 half-open. "+
+			"State is per replica and not shared. Absent until the replica has called the connection, "+
+			"and while the breaker is disabled (BREAKER_FAILURE_THRESHOLD=0).",
+		"connection", 0, snapshot)
+}
+
 // ---- rag ----
 
 // RecordRetrieval records one completed retrieval. backend is the backend

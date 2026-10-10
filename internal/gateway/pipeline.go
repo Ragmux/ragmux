@@ -364,12 +364,32 @@ func (g *Gateway) invoke(c *call, up upstreamCall) {
 	}()
 
 	var err error
+	forced := false      // every candidate was open: the primary is tried once, without retries
+	fallbackReason := "" // a fallback is counted once the next target is really tried
 	for i, target := range c.targets {
+		var probe probeToken
+		if !forced {
+			var ok bool
+			if ok, probe = g.Breakers.allow(target); !ok {
+				if i < len(c.targets)-1 || err != nil {
+					continue // an open target is skipped (ADR-020)
+				}
+				// Every candidate is open: the primary goes once, with no
+				// retry and no fail-fast answer.
+				i, target, forced, probe = 0, c.targets[0], true, 0
+			}
+		}
+		if fallbackReason != "" {
+			g.Metrics.RecordUpstreamFallback(fallbackReason)
+			fallbackReason = ""
+		}
 		c.conn = target
 		var cl attemptClass
 		for retries := 0; ; retries++ {
 			attempts++
-			if err = up.attempt(c, target); err == nil {
+			err = up.attempt(c, target)
+			g.Breakers.report(target, probe, outcomeOf(c, err))
+			if err == nil {
 				return
 			}
 			var tc *targetConfigError
@@ -380,7 +400,7 @@ func (g *Gateway) invoke(c *call, up upstreamCall) {
 			}
 			cl = classifyAttempt(err)
 			g.logAttempt(c, target, attempts, cl, err)
-			if c.ctx().Err() != nil || c.budgetSpent() || !cl.retry || retries >= g.MaxRetries {
+			if c.ctx().Err() != nil || c.budgetSpent() || !cl.retry || retries >= g.MaxRetries || forced || g.Breakers.isOpen(target.ID) {
 				break
 			}
 			wait := retryWait(retries, g.rng()(), cl.retryAfter)
@@ -394,10 +414,10 @@ func (g *Gateway) invoke(c *call, up upstreamCall) {
 				break
 			}
 		}
-		if i == len(c.targets)-1 || !cl.fallback || c.ctx().Err() != nil || c.budgetSpent() {
+		if i == len(c.targets)-1 || !cl.fallback || forced || c.ctx().Err() != nil || c.budgetSpent() {
 			break
 		}
-		g.Metrics.RecordUpstreamFallback(cl.reason)
+		fallbackReason = cl.reason
 	}
 	g.failInvoke(c, err)
 }

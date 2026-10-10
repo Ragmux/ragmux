@@ -24,6 +24,12 @@ All notable changes to Ragmux are documented here. The format follows
   together. A request is still one `request_logs` row, with `attempt` and `fallback_from`
   filled in. New metrics `ragmux_upstream_retries_total` and
   `ragmux_upstream_fallbacks_total`. See [Retry and fallback](docs/providers.md#retry-and-fallback).
+- **Circuit breaker per model connection.** A connection that fails `BREAKER_FAILURE_THRESHOLD`
+  times in a row (default `5`, `0` disables) is skipped by fallback for `BREAKER_OPEN_DURATION`
+  (default `30s`), then probed with a single call. When every target of a route is open the
+  first one is called once, without retries. State is in memory and per replica. New metric
+  `ragmux_upstream_breaker_state{connection}` (`0` closed, `1` open, `2` half-open). See
+  [Retry and fallback](docs/providers.md#retry-and-fallback).
 - `request_logs` gains `request_id`, `endpoint`, `requested_model`, `route`, `attempt` and
   `fallback_from` (migrations `0016`, `0017`); see
   [the request log](docs/observability.md#the-request-log). `0017` builds its index
