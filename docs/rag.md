@@ -9,7 +9,7 @@ listed in the [API reference](api.md#rag-stores-and-documents).
 
 | Field | Default | Meaning |
 |---|---|---|
-| `embedding_connection_id` | — | Model connection used to embed chunks and queries (`openai`, `gemini`, `ollama`, `custom_openai` or `deepseek` type). Fixed once the store has chunks |
+| `embedding_connection_id` | — | Model connection used to embed chunks and queries (`openai`, `gemini`, `ollama` or `custom_openai` type). Fixed once the store has chunks |
 | `chunk_size` | `1000` | Characters per chunk (200-20000) |
 | `chunk_overlap` | `200` | Characters carried over between consecutive chunks (`< chunk_size`) |
 | `top_k` | `5` | Passages injected per request (≤ 50) |

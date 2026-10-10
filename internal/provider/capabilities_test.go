@@ -9,16 +9,13 @@ var providerTypes = []string{"openai", "deepseek", "custom_openai", "anthropic",
 // describes: Embeddings must agree with NewEmbedder, and Streaming holds for
 // every type New builds an adapter for.
 func TestCapabilitiesMatchRegistry(t *testing.T) {
-	// DeepSeek is the one deliberate narrowing: the adapter builds, because
-	// DeepSeek speaks the OpenAI wire format, but there is no embeddings
-	// endpoint behind it and /admin/api/provider-types has always said so.
 	for _, pt := range providerTypes {
 		caps := CapabilitiesFor(pt)
 		_, err := NewEmbedder(Config{ProviderType: pt})
 		switch {
 		case caps.Embeddings && err != nil:
 			t.Errorf("%s: Embeddings claimed but NewEmbedder err = %v", pt, err)
-		case !caps.Embeddings && err == nil && pt != "deepseek":
+		case !caps.Embeddings && err == nil:
 			t.Errorf("%s: NewEmbedder builds an adapter the table does not report", pt)
 		}
 		if _, err := New(Config{ProviderType: pt}); err != nil {

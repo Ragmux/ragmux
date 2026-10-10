@@ -580,7 +580,7 @@ const heroHtml = () => `<section class="auth-hero"><div class="glow"></div>
   <div class="stack" style="gap:18px;max-width:460px"><h1>One endpoint.<br>Every model.<br>Your documents.</h1>
     <p class="lede" style="font-size:15px">OpenAI-compatible proxy over OpenAI, Anthropic, Gemini, DeepSeek and Ollama, with hybrid RAG, per-project keys and budgets, on your own PostgreSQL.</p>
     <div class="row wrap" style="gap:8px"><span class="pill">AGPL-3.0</span><span class="pill" id="heroVersion">${state.system && state.system.version ? 'v' + esc(state.system.version) : 'gateway'}</span><span class="pill">pgvector</span><span class="pill">AES-GCM sealed keys</span></div></div>
-  <div class="hint mono">ragmux.com · github.com/Ragmux/ragmux</div></section>`;
+  <div class="hint mono">ragmux.com · github.com/ragmux/ragmux</div></section>`;
 async function heroVersion() {
   try { const r = await fetch('/healthz'); const j = await r.json(); const el = $('#heroVersion'); if (el && j.version) el.textContent = 'v' + j.version; } catch (e) { /* the pill keeps its placeholder */ }
 }

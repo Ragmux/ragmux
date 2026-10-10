@@ -499,7 +499,7 @@ The summary response (also used by `/projects/{id}/metrics`):
 `rag_used` is false). `api_key_id` and `user_id` attribute the request to the user-owned
 key that made it and are `null` for a project's default key; the owner is denormalised so
 deleting the key later leaves `user_id` in place. Status semantics (`429`, `499`,
-`502`/`504`) are described in
+`502`, `503`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
 Cost fields appear on the summary objects (`window`, `total`, `previous`), on each

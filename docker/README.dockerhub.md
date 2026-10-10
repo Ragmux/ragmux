@@ -11,8 +11,8 @@ Providers: `openai`, `anthropic`, `gemini`, `deepseek`, `ollama` and `custom_ope
 an embedded dashboard at `/admin/`.
 
 - Website: https://ragmux.com
-- Source and issues: https://github.com/Ragmux/ragmux
-- Documentation: https://github.com/Ragmux/ragmux/tree/main/docs
+- Source and issues: https://github.com/ragmux/ragmux
+- Documentation: https://github.com/ragmux/ragmux/tree/main/docs
 
 ## Which tag do I want?
 
@@ -28,7 +28,7 @@ the exact version (`ragmux/ragmux:1.2.3`), the minor series (`ragmux/ragmux:1.2`
 
 The `-app` image needs a PostgreSQL with the `vector` extension available and a role that
 may create tables in `public`; see
-[Database privileges](https://github.com/Ragmux/ragmux/blob/main/docs/configuration.md#database-privileges).
+[Database privileges](https://github.com/ragmux/ragmux/blob/main/docs/configuration.md#database-privileges).
 
 **`latest` is for trying it out; pin a version in production.** The commands below use
 `latest` so they keep working as you read them, but a deployment you care about should
@@ -55,7 +55,7 @@ unattended install pass `-e ADMIN_USER=admin -e ADMIN_PASSWORD=...` instead and 
 account is created on first start. `ADMIN_PASSWORD` follows the same rule (at least 12
 characters, at most 72 bytes): on an empty database a shorter one stops the container
 with an error instead of creating a weak account. See the
-[configuration reference](https://github.com/Ragmux/ragmux/blob/main/docs/configuration.md#environment-variables).
+[configuration reference](https://github.com/ragmux/ragmux/blob/main/docs/configuration.md#environment-variables).
 
 Two things worth knowing about that command:
 
@@ -64,7 +64,7 @@ Two things worth knowing about that command:
   to back up together with the database. Keep the key with your backups.
 - **The port is bound to loopback.** Put a TLS-terminating reverse proxy in front for
   network access and set `TRUST_PROXY_HEADERS` / `SECURE_COOKIES`; see
-  [Behind a reverse proxy](https://github.com/Ragmux/ragmux/blob/main/docs/configuration.md#behind-a-reverse-proxy).
+  [Behind a reverse proxy](https://github.com/ragmux/ragmux/blob/main/docs/configuration.md#behind-a-reverse-proxy).
   Change the mapping to `-p 8765:8765` only deliberately.
 
 Everything persistent is under `/data`: `/data/pg` is the PostgreSQL cluster and
@@ -87,9 +87,9 @@ embedded server (`EMBEDDED_POSTGRES=false` does the same explicitly).
 
 Compose files for both layouts — plus the split, ParadeDB, multi-replica, OpenTelemetry
 and scheduled-backup variants — are in the repository:
-[`docker-compose.yml`](https://github.com/Ragmux/ragmux/blob/main/docker-compose.yml),
-[`docker-compose.split.yml`](https://github.com/Ragmux/ragmux/blob/main/docker-compose.split.yml),
-[`docker-compose.paradedb.yml`](https://github.com/Ragmux/ragmux/blob/main/docker-compose.paradedb.yml).
+[`docker-compose.yml`](https://github.com/ragmux/ragmux/blob/main/docker-compose.yml),
+[`docker-compose.split.yml`](https://github.com/ragmux/ragmux/blob/main/docker-compose.split.yml),
+[`docker-compose.paradedb.yml`](https://github.com/ragmux/ragmux/blob/main/docker-compose.paradedb.yml).
 
 ## Calling the gateway
 
@@ -111,7 +111,7 @@ credentials and whether retrieved passages are injected into the system prompt.
 
 Nothing is required to start. The environment variables the images read, their defaults
 and the `-healthcheck` / `-version` flags are documented in
-[Configuration](https://github.com/Ragmux/ragmux/blob/main/docs/configuration.md). The
+[Configuration](https://github.com/ragmux/ragmux/blob/main/docs/configuration.md). The
 ones you are most likely to set: `SECRET_KEY`, `DATABASE_URL`, `ADMIN_USER` /
 `ADMIN_PASSWORD`, `LOG_LEVEL`, `CORS_ORIGINS`, `TRUST_PROXY_HEADERS`, and
 `PRIVATE_UPSTREAM_ALLOWLIST` when your model server (Ollama, vLLM) is on a private
@@ -137,23 +137,23 @@ The certificate identity must be `release.yml` in this repository running for a 
 anything else means the image did not come from the release pipeline. The signature is
 attached to the manifest digest, so it also covers the `<major>.<minor>` and `latest` tags
 pointing at the same release. See
-[Verifying the container image](https://github.com/Ragmux/ragmux/blob/main/SECURITY.md#verifying-the-container-image).
+[Verifying the container image](https://github.com/ragmux/ragmux/blob/main/SECURITY.md#verifying-the-container-image).
 
 The same images are also published to GitHub Container Registry as
 `ghcr.io/ragmux/ragmux` with identical tags.
 
 ## Documentation
 
-- [Configuration](https://github.com/Ragmux/ragmux/blob/main/docs/configuration.md) — every environment variable, deployment layouts, reverse-proxy notes
-- [API reference](https://github.com/Ragmux/ragmux/blob/main/docs/api.md) — authentication, the `/v1` surface, error envelope, health endpoints
-- [Retrieval (RAG)](https://github.com/Ragmux/ragmux/blob/main/docs/rag.md) — formats, chunking, hybrid search and the `pgvector` / `pg_search` backends
-- [Users, roles and limits](https://github.com/Ragmux/ragmux/blob/main/docs/users-and-limits.md) — roles, API keys, rate limits and budgets
-- [Providers](https://github.com/Ragmux/ragmux/blob/main/docs/providers.md) — provider types and translation details
-- [Backup and restore](https://github.com/Ragmux/ragmux/blob/main/docs/backup-restore.md) — what to back up, scripts, restore runbook
-- [Scaling](https://github.com/Ragmux/ragmux/blob/main/docs/scaling.md) — several replicas against one PostgreSQL
-- [Observability](https://github.com/Ragmux/ragmux/blob/main/docs/observability.md) — `/metrics`, OpenTelemetry traces, `/readyz` vs `/healthz`
-- [Changelog](https://github.com/Ragmux/ragmux/blob/main/CHANGELOG.md)
-- [Security policy](https://github.com/Ragmux/ragmux/blob/main/SECURITY.md)
+- [Configuration](https://github.com/ragmux/ragmux/blob/main/docs/configuration.md) — every environment variable, deployment layouts, reverse-proxy notes
+- [API reference](https://github.com/ragmux/ragmux/blob/main/docs/api.md) — authentication, the `/v1` surface, error envelope, health endpoints
+- [Retrieval (RAG)](https://github.com/ragmux/ragmux/blob/main/docs/rag.md) — formats, chunking, hybrid search and the `pgvector` / `pg_search` backends
+- [Users, roles and limits](https://github.com/ragmux/ragmux/blob/main/docs/users-and-limits.md) — roles, API keys, rate limits and budgets
+- [Providers](https://github.com/ragmux/ragmux/blob/main/docs/providers.md) — provider types and translation details
+- [Backup and restore](https://github.com/ragmux/ragmux/blob/main/docs/backup-restore.md) — what to back up, scripts, restore runbook
+- [Scaling](https://github.com/ragmux/ragmux/blob/main/docs/scaling.md) — several replicas against one PostgreSQL
+- [Observability](https://github.com/ragmux/ragmux/blob/main/docs/observability.md) — `/metrics`, OpenTelemetry traces, `/readyz` vs `/healthz`
+- [Changelog](https://github.com/ragmux/ragmux/blob/main/CHANGELOG.md)
+- [Security policy](https://github.com/ragmux/ragmux/blob/main/SECURITY.md)
 
 ## License
 
@@ -161,4 +161,4 @@ Ragmux is free software licensed under the **GNU Affero General Public License v
 later** (AGPL-3.0-or-later). The AGPL's network-service clause applies: if you run a
 modified version as a service that users interact with over a network, you must offer
 those users the corresponding source of your modified version. See
-[LICENSE](https://github.com/Ragmux/ragmux/blob/main/LICENSE).
+[LICENSE](https://github.com/ragmux/ragmux/blob/main/LICENSE).

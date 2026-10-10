@@ -1,6 +1,6 @@
 # Ragmux — self-hosted AI gateway
 
-[![Designed & Maintained with Tan](https://www.muhammetsafak.com.tr/badges/designed-maintained-with-tan.svg)](https://www.muhammetsafak.com.tr/en/tan/)
+[![Designed & Maintained with Tan](https://muhammetsafak.com/badges/designed-maintained-with-tan.svg)](https://muhammetsafak.com/tan/)
 
 <https://ragmux.com>
 
@@ -128,7 +128,7 @@ container gives you: **your own PostgreSQL**, the **split layout** (the gateway 
 **backup** profile and the `scripts/` helpers. It works from a clone of the repository:
 
 ```bash
-git clone https://github.com/Ragmux/ragmux.git
+git clone https://github.com/ragmux/ragmux.git
 cd ragmux
 cp .env.example .env
 echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env   # keep it with your backups
