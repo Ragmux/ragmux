@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // RequestLog is one proxied chat completion.
@@ -38,9 +39,47 @@ type RequestLog struct {
 	// made it; both are nil for a project's default key. UserID is
 	// denormalised so deleting the key (ON DELETE SET NULL) never loses who
 	// spent the tokens.
-	APIKeyID  *int64 `json:"api_key_id"`
-	UserID    *int64 `json:"user_id"`
-	CreatedAt string `json:"created_at"`
+	APIKeyID *int64 `json:"api_key_id"`
+	UserID   *int64 `json:"user_id"`
+	// RequestID is the id the client received in X-Request-Id.
+	RequestID string `json:"request_id,omitempty"`
+	// Endpoint is the /v1 endpoint that served the row ("chat.completions").
+	Endpoint string `json:"endpoint,omitempty"`
+	// RequestedModel is the model string the client sent, cut to
+	// MaxRequestedModelBytes when it is longer. Empty when the client sent none.
+	RequestedModel string `json:"requested_model,omitempty"`
+	// Route is the route that picked the targets; empty when none was used.
+	Route string `json:"route,omitempty"`
+	// Attempt is the total upstream attempts made (ADR-020); zero for a denial
+	// that never reached the upstream.
+	Attempt int `json:"attempt,omitempty"`
+	// FallbackFrom is the connection id of the first target when a fallback
+	// served the request; nil otherwise. All of these are empty on rows
+	// written before migration 0016.
+	FallbackFrom *int64 `json:"fallback_from,omitempty"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// MaxRequestedModelBytes bounds request_logs.requested_model. The value is the
+// client's own string, so without a bound one request could leave a row as
+// large as the request body.
+const MaxRequestedModelBytes = 256
+
+// clampClientText makes a client-chosen string fit a log column: NUL bytes
+// are dropped (PostgreSQL text cannot hold them, and the insert would fail)
+// and the rest is cut to at most limit bytes on a character boundary.
+func clampClientText(s string, limit int) string {
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // CostSourceNone marks a request whose model matched no price row.
@@ -58,11 +97,13 @@ func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO request_logs
 		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed,
 		 rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens, cost_micros, cost_source,
-		 api_key_id, user_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		 api_key_id, user_id, request_id, endpoint, requested_model, route, attempt, fallback_from)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+		 NULLIF($18, ''), NULLIF($19, ''), NULLIF($20, ''), NULLIF($21, ''), NULLIF($22::int, 0)::smallint, $23)`,
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
 		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error,
-		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source, l.APIKeyID, l.UserID)
+		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source, l.APIKeyID, l.UserID,
+		l.RequestID, l.Endpoint, clampClientText(l.RequestedModel, MaxRequestedModelBytes), l.Route, l.Attempt, l.FallbackFrom)
 	return err
 }
 
@@ -203,7 +244,9 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 	}
 	q := `SELECT id, project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated,
 		latency_ms, streamed, rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens,
-		cost_micros, cost_source, api_key_id, user_id, created_at FROM request_logs WHERE true`
+		cost_micros, cost_source, api_key_id, user_id,
+		COALESCE(request_id, ''), COALESCE(endpoint, ''), COALESCE(requested_model, ''), COALESCE(route, ''),
+		COALESCE(attempt, 0), fallback_from, created_at FROM request_logs WHERE true`
 	cond, args := f.where(nil)
 	args = append(args, limit)
 	q += cond + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
@@ -220,7 +263,8 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 		if err := rows.Scan(&l.ID, &l.ProjectID, &l.ModelName, &l.StatusCode, &l.PromptTokens, &l.CompletionTokens,
 			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.RAGHits, &l.Error,
 			&l.CachedPromptTokens, &l.CacheWriteTokens, &l.CostMicros, &l.CostSource,
-			&l.APIKeyID, &l.UserID, &created); err != nil {
+			&l.APIKeyID, &l.UserID, &l.RequestID, &l.Endpoint, &l.RequestedModel, &l.Route,
+			&l.Attempt, &l.FallbackFrom, &created); err != nil {
 			return nil, err
 		}
 		l.CreatedAt = ts(created)

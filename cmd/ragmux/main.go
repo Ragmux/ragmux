@@ -508,9 +508,18 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 				// scrape is already counted in the metrics it fetches.
 				return
 			}
-			log.Info("http", "method", r.Method, "path", r.URL.Path, "status", ww.Status(),
+			reqID := middleware.GetReqID(r.Context())
+			attrs := []any{"method", r.Method, "path", r.URL.Path, "status", ww.Status(),
 				"bytes", ww.BytesWritten(), "dur_ms", time.Since(start).Milliseconds(),
-				"req_id", middleware.GetReqID(r.Context()))
+				"req_id", reqID}
+			// A /v1 response carries the id the client knows the request by
+			// (X-Request-Id). When that is the client's own value it differs
+			// from req_id, so log it beside it: it is how a client's id finds
+			// this line. The gateway validated the value before echoing it.
+			if clientID := ww.Header().Get("X-Request-Id"); clientID != "" && clientID != reqID {
+				attrs = append(attrs, "client_req_id", clientID)
+			}
+			log.Info("http", attrs...)
 		})
 	}
 }

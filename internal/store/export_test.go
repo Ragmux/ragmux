@@ -74,3 +74,7 @@ func (s *Store) SetBM25Ready(ready bool) { s.bm25Ready.Store(ready) }
 
 // EnsureBM25Index is what the pg_search backend's Prepare calls.
 func (s *Store) EnsureBM25Index(ctx context.Context) error { return s.ensureBM25Index(ctx) }
+
+// LockNoTxMigrations is the advisory lock key applyOutsideTx serialises on,
+// for tests that hold it.
+const LockNoTxMigrations = lockNoTxMigrations

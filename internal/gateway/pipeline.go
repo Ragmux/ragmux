@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
+
 	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/obs"
@@ -49,6 +51,8 @@ type operation struct {
 	// scope is the gateway scope the key must hold, and what names the endpoint
 	// in the insufficient_scope message.
 	scope, what string
+	// endpoint is the request_logs.endpoint value of the rows it writes.
+	endpoint string
 }
 
 // chatOperation is POST /v1/chat/completions.
@@ -57,6 +61,8 @@ var chatOperation = operation{
 	span:  "gateway.chat_completion",
 	scope: store.ScopeChat,
 	what:  "chat completions",
+
+	endpoint: "chat.completions",
 }
 
 // call is the state one request carries from step to step. Nothing in it is
@@ -75,6 +81,12 @@ type call struct {
 	project   *store.Project
 	projectID string
 	subject   limits.Subject
+
+	// requestID is the id returned in X-Request-Id; requestedModel is the
+	// model string the client sent, set by the endpoint's decode step. Both
+	// end up on the request log row.
+	requestID      string
+	requestedModel string
 
 	// targets is set by resolveRoute: the connections that may serve the call,
 	// in the order invoke tries them. conn is the one serving it right now --
@@ -117,11 +129,12 @@ func (g *Gateway) authenticate(w http.ResponseWriter, r *http.Request, op operat
 	ctx, span := g.Tracer.Start(r.Context(), op.span, tracing.KindInternal)
 	c := &call{
 		op: op, start: start, w: w, r: r.WithContext(ctx), span: span,
-		log:       g.Log.With("project", p.ID),
 		principal: pr, project: p, projectID: strconv.FormatInt(p.ID, 10),
-		subject: limits.Subject{Project: p},
-		obs:     &requestObs{},
+		subject:   limits.Subject{Project: p},
+		requestID: requestIDFrom(r.Context()),
+		obs:       &requestObs{},
 	}
+	c.log = callLogger(g.Log, p.ID, middleware.GetReqID(r.Context()), c.requestID)
 	if pr != nil {
 		c.subject = pr.subject()
 	}
@@ -205,6 +218,8 @@ func (g *Gateway) checkLimits(c *call, estimate int, streamed bool) bool {
 	rec := &store.RequestLog{ProjectID: c.project.ID, ModelName: c.conn.ModelName, Streamed: streamed,
 		StatusCode: http.StatusTooManyRequests, Error: decision.Reason, CostSource: store.CostSourceNone,
 		LatencyMs: time.Since(c.start).Milliseconds()}
+	// Nothing went upstream, so there is no attempt to count.
+	c.stamp(rec, 0)
 	c.principal.attribute(rec)
 	if err := g.Store.InsertRequestLog(c.ctx(), rec); err != nil {
 		c.log.Error("write request log", "err", err)
@@ -213,16 +228,46 @@ func (g *Gateway) checkLimits(c *call, estimate int, streamed bool) bool {
 	return false
 }
 
+// callLogger is the logger a call's lines go through. req_id is the id
+// obs.RequestID generated: the access log, the span and the metrics carry that
+// one, so a gateway line joins to them on it. When the client's own
+// X-Request-Id was used (requestID differs from generated), it is logged
+// beside it as client_req_id, the value the client and request_logs know the
+// request by. generated is empty when no obs.RequestID sits in front of the
+// router; requestID is then the only id there is.
+func callLogger(base *slog.Logger, projectID int64, generated, requestID string) *slog.Logger {
+	if generated == "" {
+		generated = requestID
+	}
+	log := base.With("project", projectID, "req_id", generated)
+	if requestID != generated {
+		log = log.With("client_req_id", requestID)
+	}
+	return log
+}
+
 // openRecord starts the request log row record will write. It is called once
 // the call is past checkLimits and the endpoint's own hook has run, so a
 // request that never reached the upstream leaves no row of this kind. fill, if
 // not nil, sets the endpoint's own columns on the fresh row.
 func (g *Gateway) openRecord(c *call, streamed bool, fill func(*store.RequestLog)) {
 	c.rec = &store.RequestLog{ProjectID: c.project.ID, ModelName: c.conn.ModelName, Streamed: streamed}
+	// One attempt until invoke can make more (Faz 06); route and fallback_from
+	// stay empty until routing exists (Faz 05, 06).
+	c.stamp(c.rec, 1)
 	c.principal.attribute(c.rec)
 	if fill != nil {
 		fill(c.rec)
 	}
+}
+
+// stamp writes the identity columns every request log row carries: the
+// request id, the endpoint and the model the client asked for.
+func (c *call) stamp(rec *store.RequestLog, attempt int) {
+	rec.RequestID = c.requestID
+	rec.Endpoint = c.op.endpoint
+	rec.RequestedModel = c.requestedModel
+	rec.Attempt = attempt
 }
 
 // upstreamCall is the endpoint-specific half of invoke: one attempt at one

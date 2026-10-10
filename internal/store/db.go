@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,10 @@ var ErrNotFound = errors.New("not found")
 // replicas can start (or create a new embedding table) at the same time.
 const (
 	lockMigrations int64 = 0x7261676d75780001 // "ragmux" + 1
+	// lockNoTxMigrations serialises the migrations that run outside a
+	// transaction (applyOutsideTx). A session-level lock, tried and polled,
+	// never waited on: see applyOutsideTx for why it must not be lockMigrations.
+	lockNoTxMigrations int64 = 0x7261676d75780003 // "ragmux" + 3
 	// LockJanitor is the leader lock the hourly retention pass takes so only
 	// one replica does the work. Exported: internal/maintenance takes it.
 	LockJanitor   int64 = 0x7261676d75780002 // "ragmux" + 2
@@ -270,6 +275,12 @@ func migrate(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		if hasNoTxMarker(body) {
+			if err := applyOutsideTx(ctx, conn, name, version, string(body), log); err != nil {
+				return err
+			}
+			continue
+		}
 		applied := false
 		err = withLockedTx(ctx, conn, func(tx pgx.Tx) error {
 			var exists bool
@@ -296,6 +307,150 @@ func migrate(ctx context.Context, conn *pgx.Conn, log *slog.Logger) error {
 		}
 	}
 	return nil
+}
+
+// noTxMarker on the first line of a migration asks migrate() to run it outside
+// a transaction. Statements such as CREATE INDEX CONCURRENTLY refuse to run
+// inside one. Such a migration holds exactly one statement.
+const noTxMarker = "-- ragmux:no-transaction"
+
+func hasNoTxMarker(body []byte) bool {
+	first, _, _ := strings.Cut(string(body), "\n")
+	return strings.TrimSpace(first) == noTxMarker
+}
+
+// concurrentIndexRE finds the index a no-transaction migration builds, so the
+// runner can tell a finished build from an interrupted one.
+var concurrentIndexRE = regexp.MustCompile(`(?is)\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)`)
+
+// sqlLineCommentRE matches a `-- ...` comment up to the end of its line.
+var sqlLineCommentRE = regexp.MustCompile(`--[^\n]*`)
+
+// concurrentIndexName is the index a no-transaction migration creates, or ""
+// when it creates none. Comments are dropped first: the migration's own
+// explanation mentions CREATE INDEX CONCURRENTLY too.
+func concurrentIndexName(body string) string {
+	if m := concurrentIndexRE.FindStringSubmatch(sqlLineCommentRE.ReplaceAllString(body, "")); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// noTxPollInterval is how often a replica that lost the build lock looks again.
+const noTxPollInterval = 500 * time.Millisecond
+
+// applyOutsideTx applies a no-transaction migration.
+//
+// It does NOT take the migration advisory lock (lockMigrations).
+// CREATE INDEX CONCURRENTLY waits for every other open transaction in the
+// database to finish, and a replica that is starting up sits in a transaction
+// blocked on that very lock: holding it while building would make the two
+// wait on each other (PostgreSQL reports a deadlock and aborts one side).
+//
+// What serialises replicas instead is lockNoTxMigrations, a separate
+// session-level lock taken with pg_try_advisory_lock outside any transaction.
+// A replica that does not get it polls rather than waits, so it never sits in
+// a transaction the builder could be waiting for. Once it has the lock it
+// looks at schema_migrations again: the replica that built first has recorded
+// the version by then, and this one has nothing to do.
+//
+// An interrupted CREATE INDEX CONCURRENTLY (a cancelled statement, a killed
+// pod) leaves an INVALID index, and IF NOT EXISTS would skip it and let the
+// version be recorded with a useless index behind it. So the runner drops an
+// invalid index of the name the migration creates before building, and
+// refuses to record the version unless the index is valid afterwards.
+func applyOutsideTx(ctx context.Context, conn *pgx.Conn, name string, version int, body string, log *slog.Logger) error {
+	if err := lockOutsideTx(ctx, conn, name, log); err != nil {
+		return err
+	}
+	defer func() {
+		// Best effort: the session lock goes away with the connection anyway.
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(uctx, "SELECT pg_advisory_unlock($1)", lockNoTxMigrations)
+	}()
+
+	var exists bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)", version).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	index := concurrentIndexName(body)
+	if index != "" {
+		valid, found, err := indexValidity(ctx, conn, index)
+		if err != nil {
+			return err
+		}
+		if found && !valid {
+			log.Warn("dropping an invalid index left by an interrupted build", "name", name, "index", index)
+			if _, err := conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+pgx.Identifier{index}.Sanitize()); err != nil {
+				return fmt.Errorf("drop invalid index %s: %w", index, err)
+			}
+		}
+	}
+
+	if _, err := conn.Exec(ctx, body); err != nil {
+		return fmt.Errorf("apply migration %s: %w", name, err)
+	}
+	if index != "" {
+		valid, found, err := indexValidity(ctx, conn, index)
+		if err != nil {
+			return err
+		}
+		if !found || !valid {
+			return fmt.Errorf("apply migration %s: index %s is not valid after the build; it is dropped and rebuilt on the next start", name, index)
+		}
+	}
+	tag, err := conn.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING", version)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		log.Info("applied migration", "name", name)
+	}
+	return nil
+}
+
+// lockOutsideTx takes lockNoTxMigrations on conn, polling until it is free or
+// ctx ends.
+func lockOutsideTx(ctx context.Context, conn *pgx.Conn, name string, log *slog.Logger) error {
+	waiting := false
+	for {
+		var got bool
+		if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockNoTxMigrations).Scan(&got); err != nil {
+			return fmt.Errorf("acquire lock for migration %s: %w", name, err)
+		}
+		if got {
+			return nil
+		}
+		if !waiting {
+			waiting = true
+			log.Info("another instance is applying a migration, waiting", "name", name)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for migration %s: %w", name, ctx.Err())
+		case <-time.After(noTxPollInterval):
+		}
+	}
+}
+
+// indexValidity reports whether the named index exists on the connection's
+// search path and, if so, whether PostgreSQL considers it valid.
+func indexValidity(ctx context.Context, conn *pgx.Conn, index string) (valid, found bool, err error) {
+	var v *bool
+	err = conn.QueryRow(ctx, `SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1))`,
+		pgx.Identifier{index}.Sanitize()).Scan(&v)
+	if err != nil {
+		return false, false, fmt.Errorf("check index %s: %w", index, err)
+	}
+	if v == nil {
+		return false, false, nil
+	}
+	return *v, true, nil
 }
 
 // ensureVectorExtension makes sure pgvector is installed. The check comes

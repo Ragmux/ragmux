@@ -267,16 +267,28 @@ collector: `http.request.method` on `http.server` goes through the same mapping.
 `ragmux.request_id` is generated, never read from the request. Ragmux installs its own
 `obs.RequestID` in place of chi's `middleware.RequestID`, because chi's starts from the
 client's `X-Request-Id` header and only generates an id when it is absent — which would
-put attacker-chosen bytes on a span, in the `X-Request-Id` response header and in the
-request log.
+put attacker-chosen bytes on a span.
 
-Validating the header instead was tried and does not work, which is worth stating
-plainly: a charset-and-length filter cannot tell a generated id from a credential,
-because they are the same shape. A Ragmux gateway key is `sk-user-` plus 43 characters
-from an unreserved alphabet — 51 bytes that pass any such filter — and so are an AWS
-`AKIA…` key, an OpenAI `sk-` key and every hex or base64url token short enough to fit a
-length cap. The header is therefore not read at all, which makes the guarantee
-structural rather than a question of how good the filter is.
+Validating the header instead does not make that safe, which is worth stating plainly: a
+charset-and-length filter cannot tell a generated id from a credential, because they are
+the same shape. A Ragmux gateway key is `sk-user-` plus 43 characters from an unreserved
+alphabet — 51 bytes that pass any such filter — and so are an AWS `AKIA…` key, an OpenAI
+`sk-` key and every hex or base64url token short enough to fit a length cap. For spans
+and metrics the header is therefore not read at all, which makes the guarantee structural
+rather than a question of how good the filter is.
+
+`/v1` is the one deliberate exception, and it is kept away from telemetry. A client may
+send its own `X-Request-Id` to a `/v1` endpoint (1 to 128 characters of `A-Z a-z 0-9 . _ : -`;
+anything else is replaced, never rejected). That value goes to exactly three places that
+stay inside your own boundary: the `X-Request-Id` response header that echoes it back, the
+`request_logs.request_id` column, and a `client_req_id` log field. `req_id` in the same
+log lines stays the generated id, so the gateway's lines and the `http` access line of one
+request join on `req_id`; the access line also carries `client_req_id`, which is how a
+client's id finds it. The client's value is kept in the gateway's own context key; the
+`ragmux.request_id` span attribute and every metric label still come from the generated
+id. A client that puts a credential in the header can
+therefore expose it to itself and to whoever reads your database or your logs, not to the
+collector. `/admin/api` is unchanged: its `X-Request-Id` is generated.
 
 If a proxy in front of Ragmux generates `X-Request-Id` and you correlate on it, that
 correlation ends at this hop — Ragmux answers with an id of its own. Configure the proxy
@@ -285,8 +297,8 @@ share a trace id in your tracing backend. Read [the trust gate](#the-trust-gate)
 because that setting also lets a client choose the trace id and the sampled flag.
 
 Be clear about what that does and does not recover. It joins **traces**. It does not join
-**logs**: Ragmux log lines carry `req_id`, which is the generated request id, and no log
-line carries a trace id, so a proxy log line and a Ragmux log line still have no shared
+**logs**: Ragmux log lines carry `req_id`, which is the generated request id (and
+`client_req_id` when the client sent its own), and no log line carries a trace id, so a proxy log line and a Ragmux log line still have no shared
 field to match on. And the proxies that typically mint `X-Request-Id` — nginx's
 `$request_id`, HAProxy's `unique-id` — do not emit `traceparent` unless you configure it,
 which usually means an OpenTelemetry module rather than a log-format change.
@@ -307,6 +319,36 @@ legitimate metrics from freezing, but it costs a write on every observation — 
 atomic store on the scrape path — and an evicted counter that comes back starts at zero,
 which Prometheus reads as a counter reset and turns into a silently wrong `rate()`. Data
 that is visibly missing is preferred to data that is quietly wrong.
+
+## The request log
+
+A `/v1` call that gets past authentication and request validation writes one row to
+`request_logs`, whatever happened to it afterwards: a rate-limit or budget denial is a row
+with its `429`, an upstream failure a row with its error. A call answered earlier writes
+no row: a `401` or `403`, a `400` for a malformed body or a missing `messages`,
+`project_required`, and a route or provider that could not be resolved. Those responses
+still carry an `X-Request-Id`, but looking it up in `request_logs` finds nothing. One request is one
+row — a retry or a fallback changes `attempt`, it does not add rows. Besides the usage and
+cost columns, a row identifies the request:
+
+| Column | Meaning |
+|---|---|
+| `request_id` | The `X-Request-Id` the response carried: the client's, when it sent a valid one, otherwise generated. Indexed, so `WHERE request_id = '…'` is a lookup. Rows written before it existed have `NULL` |
+| `endpoint` | Which `/v1` endpoint served it: `chat.completions` today |
+| `requested_model` | The `model` string the client sent — cut to 256 bytes when longer, NUL bytes removed; empty when it sent none. `model_name` is still the connection's real model. This is client-chosen text: it lives in the table and the dashboard, never in a metric label |
+| `route` | The route that picked the connection. `NULL` until routing exists |
+| `attempt` | How many upstream attempts the request took; `1` for a call that went upstream, `NULL` for a denial that never did |
+| `fallback_from` | When a fallback served the request, the `connection_id` of the first target it started on. `NULL` otherwise |
+
+`request_id` is a column, never a metric label (see the
+[cardinality checklist](#cardinality-checklist)). The columns are added by migrations
+`0016` and `0017`; the index is built `CONCURRENTLY`, so upgrading does not lock a large
+`request_logs` table against writes. Replicas that start together
+take turns on that build (a session advisory lock, polled rather than waited on), and an
+interrupted build repairs itself: PostgreSQL leaves an `INVALID` index behind, the next
+start drops it and builds it again, and the migration is only recorded once the index is
+valid. If the build fails, startup fails with the error instead of recording a broken
+index.
 
 ## `/readyz` and `/healthz`
 

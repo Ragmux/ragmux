@@ -6,6 +6,22 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **`/v1` accepts the client's `X-Request-Id` again.** 0.4.x ignored the header entirely.
+  A `/v1` request may now send 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; Ragmux uses it
+  as the response's `X-Request-Id`, stores it in `request_logs.request_id` and logs it as
+  `client_req_id`. Anything else is replaced by a generated id, never rejected. The span
+  attribute `ragmux.request_id`, metric labels and the `req_id` log field stay generated,
+  and `/admin/api` is unchanged. A value shaped like a credential is accepted, so it can
+  reach your database and logs; see
+  [Observability](docs/observability.md#cardinality-checklist).
+
+### Added
+- `request_logs` gains `request_id`, `endpoint`, `requested_model`, `route`, `attempt` and
+  `fallback_from` (migrations `0016`, `0017`); see
+  [the request log](docs/observability.md#the-request-log). `0017` builds its index
+  `CONCURRENTLY`, outside a transaction. `requested_model` is cut to 256 bytes.
+
 ### Security
 - **Existing `chat` gateway keys gain the `embeddings`, `retrieve` and `rerank` scopes.**
   Migration `0018` adds the three new scopes to every gateway key that carries `chat`,

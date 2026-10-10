@@ -4,6 +4,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/obs"
@@ -122,6 +125,7 @@ func (o *requestObs) noteFinishReason(reason *string) {
 
 type ctxKey struct{}
 type principalKey struct{}
+type requestIDKey struct{}
 
 // principal is the identity behind a /v1 request. A project key resolves to
 // nothing but its project; a user key adds the key row, its owner and the
@@ -197,11 +201,76 @@ const projectsHeader = "X-Ragmux-Projects"
 // check their own scope and project in the authenticate step; the listings
 // answer across every granted project and only need the scope middleware.
 func (g *Gateway) Routes(r chi.Router) {
+	r.Use(g.requestID)
 	r.Use(g.identify)
 	r.Post("/chat/completions", g.chatCompletions)
 	models := r.With(g.requireScope(store.ScopeModels, "model listings"))
 	models.Get("/models", g.listModels)
 	models.Get("/models/{id}", g.getModel)
+}
+
+// maxRequestIDLen bounds a client-supplied X-Request-Id.
+const maxRequestIDLen = 128
+
+// validRequestID reports whether a client-supplied X-Request-Id may be used
+// as is: 1 to maxRequestIDLen bytes of ASCII letters, digits and . _ : -. The
+// set excludes whitespace, control characters, quotes and separators, so the
+// value is safe in a header, a log line and a SQL text column.
+func validRequestID(v string) bool {
+	if v == "" || len(v) > maxRequestIDLen {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == ':', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// requestID gives every /v1 request one id and returns it in the X-Request-Id
+// response header, errors included: it runs before identify, so a 401 carries
+// it too. A valid X-Request-Id from the client is used; an absent or invalid
+// one is replaced, never rejected, by the id obs.RequestID generated for the
+// request (or a fresh one when that middleware is not installed).
+//
+// The id is kept in this package's own context key and nowhere else: the
+// generated id that obs.RequestID stores for spans, metrics and the access
+// log is left alone, so no client-chosen byte reaches a span or a label
+// (PRD rule 10). The client's value reaches only the response header that
+// echoes it back, the request log row and, as client_req_id beside the
+// generated req_id, log lines.
+func (g *Gateway) requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-Id")
+		if !validRequestID(id) {
+			id = middleware.GetReqID(r.Context())
+			if id == "" {
+				id = newRequestID()
+			}
+		}
+		w.Header().Set("X-Request-Id", id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+	})
+}
+
+// newRequestID is the fallback id for a router without obs.RequestID.
+func newRequestID() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "req-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// requestIDFrom is the id requestID settled on for this request.
+func requestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
 }
 
 func writeError(w http.ResponseWriter, status int, typ, msg string) {
@@ -487,6 +556,8 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// What the client asked for, before an empty model is defaulted below.
+	c.requestedModel = req.Model
 	if req.Model == "" {
 		req.Model = c.conn.ModelName
 	}

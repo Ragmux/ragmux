@@ -785,6 +785,7 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
+| `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
 | `Warning` | `299 ragmux "<text>"` when the connection accepted the request but ignored part of it — today only `response_format` (`json_schema`/`json_object`) on an Anthropic connection. Set before the first byte, so a stream carries it too. See [Anthropic](providers.md#anthropic) |
 
