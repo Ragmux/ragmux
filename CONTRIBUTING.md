@@ -2,7 +2,7 @@
 
 Bug reports, documentation fixes and pull requests are all welcome. This page is the
 short version; the full developer guide is
-[Contributing and Development](https://github.com/Ragmux/ragmux/wiki/Contributing-and-Development)
+[Contributing and Development](https://github.com/ragmux/ragmux/wiki/Contributing-and-Development)
 on the wiki — what to install, the local loop, how tests find their database, the schema
 contract and how decisions are recorded.
 
@@ -63,4 +63,4 @@ Ragmux is licensed under **AGPL-3.0-or-later**. By contributing you agree that y
 contribution is licensed under the same terms. There is no CLA.
 
 Participation is governed by the
-[Code of Conduct](https://github.com/Ragmux/.github/blob/main/CODE_OF_CONDUCT.md).
+[Code of Conduct](https://github.com/ragmux/.github/blob/main/CODE_OF_CONDUCT.md).

@@ -25,12 +25,8 @@ func New(cfg Config) (Provider, error) {
 // NewEmbedder returns the embedding adapter for a connection configuration.
 func NewEmbedder(cfg Config) (Embedder, error) {
 	switch cfg.ProviderType {
-	case "openai", "deepseek", "custom_openai":
-		def := openAIBase
-		if cfg.ProviderType == "deepseek" {
-			def = deepSeekBase
-		}
-		base := cfg.baseURL(def)
+	case "openai", "custom_openai":
+		base := cfg.baseURL(openAIBase)
 		if cfg.ProviderType != "custom_openai" && !strings.HasSuffix(base, "/v1") {
 			base += "/v1"
 		}
@@ -42,6 +38,8 @@ func NewEmbedder(cfg Config) (Embedder, error) {
 		return &geminiEmbedder{cfg: cfg, base: cfg.baseURL(geminiBase)}, nil
 	case "anthropic":
 		return nil, fmt.Errorf("anthropic does not offer an embeddings API; choose another connection for embeddings")
+	case "deepseek":
+		return nil, fmt.Errorf("deepseek does not offer an embeddings API; choose another connection for embeddings")
 	case "cohere_rerank", "voyage_rerank":
 		return nil, fmt.Errorf("%s connections only offer a rerank API; choose another connection for embeddings", cfg.ProviderType)
 	}

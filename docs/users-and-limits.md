@@ -371,8 +371,9 @@ plus two gateway-internal codes:
 | `2xx` | completed; tokens from the provider's usage block, or an estimate (`estimated: true`) |
 | `429` | rejected by the project's rate limit or budget (`rate_limited` in summaries) |
 | `499` | the client disconnected before the completion finished; the upstream call was cancelled. Counted as an error in summaries, never sent on the wire |
-| `502` / `504` | upstream failure or timeout, including streams that died mid-way |
-| other `4xx` / `5xx` | relayed from the provider |
+| `502` | upstream failure: any `5xx` other than `503` / `504`, a transport error, or a stream that died mid-way |
+| `503` / `504` | the upstream answered `503` or `504` (an Anthropic `529` becomes `503`), relayed with its `Retry-After`; `504` is also what the gateway returns when its own upstream timeout expires |
+| other `4xx` | relayed from the provider |
 
 Each row also records the model name, prompt and completion tokens, latency, whether the
 response was streamed and whether RAG context was injected. Prompts and completions are
