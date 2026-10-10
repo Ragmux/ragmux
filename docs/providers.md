@@ -117,7 +117,8 @@ RAG store's embeddings.** `provider.New` and `NewEmbedder` reject them, the dash
 model and embedding pickers filter them out, and saving a project or a store that names
 one is refused with `400` (`provider "cohere_rerank" cannot be used for chat`,
 `... cannot be used for embeddings`). The only place a connection of these types belongs
-is a RAG store's `rerank_connection_id` — see [Reranking](rag.md#reranking).
+is a RAG store's `rerank_connection_id` or a `kind = rerank` route target (served by
+`POST /v1/rerank`) — see [Reranking](rag.md#reranking).
 
 | | `cohere_rerank` | `voyage_rerank` |
 |---|---|---|

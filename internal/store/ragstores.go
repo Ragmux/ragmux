@@ -71,8 +71,10 @@ type RAGStore struct {
 	RerankCandidates int  `json:"rerank_candidates"`
 	// RerankBackend is RerankLLM, RerankCohere or RerankVoyage.
 	RerankBackend string `json:"rerank_backend"`
-	// RerankConnectionID is the model connection holding the rerank API's
-	// credentials; nil for RerankLLM. A NULL behind an API backend (the
+	// RerankConnectionID is the model connection reranking runs on: the rerank
+	// API's credentials for RerankCohere and RerankVoyage, the chat model for
+	// RerankLLM (optional there). It is also the connection the implicit route
+	// of /v1/rerank and the admin search use. A NULL behind an API backend (the
 	// connection was deleted, ON DELETE SET NULL) means the reranker is
 	// unavailable: the search skips it and logs, as it does for a failure.
 	RerankConnectionID *int64 `json:"rerank_connection_id"`
@@ -132,11 +134,6 @@ func applyRAGDefaults(r *RAGStore) {
 	}
 	if r.RerankBackend == "" {
 		r.RerankBackend = RerankLLM
-	}
-	if r.RerankBackend == RerankLLM {
-		// The connection only ever carries rerank API credentials; leaving
-		// one on an LLM store would resurrect it on a later backend switch.
-		r.RerankConnectionID = nil
 	}
 	if r.RerankCandidates <= 0 {
 		r.RerankCandidates = 15

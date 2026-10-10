@@ -1001,8 +1001,22 @@ func (a *Admin) validateRerank(r *http.Request, in *ragInput) error {
 		return fmt.Errorf("rerank_backend must be one of %s", strings.Join(store.RerankBackends, ", "))
 	}
 	want := store.RerankConnectionType(in.RerankBackend)
-	if want == "" {
+	if in.RerankConnectionID != nil && *in.RerankConnectionID == 0 {
 		in.RerankConnectionID = nil
+	}
+	if want == "" {
+		// The llm backend prompts a chat model. The connection is optional: it
+		// names the model the admin search and /v1/rerank use for this store.
+		if in.RerankConnectionID == nil {
+			return nil
+		}
+		conn, err := a.Store.GetConnection(r.Context(), *in.RerankConnectionID)
+		if err != nil {
+			return errors.New("rerank_connection_id does not reference an existing model connection")
+		}
+		if !provider.SupportsChat(conn.ProviderType) {
+			return fmt.Errorf("cannot use connection %q for llm reranking: it is a %s connection", conn.Name, conn.ProviderType)
+		}
 		return nil
 	}
 	if in.RerankConnectionID == nil || *in.RerankConnectionID == 0 {
@@ -1341,20 +1355,40 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		}
 		rs.MaxDistance = *in.MaxDistance
 	}
-	// The llm rerank backend uses the chat model of a project linked to this
-	// store; the embedding connection cannot chat. The API backends carry
-	// their own connection and need none of this.
+	// The rerank connection is the store's own setting (rerank_connection_id),
+	// never a guess from the projects that use the store. The llm backend
+	// prompts it as a chat model; the API backends build their reranker from it
+	// inside the retriever. Without a usable connection the search runs
+	// unreranked and the response says so.
 	var prov provider.Provider
 	model := ""
-	if rs.Rerank && rs.RerankBackend != store.RerankCohere && rs.RerankBackend != store.RerankVoyage {
-		if conn, err := a.rerankConnection(r, rs.ID); err == nil {
-			if p, err := a.Providers(conn); err == nil {
+	skipped := ""
+	if rs.Rerank {
+		conn, err := a.rerankConnection(r, rs)
+		switch {
+		case err != nil:
+			skipped = "the store has no rerank connection (set rerank_connection_id)"
+		case rs.RerankBackend == store.RerankCohere || rs.RerankBackend == store.RerankVoyage:
+			// The retriever's factory reads rs.RerankConnectionID itself.
+		default:
+			if p, perr := a.Providers(conn); perr == nil {
 				prov, model = p, conn.ModelName
+			} else {
+				skipped = "the rerank connection cannot be used for chat"
 			}
 		}
 	}
+	searchStore := rs
+	if skipped != "" {
+		// Search a copy with rerank off: a skipped rerank is a configuration
+		// state shown through rerank_skipped, not a failed attempt, so it must
+		// not set rerank_fallback or count as a rerank failure.
+		cp := *rs
+		cp.Rerank = false
+		searchStore = &cp
+	}
 	start := time.Now()
-	res, err := a.Retriever.SearchWith(r.Context(), rs, in.Query, in.TopK, prov, model)
+	res, err := a.Retriever.SearchWith(r.Context(), searchStore, in.Query, in.TopK, prov, model)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1365,23 +1399,22 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		// Returning it makes that visible instead of surprising.
 		"fts_config": rs.FTSConfig, "reranked": res.Reranked, "rerank_backend": res.RerankBackend,
 		"rerank_fallback": res.RerankFallback,
-		"latency_ms":      time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
+		// rerank_skipped is true when rerank was requested but the store has no
+		// usable rerank connection, so the hits are the fused order and
+		// rerank_fallback stays false: nothing was attempted, so nothing failed.
+		"rerank_skipped": skipped != "", "rerank_skipped_reason": skipped,
+		"latency_ms": time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
 		"rerank_latency_ms": res.RerankLatencyMS})
 }
 
-// rerankConnection finds a chat connection for reranking searches from the
-// admin API: the model connection of the first project using the store.
-func (a *Admin) rerankConnection(r *http.Request, storeID int64) (*store.ModelConnection, error) {
-	projects, err := a.Store.ListProjects(r.Context())
-	if err != nil {
-		return nil, err
+// rerankConnection returns the store's rerank connection, the one named by
+// rerank_connection_id. It is store.ErrNotFound when the store names none or
+// the connection is gone (ON DELETE SET NULL clears the column).
+func (a *Admin) rerankConnection(r *http.Request, rs *store.RAGStore) (*store.ModelConnection, error) {
+	if rs.RerankConnectionID == nil {
+		return nil, store.ErrNotFound
 	}
-	for _, p := range projects {
-		if p.RAGStoreID != nil && *p.RAGStoreID == storeID {
-			return a.Store.GetConnection(r.Context(), p.ModelConnectionID)
-		}
-	}
-	return nil, store.ErrNotFound
+	return a.Store.GetConnection(r.Context(), *rs.RerankConnectionID)
 }
 
 // ---- documents ----

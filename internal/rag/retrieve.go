@@ -80,6 +80,10 @@ type Result struct {
 	// EmbedUsage is what the embedding upstream reported for the query; nil
 	// when it reported none or no embedding call was made.
 	EmbedUsage *provider.Usage
+	// RerankSpend is what an API reranker's call used; nil when no such call
+	// was made. The LLM backend is not counted here: it spends through the
+	// chat provider the caller passed in.
+	RerankSpend *RerankSpend
 }
 
 // Search returns the top-k hits for a query using the store's settings.
@@ -274,7 +278,11 @@ func (r *Retriever) rerank(ctx context.Context, rs *store.RAGStore, res *Result,
 		r.warn("reranker unavailable; using fused order", rs, backend, ErrRerankUnavailable)
 		return hits
 	}
-	ranked, err := rr.Rerank(ctx, RerankInput{Query: query, Hits: hits, TopK: k, Provider: prov, Model: model})
+	spend := &RerankSpend{}
+	ranked, err := rr.Rerank(ctx, RerankInput{Query: query, Hits: hits, TopK: k, Provider: prov, Model: model, Spend: spend})
+	if !spend.IsZero() {
+		res.RerankSpend = spend
+	}
 	if err != nil {
 		res.RerankFallback = true
 		failure = err

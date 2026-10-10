@@ -7,6 +7,13 @@ All notable changes to Ragmux are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **The dashboard search reranks through the store's `rerank_connection_id`.** The
+  "first project linked to the store" heuristic is gone, so projects sharing a store rerank
+  the same way. A store without that id searches unreranked and the response carries
+  `rerank_skipped: true` and `rerank_skipped_reason`. The `llm` backend may now keep a
+  chat connection in `rerank_connection_id` (it used to be cleared); existing `llm` stores
+  need one set to rerank in the dashboard. A skipped search leaves `rerank_fallback` at
+  `false` (a skip is not a failure) and no longer counts as a rerank failure in metrics.
 - **`/v1` accepts the client's `X-Request-Id` again.** 0.4.x ignored the header entirely.
   A `/v1` request may now send 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; Ragmux uses it
   as the response's `X-Request-Id`, stores it in `request_logs.request_id` and logs it as
@@ -17,6 +24,21 @@ All notable changes to Ragmux are documented here. The format follows
   [Observability](docs/observability.md#cardinality-checklist).
 
 ### Added
+- **`POST /v1/rerank`.** Cohere-shaped rerank endpoint (`query`, `documents`, `top_n`,
+  `model`; `results[{index, relevance_score}]`), behind the new-style pipeline with scope
+  `rerank` and `endpoint = rerank` in the request log. `model` resolves to a `kind = rerank`
+  route, else to the RAG store's `rerank_connection_id` (the implicit route), else
+  `404 model_not_found`. A rerank API connection (`cohere_rerank`, `voyage_rerank`) or a
+  chat connection can serve it. See [`POST /v1/rerank`](docs/api.md#post-v1rerank).
+- **Rerank tokens are counted.** The tokens of an LLM or API rerank inside a RAG chat or
+  `/v1/retrieve` request are added to that request's row, and a `/v1/rerank` call logs its
+  own tokens. An API reranker's tokens count toward limits and usage but are not priced
+  (it bills by search unit); the estimate is made over the passages as sent (capped at 4000
+  characters each), not the full text. LLM rerank tokens are priced at the row's model.
+- **`/v1/rerank` through a chat model scores only what the model ranked.** The documents
+  the model ranked get `1.0` down to `1/r`; the others follow in request order with a
+  score of `0`, and an empty answer scores every document `0`.
+- **`RERANK_MAX_TOKENS`** sets the reply cap of the LLM reranker (default `200`, as before).
 - **Retry and route-internal fallback.** A chat call that fails before the first byte is
   sent is retried on the same target (connection never established, `429`, `503`) and then
   handed to the route's next target; `UPSTREAM_MAX_RETRIES` (default `2`, `0` disables)

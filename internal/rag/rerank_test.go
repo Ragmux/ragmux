@@ -57,6 +57,31 @@ func TestRerankReordersAndAppendsOmitted(t *testing.T) {
 	}
 }
 
+// The reply cap is configurable; unset (zero or negative) keeps the historical
+// 200, and the value reaches the upstream request.
+func TestLLMRerankerMaxTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  int
+		want int
+	}{
+		{"unset keeps the default", 0, 200},
+		{"negative keeps the default", -5, 200},
+		{"configured", 512, 512},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockChat{reply: "[2, 1]"}
+			rr := &LLMReranker{MaxTokens: tc.set}
+			if _, err := rr.Rerank(context.Background(), RerankInput{Query: "q", Hits: threeHits(), TopK: 3, Provider: m, Model: "m"}); err != nil {
+				t.Fatal(err)
+			}
+			if m.last.MaxTokens == nil || *m.last.MaxTokens != tc.want {
+				t.Errorf("max_tokens in the upstream request = %v, want %d", m.last.MaxTokens, tc.want)
+			}
+		})
+	}
+}
+
 func TestRerankFailuresKeepOriginalOrder(t *testing.T) {
 	rr := &LLMReranker{}
 	for _, m := range []*mockChat{{reply: "I cannot rank these."}, {err: errors.New("boom")}, {reply: "[]"}} {
@@ -109,4 +134,46 @@ func ids(hits []store.SearchHit) string {
 		s = append(s, strconv.FormatInt(h.ChunkID, 10))
 	}
 	return strings.Join(s, ",")
+}
+
+// An API rerank reports its tokens through RerankInput.Spend: the upstream's
+// own figure when it sends one, an estimate from the text sent when it does not.
+func TestAPIRerankerRecordsSpend(t *testing.T) {
+	reported := rerankServer(t, "/v2/rerank", "sk-rerank-secret", 200,
+		`{"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}],"meta":{"tokens":{"input_tokens":77,"output_tokens":3}}}`)
+	defer reported.Close()
+	var spend RerankSpend
+	rr := apiReranker(t, store.RerankCohere, reported.URL)
+	out, err := rr.Rerank(context.Background(), RerankInput{Query: "q", Hits: threeHits()[:2], TopK: 2, Spend: &spend})
+	if err != nil || ids(out) != "2,1" {
+		t.Fatalf("rerank: %v %v", ids(out), err)
+	}
+	if spend.PromptTokens != 77 || spend.CompletionTokens != 3 || spend.Estimated {
+		t.Errorf("reported spend: %+v", spend)
+	}
+
+	silent := rerankServer(t, "/v2/rerank", "sk-rerank-secret", 200, `{"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}]}`)
+	defer silent.Close()
+	spend = RerankSpend{}
+	rr = apiReranker(t, store.RerankCohere, silent.URL)
+	if _, err := rr.Rerank(context.Background(), RerankInput{Query: "query", Hits: threeHits()[:2], TopK: 2, Spend: &spend}); err != nil {
+		t.Fatal(err)
+	}
+	if spend.PromptTokens <= 0 || !spend.Estimated || spend.IsZero() {
+		t.Errorf("estimated spend: %+v", spend)
+	}
+}
+
+func TestLLMRerankerReportsRankedCount(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		want  int
+	}{{"[2, 1, 3]", 3}, {"[3]", 1}, {"[3, 3, 9, 1]", 2}, {"[]", 0}} {
+		var ranked int
+		_, err := (&LLMReranker{}).Rerank(context.Background(), RerankInput{Query: "q", Hits: threeHits(), TopK: 2,
+			Provider: &mockChat{reply: tc.reply}, Model: "m", Ranked: &ranked})
+		if err != nil || ranked != tc.want {
+			t.Errorf("reply %s: ranked=%d err=%v, want %d", tc.reply, ranked, err, tc.want)
+		}
+	}
 }

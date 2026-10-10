@@ -265,7 +265,7 @@ func run(cfg config.Config) error {
 	// same hardened outbound client as every other upstream call.
 	retriever.Rerankers = func(ctx context.Context, rs *store.RAGStore) (rag.Reranker, error) {
 		if rs.RerankBackend == "" || rs.RerankBackend == store.RerankLLM {
-			return &rag.LLMReranker{Timeout: cfg.RerankTimeout}, nil
+			return &rag.LLMReranker{Timeout: cfg.RerankTimeout, MaxTokens: cfg.RerankMaxTokens}, nil
 		}
 		if rs.RerankConnectionID == nil {
 			// The connection was deleted (ON DELETE SET NULL). Reranking is
@@ -289,6 +289,8 @@ func run(cfg config.Config) error {
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
 		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer,
+		Rerankers:       func(c *store.ModelConnection) (provider.Reranker, error) { return provider.NewReranker(provCfg(c)) },
+		LLMRerank:       rag.LLMReranker{Timeout: cfg.RerankTimeout, MaxTokens: cfg.RerankMaxTokens},
 		UpstreamTimeout: cfg.UpstreamTimeout, MaxRetries: cfg.UpstreamMaxRetries,
 		Breakers: gateway.NewBreakers(cfg.BreakerFailureThreshold, cfg.BreakerOpenDuration, log)}
 	met.RegisterBreakers(gw.Breakers.Snapshot)

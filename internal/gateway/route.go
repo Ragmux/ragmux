@@ -171,3 +171,53 @@ func parseCreated(ts string) int64 {
 	}
 	return time.Now().Unix()
 }
+
+// resolveKindRoute is the route resolution of the endpoints that never fall
+// back to the project's chat connection (embeddings, rerank; ADR-018): a route
+// of the given kind named model; else the implicit route, which is the
+// connection pick returns for the project's RAG store and answers to that
+// connection's model name and to an empty model; else model_not_found. pick
+// returns nil when the store has no such connection. what names the
+// connection in log lines.
+//
+// When it returns true, c.targets holds at least one connection and c.conn is
+// the first of them. When it returns false it has answered the client.
+func (g *Gateway) resolveKindRoute(c *call, kind, model, what string, pick func(*store.RAGStore) *int64) bool {
+	has, rt, err := g.Store.ResolveProjectRoute(c.ctx(), c.project.ID, kind, model)
+	if err != nil {
+		c.log.Error("resolve route", "err", err)
+		return noRoute(c)
+	}
+	if has && rt != nil {
+		var targets []*store.ModelConnection
+		for _, t := range orderTargets(rt.Targets, g.rng()) {
+			targets = append(targets, effectiveConnection(t))
+		}
+		c.routeName = rt.Name
+		return acceptTargets(c, targets)
+	}
+	if c.project.RAGStoreID == nil {
+		modelNotFound(c, model)
+		return false
+	}
+	rs, err := g.Store.GetRAGStore(c.ctx(), *c.project.RAGStoreID)
+	if err != nil {
+		c.log.Error("resolve route: rag store", "id", *c.project.RAGStoreID, "err", err)
+		return noRoute(c)
+	}
+	id := pick(rs)
+	if id == nil {
+		modelNotFound(c, model)
+		return false
+	}
+	conn, err := g.Store.GetConnection(c.ctx(), *id)
+	if err != nil {
+		c.log.Error("resolve route: "+what+" connection", "id", *id, "err", err)
+		return noRoute(c)
+	}
+	if model != "" && model != conn.ModelName {
+		modelNotFound(c, model)
+		return false
+	}
+	return acceptTargets(c, []*store.ModelConnection{conn})
+}

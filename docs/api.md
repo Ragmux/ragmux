@@ -300,7 +300,8 @@ Validation: `chunk_size` 200-20000, `chunk_overlap` ≥ 0 and smaller than `chun
 (anything but `simple` is accepted and, on the `pgvector` backend, logged as a warning,
 see [Search modes](rag.md#search-modes)), `rerank_backend` `llm`, `cohere` or `voyage`
 (`cohere` and `voyage` need a `rerank_connection_id` of the matching `cohere_rerank` /
-`voyage_rerank` type; `llm` takes none), `rerank_candidates` 1-100, `max_distance` 0-2,
+`voyage_rerank` type; `llm` may name a chat connection, see
+[Reranking](rag.md#reranking)), `rerank_candidates` 1-100, `max_distance` 0-2,
 `max_documents` and `max_bytes` ≥ 0 (`0` = unlimited, see
 [Unlimited (`0`)](configuration.md#zero-means-unlimited)). The embedding
 connection must be of a type that supports embeddings, must produce vectors of at most
@@ -349,8 +350,11 @@ and `top_k`; the full list and the meaning of the response fields are in
 [Search endpoint](rag.md#search-endpoint)); `top_k` is clamped to 1-50 (`0` or absent
 uses the store's `top_k`). `latency_ms` is the whole call, `retrieval_latency_ms` covers
 embedding the query and the database search, and `rerank_latency_ms` the reranker
-(`null` only when `rerank` is off; when reranking was requested but skipped, a number,
-often `0`, and `rerank_fallback: true`).
+(`null` when `rerank` is off or was skipped; a number, often `0`, when the reranker was
+tried and fell back, with `rerank_fallback: true`).
+When `rerank` is on but the store has no `rerank_connection_id` (and so nothing to rerank
+with), the search runs unreranked and the response says so with `"rerank_skipped": true`
+and a `rerank_skipped_reason`; both are `false` / `""` otherwise.
 A `502` is returned when the embedding call fails.
 
 ### Projects
@@ -917,10 +921,57 @@ cannot override them (the dashboard's [search endpoint](rag.md#search-endpoint) 
 ran. `usage` counts the query's embedding tokens, plus the tokens of the rerank call when
 the store reranks with the LLM backend (that call goes to the project's chat connection, so a
 key with only `retrieve` can cause it; it is counted on the request row and against the
-project's limits, priced at the row's rate). A project without a RAG store answers
+project's limits, and priced at the embedding connection's rate, the row's model; the
+tokens of an API reranker are counted but not priced). A project without a RAG store answers
 `400` with code `no_rag_store`. The call is recorded with `endpoint = retrieve`,
 `rag_used`, `rag_hits`, and the embedding connection's model, tokens and price. An
 embedding failure at the provider answers with the provider's status as in chat.
+
+### `POST /v1/rerank`
+
+Reorders documents by relevance to a query, in Cohere's request and response shape, so a
+Cohere SDK pointed at Ragmux works. Needs the key's `rerank` scope.
+
+```json
+{"model": "rerank-v3.5", "query": "vacation days", "top_n": 2,
+ "documents": ["Leave policy: 25 days.", "Parking rules.", {"text": "Sick leave: 10 days."}]}
+```
+
+`query` and a non-empty `documents` array (at most 1000; each entry a string or an object
+with a `text` string) are required. `top_n` is optional and at least `1`; omitted returns
+every document. `return_documents: true` adds the document text to each result. `model` is
+optional.
+
+```json
+{"id": "5c1e…", "results": [{"index": 0, "relevance_score": 0.92}, {"index": 2, "relevance_score": 0.31}],
+ "meta": {"tokens": {"input_tokens": 42, "output_tokens": 0}}}
+```
+
+`results` holds at most `top_n` entries sorted by `relevance_score`, highest first;
+`index` points into the request's `documents`.
+
+`model` resolves as for the other endpoints (ADR-018): a `kind = rerank` [route](#routes)
+with exactly that name; else the implicit route, the project's RAG store's
+`rerank_connection_id`, when `model` is empty or equals that connection's model name; else
+`404` with code `model_not_found`. A store without a `rerank_connection_id` has no implicit
+route. A route target or the implicit connection may be a `cohere_rerank` / `voyage_rerank`
+connection (their scores are returned as the provider gives them) or a chat connection,
+which is asked to rank the documents (at most 100 of them). With a chat model,
+`relevance_score` is derived from the rank, not a model-reported number: the `r` documents
+the model ranked get `r/r` (`1.0`) down to `1/r`, and the others follow in their request
+order with a score of `0`. A model that answers with an empty list ("none is relevant")
+therefore yields every document at `0`, not the client's own order passed off as a ranking.
+
+The call is recorded with `endpoint = rerank`: the connection's model, the tokens the
+provider reported (an estimate from the text, flagged `estimated`, when it reports none),
+the price, and the usual limits and budgets apply. Rerank tokens spent inside a RAG chat or
+`/v1/retrieve` request are added to that request's own row instead. An API reranker
+(`cohere_rerank`, `voyage_rerank`) bills by search unit, not by token, and its token count
+is optional in the response, so the estimate (characters divided by 4, over the passages
+as sent: each is capped at 4000 characters) is a measure of usage for limits only. Inside a
+chat or retrieve request those tokens are counted on the row and against the limits but are
+left out of its `cost_micros`; the `llm` backend's tokens are priced, because the chat
+model did the work.
 
 ### `GET /v1/models` and `GET /v1/models/{id}`
 

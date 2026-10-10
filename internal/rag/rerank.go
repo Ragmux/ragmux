@@ -34,6 +34,30 @@ type RerankInput struct {
 	// Provider is the project's chat model, nil when none is available.
 	Provider provider.Provider
 	Model    string
+	// Spend, when non-nil, receives the tokens an API reranker's call used. The
+	// LLM reranker leaves it alone: its tokens are the chat provider's, which
+	// the caller already sees through the Provider it handed in.
+	Spend *RerankSpend
+	// Ranked, when non-nil, receives how many of the returned hits the LLM
+	// reranker's model ranked explicitly: the leading hits of the result.
+	// Hits after them are the ones the model left out, appended in their
+	// original order, and an empty reply ("none is relevant") ranks zero.
+	// Left unset on failure and by the API rerankers, which score every
+	// hit they return.
+	Ranked *int
+}
+
+// RerankSpend is the token count of an API rerank call. Estimated is set when
+// the upstream reported none and the figure comes from the text sent.
+type RerankSpend struct {
+	PromptTokens     int
+	CompletionTokens int
+	Estimated        bool
+}
+
+// IsZero reports whether nothing was spent.
+func (s *RerankSpend) IsZero() bool {
+	return s == nil || (s.PromptTokens == 0 && s.CompletionTokens == 0)
 }
 
 // RerankerFactory builds the reranker a store is configured for. It returns
@@ -68,7 +92,14 @@ const (
 type LLMReranker struct {
 	// Timeout bounds the model call; zero selects llmRerankTimeout.
 	Timeout time.Duration
+	// MaxTokens caps the model's reply; zero selects DefaultLLMRerankMaxTokens.
+	// The reply is a short JSON array, so the default is plenty for the
+	// candidate counts the stores allow.
+	MaxTokens int
 }
+
+// DefaultLLMRerankMaxTokens is the reply cap of an LLMReranker that sets none.
+const DefaultLLMRerankMaxTokens = 200
 
 func (rr *LLMReranker) Name() string { return store.RerankLLM }
 
@@ -109,7 +140,10 @@ func (rr *LLMReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 	b.WriteString(" Example: [3, 1, 2]")
 
 	temp := 0.0
-	maxTok := 200
+	maxTok := rr.MaxTokens
+	if maxTok <= 0 {
+		maxTok = DefaultLLMRerankMaxTokens
+	}
 	req := provider.ChatRequest{
 		Model:       in.Model,
 		Messages:    []provider.Message{{Role: "user", Content: provider.TextContent(b.String())}},
@@ -128,7 +162,11 @@ func (rr *LLMReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 	if !ok {
 		return hits[:topK], fmt.Errorf("rerank: %w from reply %q", errRerankParse, truncateRunes(reply, 200))
 	}
-	return reorder(hits, zeroBased(order), topK), nil
+	order = zeroBased(order)
+	if in.Ranked != nil {
+		*in.Ranked = countRanked(order, len(hits))
+	}
+	return reorder(hits, order, topK), nil
 }
 
 // APIReranker reorders candidates with a dedicated rerank API reached
@@ -170,9 +208,13 @@ func (rr *APIReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 		// in a third party's logs or in a reply we parse.
 		docs[i] = NeutralizeContextTags(strings.TrimSpace(h.Content))
 	}
-	res, err := rr.Client.Rerank(ctx, strings.TrimSpace(in.Query), docs, topK)
+	query := strings.TrimSpace(in.Query)
+	res, usage, err := provider.RerankWithUsage(ctx, rr.Client, query, docs, topK)
 	if err != nil {
 		return hits[:topK], fmt.Errorf("rerank: %w", err)
+	}
+	if in.Spend != nil {
+		in.Spend.add(usage, provider.RerankRequestChars(query, docs))
 	}
 	order := make([]int, 0, len(res))
 	for _, r := range res {
@@ -187,6 +229,31 @@ func (rr *APIReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 		return hits[:topK], fmt.Errorf("rerank: %s returned no usable passage index: %w", rr.Backend, errRerankParse)
 	}
 	return reorder(hits, order, topK), nil
+}
+
+// add records one call's tokens: the upstream's report when it gave one,
+// otherwise an estimate from the characters sent (four per token, rounded up,
+// the same rule the gateway's fillUsage applies).
+func (s *RerankSpend) add(u *provider.Usage, promptChars int) {
+	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
+		s.PromptTokens += max(u.PromptTokens, 0)
+		s.CompletionTokens += max(u.CompletionTokens, 0)
+		return
+	}
+	s.Estimated = true
+	s.PromptTokens += (promptChars + 3) / 4
+}
+
+// countRanked is the number of distinct in-range positions in order, the
+// hits reorder puts first.
+func countRanked(order []int, n int) int {
+	seen := make(map[int]struct{}, len(order))
+	for _, p := range order {
+		if p >= 0 && p < n {
+			seen[p] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 // reorder builds the reranked slice from zero-based positions, appending

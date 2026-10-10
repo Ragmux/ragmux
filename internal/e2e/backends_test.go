@@ -139,10 +139,13 @@ func TestRerankBackendValidation(t *testing.T) {
 	if status(created) != 201 || created["rerank_backend"] != "cohere" || created["rerank_connection_id"] != co["id"] {
 		t.Fatalf("cohere store: %v", created)
 	}
-	// Switching back to the LLM backend drops the connection rather than
-	// leaving it to reappear on a later switch.
-	back := e.call("PUT", fmt.Sprintf("/admin/api/rag-stores/%d", int64(created["id"].(float64))),
-		base(map[string]any{"rerank_backend": "llm", "rerank_connection_id": co["id"]}), "")
+	// The llm backend prompts a chat model: a rerank-only connection cannot
+	// stay on a store that switches to it, and the id is optional there.
+	url := fmt.Sprintf("/admin/api/rag-stores/%d", int64(created["id"].(float64)))
+	if r := e.call("PUT", url, base(map[string]any{"rerank_backend": "llm", "rerank_connection_id": co["id"]}), ""); status(r) != 400 {
+		t.Errorf("llm backend on a rerank-only connection: %v", r)
+	}
+	back := e.call("PUT", url, base(map[string]any{"rerank_backend": "llm"}), "")
 	if status(back) != 200 || back["rerank_backend"] != "llm" || back["rerank_connection_id"] != nil {
 		t.Errorf("switch back to llm: %v", back)
 	}

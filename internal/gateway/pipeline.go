@@ -15,6 +15,7 @@ import (
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/provider"
+	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/tracing"
 )
@@ -86,6 +87,54 @@ var retrieveOperation = operation{
 	endpoint: "retrieve",
 }
 
+// rerankOperation is POST /v1/rerank.
+var rerankOperation = operation{
+	name:  "rerank",
+	span:  "gateway.rerank",
+	scope: store.ScopeRerank,
+	what:  "reranking",
+
+	endpoint: "rerank",
+}
+
+// tokenTally is a count of tokens spent by a side call (a rerank inside a chat
+// request) that the endpoint's own usage figures do not include.
+//
+// The apiPrompt and apiCompletion fields hold the part that an API reranker
+// (Cohere, Voyage) spent. It is in prompt and completion, so limits and usage
+// figures see it, but record leaves it out of the price: the row's model is not
+// the model that did the work, and a rerank API bills by search unit.
+type tokenTally struct {
+	prompt, completion int
+	estimated          bool
+	// api is the part of prompt and completion that came from an API reranker.
+	apiPrompt, apiCompletion int
+}
+
+// add counts the tokens of one search's rerank: the chat calls the LLM backend
+// made (llm) and the API backend's call (api). Either may be nil.
+func (t *tokenTally) add(llm *rerankUsageProvider, api *rag.RerankSpend) {
+	if llm != nil {
+		t.prompt += llm.prompt
+		t.completion += llm.completion
+		t.estimated = t.estimated || llm.estimated
+	}
+	if !api.IsZero() {
+		t.prompt += api.PromptTokens
+		t.completion += api.CompletionTokens
+		t.apiPrompt += api.PromptTokens
+		t.apiCompletion += api.CompletionTokens
+		t.estimated = t.estimated || api.Estimated
+	}
+}
+
+// addTo adds the tally to the request row.
+func (t tokenTally) addTo(rec *store.RequestLog) {
+	rec.PromptTokens += t.prompt
+	rec.CompletionTokens += t.completion
+	rec.Estimated = rec.Estimated || t.estimated
+}
+
 // call is the state one request carries from step to step. Nothing in it is
 // specific to an endpoint's request or response body.
 type call struct {
@@ -127,6 +176,14 @@ type call struct {
 	// invoke when the budget is limited; the zero time is no limit. Attempts
 	// read it through attemptContext and budgetLeft.
 	deadline time.Time
+	// sideSpend is what calls made outside the upstream attempts spent, such as
+	// the rerank of a chat request's retrieval. fillUsage overwrites the row's
+	// counts when the attempt finishes, so record adds this on top.
+	sideSpend tokenTally
+	// unpriced is the API rerank spend already added to the row by the
+	// endpoint itself (/v1/retrieve), which record leaves out of the price like
+	// the one in sideSpend.
+	unpriced tokenTally
 }
 
 func (c *call) ctx() context.Context { return c.r.Context() }
@@ -482,7 +539,16 @@ func (g *Gateway) failInvoke(c *call, err error) {
 func (g *Gateway) record(c *call) {
 	rec, conn, obsv := c.rec, c.conn, c.obs
 	rec.LatencyMs = time.Since(c.start).Milliseconds()
+	c.sideSpend.addTo(rec)
+	// An API rerank's tokens count toward limits and usage but are not priced
+	// at the row's model: that is not the model that did the work.
+	unpricedPrompt := c.sideSpend.apiPrompt + c.unpriced.apiPrompt
+	unpricedCompletion := c.sideSpend.apiCompletion + c.unpriced.apiCompletion
+	rec.PromptTokens -= unpricedPrompt
+	rec.CompletionTokens -= unpricedCompletion
 	g.priceRequest(conn, rec)
+	rec.PromptTokens += unpricedPrompt
+	rec.CompletionTokens += unpricedCompletion
 	if err := g.Store.InsertRequestLog(context.Background(), rec); err != nil {
 		c.log.Error("write request log", "err", err)
 	}

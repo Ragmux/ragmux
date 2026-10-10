@@ -171,6 +171,12 @@ func (in *retrieveInvocation) attempt(c *call, conn *store.ModelConnection) erro
 	// retrieve-only key opens; its tokens are counted on the row so the limits
 	// and the usage figures see them.
 	rerankSpend.addTo(c.rec)
+	// An API rerank (Cohere, Voyage) is counted the same way.
+	var apiSpend tokenTally
+	apiSpend.add(nil, res.RerankSpend)
+	apiSpend.addTo(c.rec)
+	// Counted, not priced: see call.unpriced.
+	c.unpriced = apiSpend
 	c.rec.RAGUsed, c.rec.RAGHits = true, len(res.Hits)
 	c.rec.StatusCode = http.StatusOK
 

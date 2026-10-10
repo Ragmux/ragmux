@@ -155,38 +155,8 @@ func parseEmbeddingInput(raw json.RawMessage) ([]string, string) {
 // When it returns true, c.targets holds at least one connection and c.conn is
 // the first of them. When it returns false it has answered the client.
 func (g *Gateway) resolveEmbeddingsRoute(c *call, model string) bool {
-	has, rt, err := g.Store.ResolveProjectRoute(c.ctx(), c.project.ID, store.RouteKindEmbeddings, model)
-	if err != nil {
-		c.log.Error("resolve route", "err", err)
-		return noRoute(c)
-	}
-	if has && rt != nil {
-		var targets []*store.ModelConnection
-		for _, t := range orderTargets(rt.Targets, g.rng()) {
-			targets = append(targets, effectiveConnection(t))
-		}
-		c.routeName = rt.Name
-		return acceptTargets(c, targets)
-	}
-	if c.project.RAGStoreID == nil {
-		modelNotFound(c, model)
-		return false
-	}
-	rs, err := g.Store.GetRAGStore(c.ctx(), *c.project.RAGStoreID)
-	if err != nil {
-		c.log.Error("resolve route: rag store", "id", *c.project.RAGStoreID, "err", err)
-		return noRoute(c)
-	}
-	conn, err := g.Store.GetConnection(c.ctx(), rs.EmbeddingConnectionID)
-	if err != nil {
-		c.log.Error("resolve route: embedding connection", "id", rs.EmbeddingConnectionID, "err", err)
-		return noRoute(c)
-	}
-	if model != "" && model != conn.ModelName {
-		modelNotFound(c, model)
-		return false
-	}
-	return acceptTargets(c, []*store.ModelConnection{conn})
+	return g.resolveKindRoute(c, store.RouteKindEmbeddings, model, "embedding",
+		func(rs *store.RAGStore) *int64 { return &rs.EmbeddingConnectionID })
 }
 
 // embeddingsInvocation is the embeddings endpoint's upstreamCall.

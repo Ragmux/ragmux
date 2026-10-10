@@ -18,7 +18,7 @@ listed in the [API reference](api.md#rag-stores-and-documents).
 | `fts_config` | `simple` | PostgreSQL text search configuration used to parse the query in hybrid mode. **Ignored when `search_backend` is `pg_search`** |
 | `rerank` | `false` | Reranking of the candidates |
 | `rerank_backend` | `llm` | `llm` (the project's chat model), `cohere` or `voyage` |
-| `rerank_connection_id` | `null` | Model connection holding the rerank API credentials. Required by `cohere` and `voyage`, must be `null` for `llm` |
+| `rerank_connection_id` | `null` | Model connection used for reranking outside a chat request. For `cohere` and `voyage` it holds the rerank API credentials and is required. For `llm` it is optional and names a chat connection. It is also the connection the dashboard search and the implicit `/v1/rerank` route use; see [Reranking](#reranking) |
 | `rerank_candidates` | `15` | Candidates sent to the reranker (1-100) |
 | `max_distance` | `0` | Cosine distance cut-off (0-2, `0` = off) |
 | `contextual_chunks` | `true` | Prefix the file name and section to the text that is embedded |
@@ -297,8 +297,9 @@ they are cut to `top_k`. `rerank_backend` picks who does it.
 `RERANK_TIMEOUT` (a Go duration, e.g. `3s`) overrides both defaults.
 
 **`llm`** sends the candidates in one listwise prompt (each passage cut to 800
-characters, `temperature 0`, `max_tokens 200`); the model answers with the passage
-numbers ordered by relevance.
+characters, `temperature 0`); the model answers with the passage numbers ordered by
+relevance. The reply is capped at 200 tokens unless `RERANK_MAX_TOKENS` sets another cap
+(see [Configuration](configuration.md)).
 
 **`cohere` and `voyage`** send the passages (each cut to 4000 characters) to a dedicated
 rerank API through the model connection named by `rerank_connection_id`. That connection
@@ -319,9 +320,25 @@ level. The search response then carries `"reranked": false` with
 finding out) so a skipped rerank reads as "0 ms, skipped" rather than as a blank field.
 Reranking is skipped, without the fallback flag, when fewer than two candidates remain.
 
-From the admin search endpoint the `llm` backend uses the chat model of the first project
-linked to the store; without such a project that search runs unreranked. The API backends
-need no project.
+**Which connection reranks where.** In a chat or `/v1/retrieve` request the `llm` backend
+asks the requesting project's own chat model, and the API backends use the connection named
+by `rerank_connection_id`. The dashboard's search endpoint and `POST /v1/rerank` have no
+project chat model to borrow, so they use the store's `rerank_connection_id` for every
+backend: a `cohere_rerank` / `voyage_rerank` connection, or, for `llm`, a chat connection.
+Several projects sharing one store therefore rerank through the same connection. A store
+without a `rerank_connection_id` does not guess one from its projects: the dashboard
+search runs unreranked and says so (`rerank_skipped`, below), and `/v1/rerank` answers
+`404 model_not_found` unless a `kind = rerank` route matches the requested `model`. Stores
+saved before 0.5 with the `llm` backend carry no id; set one to rerank in the dashboard.
+
+**Tokens are counted.** The tokens of an `llm` rerank in a chat or retrieve request are
+added to that request's row (priced at the row's model, which did the work), and so are
+those an API reranker reports (Cohere `meta.tokens`, Voyage `usage.total_tokens`;
+characters divided by 4, over the passages as sent, when none are reported). The API
+reranker's tokens count toward limits and usage but are not priced: it bills by search
+unit, so pricing them at the chat or embedding model's rate would invent a cost. A
+`/v1/rerank` call is one row of its own with `endpoint = rerank`. See
+the [API reference](api.md#post-v1rerank).
 
 ## Context injection
 
@@ -418,8 +435,12 @@ only get the header. Every request also records the number of injected passages 
 backend that **actually ran**, which differs from the one asked for when it is not
 available here; `fts_config` is echoed because `pg_search` ignores it.
 `retrieval_latency_ms` covers the query embedding and the database search,
-`rerank_latency_ms` the reranker (`null` when `rerank` was off; present, often `0`, when
-reranking was requested but skipped — `rerank_fallback` then says so).
+`rerank_latency_ms` the reranker (`null` when `rerank` was off or skipped; present, often
+`0`, when the reranker was tried and fell back, with `rerank_fallback: true`).
+`rerank_skipped` is `true`, with a `rerank_skipped_reason`, when `rerank` was on but the
+store has no `rerank_connection_id` (or its connection cannot serve the backend) and the
+search therefore ran without reranking; it is not a failure, so `rerank_fallback` stays
+`false`.
 
 The overrides only affect this call, and they now cover the backend settings too, so two
 configurations can be compared on the same query before either is saved. That is what
@@ -441,7 +462,9 @@ Each call embeds the query once through the store's embedding connection. Its to
 upstream's count, or an estimate of characters divided by 4 when it reports none) and
 price are written to the request log with `endpoint = retrieve`.
 When the store reranks with the LLM backend, that chat call's tokens (reported, or estimated
-from characters) are added to the same row and to the response `usage`.
+from characters) are added to the same row and to the response `usage`, and priced at the
+embedding connection's rate like the rest of the row; an API reranker's tokens are counted
+but not priced.
 
 ## Embedding token accounting
 

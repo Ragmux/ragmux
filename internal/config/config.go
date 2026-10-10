@@ -102,6 +102,9 @@ type Config struct {
 	// default 10 s (a full chat completion) and an API backend's 5 s (a
 	// single scoring call). Zero keeps each default.
 	RerankTimeout time.Duration
+	// RerankMaxTokens caps the reply of the LLM rerank backend. Zero keeps the
+	// built-in 200.
+	RerankMaxTokens int
 	// PgSearchTokenizer names the ParadeDB analyser for the BM25 index.
 	// The index is global, so it cannot be a per-store setting.
 	PgSearchTokenizer string
@@ -255,6 +258,13 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("RERANK_TIMEOUT must be positive, got %q", v)
 		}
 		c.RerankTimeout = d
+	}
+	if v := strings.TrimSpace(os.Getenv("RERANK_MAX_TOKENS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return c, fmt.Errorf("RERANK_MAX_TOKENS must be a positive integer, got %q", v)
+		}
+		c.RerankMaxTokens = n
 	}
 	if v := strings.TrimSpace(os.Getenv("PG_SEARCH_TOKENIZER")); v != "" {
 		// Interpolated into the index DDL, so the shape is checked here

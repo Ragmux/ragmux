@@ -67,6 +67,12 @@ type Gateway struct {
 	// Breakers holds the per-connection circuit breakers (ADR-020); nil
 	// disables them.
 	Breakers *Breakers
+	// Rerankers builds the rerank API adapter of a connection (POST /v1/rerank
+	// on a Cohere or Voyage connection); nil leaves such a connection unusable.
+	Rerankers func(*store.ModelConnection) (provider.Reranker, error)
+	// LLMRerank configures the chat-model reranker, used by POST /v1/rerank
+	// when the connection that serves it is a chat connection.
+	LLMRerank rag.LLMReranker
 }
 
 // requestObs collects the facts about one chat completion that the request
@@ -224,6 +230,7 @@ func (g *Gateway) Routes(r chi.Router) {
 	r.Post("/chat/completions", g.chatCompletions)
 	r.Post("/embeddings", g.embeddings)
 	r.Post("/retrieve", g.retrieve)
+	r.Post("/rerank", g.rerank)
 	models := r.With(g.requireScope(store.ScopeModels, "model listings"))
 	models.Get("/models", g.listModels)
 	models.Get("/models/{id}", g.getModel)
@@ -806,7 +813,21 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
 			q := rag.LastUserQuery(req.Messages)
-			hits, err := g.Retriever.Search(ctx, rs, q, rs.TopK, prov, c.conn.ModelName)
+			// The rerank of this retrieval is a side call of the chat request:
+			// its tokens (an LLM rerank is a chat call, an API rerank a scoring
+			// call) go on this request's log row through c.sideSpend.
+			var rerankSpend *rerankUsageProvider
+			searchProv := prov
+			if prov != nil {
+				rerankSpend = &rerankUsageProvider{Provider: prov}
+				searchProv = rerankSpend
+			}
+			res, err := g.Retriever.SearchWith(ctx, rs, q, rs.TopK, searchProv, c.conn.ModelName)
+			var hits []store.SearchHit
+			if res != nil {
+				hits = res.Hits
+				c.sideSpend.add(rerankSpend, res.RerankSpend)
+			}
 			if err != nil {
 				c.log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
