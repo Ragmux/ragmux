@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -102,6 +103,10 @@ type call struct {
 	// has run.
 	rec *store.RequestLog
 	obs *requestObs
+	// deadline ends the upstream budget (Gateway.UpstreamTimeout), set by
+	// invoke when the budget is limited; the zero time is no limit. Attempts
+	// read it through attemptContext and budgetLeft.
+	deadline time.Time
 }
 
 func (c *call) ctx() context.Context { return c.r.Context() }
@@ -272,8 +277,8 @@ func callLogger(base *slog.Logger, projectID int64, generated, requestID string)
 // not nil, sets the endpoint's own columns on the fresh row.
 func (g *Gateway) openRecord(c *call, streamed bool, fill func(*store.RequestLog)) {
 	c.rec = &store.RequestLog{ProjectID: c.project.ID, ModelName: c.conn.ModelName, Streamed: streamed}
-	// One attempt until invoke can make more (Faz 06); fallback_from stays
-	// empty until fallback exists.
+	// invoke overwrites attempt, fallback_from and model_name once it knows
+	// which attempt answered.
 	c.stamp(c.rec, 1)
 	c.principal.attribute(c.rec)
 	if fill != nil {
@@ -317,12 +322,22 @@ type upstreamCall interface {
 // ends the walk. c.rec and c.obs are filled for record to turn into the log row
 // and metrics.
 //
-// A failed attempt ends the walk unless continuesPastFailure says the failure
-// may be recovered at the next target. That predicate is the extension point
-// for retry and fallback (ADR-020 D7, Faz 06) and it answers false for every
-// error today, so exactly one attempt is made whatever resolveRoute returns:
-// repeating a non-idempotent POST, or moving to another target, is a decision
-// per failure class that has not been taken yet.
+// A failed attempt is classified (classifyAttempt, ADR-020): a transient
+// failure is repeated on the same target up to Gateway.MaxRetries times, a
+// failure that is the target's own moves the walk to the next target, and one
+// that belongs to the request ends it. All attempts share the upstream budget
+// (Gateway.UpstreamTimeout): each is cut off when it runs out, and a backoff
+// that would not fit in what is left is not waited. The client is answered
+// from the last attempt's error, so a route behaves like its last target when
+// every one of them fails.
+//
+// Retry and fallback are only possible because an attempt that returns an
+// error has written nothing (see upstreamCall); the request limit check,
+// system prompt and RAG ran once before, and usage is recorded once after.
+//
+// Afterwards the request log row says what happened: attempt is the number of
+// upstream calls made, fallback_from the first target's connection when the
+// walk moved on, and model_name the model of the target that answered.
 func (g *Gateway) invoke(c *call, up upstreamCall) {
 	if len(c.targets) == 0 {
 		// resolveRoute guarantees at least one target; this only keeps a
@@ -334,23 +349,76 @@ func (g *Gateway) invoke(c *call, up upstreamCall) {
 			Status: http.StatusInternalServerError, Type: "server_error", Message: c.rec.Error})
 		return
 	}
-	var err error
-	for _, target := range c.targets {
-		c.conn = target
-		if err = up.attempt(c, target); err == nil {
-			return
+	if g.UpstreamTimeout > 0 {
+		c.deadline = time.Now().Add(g.UpstreamTimeout)
+	}
+	first := c.targets[0]
+	attempts := 0
+	defer func() {
+		c.rec.Attempt = attempts
+		c.rec.ModelName = c.conn.ModelName
+		if c.conn != first {
+			id := first.ID
+			c.rec.FallbackFrom = &id
 		}
-		if !continuesPastFailure(err) {
+	}()
+
+	var err error
+	for i, target := range c.targets {
+		c.conn = target
+		var cl attemptClass
+		for retries := 0; ; retries++ {
+			attempts++
+			if err = up.attempt(c, target); err == nil {
+				return
+			}
+			var tc *targetConfigError
+			if errors.As(err, &tc) {
+				// No call left the gateway, so it is not an attempt: attempt
+				// counts upstream calls only (zero when none was made).
+				attempts--
+			}
+			cl = classifyAttempt(err)
+			g.logAttempt(c, target, attempts, cl, err)
+			if c.ctx().Err() != nil || c.budgetSpent() || !cl.retry || retries >= g.MaxRetries {
+				break
+			}
+			wait := retryWait(retries, g.rng()(), cl.retryAfter)
+			if !c.deadline.IsZero() && wait >= time.Until(c.deadline) {
+				// Waiting would eat the rest of the budget and leave nothing
+				// for the attempt the wait is for.
+				break
+			}
+			g.Metrics.RecordUpstreamRetry(cl.reason)
+			if g.sleep(c.ctx(), wait) != nil {
+				break
+			}
+		}
+		if i == len(c.targets)-1 || !cl.fallback || c.ctx().Err() != nil || c.budgetSpent() {
 			break
 		}
+		g.Metrics.RecordUpstreamFallback(cl.reason)
 	}
 	g.failInvoke(c, err)
 }
 
-// continuesPastFailure reports whether a failed attempt may be followed by an
-// attempt at the next target. Faz 06 classifies err here (status, network
-// error, whether any byte was written); until then no failure continues.
-func continuesPastFailure(error) bool { return false }
+// logAttempt records one failed attempt. The message is the adapter's
+// redacted one, never the raw error: an upstream's text is not trusted.
+func (g *Gateway) logAttempt(c *call, target *store.ModelConnection, attempt int, cl attemptClass, err error) {
+	var msg string
+	var pe *provider.Error
+	if errors.As(err, &pe) {
+		msg = pe.Message
+	} else {
+		msg = provider.Redact(err.Error())
+	}
+	class := cl.reason
+	if class == "" {
+		class = "terminal"
+	}
+	c.log.Warn("upstream attempt failed", "connection", target.ID, "attempt", attempt, "class", class,
+		"retry", cl.retry, "fallback", cl.fallback, "msg", msg)
+}
 
 // failInvoke answers the client for a failed upstream call.
 func (g *Gateway) failInvoke(c *call, err error) {

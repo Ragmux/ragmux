@@ -387,8 +387,9 @@ func imageCeilSeconds(d time.Duration) int {
 // Fetch downloads one image and returns its media type and base64 payload.
 // Everything a client can get wrong is a 400 naming only the host: the full
 // URL may carry a signed query string, and it is the client's own string
-// anyway. Transport and policy failures go through transportError so a
-// private-address image URL reads like a private base URL.
+// anyway. Transport and policy failures go through fetchError, which is
+// transportError marked as the client's input, so a private-address image URL
+// reads like a private base URL.
 func (f *ImageFetcher) Fetch(ctx context.Context, rawURL, tenant string, accepts map[string]bool) (string, string, error) {
 	u, err := neturl.Parse(rawURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -435,7 +436,7 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL, tenant string, accepts
 	req.Header.Set("User-Agent", "ragmux/1.0")
 	resp, err := f.Client.Do(req)
 	if err != nil {
-		return "", "", transportError(cfg, rawURL, err)
+		return "", "", fetchError(cfg, rawURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -455,7 +456,7 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL, tenant string, accepts
 	// be able to spend more memory than the cap allows.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, f.maxBytes()+1))
 	if err != nil {
-		return "", "", transportError(cfg, rawURL, err)
+		return "", "", fetchError(cfg, rawURL, err)
 	}
 	if int64(len(body)) > f.maxBytes() {
 		return "", "", imageError(f.tooLarge(u.Host))
@@ -465,6 +466,16 @@ func (f *ImageFetcher) Fetch(ctx context.Context, rawURL, tenant string, accepts
 		f.Cache.put(rawURL, mediaType, data)
 	}
 	return mediaType, data, nil
+}
+
+// fetchError is transportError for a failed image download. The host was
+// picked by the client, so the failure is not the target's: it keeps the
+// message and status the client sees, and is marked ClientInput so the
+// retry and fallback loop leaves it alone.
+func fetchError(cfg Config, rawURL string, err error) *Error {
+	e := transportError(cfg, rawURL, err)
+	e.NotSent, e.Retryable, e.ClientInput = false, false, true
+	return e
 }
 
 func (f *ImageFetcher) tooLarge(host string) string {

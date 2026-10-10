@@ -699,6 +699,61 @@ Create a route for every value that matters, or point those clients at the defau
 connection's model name. Rolling back is deleting the route: with no chat routes left the
 project echoes any `model` again.
 
+## Retry and fallback
+
+A chat call that fails before the first byte reached the client can be repeated on the
+same target (retry) or handed to the route's next target (fallback). The order of targets
+is the one [Routing](#routing) describes; a project without routes has one target, so only
+retries apply. What happens is decided by the kind of failure:
+
+| Failure | Retry | Fallback |
+|---|---|---|
+| The request never left: DNS, refused connection, TLS handshake | yes | yes |
+| Connection reset or cut after the request was sent | no | yes |
+| `429`, `503` (and Anthropic's `529`) with no `Retry-After`, or one of 2 s or less | yes | yes |
+| `429`, `503` (and Anthropic's `529`) with `Retry-After` above 2 s | no | yes |
+| `500`, `502`, other `5xx` | no | yes |
+| `504` or a timeout | no | only if budget is left |
+| `401`, `403`, `404` (the key or model is wrong for that target) | no | yes |
+| `400`, `413`, `422` and other `4xx`, a client that went away | no | no |
+
+A reset after the request was sent is never retried on the same target: the provider may
+already have processed it, and a repeat could be billed twice. A `529` from a provider
+other than Anthropic is not retried either; it only hands the request to the next target.
+A failure to download an image URL the client sent is the client's, not the target's: it
+is answered as it is, with neither retry nor fallback.
+
+**Retries.** Each target is retried up to `UPSTREAM_MAX_RETRIES` times (default `2`, `0`
+turns them off). The wait before a retry is exponential with full jitter: a random time
+below 250 ms, 500 ms, 1 s and so on, capped at 2 s. When the upstream sent `Retry-After`
+of 2 s or less, the longer of the two is waited. A longer `Retry-After` is not waited for:
+the next target takes over, and when there is none the client gets the error with
+`Retry-After` set to the upstream's value.
+
+**Budget.** `UPSTREAM_TIMEOUT` is the budget of the whole request, not of one attempt.
+Each attempt runs with what is left of it, and a wait that would use up the remainder is
+skipped, so the attempts of a non-streaming request never add up to more than
+`UPSTREAM_TIMEOUT`.
+The rate-limit check, the system prompt and retrieval run once before the first attempt,
+and usage is recorded once.
+
+**Streams.** Retry and fallback apply only until the first chunk is sent, including an
+upstream that answers `2xx` and fails before it sends anything. After the response headers
+went out the stream is never restarted or joined to another one: a cut stream ends the way
+it did before.
+
+**What the client sees.** The error of the last attempt, in the format of
+[Error relay and redaction](#error-relay-and-redaction). A fallback that succeeds is
+invisible apart from the request log: one row per request, `attempt` is the number of
+upstream calls in total, `fallback_from` is the connection id of the first target whenever
+the request moved past it (also when no target answered), and `model_name` is the model of
+the last target tried. A target whose adapter cannot be built is skipped without counting
+as a call; on a route with several targets that includes the first one. Each failed
+attempt is logged at `warn` level with its connection id and class. Retries and fallbacks
+are counted in `ragmux_upstream_retries_total` and `ragmux_upstream_fallbacks_total`
+([Observability](observability.md#the-metric-set)); a failure that is neither retried nor
+handed on, such as a `400`, reaches neither.
+
 ## Error relay and redaction
 
 Provider errors are relayed with the upstream message (cut to 512 characters) in the

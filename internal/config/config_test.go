@@ -253,3 +253,31 @@ func TestMetricsEnabledRefusesUnknownValues(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadUpstreamMaxRetries(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UpstreamMaxRetries != 2 {
+		t.Errorf("default UpstreamMaxRetries = %d, want 2", c.UpstreamMaxRetries)
+	}
+
+	// 0 is the documented way to turn retries off, not an error.
+	t.Setenv("UPSTREAM_MAX_RETRIES", "0")
+	if c, err = Load(); err != nil || c.UpstreamMaxRetries != 0 {
+		t.Errorf("UPSTREAM_MAX_RETRIES=0: %d, %v", c.UpstreamMaxRetries, err)
+	}
+	t.Setenv("UPSTREAM_MAX_RETRIES", "5")
+	if c, err = Load(); err != nil || c.UpstreamMaxRetries != 5 {
+		t.Errorf("UPSTREAM_MAX_RETRIES=5: %d, %v", c.UpstreamMaxRetries, err)
+	}
+	for _, bad := range []string{"-1", "11", "two", "1.5"} {
+		t.Setenv("UPSTREAM_MAX_RETRIES", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("UPSTREAM_MAX_RETRIES=%q accepted", bad)
+		}
+	}
+}

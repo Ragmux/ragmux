@@ -123,7 +123,7 @@ func TestAnthropicStreamWarningBeforeFirstByte(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	setRequestWarnings(w.Header(), prov, req)
-	g.stream(w, r, prov, &store.ModelConnection{ProviderType: "anthropic"}, req, &store.RequestLog{}, &requestObs{}, 0)
+	_ = g.stream(w, r, 0, prov, &store.ModelConnection{ProviderType: "anthropic"}, req, &store.RequestLog{}, &requestObs{}, 0)
 
 	res := w.Result()
 	if res.StatusCode != http.StatusOK || res.Header.Get("Warning") != anthropicWarning {

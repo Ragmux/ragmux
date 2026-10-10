@@ -17,6 +17,13 @@ All notable changes to Ragmux are documented here. The format follows
   [Observability](docs/observability.md#cardinality-checklist).
 
 ### Added
+- **Retry and route-internal fallback.** A chat call that fails before the first byte is
+  sent is retried on the same target (connection never established, `429`, `503`) and then
+  handed to the route's next target; `UPSTREAM_MAX_RETRIES` (default `2`, `0` disables)
+  sets the retries per target. `UPSTREAM_TIMEOUT` is now the budget of all attempts
+  together. A request is still one `request_logs` row, with `attempt` and `fallback_from`
+  filled in. New metrics `ragmux_upstream_retries_total` and
+  `ragmux_upstream_fallbacks_total`. See [Retry and fallback](docs/providers.md#retry-and-fallback).
 - `request_logs` gains `request_id`, `endpoint`, `requested_model`, `route`, `attempt` and
   `fallback_from` (migrations `0016`, `0017`); see
   [the request log](docs/observability.md#the-request-log). `0017` builds its index

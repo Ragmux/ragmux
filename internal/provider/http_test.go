@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -170,5 +171,102 @@ func TestGeminiModelPathEscaped(t *testing.T) {
 	}
 	if geminiModelPath("gemini-2.0-flash") != "gemini-2.0-flash" || geminiModelPath("models/text-embedding-004") != "text-embedding-004" {
 		t.Error("plain names must pass through unchanged")
+	}
+}
+
+// TestTransportErrorRetryClass pins the typed classification the gateway's
+// retry loop reads (ADR-020): a request that never left is NotSent and
+// Retryable; a connection reset after the connection was made is neither, even
+// though the client-visible message is the same "upstream unreachable".
+func TestTransportErrorRetryClass(t *testing.T) {
+	cfg := Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	dial := func(err error) error {
+		return &url.Error{Op: "Post", URL: "https://x", Err: &net.OpError{Op: "dial", Err: err}}
+	}
+	cases := []struct {
+		name      string
+		err       error
+		notSent   bool
+		retryable bool
+		message   string
+	}{
+		{"dns", dial(&net.DNSError{Err: "no such host", Name: "x", IsNotFound: true}), true, true, "upstream unreachable"},
+		{"refused", dial(syscall.ECONNREFUSED), true, true, "upstream unreachable"},
+		{"host unreachable", dial(syscall.EHOSTUNREACH), true, true, "upstream unreachable"},
+		{"tls handshake", &url.Error{Op: "Post", URL: "https://x", Err: tls.RecordHeaderError{Msg: "bad"}}, true, true, "upstream TLS handshake failed"},
+		{"reset after send", &url.Error{Op: "Post", URL: "https://x", Err: &net.OpError{Op: "read", Err: syscall.ECONNRESET}}, false, false, "upstream unreachable"},
+		{"unexpected eof", &url.Error{Op: "Post", URL: "https://x", Err: io.ErrUnexpectedEOF}, false, false, "upstream unreachable"},
+		{"timeout", dial(&timeoutErr{}), false, false, "upstream request timed out"},
+		{"guard", &url.Error{Op: "Post", URL: "https://x", Err: &netguard.Error{Host: "internal.example"}}, true, false, ""},
+	}
+	for _, c := range cases {
+		e := transportError(cfg, "https://api.example.com/v1/chat", c.err)
+		if e.NotSent != c.notSent || e.Retryable != c.retryable {
+			t.Errorf("%s: NotSent=%v Retryable=%v, want %v %v", c.name, e.NotSent, e.Retryable, c.notSent, c.retryable)
+		}
+		if c.message != "" && e.Message != c.message {
+			t.Errorf("%s: message = %q, want %q", c.name, e.Message, c.message)
+		}
+		if e.UpstreamStatus != 0 {
+			t.Errorf("%s: UpstreamStatus = %d, want 0 (no response)", c.name, e.UpstreamStatus)
+		}
+	}
+}
+
+func TestUpstreamStatusErrorRetryClass(t *testing.T) {
+	cases := []struct {
+		provider   string
+		status     int
+		retryAfter string
+		wantStatus int
+		retryable  bool
+		delay      time.Duration
+	}{
+		{"openai", 429, "", 429, true, 0},
+		{"openai", 429, "1", 429, true, time.Second},
+		{"openai", 503, "30", 503, true, 30 * time.Second},
+		{"anthropic", 529, "", 503, true, 0},
+		{"openai", 529, "", 502, false, 0},
+		{"openai", 500, "", 502, false, 0},
+		{"openai", 502, "", 502, false, 0},
+		{"openai", 504, "", 504, false, 0},
+		{"openai", 401, "", 401, false, 0},
+		{"openai", 400, "", 400, false, 0},
+		{"openai", 429, "garbage", 429, true, 0},
+	}
+	for _, c := range cases {
+		resp := &http.Response{StatusCode: c.status, Header: http.Header{}}
+		if c.retryAfter != "" {
+			resp.Header.Set("Retry-After", c.retryAfter)
+		}
+		e := upstreamStatusError(Config{ProviderType: c.provider}, resp, []byte("x"))
+		if e.UpstreamStatus != c.status || e.Status != c.wantStatus || e.Retryable != c.retryable || e.UpstreamRetryDelay != c.delay {
+			t.Errorf("%s %d Retry-After=%q: got status=%d upstream=%d retryable=%v delay=%v, want status=%d retryable=%v delay=%v",
+				c.provider, c.status, c.retryAfter, e.Status, e.UpstreamStatus, e.Retryable, e.UpstreamRetryDelay, c.wantStatus, c.retryable, c.delay)
+		}
+		if e.NotSent {
+			t.Errorf("%d: an answered request is never NotSent", c.status)
+		}
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 0},
+		{"0", 0},
+		{"7", 7 * time.Second},
+		{"99999999999999999999", maxRetryDelay},
+		{now.Add(90 * time.Second).Format(http.TimeFormat), 90 * time.Second},
+		{now.Add(-time.Minute).Format(http.TimeFormat), 0},
+		{"soon", 0},
+	}
+	for _, c := range cases {
+		if got := retryDelay(c.in, now); got != c.want {
+			t.Errorf("retryDelay(%q) = %v, want %v", c.in, got, c.want)
+		}
 	}
 }

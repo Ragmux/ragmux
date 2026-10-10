@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/store"
 )
 
@@ -303,7 +304,7 @@ func TestInvokeAnswersAProviderFailure(t *testing.T) {
 	up := &fakeUpstream{results: []error{errors.New("boom")}}
 	e.gw.invoke(c, up)
 	if up.calls != 1 {
-		t.Fatalf("attempts = %d, want 1 (no retry yet)", up.calls)
+		t.Fatalf("attempts = %d, want 1 (a single target has nowhere to fall back to)", up.calls)
 	}
 	if w.Code < 500 || c.rec.StatusCode != w.Code || c.rec.Error == "" || c.obs.errType == "" {
 		t.Errorf("response = %d %s rec = %+v obs = %+v", w.Code, w.Body.String(), c.rec, c.obs)
@@ -330,7 +331,7 @@ func TestInvokeTreatsACancelledRequestAsClientClosed(t *testing.T) {
 	}
 }
 
-func TestInvokeStopsAtTheFirstFailure(t *testing.T) {
+func TestInvokeStopsAtATerminalFailure(t *testing.T) {
 	e := newEnv(t, nil)
 	w := httptest.NewRecorder()
 	c := e.invokeCall(w)
@@ -339,13 +340,107 @@ func TestInvokeStopsAtTheFirstFailure(t *testing.T) {
 	second := *first
 	second.ModelName = "second"
 	c.targets = append(c.targets, &second)
-	up := &fakeUpstream{results: []error{errors.New("first down"), nil}}
+	bad := &provider.Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "bad request"}
+	up := &fakeUpstream{results: []error{bad, nil}}
 	e.gw.invoke(c, up)
 	if up.calls != 1 || up.seen[0] != first || c.conn != first {
 		t.Errorf("calls = %d conn = %v, want one attempt at the first target", up.calls, c.conn)
 	}
-	if w.Code < 500 || c.rec.StatusCode != w.Code {
+	if w.Code != http.StatusBadRequest || c.rec.StatusCode != w.Code {
 		t.Errorf("response = %d rec = %+v", w.Code, c.rec)
+	}
+	if c.rec.Attempt != 1 || c.rec.FallbackFrom != nil {
+		t.Errorf("attempt = %d fallback_from = %v", c.rec.Attempt, c.rec.FallbackFrom)
+	}
+}
+
+func TestInvokeFallsBackToTheNextTarget(t *testing.T) {
+	e := newEnv(t, nil)
+	w := httptest.NewRecorder()
+	c := e.invokeCall(w)
+	defer c.span.End()
+	first := c.targets[0]
+	second := *first
+	second.ID = first.ID + 1000
+	second.ModelName = "second"
+	c.targets = append(c.targets, &second)
+	down := &provider.Error{Status: http.StatusBadGateway, Type: "server_error", UpstreamStatus: 500, Message: "down"}
+	up := &fakeUpstream{results: []error{down, nil}, settle: func(c *call) {
+		c.rec.StatusCode = http.StatusOK
+		_, _ = c.w.Write([]byte("ok"))
+	}}
+	e.gw.invoke(c, up)
+	if up.calls != 2 || up.seen[1] != &second || c.conn != &second {
+		t.Fatalf("calls = %d conn = %v, want the second target to answer", up.calls, c.conn)
+	}
+	if w.Code != http.StatusOK || c.rec.StatusCode != http.StatusOK || c.rec.Error != "" {
+		t.Errorf("response = %d rec = %+v", w.Code, c.rec)
+	}
+	if c.rec.Attempt != 2 || c.rec.FallbackFrom == nil || *c.rec.FallbackFrom != first.ID || c.rec.ModelName != "second" {
+		t.Errorf("attempt = %d fallback_from = %v model = %q", c.rec.Attempt, c.rec.FallbackFrom, c.rec.ModelName)
+	}
+}
+
+func TestInvokeRetriesTheSameTarget(t *testing.T) {
+	e := newEnv(t, nil)
+	var slept []time.Duration
+	e.gw.MaxRetries = 2
+	e.gw.Rand = func() float64 { return 0.5 }
+	e.gw.Sleep = func(_ context.Context, d time.Duration) error { slept = append(slept, d); return nil }
+	w := httptest.NewRecorder()
+	c := e.invokeCall(w)
+	defer c.span.End()
+	busy := &provider.Error{Status: http.StatusServiceUnavailable, Type: "server_error", UpstreamStatus: 503, Retryable: true, Message: "busy"}
+	up := &fakeUpstream{results: []error{busy, busy, nil}, settle: func(c *call) {
+		c.rec.StatusCode = http.StatusOK
+		_, _ = c.w.Write([]byte("ok"))
+	}}
+	e.gw.invoke(c, up)
+	if up.calls != 3 || c.rec.Attempt != 3 || c.rec.FallbackFrom != nil {
+		t.Fatalf("calls = %d attempt = %d fallback_from = %v", up.calls, c.rec.Attempt, c.rec.FallbackFrom)
+	}
+	// Full jitter at 0.5 of a 250ms then 500ms ceiling.
+	if len(slept) != 2 || slept[0] != 125*time.Millisecond || slept[1] != 250*time.Millisecond {
+		t.Errorf("waits = %v", slept)
+	}
+}
+
+func TestInvokeStopsRetryingAtTheRetryLimit(t *testing.T) {
+	e := newEnv(t, nil)
+	e.gw.MaxRetries = 1
+	e.gw.Sleep = func(context.Context, time.Duration) error { return nil }
+	w := httptest.NewRecorder()
+	c := e.invokeCall(w)
+	defer c.span.End()
+	busy := &provider.Error{Status: http.StatusServiceUnavailable, Type: "server_error", UpstreamStatus: 503, Retryable: true, Message: "busy"}
+	up := &fakeUpstream{results: []error{busy, busy, busy}}
+	e.gw.invoke(c, up)
+	if up.calls != 2 || c.rec.Attempt != 2 {
+		t.Errorf("calls = %d attempt = %d, want 2 (one retry)", up.calls, c.rec.Attempt)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("response = %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvokeDoesNotWaitPastTheBudget(t *testing.T) {
+	e := newEnv(t, nil)
+	e.gw.MaxRetries = 2
+	e.gw.UpstreamTimeout = 100 * time.Millisecond
+	e.gw.Rand = func() float64 { return 0.99 }
+	e.gw.Sleep = func(context.Context, time.Duration) error {
+		t.Error("slept although the wait exceeds the budget")
+		return nil
+	}
+	w := httptest.NewRecorder()
+	c := e.invokeCall(w)
+	defer c.span.End()
+	busy := &provider.Error{Status: http.StatusServiceUnavailable, Type: "server_error", UpstreamStatus: 503, Retryable: true,
+		UpstreamRetryDelay: time.Second, Message: "busy"}
+	up := &fakeUpstream{results: []error{busy, nil}}
+	e.gw.invoke(c, up)
+	if up.calls != 1 || w.Code != http.StatusServiceUnavailable {
+		t.Errorf("calls = %d response = %d", up.calls, w.Code)
 	}
 }
 

@@ -145,6 +145,8 @@ which the success, error, mid-stream-failure and client-disconnect paths all rea
 | `ragmux_gateway_cost_usd_total` | counter (float) | `project`, `model` | Estimated spend, from the same price table the request log uses. |
 | `ragmux_gateway_errors_total` | counter | `project`, `provider`, `type` | `type` is the provider error type, a bounded set. |
 | `ragmux_gateway_client_disconnects_total` | counter | — | Completions the client abandoned (status 499). |
+| `ragmux_upstream_retries_total` | counter | `reason` | Retries of the same target. `reason` is `dial`, `rate_limited`, `unavailable`, `server_error`, `timeout` or `target_config` and nothing else. |
+| `ragmux_upstream_fallbacks_total` | counter | `reason` | Moves to a route's next target, with the same closed `reason` set as the retries. |
 | `ragmux_requests_unpriced_total` | counter | `provider` | Successful completions whose model has no entry in the price table, so their spend is missing from `cost_usd_total` and the request log. `provider` is the provider type, a fixed set. |
 
 `tokens_estimated_total` is a separate metric rather than a `estimated="true"` label on

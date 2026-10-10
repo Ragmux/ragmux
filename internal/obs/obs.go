@@ -106,6 +106,9 @@ type Metrics struct {
 
 	limitsDenied *metrics.CounterVec
 
+	upstreamRetries   *metrics.CounterVec
+	upstreamFallbacks *metrics.CounterVec
+
 	ragRetrieval    *metrics.HistogramVec
 	ragEmbed        *metrics.HistogramVec
 	ragRerank       *metrics.HistogramVec
@@ -176,6 +179,13 @@ func New(reg *metrics.Registry) *Metrics {
 	m.limitsDenied = reg.Counter("ragmux_limits_denied_total",
 		"Requests refused by a rate limit or a token budget, by project and deny reason.",
 		"project", "reason")
+
+	m.upstreamRetries = reg.Counter("ragmux_upstream_retries_total",
+		"Repeat calls the gateway made to the same upstream target after a transient failure, by failure class.",
+		"reason")
+	m.upstreamFallbacks = reg.Counter("ragmux_upstream_fallbacks_total",
+		"Moves to the next target of a route after a failure, by failure class of the target it left.",
+		"reason")
 
 	m.ragRetrieval = reg.Histogram("ragmux_rag_retrieval_duration_seconds",
 		"Query embedding plus the database search, by store, effective backend and search mode.",
@@ -381,6 +391,37 @@ func (m *Metrics) RecordLimitDenied(project, reason string) {
 		return
 	}
 	m.limitsDenied.With(project, reason).Inc()
+}
+
+// Upstream failure classes, the values of the reason label of
+// ragmux_upstream_retries_total and ragmux_upstream_fallbacks_total. The set
+// is closed on purpose: the label may never carry err.Error() or a status text
+// (ADR-002).
+const (
+	UpstreamDial         = "dial"
+	UpstreamRateLimited  = "rate_limited"
+	UpstreamUnavailable  = "unavailable"
+	UpstreamServerError  = "server_error"
+	UpstreamTimeout      = "timeout"
+	UpstreamTargetConfig = "target_config"
+)
+
+// RecordUpstreamRetry counts one repeat call on the same target. reason is one
+// of the Upstream* constants.
+func (m *Metrics) RecordUpstreamRetry(reason string) {
+	if m == nil {
+		return
+	}
+	m.upstreamRetries.With(reason).Inc()
+}
+
+// RecordUpstreamFallback counts one move to the next target of a route.
+// reason is one of the Upstream* constants.
+func (m *Metrics) RecordUpstreamFallback(reason string) {
+	if m == nil {
+		return
+	}
+	m.upstreamFallbacks.With(reason).Inc()
 }
 
 // ---- rag ----

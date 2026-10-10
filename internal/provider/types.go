@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Message is one OpenAI chat message. Content is kept raw because it may be
@@ -391,6 +392,34 @@ type Error struct {
 	// are present, because the gateway's own figure is the one it can vouch
 	// for.
 	UpstreamRetryAfter string
+
+	// The fields below classify the failure for the gateway's retry and
+	// fallback loop (ADR-020). The adapters only describe what happened;
+	// whether and how often to repeat a call is the gateway's decision, so
+	// none of them changes a message or a status the client sees.
+	//
+	// UpstreamStatus is the status the upstream answered with, before it was
+	// normalised into Status (a 500 becomes a 502, Anthropic's 529 a 503). It
+	// is zero when no response arrived.
+	UpstreamStatus int
+	// NotSent reports that the request provably never left the gateway: the
+	// connection could not be made (dial, DNS, refusal) or the TLS handshake
+	// failed. Repeating such a call cannot be billed twice.
+	NotSent bool
+	// Retryable reports that the failure is of a kind that clears by itself
+	// and may be repeated on the same target: a request that was not sent,
+	// or an upstream 429 or 503 (529 included). Whether a given Retry-After
+	// is worth waiting for is the caller's call.
+	Retryable bool
+	// UpstreamRetryDelay is the upstream's Retry-After as a duration, zero
+	// when the header was absent, malformed or already in the past.
+	UpstreamRetryDelay time.Duration
+	// ClientInput reports that the failure came from something the client
+	// supplied, not from the target: fetching an image URL from the request
+	// is the case. Such an error says nothing about the target's health, so
+	// the gateway neither retries it, nor falls back on it, nor counts it
+	// against the target. NotSent and Retryable are never set alongside it.
+	ClientInput bool
 }
 
 func (e *Error) Error() string {

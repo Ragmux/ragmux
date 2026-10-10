@@ -17,6 +17,10 @@ import (
 	"github.com/ragmux/ragmux/internal/bm25"
 )
 
+// MaxUpstreamRetries is the ceiling of UPSTREAM_MAX_RETRIES. Backoff is capped
+// at two seconds a wait, so a larger number only lengthens the tail.
+const MaxUpstreamRetries = 10
+
 // Config holds every tunable the gateway reads at startup.
 type Config struct {
 	// DatabaseURL is the PostgreSQL connection string (required).
@@ -35,8 +39,13 @@ type Config struct {
 	CORSOrigins   []string
 	// SessionTTL controls how long a dashboard login stays valid.
 	SessionTTL time.Duration
-	// UpstreamTimeout bounds a single non-streaming provider call.
+	// UpstreamTimeout is the total time budget of a request's upstream calls:
+	// every attempt, retry and fallback of a non-streaming call shares it, and
+	// a streaming call spends it before its first byte.
 	UpstreamTimeout time.Duration
+	// UpstreamMaxRetries is how many times the gateway repeats a failed call
+	// on the same target before moving on. 0 disables retries.
+	UpstreamMaxRetries int
 	// IngestWorkers is the number of concurrent document ingestion jobs.
 	IngestWorkers int
 	// IngestLease is how long a replica owns a document it claimed without
@@ -170,19 +179,20 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c := Config{
-		PgSearchTokenizer: "default",
-		DatabaseURL:       dbURL,
-		DBMaxConns:        10,
-		SecretKeyHex:      secretKey,
-		DataDir:           env("DATA_DIR", "/app/data"),
-		Port:              8765,
-		AdminUser:         env("ADMIN_USER", "admin"),
-		AdminPassword:     os.Getenv("ADMIN_PASSWORD"),
-		LogLevel:          env("LOG_LEVEL", "info"),
-		SessionTTL:        24 * time.Hour,
-		UpstreamTimeout:   5 * time.Minute,
-		IngestWorkers:     2,
-		MaxUploadBytes:    50 << 20,
+		PgSearchTokenizer:  "default",
+		DatabaseURL:        dbURL,
+		DBMaxConns:         10,
+		SecretKeyHex:       secretKey,
+		DataDir:            env("DATA_DIR", "/app/data"),
+		Port:               8765,
+		AdminUser:          env("ADMIN_USER", "admin"),
+		AdminPassword:      os.Getenv("ADMIN_PASSWORD"),
+		LogLevel:           env("LOG_LEVEL", "info"),
+		SessionTTL:         24 * time.Hour,
+		UpstreamTimeout:    5 * time.Minute,
+		UpstreamMaxRetries: 2,
+		IngestWorkers:      2,
+		MaxUploadBytes:     50 << 20,
 
 		IngestLease:         2 * time.Minute,
 		IngestPollInterval:  5 * time.Second,
@@ -265,6 +275,13 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid UPSTREAM_TIMEOUT %q: %w", v, err)
 		}
 		c.UpstreamTimeout = d
+	}
+	if v := os.Getenv("UPSTREAM_MAX_RETRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > MaxUpstreamRetries {
+			return c, fmt.Errorf("invalid UPSTREAM_MAX_RETRIES %q (0 to %d)", v, MaxUpstreamRetries)
+		}
+		c.UpstreamMaxRetries = n
 	}
 	if v := os.Getenv("INGEST_WORKERS"); v != "" {
 		n, err := strconv.Atoi(v)

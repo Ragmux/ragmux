@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -53,6 +54,16 @@ type Gateway struct {
 	// value in [0, 1). Nil uses math/rand/v2's concurrency-safe generator;
 	// tests inject a seeded one.
 	Rand func() float64
+	// UpstreamTimeout is the total time budget of one request's upstream
+	// attempts, retries and fallbacks together. Zero means no budget.
+	UpstreamTimeout time.Duration
+	// MaxRetries is how often a transient failure is repeated on the same
+	// target before the route moves on. Zero disables retries; fallback to the
+	// next target is not affected.
+	MaxRetries int
+	// Sleep waits between a failed attempt and its retry. Nil uses a timer;
+	// tests inject one that records the wait instead of taking it.
+	Sleep func(ctx context.Context, d time.Duration) error
 }
 
 // requestObs collects the facts about one chat completion that the request
@@ -575,7 +586,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !g.resolveRoute(c, req.Model) {
 		return
 	}
-	prov, ok := g.chatProvider(c)
+	prov, ok, buildErr := g.chatProvider(c)
 	if !ok {
 		return
 	}
@@ -594,17 +605,33 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	g.openRecord(c, req.Stream, prep.apply)
 	defer g.record(c)
 
-	g.invoke(c, &chatInvocation{gw: g, prov: prov, req: req, promptChars: messageChars(req.Messages),
+	// A nil prov (the first target's adapter could not be built) leaves provConn
+	// unset and records the connection and its error as failedConn and
+	// failedErr: providerFor hands that error back without building again, and
+	// the walk falls back.
+	var provConn, failedConn *store.ModelConnection
+	if prov != nil {
+		provConn = c.conn
+	} else {
+		failedConn = c.conn
+	}
+	g.invoke(c, &chatInvocation{gw: g, prov: prov, provConn: provConn, failedConn: failedConn, failedErr: buildErr, req: req, promptChars: messageChars(req.Messages),
 		opts: prep.opts, sources: prep.sources, contextBlock: prep.contextBlock})
 }
 
 // chatInvocation is the chat endpoint's upstreamCall.
 type chatInvocation struct {
 	gw *Gateway
-	// prov is the adapter for the primary target. It matches conn only for
-	// the first attempt, which is the only one invoke makes today; before a
-	// second target can be tried the provider has to be built per target.
-	prov provider.Provider
+	// prov is the adapter for provConn, the connection it was built for: the
+	// first target to begin with, then whichever target was tried last. A
+	// target is only given a new adapter when invoke moves to another one.
+	prov     provider.Provider
+	provConn *store.ModelConnection
+	// failedConn is the connection whose adapter could not be built before the
+	// walk began, and failedErr the target_config error that stands for it:
+	// the build is tried once per request, not again at the walk.
+	failedConn *store.ModelConnection
+	failedErr  error
 	// req is the request as it goes upstream; req.Model is the client's model
 	// string, which the response is rewritten back to.
 	req provider.ChatRequest
@@ -618,18 +645,48 @@ type chatInvocation struct {
 	contextBlock string
 }
 
+// providerFor returns the adapter of conn, building it the first time invoke
+// reaches a target other than the one prov was made for. A connection whose
+// adapter cannot be built is that target's own fault, so the walk may go on.
+func (in *chatInvocation) providerFor(c *call, conn *store.ModelConnection) (provider.Provider, error) {
+	if conn == in.provConn {
+		return in.prov, nil
+	}
+	if conn == in.failedConn && in.failedErr != nil {
+		return nil, in.failedErr
+	}
+	prov, err := in.gw.Providers(conn)
+	if err != nil {
+		// The factory error names the provider type or URL; it stays in the
+		// log, as in chatProvider.
+		c.log.Error("provider setup", "connection", conn.ID, "err", err)
+		return nil, newTargetConfigError()
+	}
+	in.prov, in.provConn = prov, conn
+	// The warnings prepareChat set describe what the first adapter ignores;
+	// nothing has been written yet, so they can still be replaced.
+	c.w.Header().Del("Warning")
+	setRequestWarnings(c.w.Header(), prov, in.req)
+	return prov, nil
+}
+
 // attempt is one chat call, streamed or not. A stream answers the client
-// itself and is always settled; a plain call returns the provider's error
-// untouched when it fails, before anything is written.
+// itself once its first chunk arrives and is settled from then on; before that,
+// like a plain call, it returns the provider's error untouched when it fails.
 func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	req := in.req
+	prov, err := in.providerFor(c, conn)
+	if err != nil {
+		return err
+	}
 	if req.Stream {
-		in.gw.stream(c.w, c.r, in.prov, conn, req, c.rec, c.obs, in.promptChars)
-		return nil
+		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars)
 	}
 
+	ctx, cancel := c.attemptContext()
+	defer cancel()
 	upstreamStart := time.Now()
-	resp, err := in.prov.Chat(c.ctx(), req)
+	resp, err := prov.Chat(ctx, req)
 	c.obs.upstream = time.Since(upstreamStart)
 	if err != nil {
 		return err
@@ -671,17 +728,29 @@ func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, bool) {
 	return req, true
 }
 
-// chatProvider builds the chat adapter for the routed connection.
-func (g *Gateway) chatProvider(c *call) (provider.Provider, bool) {
+// chatProvider builds the chat adapter for the routed connection. A route with
+// other targets does not fail on it (ADR-020's target_config class): it
+// returns a nil adapter and the target_config error, which invoke reports as
+// that target's attempt before moving on to the next one.
+func (g *Gateway) chatProvider(c *call) (provider.Provider, bool, error) {
 	prov, err := g.Providers(c.conn)
 	if err != nil {
 		// The factory error names the provider type or URL; clients only
 		// need to know the project is misconfigured.
 		c.log.Error("provider setup", "connection", c.conn.ID, "err", err)
+		if len(c.targets) > 1 {
+			return nil, true, newTargetConfigError()
+		}
 		writeError(c.w, http.StatusInternalServerError, "server_error", "model connection unavailable")
-		return nil, false
+		return nil, false, nil
 	}
-	return prov, true
+	return prov, true, nil
+}
+
+// newTargetConfigError is the error of a target whose adapter cannot be built.
+func newTargetConfigError() error {
+	return &targetConfigError{pe: &provider.Error{
+		Status: http.StatusInternalServerError, Type: "server_error", Message: "model connection unavailable"}}
 }
 
 // chatPrep is what prepareChat hands on to invoke and the request log.
@@ -723,6 +792,11 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 
 	// RAG pipeline. The hit count and sources headers are set here, before
 	// either the JSON or the streaming path writes the status line.
+	//
+	// prov may be nil when the first target's adapter could not be built.
+	// Retrieval embeds through the store's own connection and uses prov only
+	// for the LLM rerank backend, which a nil prov skips; the walk still
+	// answers from another target with the same context (ADR-020).
 	if p.RAGStoreID != nil && g.Retriever != nil {
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
@@ -849,15 +923,32 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 	return append(b, '\n'), nil
 }
 
-func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, conn *store.ModelConnection,
-	req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) {
+// stream relays one streamed chat call to the client.
+//
+// It returns an error only when the upstream failed before the first chunk, so
+// that nothing has been written and rec is untouched: the caller may then try
+// another target. Once a chunk has arrived the response is the stream's own
+// and every outcome is settled in rec. firstByte, if positive, is how long the
+// upstream has to produce that first chunk; it does not limit the stream
+// afterwards.
+func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.Duration, prov provider.Provider,
+	conn *store.ModelConnection, req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by server")
-		return
+		return nil
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	var budgetHit atomic.Bool
+	var budgetTimer *time.Timer
+	if firstByte > 0 {
+		budgetTimer = time.AfterFunc(firstByte, func() {
+			budgetHit.Store(true)
+			cancel()
+		})
+		defer budgetTimer.Stop()
+	}
 
 	// The chunk counter is resolved once, here: the registry's With costs an
 	// allocation, and a per-chunk lookup in a streaming handler is exactly
@@ -890,6 +981,9 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 			return
 		}
 		headersSent = true
+		if budgetTimer != nil {
+			budgetTimer.Stop()
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -956,14 +1050,17 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		// request through ctx; nothing can be written to the client.
 		rec.StatusCode, rec.Error = statusClientClosed, errClientClosed
 		fillUsage(rec, usage, promptChars, compChars)
-		return
+		return nil
+	}
+	if budgetHit.Load() && !headersSent {
+		// The first-byte budget cut the call off; the context error that
+		// reached us is ours, not the client's.
+		err = &provider.Error{Status: http.StatusGatewayTimeout, Type: "timeout", Message: "upstream request cancelled or timed out"}
 	}
 	if err != nil && !headersSent {
-		status, pe := providerError(err)
-		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
-		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
-		writeProviderError(w, status, pe)
-		return
+		// Nothing was written: the caller decides whether to try another
+		// target or to answer with this error.
+		return err
 	}
 	sendHeaders()
 	if err != nil {
@@ -978,6 +1075,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	fillUsage(rec, usage, promptChars, compChars)
+	return nil
 }
 
 func messageChars(msgs []provider.Message) int {

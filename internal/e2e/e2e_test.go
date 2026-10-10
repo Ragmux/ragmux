@@ -157,6 +157,9 @@ type envOpts struct {
 	// tracer, when set, is wired through every span site the way main.go
 	// wires it.
 	tracer *tracing.Tracer
+	// gwTune, when set, adjusts the gateway before it is served (the retry
+	// and budget settings main.go takes from the configuration).
+	gwTune func(*gateway.Gateway)
 }
 
 // newEnv wires the whole application against the schema described by cfg.
@@ -210,6 +213,9 @@ func newEnvOpts(t *testing.T, cfg store.OpenConfig, opts envOpts) *env {
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log, Limiter: usage,
 		Metrics: met, Tracer: tracer}
+	if opts.gwTune != nil {
+		opts.gwTune(gw)
+	}
 	// The mock upstreams listen on loopback, which the save-time base_url
 	// check would otherwise reject.
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
