@@ -313,3 +313,90 @@ func TestLoadBreakerSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadOTLPProtocol(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x/y")
+	t.Setenv("SECRET_KEY", strings.Repeat("a", 64))
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "")
+
+	load := func(general, traces string) (Config, error) {
+		t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", general)
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", traces)
+		return Load()
+	}
+	for _, tc := range []struct{ general, traces, want string }{
+		{"", "", "http"},
+		{"http/json", "", "http"},
+		{"http/protobuf", "", "http"},
+		{"grpc", "", "grpc"},
+		{" grpc ", "", "grpc"},
+		// The signal-specific variable wins over the general one.
+		{"grpc", "http/json", "http"},
+		{"http/json", "grpc", "grpc"},
+	} {
+		c, err := load(tc.general, tc.traces)
+		if err != nil {
+			t.Errorf("protocol %q/%q rejected: %v", tc.general, tc.traces, err)
+			continue
+		}
+		if c.OTLPProtocol != tc.want {
+			t.Errorf("protocol %q/%q = %q, want %q", tc.general, tc.traces, c.OTLPProtocol, tc.want)
+		}
+	}
+	for _, bad := range []string{"udp", "GRPC", "http", "json"} {
+		_, err := load(bad, "")
+		if err == nil {
+			t.Errorf("protocol %q was accepted", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "OTEL_EXPORTER_OTLP_PROTOCOL") {
+			t.Errorf("protocol %q: the error must name the variable, got %q", bad, err)
+		}
+	}
+	// A bad signal-specific value is blamed on the variable that holds it.
+	if _, err := load("grpc", "udp"); err == nil || !strings.Contains(err.Error(), "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL") {
+		t.Errorf("a bad traces protocol must name OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, got %v", err)
+	}
+}
+
+func TestLoadOTLPInsecure(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x/y")
+	t.Setenv("SECRET_KEY", strings.Repeat("a", 64))
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-collector:4317")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+
+	load := func(general, traces string) (Config, error) {
+		t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", general)
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_INSECURE", traces)
+		return Load()
+	}
+	for _, tc := range []struct {
+		general, traces string
+		want            bool
+	}{
+		{"", "", false},
+		{"true", "", true},
+		{" true ", "", true},
+		{"false", "", false},
+		// The signal-specific variable wins over the general one.
+		{"true", "false", false},
+		{"false", "true", true},
+	} {
+		c, err := load(tc.general, tc.traces)
+		if err != nil {
+			t.Errorf("insecure %q/%q rejected: %v", tc.general, tc.traces, err)
+			continue
+		}
+		if c.OTLPInsecure != tc.want {
+			t.Errorf("insecure %q/%q = %v, want %v", tc.general, tc.traces, c.OTLPInsecure, tc.want)
+		}
+	}
+	if _, err := load("yes", ""); err == nil || !strings.Contains(err.Error(), "OTEL_EXPORTER_OTLP_INSECURE") {
+		t.Errorf("a bad value must be rejected naming the variable, got %v", err)
+	}
+	if _, err := load("true", "1"); err == nil || !strings.Contains(err.Error(), "OTEL_EXPORTER_OTLP_TRACES_INSECURE") {
+		t.Errorf("a bad traces value must be rejected naming its variable, got %v", err)
+	}
+}

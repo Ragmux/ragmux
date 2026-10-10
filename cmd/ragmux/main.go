@@ -148,8 +148,13 @@ func run(cfg config.Config) error {
 	}
 
 	registry, met := buildMetrics(cfg, st, log)
+	if cfg.TracingEnabled {
+		if err := tracing.ValidateEndpoint(tracing.Protocol(cfg.OTLPProtocol), cfg.OTLPEndpoint); err != nil {
+			return err
+		}
+	}
 	tracer := tracing.New(tracing.Config{
-		Endpoint: cfg.OTLPEndpoint, Headers: cfg.OTLPHeaders,
+		Endpoint: cfg.OTLPEndpoint, Protocol: tracing.Protocol(cfg.OTLPProtocol), Insecure: cfg.OTLPInsecure, Headers: cfg.OTLPHeaders,
 		ServiceName: cfg.ServiceName, ServiceVersion: version, ResourceAttrs: cfg.ResourceAttrs,
 		SampleRatio: cfg.TraceSampleRatio, TrustIncoming: cfg.TracingTrustIncoming, Logger: log,
 	})
@@ -159,7 +164,7 @@ func run(cfg config.Config) error {
 		tracer = tracing.New(tracing.Config{Logger: log})
 	}
 	if tracer.Enabled() {
-		log.Info("tracing enabled", "endpoint", cfg.OTLPEndpoint, "service", cfg.ServiceName,
+		log.Info("tracing enabled", "endpoint", cfg.OTLPEndpoint, "protocol", cfg.OTLPProtocol, "service", cfg.ServiceName,
 			"sample_ratio", cfg.TraceSampleRatio, "trust_incoming", cfg.TracingTrustIncoming)
 		met.RegisterTracing(tracer)
 	}

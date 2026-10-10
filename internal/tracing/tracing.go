@@ -1,11 +1,16 @@
-// Package tracing emits OpenTelemetry spans over OTLP/HTTP with the JSON
-// encoding, using nothing outside the standard library.
+// Package tracing emits OpenTelemetry spans over OTLP, using nothing outside
+// the standard library.
+//
+// Two transports exist. OTLP/HTTP with the JSON encoding is the default.
+// OTLP/gRPC is opt-in (Config.Protocol): it is a hand-written unary
+// TraceService/Export call over net/http's HTTP/2, with the protobuf messages
+// encoded by hand, so selecting it adds no dependency.
 //
 // It is a deliberately small subset. There is no auto-instrumentation: only
 // the span sites this repository creates by hand exist, so a slow database
 // query shows up as unexplained time inside its parent rather than as a span
 // of its own. There are no events, no links, no baggage, no metrics or logs
-// signal, no gRPC transport and no resource auto-detection.
+// signal, no gRPC streaming or health service and no resource auto-detection.
 //
 // Tracing is off unless an endpoint is configured. While it is off a span
 // site costs one atomic load and one branch, and allocates nothing.
@@ -122,11 +127,29 @@ type Tracer struct {
 	log           *slog.Logger
 }
 
+// Protocol selects the OTLP transport.
+type Protocol string
+
+const (
+	// ProtocolHTTP is OTLP/HTTP with the JSON encoding. It is the default.
+	ProtocolHTTP Protocol = "http"
+	// ProtocolGRPC is OTLP/gRPC with the protobuf encoding.
+	ProtocolGRPC Protocol = "grpc"
+)
+
 // Config configures a tracer.
 type Config struct {
-	// Endpoint is the OTLP/HTTP base or full traces URL. Empty disables
-	// tracing entirely.
+	// Endpoint is the collector's address. Empty disables tracing entirely.
+	// For ProtocolHTTP it is the OTLP/HTTP base or full traces URL. For
+	// ProtocolGRPC it is host:port or a URL: an http:// scheme means
+	// plaintext, an https:// scheme or no scheme means TLS.
 	Endpoint string
+	// Protocol selects the transport; empty means ProtocolHTTP.
+	Protocol Protocol
+	// Insecure makes a ProtocolGRPC endpoint written without a scheme
+	// plaintext rather than TLS (OTEL_EXPORTER_OTLP_INSECURE). A scheme in the
+	// endpoint wins, and the HTTP transport ignores it.
+	Insecure bool
 	// Headers are sent with every export request.
 	Headers map[string]string
 	// ServiceName defaults to "ragmux".
@@ -210,6 +233,19 @@ func SpanFromContext(ctx context.Context) *Span {
 		return s
 	}
 	return noSpan
+}
+
+// SetName replaces the span's name. A request span is opened before the model
+// it will be served by is known (the route is resolved after authentication),
+// and the GenAI convention names it "{operation} {model}", so the name is
+// completed once the model is.
+func (s *Span) SetName(name string) {
+	if s.tr == nil {
+		return
+	}
+	s.mu.Lock()
+	s.name = name
+	s.mu.Unlock()
 }
 
 // SetAttributes adds attributes to the span.

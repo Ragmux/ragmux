@@ -161,8 +161,14 @@ type Config struct {
 	// trace and force the sampled flag on all of it.
 	TracingTrustIncoming bool
 	// OTLPEndpoint is the collector's OTLP/HTTP base URL (or the full
-	// traces URL).
+	// traces URL), or its OTLP/gRPC address when OTLPProtocol is "grpc".
 	OTLPEndpoint string
+	// OTLPProtocol is the export transport: "http" (OTLP/HTTP with JSON, the
+	// default) or "grpc" (OTLP/gRPC).
+	OTLPProtocol string
+	// OTLPInsecure makes a gRPC endpoint given without a scheme plaintext
+	// instead of TLS. An http:// or https:// scheme decides for itself.
+	OTLPInsecure bool
 	// OTLPHeaders are sent with every export request (auth for a vendor
 	// endpoint, usually nothing for a local Collector).
 	OTLPHeaders map[string]string
@@ -637,6 +643,34 @@ func loadTracing(c *Config) error {
 	if c.TracingEnabled && c.OTLPEndpoint == "" {
 		return errors.New("TRACING_ENABLED=true without OTEL_EXPORTER_OTLP_ENDPOINT " +
 			"(or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT); point it at an OpenTelemetry Collector, e.g. http://otel-collector:4318")
+	}
+	// The transport follows the OpenTelemetry names too. "http/protobuf" is
+	// accepted as HTTP because a sidecar that injects it expects an OTLP/HTTP
+	// receiver, which takes the JSON body Ragmux sends on the same path.
+	protoVar := "OTEL_EXPORTER_OTLP_PROTOCOL"
+	if strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")) != "" {
+		protoVar = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"
+	}
+	switch p := strings.TrimSpace(os.Getenv(protoVar)); p {
+	case "", "http/json", "http/protobuf":
+		c.OTLPProtocol = "http"
+	case "grpc":
+		c.OTLPProtocol = "grpc"
+	default:
+		return fmt.Errorf("invalid %s %q (http/json, http/protobuf or grpc)", protoVar, p)
+	}
+	// INSECURE only matters to a gRPC endpoint written without a scheme; the
+	// default for that is TLS, and this is the specification's way to opt out.
+	insecureVar := "OTEL_EXPORTER_OTLP_INSECURE"
+	if strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_INSECURE")) != "" {
+		insecureVar = "OTEL_EXPORTER_OTLP_TRACES_INSECURE"
+	}
+	switch v := strings.TrimSpace(os.Getenv(insecureVar)); v {
+	case "true":
+		c.OTLPInsecure = true
+	case "false", "":
+	default:
+		return fmt.Errorf("invalid %s %q (true or false)", insecureVar, v)
 	}
 	c.TracingTrustIncoming = os.Getenv("TRACING_TRUST_INCOMING") == "true"
 	c.ServiceName = env("OTEL_SERVICE_NAME", "ragmux")

@@ -559,3 +559,29 @@ func TestGenAIProviderName(t *testing.T) {
 		}
 	}
 }
+
+func TestSetName(t *testing.T) {
+	c := newCollector(t)
+	tr := newTracer(t, c, Config{})
+	_, s := tr.Start(context.Background(), "gateway.chat_completion", KindInternal)
+	s.SetName("chat gpt-4o")
+	s.End()
+	flush(t, tr)
+
+	spans := c.spans(t)
+	if len(spans) != 1 || spans[0]["name"] != "chat gpt-4o" {
+		t.Fatalf("spans = %v, want one named %q", spans, "chat gpt-4o")
+	}
+
+	// A no-op span takes the call without panicking or allocating.
+	noSpan.SetName("x")
+}
+
+func flush(t *testing.T, tr *Tracer) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := tr.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}

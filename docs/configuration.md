@@ -66,6 +66,9 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `TRACING_TRUST_INCOMING` | `false` | `true` continues a trace a client started from its `traceparent` header. Off by default: a client could otherwise pin every request into one trace and force the sampled flag on all of it. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(none)* | Base URL of an OpenTelemetry Collector's OTLP/HTTP receiver, e.g. `http://otel-collector:4318`. `/v1/traces` is appended unless the URL already ends in it. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | *(none)* | Traces-signal URL; takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` | Trace transport: `http/json` (default), `grpc`, or `http/protobuf` (accepted, sent as `http/json`). Anything else is a start-up error. With `grpc` the endpoint is a gRPC target, e.g. `http://otel-collector:4317`: `http://` is plaintext, `https://` or a bare `host:port` is TLS, and a path is ignored. See [Exporting over gRPC](observability.md#exporting-over-grpc). |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | *(none)* | Traces-signal transport; takes precedence over `OTEL_EXPORTER_OTLP_PROTOCOL`. |
+| `OTEL_EXPORTER_OTLP_INSECURE` | `false` | `true` or `false`, for `grpc` only: makes an endpoint written without a scheme (`host:4317`) plaintext instead of TLS. A scheme in the endpoint wins. `OTEL_EXPORTER_OTLP_TRACES_INSECURE` takes precedence. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | *(none)* | `k=v,k2=v2` headers sent with every export request (a vendor's auth header). A value may contain `=`; only the first one separates. |
 | `OTEL_SERVICE_NAME` | `ragmux` | `service.name` resource attribute. |
 | `OTEL_RESOURCE_ATTRIBUTES` | *(none)* | Extra resource attributes in the same `k=v,k2=v2` form, e.g. `deployment.environment=prod`. |

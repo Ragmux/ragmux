@@ -14,7 +14,7 @@ takes no Go module dependency for either.
 - [`/readyz` and `/healthz`](#readyz-and-healthz)
 - [Tracing](#tracing)
   - [Turning tracing on](#turning-tracing-on)
-  - [The seven spans](#the-seven-spans)
+  - [The spans](#the-spans)
   - [Sampling](#sampling)
   - [The trust gate](#the-trust-gate)
   - [No span carries content](#no-span-carries-content)
@@ -439,6 +439,9 @@ traffic on either.
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(none)* | Collector base URL, e.g. `http://otel-collector:4318`. `/v1/traces` is appended unless already present. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | *(none)* | Traces-signal URL; wins over the base URL. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` | Transport: `http/json` (the default), `grpc`, or `http/protobuf` (accepted, sent as `http/json`). See [Exporting over gRPC](#exporting-over-grpc). |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | *(none)* | Traces-signal transport; wins over `OTEL_EXPORTER_OTLP_PROTOCOL`. |
+| `OTEL_EXPORTER_OTLP_INSECURE` | `false` | gRPC only: a bare `host:port` endpoint is plaintext instead of TLS. `OTEL_EXPORTER_OTLP_TRACES_INSECURE` wins over it. See [Exporting over gRPC](#exporting-over-grpc). |
 | `TRACING_ENABLED` | *(endpoint set)* | `true` when an endpoint is configured, `false` otherwise. An explicit `false` always wins. |
 | `TRACING_TRUST_INCOMING` | `false` | Continue a trace the client started. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | *(none)* | `k=v,k2=v2` sent with every export. |
@@ -453,20 +456,63 @@ injects the `OTEL_*` variables and you want this one process quiet.
 While tracing is off, a span site costs one atomic load and one branch, and allocates
 nothing.
 
-### The seven spans
+### The spans
 
-There are exactly seven span sites and no more. They are hand-written, so each one is a
+There are eight span sites and no more. They are hand-written, so each one is a
 decision rather than a by-product.
 
 | Span | Kind | Where | Attributes |
 |---|---|---|---|
 | `http.server` | Server | middleware after the request-id middleware | `http.request.method`, `http.route` (the chi pattern, read after the handler ran), `http.response.status_code`, `ragmux.request_id` |
-| `gateway.chat_completion` | Internal | the `/v1/chat/completions` handler | `ragmux.project.id`, `gen_ai.operation.name` (`chat`), `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `ragmux.stream`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens` |
+| `chat {model}` / `embeddings {model}` / `rerank {model}` / `retrieval {store id}` | Internal | the `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank` and `/v1/retrieve` handlers; see [Request span names](#request-span-names) | `ragmux.project.id`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `ragmux.stream`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens` (the ones the endpoint has), `ragmux.route`, `ragmux.attempts`, `ragmux.fallback.from_connection`, `gen_ai.data_source.id` (retrieval) |
+| `gateway.attempt` | Internal | one upstream call of the retry and fallback walk; a child of the request span | `ragmux.attempt`, `ragmux.retry`, `ragmux.fallback`, `ragmux.fallback.from_connection`, `ragmux.connection.id`, `ragmux.route`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `error.type` |
 | `rag.retrieve` | Internal | `Retriever.SearchWith` | `ragmux.rag.store_id`, `.mode`, `.backend`, `.top_k`, `.hits` |
 | `rag.embed_query` | Client | around the query embedding call | `gen_ai.provider.name`, `gen_ai.system` (deprecated) |
 | `rag.rerank` | Client | around the rerank call | `ragmux.rerank.backend`, `ragmux.rerank.fallback` |
 | `provider.chat` / `provider.embed` / `provider.rerank` | Client | `internal/provider/http.go`, `doRequest` / `doStream` | `server.address` (host only), `gen_ai.provider.name`, `gen_ai.system` (deprecated), `gen_ai.operation.name` (`chat` or `embeddings`; absent on rerank), `http.response.status_code`, `ragmux.stream.bytes` |
 | `ingest.document` | Internal | the ingestion worker; its own trace root | `ragmux.document.id`, `.store_id`, `.chunks`, `.attempt` |
+
+#### Request span names
+
+The request span follows the GenAI convention, `{operation} {model}`, and takes its name
+once the request has been routed, because that is when the model is known:
+
+| Endpoint | Span name | Why |
+|---|---|---|
+| `POST /v1/chat/completions` | `chat {model}` | The convention's own name. `{model}` is the model name of the connection that answered. |
+| `POST /v1/embeddings` | `embeddings {model}` | Same. |
+| `POST /v1/rerank` | `rerank {model}` | The convention registers no rerank operation, so `rerank` is a custom value of `gen_ai.operation.name`. It keeps the `{operation} {model}` shape so rerank traces sort next to the others. |
+| `POST /v1/retrieve` | `retrieval {store id}` | `retrieval` is a registered operation, and the convention names it after its data source, not a model. The only model in a search is the store's embedding model, which says little about the call; the store is what you filter on. The id is also in `gen_ai.data_source.id`. |
+
+A request refused before a model was chosen (a bad key, a malformed body, an unknown
+route) keeps the fixed names `gateway.chat_completion`, `gateway.embeddings`,
+`gateway.retrieve` and `gateway.rerank`. There is no model to put in the name yet.
+
+On a route with fallback targets the name carries the model that **finally answered**,
+or the last target tried when none did; the individual targets are the `gateway.attempt`
+spans beneath it.
+
+#### Attempts
+
+Every upstream call of the walk (see [Retry and fallback](providers.md#retry-and-fallback)) is its own
+`gateway.attempt` child span, whether it is a retry of the same target or the first call
+to a fallback target. Provider spans (`provider.chat`, `rag.embed_query`, ...) hang
+beneath the attempt that made them, so a trace reads top to bottom as request, attempt,
+upstream call.
+
+| Attribute | Meaning |
+|---|---|
+| `ragmux.attempt` | The attempt's number within the request, from `1`. Retries and fallbacks share one count. Absent on a `target_config` failure: that target's adapter could not be built, no call left the gateway, so it is not an attempt (it is not in `ragmux.attempts` or the request log's `attempt` either). |
+| `ragmux.retry` | How many times this same target had already been tried; `0` on its first call. |
+| `ragmux.fallback` | `true` when the target is not the route's first. |
+| `ragmux.fallback.from_connection` | On a fallback attempt, the id of the route's first target. |
+| `ragmux.connection.id` | The connection this attempt called. |
+| `ragmux.route` | The route name, when the request went through one. |
+| `error.type` | On a failed attempt, the failure class (a closed set: `dial`, `rate_limited`, `unavailable`, `server_error`, `timeout`, `target_config`, or `terminal`), never the upstream's own error text. |
+
+The request span repeats the outcome: `ragmux.attempts` is the number of attempts made
+(when more than zero), `ragmux.route` the route, and `ragmux.fallback.from_connection`
+the first target when a fallback served the request.
 
 The `gen_ai.*` names follow the OpenTelemetry GenAI semantic conventions:
 
@@ -548,14 +594,16 @@ it cannot pass by exporting nothing.
 dependency-free binary and costs the following, all of which you would get from the
 OpenTelemetry Go SDK:
 
-- **No auto-instrumentation.** Only the seven spans above exist. pgx queries, chi
+- **No auto-instrumentation.** Only the spans above exist. pgx queries, chi
   routing, DNS resolution and TLS handshakes produce no spans at all, so a slow query
   shows up as unexplained time inside its parent span rather than as a span of its own.
   This is the largest single difference and the one to remember when reading a trace.
 - **No metrics or logs signal.** OTLP carries three signals; this exports one. Metrics go
   to Prometheus at `/metrics`, logs to stdout as JSON.
-- **No OTLP/gRPC.** HTTP only, port 4318, not 4317.
-- **No compression.** Payloads are uncompressed JSON. At a 5 % sample rate on a gateway
+- **OTLP/gRPC is minimal.** It is opt-in, see [Exporting over gRPC](#exporting-over-grpc),
+  and does one thing: unary `Export` calls, uncompressed, with no service config and no
+  load balancing.
+- **No compression.** Payloads are uncompressed (JSON over HTTP, protobuf over gRPC). At a 5 % sample rate on a gateway
   this is small; at 100 % on a busy one it is not.
 - **No span links, events or baggage.** Attributes and a status, nothing else.
 - **No resource auto-detection.** Nothing is inferred about the host, container,
@@ -565,13 +613,41 @@ OpenTelemetry Go SDK:
   dropped and counted in `ragmux_tracing_export_failures_total`. A backlog of retries
   would compete with the requests that produced it.
 
-The exporter speaks **OTLP/HTTP with the JSON encoding**, which is what an OpenTelemetry
-Collector accepts on port 4318 with no extra configuration. Vendor-direct endpoints vary
+By default the exporter speaks **OTLP/HTTP with the JSON encoding**, which is what an
+OpenTelemetry Collector accepts on port 4318 with no extra configuration. Vendor-direct endpoints vary
 and several are protobuf-only, so pointing Ragmux straight at a vendor may or may not
 work depending on the vendor. **The supported configuration is to point Ragmux at a
 Collector** and let the Collector talk to your backend — which is also where you add
 compression, retries, tail sampling and resource detection, all of the things in the list
 above.
+
+### Exporting over gRPC
+
+Some Collectors and vendor agents only open the gRPC receiver (port 4317). Set the
+protocol to switch the exporter to OTLP/gRPC:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+```
+
+- HTTP stays the default. `http/protobuf` is accepted so a sidecar that injects it does
+  not break start-up, but the body is still the JSON encoding.
+- **The scheme picks the security of the connection.** `http://host:4317` is plaintext
+  HTTP/2; `https://host:4317` and a bare `host:4317` are TLS. A plaintext link is
+  something you opt into by writing `http://`. The OpenTelemetry way to the same end,
+  `OTEL_EXPORTER_OTLP_INSECURE=true` (or `OTEL_EXPORTER_OTLP_TRACES_INSECURE`, which wins),
+  makes a bare `host:4317` plaintext; an explicit `http://` or `https://` always decides for
+  itself, and the HTTP transport ignores the variable.
+- A path in the endpoint (`/v1/traces`) is ignored: a gRPC target names a server.
+- `OTEL_EXPORTER_OTLP_HEADERS` are sent as gRPC metadata. Batching, the one retry and
+  `ragmux_tracing_export_failures_total` behave as over HTTP, and a collector that
+  answers with a non-zero `grpc-status` counts as a failed export.
+- An endpoint that cannot be parsed, or an unknown protocol, is a start-up error.
+
+The span contents are identical on both transports. The gRPC client is built on the
+standard library's HTTP/2 rather than `google.golang.org/grpc`, so the binary gains no
+dependency.
 
 ### Running a Collector
 

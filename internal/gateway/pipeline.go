@@ -46,7 +46,9 @@ import (
 // operation describes the endpoint a call belongs to. It is the only thing a
 // new endpoint has to say about itself to reuse the steps.
 type operation struct {
-	// name is gen_ai.operation.name on the request span.
+	// name is gen_ai.operation.name on the request span, and the first word of
+	// its name once the model is known. Reranking has no registered value in
+	// the GenAI convention, so "rerank" is a custom one.
 	name string
 	// span is the name of the span every downstream span hangs beneath.
 	span string
@@ -79,7 +81,7 @@ var embeddingsOperation = operation{
 
 // retrieveOperation is POST /v1/retrieve.
 var retrieveOperation = operation{
-	name:  "retrieve",
+	name:  "retrieval",
 	span:  "gateway.retrieve",
 	scope: store.ScopeRetrieve,
 	what:  "retrieval",
@@ -286,6 +288,9 @@ func acceptTargets(c *call, targets []*store.ModelConnection) bool {
 	}
 	c.targets = targets
 	c.conn = targets[0]
+	if c.span.IsRecording() {
+		c.nameRequestSpan()
+	}
 	return true
 }
 
@@ -464,7 +469,7 @@ func (g *Gateway) invoke(c *call, up upstreamCall) {
 		var cl attemptClass
 		for retries := 0; ; retries++ {
 			attempts++
-			err = up.attempt(c, target)
+			err = g.runAttempt(c, up, target, first, attempts, retries)
 			g.Breakers.report(target, probe, outcomeOf(c, err))
 			if err == nil {
 				return
@@ -497,6 +502,87 @@ func (g *Gateway) invoke(c *call, up upstreamCall) {
 		fallbackReason = cl.reason
 	}
 	g.failInvoke(c, err)
+}
+
+// runAttempt makes one upstream call of the walk inside its own span, so a
+// trace shows every retry and every fallback as a separate child of the
+// request span rather than folding them into one bar. n is the attempt's
+// number (as counted by invoke), retries how many times this target was
+// already tried.
+//
+// The attempt's context replaces the call's for its duration: the provider
+// spans (provider.chat, rag.embed_query, ...) are started from c.ctx() inside
+// up.attempt and so hang beneath the attempt, not beside it. While tracing is
+// off, or the trace is not sampled, nothing here costs more than the branch.
+func (g *Gateway) runAttempt(c *call, up upstreamCall, target, first *store.ModelConnection, n, retries int) error {
+	if !c.span.IsRecording() {
+		return up.attempt(c, target)
+	}
+	outer := c.r
+	ctx, span := g.Tracer.Start(outer.Context(), "gateway.attempt", tracing.KindInternal)
+	c.r = outer.WithContext(ctx)
+	err := up.attempt(c, target)
+	c.r = outer
+
+	// A target_config failure never left the gateway, so it is not an
+	// attempt and has no number: invoke does not count it, and giving it one
+	// would hand the same number to the next real attempt.
+	var tc *targetConfigError
+	if !errors.As(err, &tc) {
+		span.SetAttributes(tracing.Int("ragmux.attempt", n))
+	}
+	span.SetAttributes(
+		tracing.Int("ragmux.retry", retries),
+		tracing.Int64("ragmux.connection.id", target.ID),
+		tracing.String("gen_ai.operation.name", c.op.name),
+		tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(target.ProviderType)),
+		tracing.String("gen_ai.request.model", target.ModelName),
+		tracing.Bool("ragmux.fallback", target != first),
+	)
+	if c.routeName != "" {
+		span.SetAttributes(tracing.String("ragmux.route", c.routeName))
+	}
+	if target != first {
+		span.SetAttributes(tracing.Int64("ragmux.fallback.from_connection", first.ID))
+	}
+	if err != nil {
+		// The class is a closed set (the obs.Upstream* reasons, or
+		// "terminal"); the error's own text can quote the request back and
+		// stays out of the span.
+		class := classifyAttempt(err).reason
+		if class == "" {
+			class = "terminal"
+		}
+		span.SetAttributes(tracing.String("error.type", class))
+		span.RecordError(errors.New(class))
+	} else {
+		span.SetStatusOK()
+	}
+	span.End()
+	return err
+}
+
+// nameRequestSpan gives the request span its GenAI name once the model is
+// known. The span opens before routing (it has to enclose the refusals that
+// follow authentication), so until then it carries the gateway.* name from its
+// operation, which is also what a request refused before a model was chosen
+// keeps.
+//
+// Chat, embeddings and rerank follow the convention's "{operation} {model}".
+// Retrieval names the data source instead, as the convention does for the
+// operation it registers: its model is only the embedding model of the store,
+// and the store is what the search is about.
+func (c *call) nameRequestSpan() {
+	switch {
+	case c.conn == nil:
+		return
+	case c.op.name == retrieveOperation.name:
+		if c.project.RAGStoreID != nil {
+			c.span.SetName(c.op.name + " " + strconv.FormatInt(*c.project.RAGStoreID, 10))
+		}
+	default:
+		c.span.SetName(c.op.name + " " + c.conn.ModelName)
+	}
 }
 
 // logAttempt records one failed attempt. The message is the adapter's
@@ -589,6 +675,20 @@ func (g *Gateway) record(c *call) {
 			tracing.Int("gen_ai.usage.output_tokens", rec.CompletionTokens),
 			tracing.Int("gen_ai.usage.cache_read.input_tokens", rec.CachedPromptTokens),
 		)
+		// The target that answered may not be the one the span was named for.
+		c.nameRequestSpan()
+		if c.op.name == retrieveOperation.name && c.project.RAGStoreID != nil {
+			c.span.SetAttributes(tracing.String("gen_ai.data_source.id", strconv.FormatInt(*c.project.RAGStoreID, 10)))
+		}
+		if c.routeName != "" {
+			c.span.SetAttributes(tracing.String("ragmux.route", c.routeName))
+		}
+		if rec.Attempt > 0 {
+			c.span.SetAttributes(tracing.Int("ragmux.attempts", rec.Attempt))
+		}
+		if rec.FallbackFrom != nil {
+			c.span.SetAttributes(tracing.Int64("ragmux.fallback.from_connection", *rec.FallbackFrom))
+		}
 		if obsv.responseModel != "" {
 			c.span.SetAttributes(tracing.String("gen_ai.response.model", obsv.responseModel))
 		}

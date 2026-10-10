@@ -47,8 +47,10 @@ type Gateway struct {
 	// Metrics records the gateway counters at the deferred chokepoint of a
 	// finished request; nil records nothing.
 	Metrics *obs.Metrics
-	// Tracer opens the gateway.chat_completion span every downstream span
-	// hangs beneath; nil is a disabled tracer.
+	// Tracer opens the request span every downstream span hangs beneath
+	// (named "{operation} {model}" once the request is routed, per the GenAI
+	// conventions) and one gateway.attempt child span per upstream attempt;
+	// nil is a disabled tracer.
 	Tracer *tracing.Tracer
 	// Rand is the random source of weighted target selection: it returns a
 	// value in [0, 1). Nil uses math/rand/v2's concurrency-safe generator;

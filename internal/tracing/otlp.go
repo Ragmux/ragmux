@@ -23,12 +23,21 @@ const (
 	batchInterval = 5 * time.Second
 )
 
+// transport is the wire half of the exporter: how a batch of finished spans is
+// encoded and how the encoded bytes reach the collector. The batching, the
+// queue and the single retry around it are the same for both.
+//
+// encode and post are separate so a batch that cannot be encoded is counted
+// as failed without being retried, while a failed delivery is tried once more.
+type transport interface {
+	encode(res []Attr, batch []*Span) ([]byte, error)
+	post(body []byte) error
+}
+
 type exporter struct {
-	url     string
-	headers map[string]string
-	client  *http.Client
-	res     []Attr
-	log     *slog.Logger
+	tp  transport
+	res []Attr
+	log *slog.Logger
 
 	in   chan *Span
 	done chan struct{}
@@ -56,19 +65,28 @@ func newExporter(cfg Config) *exporter {
 	for k, v := range cfg.ResourceAttrs {
 		res = append(res, String(k, v))
 	}
+	var tp transport
+	switch cfg.Protocol {
+	case ProtocolGRPC:
+		tp = newGRPCTransport(cfg.Endpoint, cfg.Insecure, cfg.Headers, timeout)
+	default:
+		tp = &httpTransport{
+			url:     tracesURL(cfg.Endpoint),
+			headers: cfg.Headers,
+			// A plain client on purpose. The collector normally sits at an
+			// address like http://otel-collector:4318, which is exactly what
+			// the outbound SSRF guard exists to block. That guard governs
+			// provider calls a user can influence; this endpoint is
+			// operator-configured, like DATABASE_URL.
+			client: &http.Client{Timeout: timeout},
+		}
+	}
 	e := &exporter{
-		url:     tracesURL(cfg.Endpoint),
-		headers: cfg.Headers,
-		// A plain client on purpose. The collector normally sits at an
-		// address like http://otel-collector:4318, which is exactly what the
-		// outbound SSRF guard exists to block. That guard governs provider
-		// calls a user can influence; this endpoint is operator-configured,
-		// like DATABASE_URL.
-		client: &http.Client{Timeout: timeout},
-		res:    res,
-		log:    cfg.Logger,
-		in:     make(chan *Span, queueSize),
-		done:   make(chan struct{}),
+		tp:   tp,
+		res:  res,
+		log:  cfg.Logger,
+		in:   make(chan *Span, queueSize),
+		done: make(chan struct{}),
 	}
 	e.wg.Add(1)
 	go e.run()
@@ -181,7 +199,7 @@ func (e *exporter) shutdown(ctx context.Context) error {
 }
 
 func (e *exporter) send(batch []*Span) {
-	body, err := json.Marshal(buildPayload(e.res, batch))
+	body, err := e.tp.encode(e.res, batch)
 	if err != nil {
 		e.failures.Add(1)
 		e.log.Warn("tracing: encode spans", "err", err)
@@ -189,25 +207,36 @@ func (e *exporter) send(batch []*Span) {
 	}
 	// One retry, then give up. A backlog of retries would compete with the
 	// requests that produced it, and a dropped trace is not worth that.
-	if err := e.post(body); err != nil {
+	if err := e.tp.post(body); err != nil {
 		time.Sleep(time.Second)
-		if err = e.post(body); err != nil {
+		if err = e.tp.post(body); err != nil {
 			e.failures.Add(1)
 			e.log.Warn("tracing: export spans", "spans", len(batch), "err", err)
 		}
 	}
 }
 
-func (e *exporter) post(body []byte) error {
-	req, err := http.NewRequest(http.MethodPost, e.url, bytes.NewReader(body))
+// httpTransport is OTLP/HTTP with the JSON encoding, the default.
+type httpTransport struct {
+	url     string
+	headers map[string]string
+	client  *http.Client
+}
+
+func (h *httpTransport) encode(res []Attr, batch []*Span) ([]byte, error) {
+	return json.Marshal(buildPayload(res, batch))
+}
+
+func (h *httpTransport) post(body []byte) error {
+	req, err := http.NewRequest(http.MethodPost, h.url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	for k, v := range e.headers {
+	for k, v := range h.headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := e.client.Do(req)
+	resp, err := h.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -295,12 +324,13 @@ func buildPayload(res []Attr, spans []*Span) otlpPayload {
 		s.mu.Lock()
 		attrs := attrsToOTLP(s.attrs)
 		status := otlpStatus{Code: int(s.status), Message: s.msg}
+		name := s.name
 		s.mu.Unlock()
 
 		os := otlpSpan{
 			TraceID:           s.sc.TraceID.String(),
 			SpanID:            s.sc.SpanID.String(),
-			Name:              s.name,
+			Name:              name,
 			Kind:              int(s.kind),
 			StartTimeUnixNano: strconv.FormatInt(s.start.UnixNano(), 10),
 			EndTimeUnixNano:   strconv.FormatInt(s.end.UnixNano(), 10),

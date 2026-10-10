@@ -7,6 +7,11 @@ All notable changes to Ragmux are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **The span names of the four `/v1` endpoints, and `gen_ai.operation.name` of
+  `/v1/retrieve`.** `gateway.chat_completion` and its siblings are replaced by the GenAI
+  names listed under Added, so a dashboard or alert that filters on the old names needs updating. The
+  retrieve endpoint's `gen_ai.operation.name` is `retrieval` (the convention's registered
+  value) instead of `retrieve`. Metrics and their labels are unchanged.
 - **The dashboard search reranks through the store's `rerank_connection_id`.** The
   "first project linked to the store" heuristic is gone, so projects sharing a store rerank
   the same way. A store without that id searches unreranked and the response carries
@@ -24,6 +29,19 @@ All notable changes to Ragmux are documented here. The format follows
   [Observability](docs/observability.md#cardinality-checklist).
 
 ### Added
+- **OpenTelemetry GenAI span names and per-attempt spans.** The request span is now named
+  `chat {model}`, `embeddings {model}`, `rerank {model}` or `retrieval {store id}` once the
+  request is routed (a request refused earlier keeps `gateway.*`). Every upstream attempt,
+  retry or fallback, is a `gateway.attempt` child span carrying `ragmux.attempt`,
+  `ragmux.retry`, `ragmux.fallback`, the route and the failure class; provider spans hang
+  beneath it. The request span adds `ragmux.route`, `ragmux.attempts` and
+  `ragmux.fallback.from_connection`. See
+  [Observability](docs/observability.md#the-spans).
+- **Optional OTLP/gRPC trace exporter.** `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` (or
+  `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`) sends traces to a collector's gRPC port. HTTP/JSON
+  stays the default, and the gRPC client is built on the standard library, so there is no
+  new dependency. `OTEL_EXPORTER_OTLP_INSECURE=true` makes a scheme-less endpoint
+  plaintext. See [Observability](docs/observability.md#exporting-over-grpc).
 - **`POST /v1/rerank`.** Cohere-shaped rerank endpoint (`query`, `documents`, `top_n`,
   `model`; `results[{index, relevance_score}]`), behind the new-style pipeline with scope
   `rerank` and `endpoint = rerank` in the request log. `model` resolves to a `kind = rerank`
