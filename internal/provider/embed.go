@@ -12,29 +12,39 @@ type openAIEmbedder struct {
 	base string
 }
 
-func (e *openAIEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
-	var out struct {
-		Data []struct {
-			Index     int       `json:"index"`
-			Embedding []float32 `json:"embedding"`
-		} `json:"data"`
-	}
-	body := map[string]any{"model": e.cfg.Model, "input": inputs, "encoding_format": "float"}
-	if err := doJSON(ctx, e.cfg, opEmbed, e.base+"/embeddings",
-		map[string]string{"Authorization": "Bearer " + e.cfg.APIKey}, body, &out); err != nil {
-		return nil, err
-	}
-	if len(out.Data) != len(inputs) {
+// openAIEmbeddingsResponse is the /embeddings body shared by every
+// OpenAI-format server, Azure OpenAI included.
+type openAIEmbeddingsResponse struct {
+	Data []struct {
+		Index     int       `json:"index"`
+		Embedding []float32 `json:"embedding"`
+	} `json:"data"`
+}
+
+// vectors returns the embeddings in input order and checks that the upstream
+// answered for exactly n inputs.
+func (r openAIEmbeddingsResponse) vectors(n int) ([][]float32, error) {
+	if len(r.Data) != n {
 		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "embedding count mismatch"}
 	}
-	vecs := make([][]float32, len(inputs))
-	for _, d := range out.Data {
+	vecs := make([][]float32, n)
+	for _, d := range r.Data {
 		if d.Index < 0 || d.Index >= len(vecs) {
 			return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "embedding index out of range"}
 		}
 		vecs[d.Index] = d.Embedding
 	}
 	return vecs, nil
+}
+
+func (e *openAIEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
+	var out openAIEmbeddingsResponse
+	body := map[string]any{"model": e.cfg.Model, "input": inputs, "encoding_format": "float"}
+	if err := doJSON(ctx, e.cfg, opEmbed, e.base+"/embeddings",
+		map[string]string{"Authorization": "Bearer " + e.cfg.APIKey}, body, &out); err != nil {
+		return nil, err
+	}
+	return out.vectors(len(inputs))
 }
 
 // ollamaEmbedder uses Ollama's native /api/embed (batch capable).

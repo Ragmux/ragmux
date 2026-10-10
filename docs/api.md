@@ -201,6 +201,7 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
 | POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
+| GET | `/provider-presets` | viewer | Ready-made `custom_openai` setups for hosted OpenAI-compatible providers (Mistral, xAI, Groq), each with `id`, `label`, `provider_type`, `base_url`, suggested `models`, an optional `embedding_model` and `requires_api_key`. A preset is not stored: create the connection with `POST /models` using its `provider_type` and `base_url`. No preset carries a price — see [Presets](providers.md#presets) |
 
 ### Model connections
 

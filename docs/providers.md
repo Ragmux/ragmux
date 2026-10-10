@@ -17,6 +17,7 @@ gateway. Connections are managed with `POST /admin/api/models` (see the
 | `deepseek` | `https://api.deepseek.com/v1` | `POST {base}/chat/completions` | reported as unsupported (`supports_embeddings: false`) | `Authorization: Bearer <api_key>` |
 | `ollama` | `http://localhost:11434` | `POST {base}/api/chat` (native API) | yes — `POST {base}/api/embed` | none; an `api_key` is sent as `Authorization: Bearer` for a proxy in front of Ollama |
 | `custom_openai` | *(required; dashboard suggests `http://localhost:8000/v1`)* | `POST {base}/chat/completions` | yes — `POST {base}/embeddings` | `Authorization: Bearer <api_key>` (optional) |
+| `azure_openai` | *(required; dashboard suggests `https://your-resource.openai.azure.com`)* | `POST {endpoint}/openai/deployments/{deployment}/chat/completions?api-version=…` | yes — `POST {endpoint}/openai/deployments/{deployment}/embeddings?api-version=…` | `api-key: <api_key>` (no `Authorization` header) |
 | `cohere_rerank` | `https://api.cohere.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
 | `voyage_rerank` | `https://api.voyageai.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
 
@@ -27,7 +28,8 @@ trailing `/v1` is removed because the native endpoints live at the root. When th
 runs in Docker, local servers on the host are reachable as `http://host.docker.internal:<port>`.
 
 A `base_url` must be a plain `http://` or `https://` URL with a host and without
-credentials, query string or fragment. Hosts on private or local networks (the Docker
+credentials, query string or fragment (`azure_openai` alone may carry an `api-version`
+query parameter, see [Azure OpenAI](#azure-openai)). Hosts on private or local networks (the Docker
 host, a Compose service, `localhost`) are refused unless they are listed in
 `PRIVATE_UPSTREAM_ALLOWLIST` or `ALLOW_PRIVATE_UPSTREAMS=true` is set — see
 [Private upstreams](configuration.md#private-upstreams). `model_name` may contain letters,
@@ -44,23 +46,50 @@ whose stored key is reused. Each connection also reports `private_upstream`: whe
 `base_url` pointed at a loopback, private or link-local address when it was saved. See
 [REST API reference](api.md#model-connections).
 
+## Presets
+
+Hosted providers that speak the OpenAI Chat Completions format need no adapter of their
+own: they are `custom_openai` connections with a known base URL. `GET
+/admin/api/provider-presets` lists the ready-made ones, each with the `provider_type`,
+`base_url` and model names to use, so a client can offer them as a one-step choice:
+
+| Preset `id` | Provider | `provider_type` | `base_url` | Suggested `model_name` |
+|---|---|---|---|---|
+| `mistral` | Mistral AI | `custom_openai` | `https://api.mistral.ai/v1` | `mistral-large-latest`, `mistral-medium-latest`, `mistral-small-latest`, `codestral-latest`; embeddings: `mistral-embed` |
+| `xai` | xAI | `custom_openai` | `https://api.x.ai/v1` | `grok-4`, `grok-3`, `grok-3-mini` |
+| `groq` | Groq | `custom_openai` | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `openai/gpt-oss-120b`, `openai/gpt-oss-20b` |
+
+Every preset needs an API key (`requires_api_key: true`), sent as `Authorization: Bearer`.
+A preset is a convenience, not a stored type: send its `provider_type` and `base_url`,
+and a `model_name` of your choice, to `POST /admin/api/models`. The result is an ordinary
+`custom_openai` connection that is validated and tested like one typed by hand. The model names are suggestions; any name the
+provider serves works, and a provider that retires one does not break existing
+connections.
+
+Presets carry **no price**. `custom_openai` ships no built-in price rows, because the type
+names a URL rather than a vendor and a row keyed on it would price every self-hosted
+server like the hosted service. Add the models you use to the
+[price table](api.md#model-prices) (provider type `custom_openai`) to get cost figures;
+until then usage is counted and a request is logged with `cost_source: "none"` and a cost
+of zero.
+
 ## Capabilities
 
 What each adapter can do with a provider type. These describe the **adapter**, not the
 upstream model: a model that cannot see images still shows `vision` for its provider
 type, because the translation exists — the model's own refusal is relayed as it comes.
 
-| | `openai` | `anthropic` | `gemini` | `deepseek` | `ollama` | `custom_openai` |
-|---|---|---|---|---|---|---|
-| `streaming` | yes | yes | yes | yes | yes | yes |
-| `embeddings` | yes | no | yes | no | yes | yes |
-| `tools` | yes | yes | yes | yes | yes | yes |
-| `tool_streaming` | yes | yes | no ¹ | yes | no ¹ | yes |
-| `vision` | yes | yes | yes | no | yes | yes |
-| `remote_images` | yes | yes | no ² | no | no ² | yes |
-| `prompt_caching` | no ³ | yes | no | no | no | no |
-| `cached_token_usage` | yes | yes | yes | yes | no | no |
-| `rerank` | no | no | no | no | no | no |
+| | `openai` | `anthropic` | `gemini` | `deepseek` | `ollama` | `custom_openai` | `azure_openai` |
+|---|---|---|---|---|---|---|---|
+| `streaming` | yes | yes | yes | yes | yes | yes | yes |
+| `embeddings` | yes | no | yes | no | yes | yes | yes |
+| `tools` | yes | yes | yes | yes | yes | yes | yes |
+| `tool_streaming` | yes | yes | no ¹ | yes | no ¹ | yes | yes |
+| `vision` | yes | yes | yes | no | yes | yes | yes |
+| `remote_images` | yes | yes | no ² | no | no ² | yes | yes |
+| `prompt_caching` | no ³ | yes | no | no | no | no | no ³ |
+| `cached_token_usage` | yes | yes | yes | yes | no | no | yes |
+| `rerank` | no | no | no | no | no | no | no |
 
 `cohere_rerank` and `voyage_rerank` sit outside that table: `rerank` is the only
 capability they have, and `chat` and `embeddings` are both `no`.
@@ -70,7 +99,7 @@ argument fragments, because that is how the upstream sends them — see
 [Ollama](#ollama-native-api) and [Gemini](#gemini).
 ² The upstream cannot fetch an image URL, so the gateway downloads it and sends the bytes;
 see [Images](#images).
-³ OpenAI caches prompts automatically, so there is no marker to send.
+³ OpenAI and Azure OpenAI cache prompts automatically, so there is no marker to send.
 
 The table gates nothing: an adapter answers for itself with a typed error when a request
 asks for something it cannot do, and a second copy of those rules in front of it would
@@ -160,6 +189,60 @@ the upstream unchanged, so provider-specific options (`seed`, a request-side `lo
 `reasoning_effort`, vLLM's `guided_json`, …) work without gateway support. For `ollama` a
 defined subset is
 mapped (below); `anthropic` and `gemini` ignore unknown fields.
+
+## Azure OpenAI
+
+`azure_openai` talks to an Azure OpenAI resource. It uses the Chat Completions body and
+response, so streaming, tool calls, images and embeddings behave as they do for `openai`;
+what differs is how the request is addressed and authenticated:
+
+```
+POST {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}
+POST {endpoint}/openai/deployments/{deployment}/embeddings?api-version={version}
+api-key: <api_key>
+```
+
+The key travels in the `api-key` header; no `Authorization: Bearer` header is sent. A
+model connection has no column for the version, so the four settings map onto the
+existing fields:
+
+| Setting | Field | Example |
+|---|---|---|
+| Endpoint | `base_url` | `https://my-resource.openai.azure.com` |
+| Deployment | `model_name` | `my-gpt4o` (the deployment name you chose in Azure, not the model family) |
+| API version | `api-version` query parameter of `base_url`, optional | `https://my-resource.openai.azure.com?api-version=2025-04-01-preview` |
+| Key | `api_key` | one of the resource's two keys |
+
+`$AUTH` is the bearer header from the login example in [the API reference](api.md).
+
+```bash
+curl -X POST http://localhost:8765/admin/api/models \
+  -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"name":"azure-gpt4o","provider_type":"azure_openai",
+       "base_url":"https://my-resource.openai.azure.com",
+       "model_name":"my-gpt4o","api_key":"<azure key>"}'
+```
+
+Without an `api-version` the gateway uses `2024-10-21`. Pass another one when a feature
+you need (a newer model, a preview capability) requires it. The same connection can serve
+a RAG store's embeddings when its deployment is an embedding model; chat and embedding
+deployments are separate connections.
+
+Validation on save: `base_url` is required and takes no credentials or fragment, and its
+only allowed query parameter is a single `api-version` (letters, digits, `.`, `_`, `-`);
+a pasted trailing `/` or `/openai` is accepted and removed. `model_name` is the deployment
+name: letters, digits, `.`, `_` and `-`, starting with a letter or digit, up to 64
+characters. The endpoint goes through the same private-address check as every other
+`base_url`; use `PRIVATE_UPSTREAM_ALLOWLIST` for a private endpoint such as an Azure
+Private Link address.
+
+The key sits in the same encrypted `api_key` field as every other provider key: AES-256-GCM
+at rest, masked in the API, and re-encrypted by `ragmux rotate-key` along with the rest.
+Upstream errors are relayed and redacted like any other provider's, so the key never
+appears in one.
+
+Azure prices are not built in; add them to the [price table](api.md#model-prices) with
+provider type `azure_openai`.
 
 ## Anthropic
 

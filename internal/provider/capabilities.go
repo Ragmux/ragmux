@@ -55,6 +55,12 @@ func CapabilitiesFor(providerType string) Capabilities {
 		// allows, not a promise about a particular build.
 		return Capabilities{Chat: true, Streaming: true, Embeddings: true, Tools: true, ToolStreaming: true,
 			Vision: true, RemoteImages: true}
+	case AzureProviderType:
+		// The OpenAI wire format behind a deployment URL and an api-key
+		// header. Azure fetches image URLs itself and reports cached prompt
+		// tokens in usage like OpenAI does.
+		return Capabilities{Chat: true, Streaming: true, Embeddings: true, Tools: true, ToolStreaming: true,
+			Vision: true, RemoteImages: true, CachedTokenUsage: true}
 	case "anthropic":
 		return Capabilities{Chat: true, Streaming: true, Tools: true, ToolStreaming: true, Vision: true,
 			RemoteImages: true, PromptCaching: true, CachedTokenUsage: true}

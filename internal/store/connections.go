@@ -48,7 +48,7 @@ const MaxTestError = 512
 // separate credential path would have to re-implement all of that, and
 // rotate-key would skip it in silence.
 var ValidProviderTypes = []string{"openai", "anthropic", "gemini", "deepseek", "ollama", "custom_openai",
-	"cohere_rerank", "voyage_rerank"}
+	"cohere_rerank", "voyage_rerank", "azure_openai"}
 
 // IsValidProviderType checks membership in ValidProviderTypes.
 func IsValidProviderType(t string) bool {

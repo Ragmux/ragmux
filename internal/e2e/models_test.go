@@ -176,10 +176,10 @@ func TestProviderTypeCapabilities(t *testing.T) {
 	e := newEnv(t, testdb.Config(t))
 	list := e.call("GET", "/admin/api/provider-types", nil, "")["_list"].([]any)
 	// Every chat adapter now translates tools, Gemini included.
-	wantTools := map[string]bool{"openai": true, "anthropic": true, "gemini": true, "deepseek": true, "ollama": true, "custom_openai": true}
+	wantTools := map[string]bool{"openai": true, "anthropic": true, "gemini": true, "deepseek": true, "ollama": true, "custom_openai": true, "azure_openai": true}
 	// Gemini sends a function call whole inside one chunk rather than as
 	// argument deltas, which is the one capability that separates it here.
-	wantToolStreaming := map[string]bool{"openai": true, "anthropic": true, "gemini": false, "deepseek": true, "ollama": false, "custom_openai": true}
+	wantToolStreaming := map[string]bool{"openai": true, "anthropic": true, "gemini": false, "deepseek": true, "ollama": false, "custom_openai": true, "azure_openai": true}
 	// The rerank-only types sit outside those tables: they neither chat nor
 	// embed, so the dashboard's chat and embedding pickers must skip them.
 	wantRerankOnly := map[string]bool{"cohere_rerank": true, "voyage_rerank": true}

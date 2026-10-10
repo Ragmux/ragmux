@@ -133,6 +133,7 @@ func (a *Admin) authenticated(r chi.Router) {
 	r.Post("/api/me/password", a.changePassword)
 
 	read.Get("/api/provider-types", a.providerTypes)
+	read.Get("/api/provider-presets", a.providerPresets)
 	read.Get("/api/search-backends", a.searchBackends)
 
 	// Model connections: viewers may read, editors mutate and test (a
@@ -541,6 +542,7 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", true},
 		{"ollama", "Ollama", "http://localhost:11434", false},
 		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", false},
+		{provider.AzureProviderType, "Azure OpenAI", "https://your-resource.openai.azure.com", true},
 		{"cohere_rerank", "Cohere Rerank (reranking only)", "https://api.cohere.com", true},
 		{"voyage_rerank", "Voyage Rerank (reranking only)", "https://api.voyageai.com", true},
 	}
@@ -607,6 +609,11 @@ func (in connInput) validateEndpoint(ctx context.Context, a *Admin) error {
 	if in.ProviderType == "custom_openai" && in.BaseURL == "" {
 		return errors.New("base_url is required for custom_openai")
 	}
+	if in.ProviderType == provider.AzureProviderType {
+		if err := in.validateAzure(); err != nil {
+			return err
+		}
+	}
 	if in.BaseURL == "" {
 		return nil
 	}
@@ -620,7 +627,10 @@ func (in connInput) validateEndpoint(ctx context.Context, a *Admin) error {
 	if u.User != nil {
 		return errors.New("base_url must not contain credentials")
 	}
-	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
+	// An Azure base_url may carry the api-version query parameter and nothing
+	// else; validateAzure has already checked it.
+	azureQuery := in.ProviderType == provider.AzureProviderType && u.RawQuery != "" && !u.ForceQuery
+	if (u.RawQuery != "" && !azureQuery) || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
 		return errors.New("base_url must not contain a query string or fragment")
 	}
 	// Reject a host that only resolves to private addresses now so the
