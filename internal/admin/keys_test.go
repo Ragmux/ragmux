@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -179,7 +180,7 @@ func TestCreateGatewayKeyMembershipGate(t *testing.T) {
 		t.Fatalf("api_key = %q", secret)
 	}
 	k, _ := out["key"].(map[string]any)
-	if scopes, _ := k["scopes"].([]any); len(scopes) != 2 {
+	if scopes, _ := k["scopes"].([]any); len(scopes) != len(store.DefaultGatewayScopes()) {
 		t.Errorf("default scopes = %v", k["scopes"])
 	}
 
@@ -691,5 +692,78 @@ func TestDeletingAUserWithAttributedSpendIsRefused(t *testing.T) {
 	spare := e.user("no-spend", "viewer")
 	if status, out := e.do(http.MethodDelete, "/api/users/"+itoa(spare.ID), nil, admin.token); status != http.StatusOK {
 		t.Errorf("deleting an account with no attributed usage: %d %v", status, out)
+	}
+}
+
+// A gateway key created without scopes (absent or empty) gets every gateway
+// scope, the three v0.5 ones included.
+func TestGatewayKeyDefaultScopesIncludeV05Scopes(t *testing.T) {
+	e := newAdminEnv(t)
+	alice := e.user("alice", "editor", e.proj.ID)
+	for name, body := range map[string]map[string]any{
+		"absent": {"kind": "gateway", "name": "absent", "project_ids": []int64{e.proj.ID}},
+		"empty":  {"kind": "gateway", "name": "empty", "project_ids": []int64{e.proj.ID}, "scopes": []string{}},
+	} {
+		status, out := e.do(http.MethodPost, "/api/keys", body, alice.token)
+		if status != http.StatusCreated {
+			t.Fatalf("%s: create: %d %v", name, status, out)
+		}
+		k, _ := out["key"].(map[string]any)
+		got, _ := k["scopes"].([]any)
+		have := map[string]bool{}
+		for _, s := range got {
+			str, _ := s.(string)
+			have[str] = true
+		}
+		for _, want := range []string{store.ScopeChat, store.ScopeModels, store.ScopeEmbeddings, store.ScopeRetrieve, store.ScopeRerank} {
+			if !have[want] {
+				t.Errorf("%s: default scopes %v lack %q", name, got, want)
+			}
+		}
+		if len(got) != len(store.DefaultGatewayScopes()) {
+			t.Errorf("%s: default scopes = %v", name, got)
+		}
+	}
+}
+
+// An unknown scope is a 400 whose message lists the valid values, on create
+// and on update.
+func TestKeyUnknownScopeListsValidValues(t *testing.T) {
+	e := newAdminEnv(t)
+	alice := e.user("alice", "editor", e.proj.ID)
+
+	status, out := e.do(http.MethodPost, "/api/keys", map[string]any{
+		"kind": "gateway", "name": "bad", "project_ids": []int64{e.proj.ID},
+		"scopes": []string{store.ScopeChat, "images"}}, alice.token)
+	if status != http.StatusBadRequest {
+		t.Fatalf("unknown scope on create: %d %v", status, out)
+	}
+	msg := errMessage(out)
+	for _, want := range append([]string{`"images"`}, store.GatewayScopes()...) {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q does not mention %s", msg, want)
+		}
+	}
+
+	// A management scope is not a gateway scope either.
+	status, out = e.do(http.MethodPost, "/api/keys", map[string]any{
+		"kind": "gateway", "name": "bad2", "project_ids": []int64{e.proj.ID},
+		"scopes": []string{store.ScopeRead}}, alice.token)
+	if status != http.StatusBadRequest {
+		t.Errorf("management scope on a gateway key: %d %v", status, out)
+	}
+
+	// A new scope is accepted, and an update with an unknown one is refused.
+	status, out = e.do(http.MethodPost, "/api/keys", map[string]any{
+		"kind": "gateway", "name": "ok", "project_ids": []int64{e.proj.ID},
+		"scopes": []string{store.ScopeRetrieve}}, alice.token)
+	if status != http.StatusCreated {
+		t.Fatalf("retrieve-only key: %d %v", status, out)
+	}
+	id := keyID(t, out)
+	status, out = e.do(http.MethodPut, "/api/keys/"+itoa(id), map[string]any{
+		"name": "ok", "project_ids": []int64{e.proj.ID}, "scopes": []string{"rerank-all"}}, alice.token)
+	if status != http.StatusBadRequest || !strings.Contains(errMessage(out), store.ScopeRerank) {
+		t.Errorf("unknown scope on update: %d %v", status, out)
 	}
 }

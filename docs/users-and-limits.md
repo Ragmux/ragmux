@@ -60,7 +60,8 @@ Deactivation stops every key the user holds at once, at `/v1` with
 gateway side. Role is intersected with a key's scopes on `/admin/api` only, where it is
 read live on every request, so a demotion narrows the `sk-mgmt-…` keys the user holds
 immediately. It changes nothing about an `sk-user-…` key: `/v1` does not consult roles,
-and `chat` and `models` are scopes every role including `viewer` already covers.
+and every gateway scope (`chat`, `models`, `embeddings`, `retrieve`, `rerank`) is one every
+role including `viewer` already covers.
 
 Roles do still bind where they are the control: a `viewer` cannot put a `write`, `admin`
 or `keys` scope on any key it mints, and a `management` key needs at least `editor` plus
@@ -104,7 +105,7 @@ credentials in the **API keys** tab or through `/admin/api/keys`. They come in t
 
 | Kind | Prefix | Calls | Carries |
 |---|---|---|---|
-| `gateway` | `sk-user-…` | `/v1` | a set of granted projects, its own rate limits and budgets, scopes `chat` and `models` |
+| `gateway` | `sk-user-…` | `/v1` | a set of granted projects, its own rate limits and budgets, scopes `chat`, `models`, `embeddings`, `retrieve` and `rerank` |
 | `management` | `sk-mgmt-…` | `/admin/api` | scopes `read`, `write`, `admin`, `keys`; no projects and no limits |
 
 All three prefixes keep the `sk-` head so secret scanners that watch for OpenAI-shaped
@@ -120,7 +121,7 @@ What that lookup enforces differs by surface. On `/admin/api` the effective perm
 the key's scopes intersected with the owner's role, so demoting a user narrows every
 `sk-mgmt-…` key they hold at once. `/v1` does not read the role at all — it checks only
 that the account is active — so a demotion changes nothing about an `sk-user-…` key:
-`chat` and `models` are scopes every role including `viewer` already covers. See
+every gateway scope is one every role including `viewer` already covers. See
 [A role bounds the admin surface, not spend](#a-role-bounds-the-admin-surface-not-spend).
 
 **Deactivating** an account stops both kinds at once: the key stops resolving entirely
@@ -130,13 +131,32 @@ that the account is active — so a demotion changes nothing about an `sk-user-�
 |---|---|---|
 | gateway | `chat` | `POST /v1/chat/completions` |
 | gateway | `models` | `GET /v1/models`, `GET /v1/models/{id}` |
+| gateway | `embeddings` | `POST /v1/embeddings` |
+| gateway | `retrieve` | `POST /v1/retrieve` |
+| gateway | `rerank` | `POST /v1/rerank` |
 | management | `read` | every listing and metrics route (the `viewer` set) |
 | management | `write` | the routes that need `editor` |
 | management | `admin` | the routes that need `admin` (users, audit log, login security) |
 | management | `keys` | `/admin/api/keys*`, separate from `write` so a leaked write key cannot mint more keys |
 
-Both gateway scopes are granted by default. A management key needs at least one scope and
-the `editor` role; the `admin` scope needs the `admin` role.
+All five gateway scopes are granted by default: a gateway key created with no `scopes`, or
+with an empty list, gets `chat`, `models`, `embeddings`, `retrieve` and `rerank`. A scope
+name outside that list is a `400` whose message lists the valid values. The check lives in
+the application, not in a database constraint, so a future scope needs no migration. A
+management key needs at least one scope and the `editor` role; the `admin` scope needs the
+`admin` role.
+
+**Upgrading from v0.4.** Migration `0018` gives the three new scopes to every existing
+gateway key that carries `chat`: keys that could call chat completions can call the new
+endpoints too. This is a deliberate widening of what those keys may do, and the changelog
+marks it as security-relevant. Revoked and expired keys are included, so reviving or
+extending one later does not change its reach. The migration only adds: it is idempotent,
+it leaves `updated_at` alone, and it does not touch keys that carry only `models` or any
+management key. To keep a key out of the new endpoints, edit its scopes after upgrading.
+
+**The project's default key** (`sk-proj-…`) carries no scopes at all, so it reaches the new
+endpoints automatically, like every other `/v1` route. It cannot be narrowed; mint a
+user-owned gateway key with the scopes you want when you need that.
 
 Three actions refuse an api-key principal outright and answer
 `403 {"error":{"code":"session_required"}}`: changing your own password, resetting

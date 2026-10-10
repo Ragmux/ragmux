@@ -4,6 +4,17 @@ All notable changes to Ragmux are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+- **Existing `chat` gateway keys gain the `embeddings`, `retrieve` and `rerank` scopes.**
+  Migration `0018` adds the three new scopes to every gateway key that carries `chat`,
+  revoked and expired keys included, so those keys can call the new `/v1` endpoints after
+  the upgrade. It only adds scopes and is safe to run twice; keys with only `models`, and
+  management keys, are untouched. Edit a key's scopes afterwards to keep it out of the new
+  endpoints. The project's default `sk-proj-…` key carries no scopes and reaches them
+  automatically. See [Users, roles and limits](docs/users-and-limits.md#api-keys).
+
 ## [0.4.2] — 2026-10-02
 
 Bug fixes, observability and documentation. No schema change.

@@ -421,17 +421,19 @@ itself a management key.
 Request body:
 
 ```json
-{"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models"],
+{"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models", "retrieve"],
  "project_ids": [1, 2], "default_project_id": 1, "expires_at": "2027-01-01T00:00:00Z",
  "user_id": 4,
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
 ```
 
 `kind` is `gateway` (default) or `management`. `name` is required, at most 64 characters
-and unique per owner (`409` otherwise). `scopes` defaults to `["chat","models"]` for a
-gateway key and is required for a management key; an unknown scope, or one the caller's
-own role does not cover, is a `400`. `expires_at` is RFC 3339, and `null` or `""` clears
-it. `user_id` mints the key for another account and needs the `admin` role; the grants
+and unique per owner (`409` otherwise). A gateway key's `scopes` may name `chat`, `models`,
+`embeddings`, `retrieve` and `rerank` and defaults to all five when omitted or empty; a
+management key's `scopes` may name `read`, `write`, `admin` and `keys` and are required. An
+unknown scope (the message lists the valid values for the kind), or one the caller's own
+role does not cover, is a `400`. `expires_at` is RFC 3339, and `null` or `""` clears it.
+`user_id` mints the key for another account and needs the `admin` role; the grants
 are then checked against *that* account, not the admin's.
 
 For a `gateway` key, every id in `project_ids` must be a project the **owner** can access
@@ -444,7 +446,7 @@ The key object never contains the credential:
 
 ```json
 {"id": 7, "kind": "gateway", "name": "ci-pipeline", "key_prefix": "sk-user-Wg8TwBF",
- "user_id": 1, "created_by": 1, "scopes": ["chat", "models"], "project_ids": [1, 2],
+ "user_id": 1, "created_by": 1, "scopes": ["chat", "models", "retrieve"], "project_ids": [1, 2],
  "default_project_id": null, "rate_limit_rpm": 0, "rate_limit_tpm": 0,
  "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "expires_at": null, "revoked_at": null, "last_used_at": "2026-09-19T03:41:00Z",
