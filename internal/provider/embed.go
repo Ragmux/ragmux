@@ -19,6 +19,29 @@ type openAIEmbeddingsResponse struct {
 		Index     int       `json:"index"`
 		Embedding []float32 `json:"embedding"`
 	} `json:"data"`
+	Usage *struct {
+		PromptTokens int `json:"prompt_tokens"`
+		TotalTokens  int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+// usage returns the reported token counts, or nil when the upstream sent
+// none or sent only zeros.
+func (r openAIEmbeddingsResponse) usage() *Usage {
+	if r.Usage == nil {
+		return nil
+	}
+	prompt, total := r.Usage.PromptTokens, r.Usage.TotalTokens
+	if prompt <= 0 {
+		prompt = total
+	}
+	if prompt <= 0 {
+		return nil
+	}
+	if total < prompt {
+		total = prompt
+	}
+	return &Usage{PromptTokens: prompt, TotalTokens: total}
 }
 
 // vectors returns the embeddings in input order and checks that the upstream
@@ -37,14 +60,18 @@ func (r openAIEmbeddingsResponse) vectors(n int) ([][]float32, error) {
 	return vecs, nil
 }
 
-func (e *openAIEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
+func (e *openAIEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, *Usage, error) {
 	var out openAIEmbeddingsResponse
 	body := map[string]any{"model": e.cfg.Model, "input": inputs, "encoding_format": "float"}
 	if err := doJSON(ctx, e.cfg, opEmbed, e.base+"/embeddings",
 		map[string]string{"Authorization": "Bearer " + e.cfg.APIKey}, body, &out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out.vectors(len(inputs))
+	vecs, err := out.vectors(len(inputs))
+	if err != nil {
+		return nil, nil, err
+	}
+	return vecs, out.usage(), nil
 }
 
 // ollamaEmbedder uses Ollama's native /api/embed (batch capable).
@@ -53,9 +80,10 @@ type ollamaEmbedder struct {
 	base string
 }
 
-func (e *ollamaEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
+func (e *ollamaEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, *Usage, error) {
 	var out struct {
-		Embeddings [][]float32 `json:"embeddings"`
+		Embeddings      [][]float32 `json:"embeddings"`
+		PromptEvalCount int         `json:"prompt_eval_count"`
 	}
 	body := map[string]any{"model": e.cfg.Model, "input": inputs}
 	hdr := map[string]string{}
@@ -63,12 +91,16 @@ func (e *ollamaEmbedder) Embed(ctx context.Context, inputs []string) ([][]float3
 		hdr["Authorization"] = "Bearer " + e.cfg.APIKey
 	}
 	if err := doJSON(ctx, e.cfg, opEmbed, e.base+"/api/embed", hdr, body, &out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(out.Embeddings) != len(inputs) {
-		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "embedding count mismatch"}
+		return nil, nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "embedding count mismatch"}
 	}
-	return out.Embeddings, nil
+	var usage *Usage
+	if out.PromptEvalCount > 0 {
+		usage = &Usage{PromptTokens: out.PromptEvalCount, TotalTokens: out.PromptEvalCount}
+	}
+	return out.Embeddings, usage, nil
 }
 
 // geminiEmbedder uses batchEmbedContents.
@@ -77,7 +109,8 @@ type geminiEmbedder struct {
 	base string
 }
 
-func (e *geminiEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
+// Embed returns no usage: batchEmbedContents reports no token counts.
+func (e *geminiEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, *Usage, error) {
 	// The body carries the plain "models/<name>"; the URL gets the escaped
 	// segment so the name cannot alter the request path.
 	model := "models/" + strings.TrimPrefix(e.cfg.Model, "models/")
@@ -93,14 +126,14 @@ func (e *geminiEmbedder) Embed(ctx context.Context, inputs []string) ([][]float3
 	}
 	if err := doJSON(ctx, e.cfg, opEmbed, e.base+path+":batchEmbedContents",
 		map[string]string{"x-goog-api-key": e.cfg.APIKey}, map[string]any{"requests": reqs}, &out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(out.Embeddings) != len(inputs) {
-		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "embedding count mismatch"}
+		return nil, nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: "embedding count mismatch"}
 	}
 	vecs := make([][]float32, len(inputs))
 	for i, em := range out.Embeddings {
 		vecs[i] = em.Values
 	}
-	return vecs, nil
+	return vecs, nil, nil
 }

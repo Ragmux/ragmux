@@ -370,9 +370,11 @@ type RequestWarner interface {
 	RequestWarnings(req ChatRequest) []string
 }
 
-// Embedder produces vector embeddings.
+// Embedder produces vector embeddings. The returned Usage is what the
+// upstream reported for the call; it is nil when the upstream reports none
+// (callers estimate in that case).
 type Embedder interface {
-	Embed(ctx context.Context, inputs []string) ([][]float32, error)
+	Embed(ctx context.Context, inputs []string) ([][]float32, *Usage, error)
 }
 
 // Error is an upstream failure carrying an HTTP status to relay.

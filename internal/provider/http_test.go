@@ -162,7 +162,7 @@ func TestGeminiModelPathEscaped(t *testing.T) {
 		t.Fatal(err)
 	}
 	emb, _ := NewEmbedder(cfg)
-	if _, err := emb.Embed(context.Background(), []string{"a"}); err != nil {
+	if _, _, err := emb.Embed(context.Background(), []string{"a"}); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"/models/..%2F..%2Fevil%2Fx%3Fy=1:generateContent", "/models/..%2F..%2Fevil%2Fx%3Fy=1:batchEmbedContents"}

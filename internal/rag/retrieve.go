@@ -77,6 +77,9 @@ type Result struct {
 	// whenever the store has rerank on, even when the reranker was skipped,
 	// so the dashboard shows "0 ms, skipped" rather than a blank field.
 	RerankLatencyMS *int64
+	// EmbedUsage is what the embedding upstream reported for the query; nil
+	// when it reported none or no embedding call was made.
+	EmbedUsage *provider.Usage
 }
 
 // Search returns the top-k hits for a query using the store's settings.
@@ -121,7 +124,7 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	if err != nil {
 		return nil, err
 	}
-	vecs, err := r.embedQuery(ctx, emb, conn.ProviderType, query)
+	vecs, embedUsage, err := r.embedQuery(ctx, emb, conn.ProviderType, query)
 	if err != nil {
 		span.RecordError(errSpanEmbed)
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -146,6 +149,7 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 		return nil, err
 	}
 	res.Backend = used
+	res.EmbedUsage = embedUsage
 	retrieval := time.Since(start)
 	res.RetrievalLatencyMS = retrieval.Milliseconds()
 	if rs.Rerank {
@@ -171,10 +175,20 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	return res, nil
 }
 
+// Embedder builds the embedder for a model connection with the factory the
+// retriever itself embeds queries through, so every embedding call of the
+// process shares one client configuration (timeouts, upstream address policy).
+func (r *Retriever) Embedder(conn *store.ModelConnection) (provider.Embedder, error) {
+	if r == nil || r.factory == nil {
+		return nil, errors.New("no embedder factory configured")
+	}
+	return r.factory(conn)
+}
+
 // embedQuery embeds the retrieval query in its own client span. The span
 // names the provider and nothing else: the query itself is exactly the kind
 // of payload that must not leave in a span.
-func (r *Retriever) embedQuery(ctx context.Context, emb provider.Embedder, providerType, query string) ([][]float32, error) {
+func (r *Retriever) embedQuery(ctx context.Context, emb provider.Embedder, providerType, query string) ([][]float32, *provider.Usage, error) {
 	ctx, span := r.Tracer.Start(ctx, "rag.embed_query", tracing.KindClient)
 	defer span.End()
 	// Guarded: Attr.Value is an any, so providerType is boxed onto the heap
@@ -189,14 +203,14 @@ func (r *Retriever) embedQuery(ctx context.Context, emb provider.Embedder, provi
 		)
 	}
 	start := time.Now()
-	vecs, err := emb.Embed(ctx, []string{query})
+	vecs, usage, err := emb.Embed(ctx, []string{query})
 	r.Metrics.RecordEmbedQuery(providerType, time.Since(start))
 	if err != nil {
 		span.RecordError(errSpanEmbed)
-		return nil, err
+		return nil, nil, err
 	}
 	span.SetStatusOK()
-	return vecs, nil
+	return vecs, usage, nil
 }
 
 // rerank reorders hits and records the outcome on res. It never returns an

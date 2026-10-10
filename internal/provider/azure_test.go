@@ -252,7 +252,7 @@ func TestAzureEmbeddings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vecs, err := e.Embed(context.Background(), []string{"first", "second"})
+	vecs, _, err := e.Embed(context.Background(), []string{"first", "second"})
 	if err != nil {
 		t.Fatal(err)
 	}

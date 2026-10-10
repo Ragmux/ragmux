@@ -842,7 +842,7 @@ func (a *Admin) runConnectionTest(ctx context.Context, c *store.ModelConnection,
 		if err != nil {
 			return nil, err
 		}
-		vecs, err := emb.Embed(ctx, []string{"ping"})
+		vecs, _, err := emb.Embed(ctx, []string{"ping"})
 		if err != nil {
 			return failed(err), nil
 		}
@@ -1215,7 +1215,7 @@ func (a *Admin) probeEmbeddingWidth(ctx context.Context, conn *store.ModelConnec
 	if err != nil {
 		return 0, err
 	}
-	vecs, err := emb.Embed(ctx, []string{"ping"})
+	vecs, _, err := emb.Embed(ctx, []string{"ping"})
 	if err != nil {
 		return 0, err
 	}

@@ -198,16 +198,20 @@ type azureEmbedder struct {
 	t azureTarget
 }
 
-func (e *azureEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
+func (e *azureEmbedder) Embed(ctx context.Context, inputs []string) ([][]float32, *Usage, error) {
 	endpoint, err := e.t.url("embeddings")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out openAIEmbeddingsResponse
 	// The deployment names the model, so the body carries none.
 	body := map[string]any{"input": inputs, "encoding_format": "float"}
 	if err := doJSON(ctx, e.t.cfg, opEmbed, endpoint, e.t.headers(), body, &out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out.vectors(len(inputs))
+	vecs, err := out.vectors(len(inputs))
+	if err != nil {
+		return nil, nil, err
+	}
+	return vecs, out.usage(), nil
 }

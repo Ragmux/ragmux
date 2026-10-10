@@ -855,6 +855,73 @@ Status codes:
 | `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
 
+### `POST /v1/embeddings`
+
+OpenAI's `embeddings.create`, so an SDK's `client.embeddings.create(...)` works against the
+gateway. Needs the key's `embeddings` scope (`403` otherwise).
+
+```json
+{"model": "text-embedding-3-small", "input": ["first text", "second text"], "encoding_format": "float"}
+```
+
+- `input` is a string or an array of up to 2048 non-empty strings. Arrays of token ids are
+  refused (`400`); the providers behind the gateway embed text.
+- `encoding_format` is `float` (default) or `base64`, the little-endian `float32` bytes
+  base64-encoded, as OpenAI's SDKs expect.
+- `dimensions` is not supported and answers `400`: the adapters cannot shorten a vector.
+
+```json
+{"object": "list", "model": "text-embedding-3-small",
+ "data": [{"object": "embedding", "index": 0, "embedding": [0.01, -0.02, …]}],
+ "usage": {"prompt_tokens": 9, "total_tokens": 9}}
+```
+
+`model` is resolved in this order: a route of kind `embeddings` with exactly that name
+(see [Routes](#routes), which also gives it retries and fallback targets); the implicit
+route, which is the embedding connection of the project's RAG store and answers to that
+connection's model name and to an empty `model`; anything else is `404`
+`{"error": {"type": "invalid_request_error", "code": "model_not_found", …}}`. It never
+falls back to the project's chat connection, a model that cannot embed, and a project with
+no RAG store has no implicit route. The response `model` is the client's value (the
+connection's model name when none was sent).
+
+Each call goes through the same steps as chat: limits and budgets are checked first, the
+call is recorded in the request log with `endpoint = embeddings`, the upstream's
+`prompt_tokens` and the price. An upstream that reports no usage gets an estimate
+(characters divided by 4), flagged `estimated` in the log. Errors use the
+[error envelope](#error-envelope) and the status mapping of chat completions.
+
+### `POST /v1/retrieve`
+
+Searches the project's RAG store and returns the passages, without calling a chat model.
+Needs the key's `retrieve` scope. The scope decides, not the owner's role: a key a viewer
+minted for the project works.
+
+```json
+{"query": "how many vacation days do I get?", "top_k": 5}
+```
+
+`query` is required. `top_k` is optional, 1 to 50; omitted or `0` uses the store's
+`top_k`. The store's search mode, backend, rerank and distance settings apply; a request
+cannot override them (the dashboard's [search endpoint](rag.md#search-endpoint) can).
+
+```json
+{"object": "retrieval", "mode": "hybrid", "backend": "pg_search", "reranked": false,
+ "rerank_backend": "", "rerank_fallback": false, "retrieval_latency_ms": 41, "rerank_latency_ms": null,
+ "hits": [{"chunk_id": 8, "document_id": 2, "content": "…", "score": 0.0325, "distance": 0.18,
+           "metadata": {"filename": "handbook.pdf", "section": "Leave > Vacation", "page": 12, "chunk_index": 3}}],
+ "usage": {"prompt_tokens": 7, "total_tokens": 7}}
+```
+
+`hits` is always an array, empty when nothing matched. `backend` is the one that actually
+ran. `usage` counts the query's embedding tokens, plus the tokens of the rerank call when
+the store reranks with the LLM backend (that call goes to the project's chat connection, so a
+key with only `retrieve` can cause it; it is counted on the request row and against the
+project's limits, priced at the row's rate). A project without a RAG store answers
+`400` with code `no_rag_store`. The call is recorded with `endpoint = retrieve`,
+`rag_used`, `rag_hits`, and the embedding connection's model, tokens and price. An
+embedding failure at the provider answers with the provider's status as in chat.
+
 ### `GET /v1/models` and `GET /v1/models/{id}`
 
 Return the project's models in OpenAI's shape so SDK model listings work:

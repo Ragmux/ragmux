@@ -426,3 +426,32 @@ configurations can be compared on the same query before either is saved. That is
 makes these settings usable: run `{"backend":"pgvector"}` and `{"backend":"pg_search"}`,
 or `{"rerank_backend":"llm"}` and `{"rerank_backend":"cohere","rerank_connection_id":3}`,
 and read the orders off against each other.
+
+## Client retrieve endpoint
+
+`POST /v1/retrieve` is the search endpoint for applications: a gateway key with the
+`retrieve` scope sends `{query, top_k}` and gets the hits back, with their scores and
+metadata, the search `mode` and the `backend` that ran. It calls the same function as the
+dashboard search and as context injection (`SearchWith`), so a query ranks the same way in
+all three; the difference is that it uses the store's saved settings and takes no
+per-request overrides. Wire format and errors are in the
+[API reference](api.md#post-v1retrieve).
+
+Each call embeds the query once through the store's embedding connection. Its tokens (the
+upstream's count, or an estimate of characters divided by 4 when it reports none) and
+price are written to the request log with `endpoint = retrieve`.
+When the store reranks with the LLM backend, that chat call's tokens (reported, or estimated
+from characters) are added to the same row and to the response `usage`.
+
+## Embedding token accounting
+
+Ingestion embeds every chunk, and since 0.5 the tokens it spends are counted. Each
+embedding batch records the upstream's `usage` when the provider reports it (OpenAI-style
+`usage.prompt_tokens`, Ollama's `prompt_eval_count`) and an estimate otherwise (Gemini
+reports none). The totals are the `ragmux_ingest_embed_tokens_total` counter, labelled
+`source="reported"` or `source="estimated"`, and the `embed_tokens` field of the
+`document ingested` log line.
+
+Ingestion belongs to a store, not to a project, and `request_logs` rows carry a project,
+so these tokens are not part of any project's usage, budgets or request log. Query-time
+embeddings are: they are charged to the project that made the call.

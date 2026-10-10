@@ -120,6 +120,7 @@ type Metrics struct {
 	ingestJobs      *metrics.CounterVec
 	ingestDuration  *metrics.HistogramVec
 	ingestChunks    *metrics.CounterVec
+	ingestEmbedTok  *metrics.CounterVec
 	ingestClaims    *metrics.CounterVec
 	ingestLeaseLost *metrics.CounterVec
 
@@ -211,6 +212,8 @@ func New(reg *metrics.Registry) *Metrics {
 		"Wall time of one document's parse, chunk, embed and store cycle.", ingestBuckets)
 	m.ingestChunks = reg.Counter("ragmux_ingest_chunks_total",
 		"Chunks written by ingestion.")
+	m.ingestEmbedTok = reg.Counter("ragmux_ingest_embed_tokens_total",
+		"Embedding tokens spent by ingestion, by whether the upstream reported them.", "source")
 	m.ingestClaims = reg.Counter("ragmux_ingest_claims_total",
 		"Dispatcher claim attempts by outcome.", "outcome")
 	m.ingestLeaseLost = reg.Counter("ragmux_ingest_lease_lost_total",
@@ -496,6 +499,24 @@ func (m *Metrics) RecordIngestJob(outcome string, chunks int, d time.Duration) {
 	if outcome == IngestLeaseLost {
 		m.ingestLeaseLost.With().Inc()
 	}
+}
+
+// Sources of the ingest embedding token count.
+const (
+	// EmbedTokensReported marks tokens the embedding upstream reported.
+	EmbedTokensReported = "reported"
+	// EmbedTokensEstimated marks tokens estimated from the input text because
+	// the upstream reported none.
+	EmbedTokensEstimated = "estimated"
+)
+
+// RecordIngestEmbedTokens records the embedding tokens one ingestion batch
+// spent. source is EmbedTokensReported or EmbedTokensEstimated.
+func (m *Metrics) RecordIngestEmbedTokens(source string, tokens int) {
+	if m == nil || tokens <= 0 {
+		return
+	}
+	m.ingestEmbedTok.With(source).Add(uint64(tokens))
 }
 
 // RecordIngestClaim records one dispatcher claim attempt. outcome is one of

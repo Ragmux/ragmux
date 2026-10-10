@@ -222,6 +222,8 @@ func (g *Gateway) Routes(r chi.Router) {
 	r.Use(g.requestID)
 	r.Use(g.identify)
 	r.Post("/chat/completions", g.chatCompletions)
+	r.Post("/embeddings", g.embeddings)
+	r.Post("/retrieve", g.retrieve)
 	models := r.With(g.requireScope(store.ScopeModels, "model listings"))
 	models.Get("/models", g.listModels)
 	models.Get("/models/{id}", g.getModel)

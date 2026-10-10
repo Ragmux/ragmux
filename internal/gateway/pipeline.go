@@ -66,6 +66,26 @@ var chatOperation = operation{
 	endpoint: "chat.completions",
 }
 
+// embeddingsOperation is POST /v1/embeddings.
+var embeddingsOperation = operation{
+	name:  "embeddings",
+	span:  "gateway.embeddings",
+	scope: store.ScopeEmbeddings,
+	what:  "embeddings",
+
+	endpoint: "embeddings",
+}
+
+// retrieveOperation is POST /v1/retrieve.
+var retrieveOperation = operation{
+	name:  "retrieve",
+	span:  "gateway.retrieve",
+	scope: store.ScopeRetrieve,
+	what:  "retrieval",
+
+	endpoint: "retrieve",
+}
+
 // call is the state one request carries from step to step. Nothing in it is
 // specific to an endpoint's request or response body.
 type call struct {

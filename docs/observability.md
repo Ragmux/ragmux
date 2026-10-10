@@ -194,6 +194,7 @@ sum by (store) (rate(ragmux_rag_searches_total{used="pgvector"}[5m]))
 | `ragmux_ingest_jobs_total` | counter | `outcome` | `ready`, `failed`, `cancelled` or `lease_lost`. |
 | `ragmux_ingest_duration_seconds` | histogram | — | One document's parse, chunk, embed and store cycle. Buckets `1 5 15 30 60 120 300 600 900`. |
 | `ragmux_ingest_chunks_total` | counter | — | Chunks written. |
+| `ragmux_ingest_embed_tokens_total` | counter | `source` | Embedding tokens spent by ingestion: `reported` (the provider's count) or `estimated` (characters divided by 4, when it reports none). |
 | `ragmux_ingest_claims_total` | counter | `outcome` | `claimed`, `empty` or `error`. |
 | `ragmux_ingest_lease_lost_total` | counter | — | Jobs another replica took over. |
 | `ragmux_documents` | gauge | `status` | Documents by status; `pending` is the cluster's ingestion backlog. |

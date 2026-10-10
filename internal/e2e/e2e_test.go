@@ -125,7 +125,7 @@ func loopbackEmbeddingWidth(embedders func(*store.ModelConnection) (provider.Emb
 		if err != nil {
 			return 0, err
 		}
-		vecs, err := emb.Embed(ctx, []string{"ping"})
+		vecs, _, err := emb.Embed(ctx, []string{"ping"})
 		if err != nil {
 			return 0, err
 		}
