@@ -158,7 +158,7 @@ Management endpoints answer errors as
 ```
 
 where `type` is the HTTP status text: `Bad Request` (validation), `Not Found`,
-`Conflict` (duplicate name, or an item still referenced by a project or RAG store),
+`Conflict` (duplicate name, or an item still referenced by a project, RAG store or route),
 `Forbidden`, `Internal Server Error`. Login limiting and the auth middleware use the
 lower-case types shown above.
 
@@ -211,7 +211,7 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | POST | `/models` | editor | Create → `201` connection |
 | GET | `/models/{id}` | viewer | Read one |
 | PUT | `/models/{id}` | editor | Update; an empty `api_key` keeps the stored key |
-| DELETE | `/models/{id}` | editor | Delete → `{"ok": true}`; `409` while a project or RAG store uses it |
+| DELETE | `/models/{id}` | editor | Delete → `{"ok": true}`; `409` while a project, RAG store or route target uses it |
 | POST | `/models/{id}/test` | editor | `{"mode": "chat"}` (default) or `{"mode": "embedding"}`; spends provider quota, so it is a write; the outcome is recorded on the connection |
 | POST | `/models/test` | editor | Test an unsaved connection: the create body plus `mode` and optionally `connection_id` (reuse that connection's stored key when `api_key` is empty); nothing is recorded |
 
@@ -401,6 +401,49 @@ again.
 each budget would run out at that pace. A value is `null` when the budget is not set,
 nothing was consumed in the last hour, or the projection lands after the window resets
 (`resets_at`); an already exhausted budget projects to `generated_at`.
+
+### Routes
+
+A route is a named entry point inside a project: the client's `model` field selects it,
+and the route spreads requests over its targets. A project without chat routes works as
+before (see [Model field echo](providers.md#model-field-echo)). Adding the first chat route
+changes what an unknown `model` string gets: read
+[Before your first chat route](providers.md#before-your-first-chat-route) first.
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/projects/{id}/routes` | member | List the project's routes with their targets |
+| POST | `/projects/{id}/routes` | member + editor | Create → `201` route |
+| GET | `/projects/{id}/routes/{routeId}` | member | Read one |
+| PUT | `/projects/{id}/routes/{routeId}` | member + editor | Replace the route and all of its targets in one transaction |
+| DELETE | `/projects/{id}/routes/{routeId}` | member + editor | Delete → `{"ok": true}` |
+
+Route body:
+
+```json
+{"name": "smart", "kind": "chat", "strategy": "weighted",
+ "targets": [
+   {"connection_id": 1, "model": "gpt-4.1", "weight": 3, "priority": 0},
+   {"connection_id": 2, "weight": 1, "priority": 0}]}
+```
+
+- `name` is 1 to 256 characters without control characters and is unique within the
+  project (`409` otherwise).
+- `kind` is `chat` (default), `embeddings` or `rerank`. `strategy` is `weighted`
+  (default), the only one.
+- `targets` holds 1 to 8 entries. `connection_id` must exist and its provider type must
+  support the route's `kind`. `model` is optional: when set it replaces the connection's
+  model name for calls through that target. `weight` is 1 to 1000 (default 1) and
+  `priority` is 0 to 100 (default 0, lower first). The same connection and `model` pair may
+  appear only once per route.
+- Invalid input is `400`. The response lists `targets` ordered by `priority`, then `id`,
+  each with `connection_name` and `provider_type` next to the stored fields.
+
+Candidate order for a call: groups by `priority` ascending; inside a group a weighted
+random order without replacement. A single target is called per request in this release.
+Deleting a project removes its routes; a connection that a route target still uses cannot
+be deleted (`409`). Create, update and delete are audited as `route.create`,
+`route.update` and `route.delete`. Route and target names are never metric labels.
 
 ### API keys
 
@@ -814,13 +857,25 @@ Status codes:
 
 ### `GET /v1/models` and `GET /v1/models/{id}`
 
-Return the project's single model in OpenAI's shape so SDK model listings work:
+Return the project's models in OpenAI's shape so SDK model listings work:
 
 ```json
 {"object": "list", "data": [{"id": "claude-sonnet-4-5", "object": "model", "created": 1758190800, "owned_by": "anthropic"}]}
 ```
 
-With one project resolved, `{id}` is ignored and both routes describe that project's
-connection. A `sk-user-…` key that grants several projects and names none lists one entry
+A project without chat routes lists its connection's model, as above. When the project
+has chat routes, the list holds each chat route's name (`owned_by: "ragmux"`) plus the
+implicit route's name, the default connection's model name, unless a route already has
+that name. With more than one entry, `{id}` has to match one of them (`404` otherwise).
+
+When the project has chat routes, `POST /v1/chat/completions` resolves `model` in this
+order: an exact route name; the default connection's model name (the implicit route); an
+empty `model` (the implicit route). Anything else is `404`
+`{"error": {"type": "invalid_request_error", "code": "model_not_found", "message": …}}`.
+The message repeats the requested value (cut to 128 characters) and does not list the
+valid names. The response `model` is always the client's value.
+
+For a project without chat routes, with one project resolved, `{id}` is ignored and both
+routes describe that project's connection. A `sk-user-…` key that grants several projects and names none lists one entry
 per granted project's connection instead, deduplicated by model name; `{id}` then has to
 match one of them (`404` otherwise). Both routes need the key's `models` scope.

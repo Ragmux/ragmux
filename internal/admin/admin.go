@@ -173,6 +173,11 @@ func (a *Admin) authenticated(r chi.Router) {
 	read.Get("/api/projects/{id}/usage", a.projectUsage)
 	read.Get("/api/projects/{id}/members", a.listMembers)
 	editor.Put("/api/projects/{id}/members", a.setMembers)
+	read.Get("/api/projects/{id}/routes", a.listRoutes)
+	editor.Post("/api/projects/{id}/routes", a.createRoute)
+	read.Get("/api/projects/{id}/routes/{routeId}", a.getRoute)
+	editor.Put("/api/projects/{id}/routes/{routeId}", a.updateRoute)
+	editor.Delete("/api/projects/{id}/routes/{routeId}", a.deleteRoute)
 
 	// API keys: ownership is checked inside the handlers (404 for someone
 	// else's key). Deleting one is admin-only; everyone else revokes.
@@ -255,7 +260,7 @@ func (a *Admin) fail(w http.ResponseWriter, err error) {
 	case store.IsUniqueViolation(err):
 		writeErr(w, http.StatusConflict, "an item with that name already exists")
 	case store.IsForeignKeyViolation(err):
-		writeErr(w, http.StatusConflict, "item is still referenced by a project or RAG store")
+		writeErr(w, http.StatusConflict, "item is still referenced by a project, RAG store or route")
 	default:
 		reqID := w.Header().Get("X-Request-Id")
 		a.Log.Error("admin request failed", "err", err, "req_id", reqID)
@@ -716,6 +721,13 @@ func (a *Admin) updateConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := in.validate(r.Context(), a); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if msg, err := a.routeKindConflict(r.Context(), id, in.ProviderType); err != nil {
+		a.fail(w, err)
+		return
+	} else if msg != "" {
+		writeErr(w, http.StatusConflict, msg)
 		return
 	}
 	c, err := a.Store.UpdateConnection(r.Context(), in.connection(r.Context(), id))

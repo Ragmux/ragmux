@@ -656,12 +656,48 @@ prefix most worth a breakpoint, but the gateway does not mark one: a project-lev
 
 ## Model field echo
 
-The `model` value in a client request never selects the upstream model — the project's
-connection does. The gateway replaces it with the connection's model name before calling
-the provider and echoes the client's original value back in the response (and in every
-stream chunk) so SDKs that compare the field stay happy. When the client sends an empty
-`model`, the connection's model name is returned instead. `GET /v1/models` lists that
+A project without chat routes ignores the client's `model` for selection: the project's
+connection decides. The gateway replaces the value with the connection's model name before
+calling the provider and echoes the client's original value back in the response (and in
+every stream chunk) so SDKs that compare the field stay happy. When the client sends an
+empty `model`, the connection's model name is returned instead. `GET /v1/models` lists that
 model name with `owned_by` set to the provider type.
+
+## Routing
+
+A project can define named routes (see [Routes](api.md#routes)). Each route has one to
+eight targets: a connection, an optional `model` override, a `weight` and a `priority`.
+Once a project has at least one chat route, the client's `model` selects what runs:
+
+1. A route name matches exactly: the route's targets are ordered (priority groups
+   ascending, weighted random inside a group) and the first one is called.
+2. Otherwise the default connection's model name selects the implicit route: the project's
+   own connection, as before.
+3. An empty `model` also selects the implicit route.
+4. Anything else is `404` `model_not_found`.
+
+The target's `model` replaces the connection's model name for the call; the provider,
+pricing, request log and trace all see that effective model. The response `model` still
+echoes the client's value (for an empty `model`, the connection's model name). In
+`request_logs`, `model_name` is the effective model, `requested_model` is the client's
+value and `route` is the route name, empty for the implicit route. Routes of kind
+`embeddings` or `rerank` do not switch chat routing on.
+
+### Before your first chat route
+
+Without chat routes the gateway answers whatever `model` string a client sends (it echoes
+it back). The first chat route ends that: any string that is neither a route name nor the
+default connection's model name becomes `404 model_not_found`. Check what your clients
+actually send before you create it:
+
+```sql
+SELECT requested_model, count(*) FROM request_logs
+WHERE project_id = <project id> GROUP BY requested_model ORDER BY count(*) DESC;
+```
+
+Create a route for every value that matters, or point those clients at the default
+connection's model name. Rolling back is deleting the route: with no chat routes left the
+project echoes any `model` again.
 
 ## Error relay and redaction
 

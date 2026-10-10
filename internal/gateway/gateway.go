@@ -49,6 +49,10 @@ type Gateway struct {
 	// Tracer opens the gateway.chat_completion span every downstream span
 	// hangs beneath; nil is a disabled tracer.
 	Tracer *tracing.Tracer
+	// Rand is the random source of weighted target selection: it returns a
+	// value in [0, 1). Nil uses math/rand/v2's concurrency-safe generator;
+	// tests inject a seeded one.
+	Rand func() float64
 }
 
 // requestObs collects the facts about one chat completion that the request
@@ -516,6 +520,20 @@ func (g *Gateway) visibleModels(w http.ResponseWriter, r *http.Request) ([]map[s
 	out := []map[string]any{}
 	seen := map[string]bool{}
 	for _, p := range projects {
+		routed, isRouted, err := g.routedModels(r, p)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+			return nil, false
+		}
+		if isRouted {
+			for _, m := range routed {
+				if id, _ := m["id"].(string); !seen[id] {
+					seen[id] = true
+					out = append(out, m)
+				}
+			}
+			continue
+		}
 		conn, err := g.Store.GetConnection(ctx, p.ModelConnectionID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
@@ -549,15 +567,18 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer c.span.End()
 
 	req, ok := g.decodeChat(c)
-	if !ok || !g.resolveRoute(c) {
+	if !ok {
+		return
+	}
+	// What the client asked for, before an empty model is defaulted below.
+	c.requestedModel = req.Model
+	if !g.resolveRoute(c, req.Model) {
 		return
 	}
 	prov, ok := g.chatProvider(c)
 	if !ok {
 		return
 	}
-	// What the client asked for, before an empty model is defaulted below.
-	c.requestedModel = req.Model
 	if req.Model == "" {
 		req.Model = c.conn.ModelName
 	}

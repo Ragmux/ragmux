@@ -336,7 +336,7 @@ cost columns, a row identifies the request:
 | `request_id` | The `X-Request-Id` the response carried: the client's, when it sent a valid one, otherwise generated. Indexed, so `WHERE request_id = '…'` is a lookup. Rows written before it existed have `NULL` |
 | `endpoint` | Which `/v1` endpoint served it: `chat.completions` today |
 | `requested_model` | The `model` string the client sent — cut to 256 bytes when longer, NUL bytes removed; empty when it sent none. `model_name` is still the connection's real model. This is client-chosen text: it lives in the table and the dashboard, never in a metric label |
-| `route` | The route that picked the connection. `NULL` until routing exists |
+| `route` | The name of the route that picked the connection. `NULL` for the implicit route and for projects without routes. Like `requested_model`, it lives in the table only, never in a metric label |
 | `attempt` | How many upstream attempts the request took; `1` for a call that went upstream, `NULL` for a denial that never did |
 | `fallback_from` | When a fallback served the request, the `connection_id` of the first target it started on. `NULL` otherwise |
 

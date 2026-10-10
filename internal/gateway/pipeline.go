@@ -87,6 +87,9 @@ type call struct {
 	// end up on the request log row.
 	requestID      string
 	requestedModel string
+	// routeName is the route that resolved the call; empty for the implicit
+	// route (the project's own connection), which logs NULL.
+	routeName string
 
 	// targets is set by resolveRoute: the connections that may serve the call,
 	// in the order invoke tries them. conn is the one serving it right now --
@@ -159,16 +162,33 @@ func (g *Gateway) readBody(c *call) ([]byte, bool) {
 	return body, true
 }
 
-// resolveRoute picks the model connections that serve the call. Today that is
-// always the project's own connection; this is the seam where routing across
-// several connections plugs in: it fills c.targets, invoke walks them, and
-// everything else reads c.conn and never the project's connection id.
+// resolveRoute picks the model connections that serve the call, in the order
+// invoke tries them. model is the client's model string.
+//
+// A project without chat routes keeps the behaviour it always had: its own
+// connection serves every request and the model string is only echoed. A
+// project with chat routes resolves the string as ADR-018 sets out (a route
+// name, else the implicit route, else model_not_found), and a route yields its
+// targets ordered by priority and weighted choice (ADR-017). Each target is an
+// effective connection: a copy, with the target's model override applied.
 //
 // The contract: when it returns true, c.targets holds at least one connection
 // and c.conn is the first of them. When no connection can serve the call it
 // answers the client itself and returns false, so no later step ever sees an
 // empty route or a nil c.conn.
-func (g *Gateway) resolveRoute(c *call) bool {
+func (g *Gateway) resolveRoute(c *call, model string) bool {
+	targets, name, routed, matched, err := g.resolveChatTargets(c, model)
+	switch {
+	case err != nil:
+		c.log.Error("resolve route", "err", err)
+		return noRoute(c)
+	case routed && !matched:
+		modelNotFound(c, model)
+		return false
+	case routed:
+		c.routeName = name
+		return acceptTargets(c, targets)
+	}
 	conn, err := g.Store.GetConnection(c.ctx(), c.project.ModelConnectionID)
 	if err != nil {
 		return noRoute(c)
@@ -252,8 +272,8 @@ func callLogger(base *slog.Logger, projectID int64, generated, requestID string)
 // not nil, sets the endpoint's own columns on the fresh row.
 func (g *Gateway) openRecord(c *call, streamed bool, fill func(*store.RequestLog)) {
 	c.rec = &store.RequestLog{ProjectID: c.project.ID, ModelName: c.conn.ModelName, Streamed: streamed}
-	// One attempt until invoke can make more (Faz 06); route and fallback_from
-	// stay empty until routing exists (Faz 05, 06).
+	// One attempt until invoke can make more (Faz 06); fallback_from stays
+	// empty until fallback exists.
 	c.stamp(c.rec, 1)
 	c.principal.attribute(c.rec)
 	if fill != nil {
@@ -262,11 +282,13 @@ func (g *Gateway) openRecord(c *call, streamed bool, fill func(*store.RequestLog
 }
 
 // stamp writes the identity columns every request log row carries: the
-// request id, the endpoint and the model the client asked for.
+// request id, the endpoint, the model the client asked for and the route that
+// resolved it.
 func (c *call) stamp(rec *store.RequestLog, attempt int) {
 	rec.RequestID = c.requestID
 	rec.Endpoint = c.op.endpoint
 	rec.RequestedModel = c.requestedModel
+	rec.Route = c.routeName
 	rec.Attempt = attempt
 }
 

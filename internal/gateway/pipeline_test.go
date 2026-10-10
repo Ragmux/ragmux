@@ -29,7 +29,7 @@ func (e *env) routedCall(w *httptest.ResponseRecorder) *call {
 	if !ok {
 		e.t.Fatalf("authenticate refused: %d %s", w.Code, w.Body.String())
 	}
-	if !e.gw.resolveRoute(c) {
+	if !e.gw.resolveRoute(c, "") {
 		e.t.Fatalf("resolveRoute refused: %d %s", w.Code, w.Body.String())
 	}
 	return c
@@ -121,7 +121,7 @@ func TestResolveRouteMissingConnection(t *testing.T) {
 		t.Fatalf("authenticate refused: %d", w.Code)
 	}
 	defer c.span.End()
-	if e.gw.resolveRoute(c) || c.conn != nil {
+	if e.gw.resolveRoute(c, "") || c.conn != nil {
 		t.Fatal("resolveRoute accepted a missing connection")
 	}
 	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "model connection unavailable") {
@@ -203,7 +203,7 @@ func TestOpenRecordAndRecordWriteTheRow(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, ok := e.gw.authenticate(w, pipelineRequest(&principal{project: e.proj, key: key, user: e.owner}), chatOperation)
-	if !ok || !e.gw.resolveRoute(c) {
+	if !ok || !e.gw.resolveRoute(c, "") {
 		t.Fatalf("setup refused: %d %s", w.Code, w.Body.String())
 	}
 	e.gw.openRecord(c, false, func(rec *store.RequestLog) { rec.RAGUsed, rec.RAGHits = true, 4 })
