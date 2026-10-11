@@ -111,11 +111,12 @@ func newGRPCTransport(endpoint string, insecure bool, headers map[string]string,
 // (always 0) and a big-endian message length, then the message.
 func (g *grpcTransport) encode(res []Attr, batch []*Span) ([]byte, error) {
 	msg := encodeExportRequest(res, batch)
-	if uint64(len(msg)) > math.MaxUint32 {
+	size := uint64(len(msg))
+	if size > math.MaxUint32 {
 		return nil, fmt.Errorf("export request of %d bytes exceeds the gRPC frame limit", len(msg))
 	}
 	out := make([]byte, 5, 5+len(msg))
-	binary.BigEndian.PutUint32(out[1:], uint32(len(msg)))
+	binary.BigEndian.PutUint32(out[1:], uint32(size))
 	return append(out, msg...), nil
 }
 
@@ -181,10 +182,29 @@ func statusMessage(raw string) string {
 // payload also carries are written.
 
 const (
-	wireVarint  = 0
-	wireFixed64 = 1
-	wireBytes   = 2
+	wireVarint  uint64 = 0
+	wireFixed64 uint64 = 1
+	wireBytes   uint64 = 2
 )
+
+// nonNegative converts an enum-like int to its unsigned wire value. Negative
+// input cannot occur (the span kinds and status codes are 0..3); it maps to 0
+// rather than wrapping.
+func nonNegative(n int) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
+
+// int64Varint is the protobuf int64 wire value: the two's complement bits.
+func int64Varint(v int64) uint64 {
+	if v >= 0 {
+		return uint64(v)
+	}
+	// The low 63 bits are the same in both representations; the sign bit is set.
+	return uint64(v&math.MaxInt64) | 1<<63
+}
 
 func appendVarint(b []byte, v uint64) []byte {
 	for v >= 0x80 {
@@ -194,27 +214,27 @@ func appendVarint(b []byte, v uint64) []byte {
 	return append(b, byte(v))
 }
 
-func appendTag(b []byte, field, wire int) []byte {
-	return appendVarint(b, uint64(field)<<3|uint64(wire))
+func appendTag(b []byte, field, wire uint64) []byte {
+	return appendVarint(b, field<<3|wire)
 }
 
-func appendBytesField(b []byte, field int, v []byte) []byte {
+func appendBytesField(b []byte, field uint64, v []byte) []byte {
 	b = appendTag(b, field, wireBytes)
 	b = appendVarint(b, uint64(len(v)))
 	return append(b, v...)
 }
 
-func appendStringField(b []byte, field int, v string) []byte {
+func appendStringField(b []byte, field uint64, v string) []byte {
 	b = appendTag(b, field, wireBytes)
 	b = appendVarint(b, uint64(len(v)))
 	return append(b, v...)
 }
 
-func appendVarintField(b []byte, field int, v uint64) []byte {
+func appendVarintField(b []byte, field uint64, v uint64) []byte {
 	return appendVarint(appendTag(b, field, wireVarint), v)
 }
 
-func appendFixed64Field(b []byte, field int, v uint64) []byte {
+func appendFixed64Field(b []byte, field uint64, v uint64) []byte {
 	b = appendTag(b, field, wireFixed64)
 	return binary.LittleEndian.AppendUint64(b, v)
 }
@@ -254,7 +274,7 @@ func encodeSpan(s *Span) []byte {
 		b = appendBytesField(b, 4, s.parent[:])
 	}
 	b = appendStringField(b, 5, name)
-	b = appendVarintField(b, 6, uint64(s.kind))
+	b = appendVarintField(b, 6, nonNegative(int(s.kind)))
 	b = appendFixed64Field(b, 7, uint64(s.start.UnixNano()))
 	b = appendFixed64Field(b, 8, uint64(s.end.UnixNano()))
 	for _, a := range attrs {
@@ -267,7 +287,7 @@ func encodeSpan(s *Span) []byte {
 		if msg != "" {
 			st = appendStringField(st, 2, msg)
 		}
-		st = appendVarintField(st, 3, uint64(status))
+		st = appendVarintField(st, 3, nonNegative(int(status)))
 		b = appendBytesField(b, 15, st)
 	}
 	return b
@@ -297,7 +317,7 @@ func encodeAnyValue(v any) ([]byte, bool) {
 		}
 		return appendVarintField(nil, 2, n), true
 	case int64:
-		return appendVarintField(nil, 3, uint64(v)), true
+		return appendVarintField(nil, 3, int64Varint(v)), true
 	case float64:
 		return appendFixed64Field(nil, 4, math.Float64bits(v)), true
 	case []string:

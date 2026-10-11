@@ -25,8 +25,6 @@ func seededRand(seed uint64) func() float64 {
 	}
 }
 
-func intp(v int) *int { return &v }
-
 func strp(s string) *string { return &s }
 
 // secondConn adds a connection to a second scripted upstream and returns both.

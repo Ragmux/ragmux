@@ -57,7 +57,7 @@ const apiDocPath = "../../docs/api.md"
 // jsonFieldNames lists the JSON object keys encoding/json produces or reads
 // for t, following embedded structs.
 func jsonFieldNames(t reflect.Type) []string {
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	var out []string
@@ -70,7 +70,7 @@ func jsonFieldNames(t reflect.Type) []string {
 		}
 		if f.Anonymous && name == "" {
 			ft := f.Type
-			for ft.Kind() == reflect.Ptr {
+			for ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
 			if ft.Kind() == reflect.Struct {

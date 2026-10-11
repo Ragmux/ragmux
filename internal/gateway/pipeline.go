@@ -481,7 +481,6 @@ func (g *Gateway) invoke(c *call, up upstreamCall) {
 		}
 		if fallbackReason != "" {
 			g.Metrics.RecordUpstreamFallback(fallbackReason)
-			fallbackReason = ""
 		}
 		c.conn = target
 		var cl attemptClass

@@ -126,6 +126,16 @@ const (
 	wireBytes   = 2
 )
 
+// varintInt64 reads a protobuf int64 varint: the value holds the two's
+// complement bits, so one above MaxInt64 is a negative number.
+func varintInt64(u uint64) int64 {
+	if u <= math.MaxInt64 {
+		return int64(u)
+	}
+	// Drop the sign bit, then subtract 2^63 from the remainder.
+	return int64(u&math.MaxInt64) - math.MaxInt64 - 1
+}
+
 type field struct {
 	num  int
 	wire int
@@ -215,7 +225,7 @@ func attrs(t *testing.T, fs []field, num int) map[string]any {
 		case 2:
 			out[key] = v.v == 1
 		case 3:
-			out[key] = int64(v.v)
+			out[key] = varintInt64(v.v)
 		case 4:
 			out[key] = math.Float64frombits(v.v)
 		case 5:
