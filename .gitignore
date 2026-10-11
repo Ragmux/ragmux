@@ -2,3 +2,36 @@
 /data/
 .env
 /backups/
+
+# Single source of truth lives in the separate .ssot repository, never here
+/.ssot/
+
+# Environment files: never commit; document variables in .env.example
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+
+# Editors and IDEs (shared VS Code settings stay versioned)
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Go (github/gitignore Go.gitignore)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+!coverage.go
+*.coverprofile
+profile.cov
+go.work
+go.work.sum

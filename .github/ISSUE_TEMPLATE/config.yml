@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or help with a deployment
+    url: mailto:contact@ragmux.com
+    about: Usage questions, provider and deployment help, and anything that is not a bug report.
+  - name: Documentation
+    url: https://github.com/Ragmux/ragmux#documentation
+    about: Configuration, API reference, RAG, providers, backup and restore.
+  - name: Report a security vulnerability
+    url: https://github.com/Ragmux/ragmux/security/advisories/new
+    about: Privately, never in a public issue. Email info@muhammetsafak.com with the subject [SECURITY] if you cannot use GitHub.

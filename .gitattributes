@@ -1,0 +1,24 @@
+# Normalize line endings to LF for all text files
+* text=auto eol=lf
+
+# Binary files
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.webp   binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.tar    binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.otf    binary
+*.eot    binary
+*.mp4    binary
+*.mp3    binary
+
+# Generated files (collapsed in diffs, excluded from language stats)
+go.sum   linguist-generated

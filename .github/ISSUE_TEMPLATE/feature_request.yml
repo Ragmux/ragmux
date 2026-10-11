@@ -1,0 +1,67 @@
+name: Feature request
+description: Suggest a capability or a change to an existing one
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the **problem** first. Something may already be solvable with
+        existing configuration, or deliberately out of scope — a short conversation before
+        writing code saves you an afternoon.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I checked the [documentation](https://github.com/Ragmux/ragmux#documentation) and the [changelog](https://github.com/Ragmux/ragmux/blob/main/CHANGELOG.md).
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and where does Ragmux get in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: >
+        The behaviour you are asking for. If it touches the API, the schema or configuration,
+        sketch the shape — endpoint, field, environment variable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Workarounds you tried, and why they are not enough.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Gateway / OpenAI-compatible API
+        - Providers and adapters
+        - Retrieval (RAG)
+        - Projects, users and roles
+        - Rate limits and budgets
+        - Metrics and logging
+        - Dashboard
+        - Deployment, configuration, backups
+        - Documentation
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to open a pull request for this.

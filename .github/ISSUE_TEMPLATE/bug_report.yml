@@ -1,0 +1,121 @@
+name: Bug report
+description: Something in Ragmux behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please **do not** report security problems here —
+        follow the [security policy](https://github.com/Ragmux/ragmux/security/policy) instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I am running a supported version (the latest release, or `main`).
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `ragmux -version`, or the `version` field of `/healthz`.
+      placeholder: "x.y.z"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose (bundled Postgres)
+        - Docker image with an external PostgreSQL
+        - Bare binary
+        - Built from source
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider involved
+      description: Leave empty if the problem is not tied to one provider.
+      multiple: true
+      options:
+        - openai
+        - anthropic
+        - gemini
+        - deepseek
+        - ollama
+        - custom_openai (vLLM, LM Studio, LiteLLM, …)
+        - none / not provider specific
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >
+        The smallest sequence that shows the problem. `curl` commands are ideal —
+        please redact API keys.
+      placeholder: |
+        1. Create a model connection with provider_type "anthropic"
+        2. curl -N localhost:8080/v1/chat/completions -H 'Authorization: Bearer sk-proj-...' ...
+        3. The stream ends after the first chunk
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and error output
+      description: >
+        Relevant gateway log lines and the error envelope you received.
+        Secrets, project keys and provider keys must be removed.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: >
+        The environment variables that matter here, **without values for secrets**
+        (`SECRET_KEY`, `DATABASE_URL`, provider keys).
+      render: text
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, reverse proxy, PostgreSQL version, replica count, anything unusual about the setup.
