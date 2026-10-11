@@ -39,19 +39,19 @@ func TestConcurrentIndexRE(t *testing.T) {
 	}
 }
 
-func TestClampClientText(t *testing.T) {
-	if got := clampClientText("gpt-4o"); got != "gpt-4o" {
+func TestClampRequestedModel(t *testing.T) {
+	if got := clampRequestedModel("gpt-4o"); got != "gpt-4o" {
 		t.Errorf("short value changed: %q", got)
 	}
-	if got := clampClientText("a\x00b"); got != "ab" {
+	if got := clampRequestedModel("a\x00b"); got != "ab" {
 		t.Errorf("NUL not removed: %q", got)
 	}
 	long := strings.Repeat("x", 5000)
-	if got := clampClientText(long); len(got) != 256 {
+	if got := clampRequestedModel(long); len(got) != 256 {
 		t.Errorf("len = %d, want 256", len(got))
 	}
 	// A multi-byte character straddling the limit is dropped whole.
-	got := clampClientText(strings.Repeat("a", 255) + "\u00e9\u00e9")
+	got := clampRequestedModel(strings.Repeat("a", 255) + "\u00e9\u00e9")
 	if !utf8.ValidString(got) || got != strings.Repeat("a", 255) {
 		t.Errorf("cut inside a character: %q", got)
 	}

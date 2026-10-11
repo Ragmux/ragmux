@@ -65,11 +65,11 @@ type RequestLog struct {
 // large as the request body.
 const MaxRequestedModelBytes = 256
 
-// clampClientText makes a client-chosen string fit a log column: NUL bytes
-// are dropped (PostgreSQL text cannot hold them, and the insert would fail)
-// and the rest is cut to at most MaxRequestedModelBytes bytes on a character
-// boundary.
-func clampClientText(s string) string {
+// clampRequestedModel makes the client-chosen model name fit its log column:
+// NUL bytes are dropped (PostgreSQL text cannot hold them, and the insert
+// would fail) and the rest is cut to at most MaxRequestedModelBytes bytes on
+// a character boundary.
+func clampRequestedModel(s string) string {
 	if strings.IndexByte(s, 0) >= 0 {
 		s = strings.ReplaceAll(s, "\x00", "")
 	}
@@ -104,7 +104,7 @@ func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
 		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error,
 		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source, l.APIKeyID, l.UserID,
-		l.RequestID, l.Endpoint, clampClientText(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom)
+		l.RequestID, l.Endpoint, clampRequestedModel(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom)
 	return err
 }
 
