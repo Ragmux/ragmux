@@ -37,7 +37,7 @@ These are the same commands that CI runs. Run them before opening a pull request
 ```bash
 gofmt -l .                  # must print nothing
 go vet ./...
-golangci-lint run ./...     # golangci-lint v2.13.2, config in .golangci.yml
+golangci-lint run ./...     # golangci-lint v2.14.0, config in .golangci.yml
 go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 ```
 
