@@ -6,6 +6,8 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-11
+
 ### Fixed
 - **Rerank spend is priced with the connection that did the rerank.** The `cost_micros`
   of a request row used to be priced by the row's own connection only: the tokens of a
@@ -904,7 +906,8 @@ projects with `sk-proj-` keys, metrics and an embedded dashboard.
 No git tag was created for this release, so there is no release page for it. The first
 tagged release is [0.2.0](https://github.com/ragmux/ragmux/releases/tag/v0.2.0).
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ragmux/ragmux/releases/tag/v0.5.0
 [0.4.2]: https://github.com/ragmux/ragmux/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ragmux/ragmux/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ragmux/ragmux/releases/tag/v0.4.0
