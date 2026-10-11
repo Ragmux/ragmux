@@ -335,32 +335,32 @@ search runs unreranked and says so (`rerank_skipped`, below), and `/v1/rerank` a
 saved before 0.5 with the `llm` backend carry no id; set one to rerank in the dashboard.
 
 **Tokens are counted.** The tokens of an `llm` rerank in a chat or retrieve request are
-added to that request's row (priced at the row's model, which did the work), and so are
-those an API reranker reports (Cohere `meta.tokens`, Voyage `usage.total_tokens`;
-characters divided by 4, over the passages as sent, when none are reported). The API
-reranker's tokens count toward limits and usage but are not priced: it bills by search
-unit, so pricing them at the chat or embedding model's rate would invent a cost. A
-`/v1/rerank` call is one row of its own with `endpoint = rerank`. See
-the [API reference](api.md#post-v1rerank).
+added to that request's row, and so are those an API reranker reports (Cohere
+`meta.tokens`, Voyage `usage.total_tokens`; characters divided by 4, over the passages as
+sent, when none are reported). A `/v1/rerank` call is one row of its own with
+`endpoint = rerank`. See the [API reference](api.md#post-v1rerank).
 
-**Known limitations of rerank cost.** Three things about the price of a rerank are
-approximations, not a bill:
+**Rerank is priced with the connection that did it.** The `cost_micros` of a row is the
+cost of the main call plus the cost of each rerank spend, and each rerank spend is priced
+by the `model_prices` row of the connection that ran it, never by the row's own model:
 
-- The tokens of an API reranker (`cohere`, `voyage`) are added to the request's token
-  totals, so they count toward `rate_limit_tpm`, the token budgets and the usage report,
-  but they never enter `cost_micros`. The provider charges per search unit, which the
-  gateway does not price. The real cost of those calls is on the provider's invoice.
-- On `POST /v1/retrieve` the row has no chat model. The tokens of an `llm` rerank are
-  therefore priced at the price of the store's embedding connection, the only connection
-  the row carries, although a chat model did the work. In a chat request the row's model
-  is the chat model, so the same rerank is priced at its own rate.
-- In a chat request on a project with routes, an `llm` rerank runs once, through the
-  first target's provider. If that target then fails and a fallback target answers, the
-  row is priced at the fallback target's model, so the rerank tokens are priced at a
-  model that did not do the rerank.
+- An API reranker is priced with its rerank connection. Cohere bills by search unit, so
+  the spend adds `search_units x per_search_unit` (the response's
+  `meta.billed_units.search_units`, 1 when absent) and nothing else: a row that has a
+  `per_search_unit` rate never adds its token prices to a rerank, even if an operator typed
+  one in. Voyage bills by token, so the reported tokens are priced at the `voyage_rerank`
+  row's `input_per_mtok`.
+- An `llm` rerank is priced with the chat connection that ran it: on `POST /v1/retrieve`
+  that is the project's chat connection, not the store's embedding connection, and in a routed
+  chat it is the target that ran the rerank, even if a fallback target answers.
+- A rerank spend with no price row, or a price of zero, adds 0 and the request still
+  succeeds. `cost_source` stays that of the main call; the figure is an estimate, like
+  every cost the gateway writes.
 
-None of these is corrected by the gateway; a deployment that needs exact figures for reranked
-retrieval should take them from the provider.
+Token counts, limits, budgets and the usage report are unaffected: they count the rerank
+tokens exactly as before. Prices are managed under [Model
+prices](api.md#model-prices); add a `cohere_rerank` or `voyage_rerank` row for a model
+the built-in table does not know.
 
 ## Context injection
 
@@ -485,8 +485,9 @@ upstream's count, or an estimate of characters divided by 4 when it reports none
 price are written to the request log with `endpoint = retrieve`.
 When the store reranks with the LLM backend, that chat call's tokens (reported, or estimated
 from characters) are added to the same row and to the response `usage`, and priced at the
-embedding connection's rate like the rest of the row; an API reranker's tokens are counted
-but not priced.
+rate of the connection that ran the rerank, not the embedding connection's; an API
+reranker's spend is priced at its own connection's price (see
+[Rerank is priced with the connection that did it](#reranking)).
 
 ## Embedding token accounting
 

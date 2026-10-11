@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -135,5 +136,93 @@ func TestResetPriceRejectsRowsWithNoShippedCounterpart(t *testing.T) {
 	w, _ := callReset(t, a, own.ID)
 	if w.Code != http.StatusConflict {
 		t.Errorf("reset of an operator's own row = %d %s, want 409", w.Code, w.Body.String())
+	}
+}
+
+// callPrice posts body to the create handler, or to the update handler when id
+// is non-zero, and returns the recorder.
+func callPrice(t *testing.T, a *Admin, id int64, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	method, handler := http.MethodPost, a.createPrice
+	target := "/prices"
+	r := httptest.NewRequest(method, target, strings.NewReader(body))
+	if id != 0 {
+		handler = a.updatePrice
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", strconv.FormatInt(id, 10))
+		r = r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+	}
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, r)
+	return w
+}
+
+// TestPricePerSearchUnitThroughAdminAPI covers the rerank pricing contract:
+// the rerank-only provider types are valid price rows, per_search_unit is
+// accepted and returned, bounded, and restored by a reset.
+func TestPricePerSearchUnitThroughAdminAPI(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	a := &Admin{Store: s, Log: quietLog()}
+
+	w := callPrice(t, a, 0, `{"provider_type":"cohere_rerank","model_pattern":"rerank-house*",`+
+		`"input_per_mtok":0,"output_per_mtok":0,"per_search_unit":0.0025}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create cohere_rerank price = %d: %s", w.Code, w.Body.String())
+	}
+	created := &store.ModelPrice{}
+	if err := json.Unmarshal(w.Body.Bytes(), created); err != nil {
+		t.Fatal(err)
+	}
+	if created.PerSearchUnit == nil || *created.PerSearchUnit != 0.0025 {
+		t.Errorf("created per_search_unit = %v, want 0.0025", created.PerSearchUnit)
+	}
+
+	// voyage_rerank is priced per token and needs no search-unit rate.
+	w = callPrice(t, a, 0, `{"provider_type":"voyage_rerank","model_pattern":"rerank-house*","input_per_mtok":0.05,"output_per_mtok":0}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create voyage_rerank price = %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"per_search_unit":null`) {
+		t.Errorf("omitted per_search_unit not returned as null: %s", w.Body.String())
+	}
+
+	// Update changes the rate.
+	w = callPrice(t, a, created.ID, `{"input_per_mtok":0,"output_per_mtok":0,"per_search_unit":0.004}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update = %d: %s", w.Code, w.Body.String())
+	}
+	if got := priceRow(t, s, "cohere_rerank", "rerank-house*"); got.PerSearchUnit == nil || *got.PerSearchUnit != 0.004 {
+		t.Errorf("stored per_search_unit = %v, want 0.004", got.PerSearchUnit)
+	}
+
+	// Bounds and unknown provider types.
+	for name, body := range map[string]string{
+		"negative": `{"provider_type":"cohere_rerank","model_pattern":"x*","per_search_unit":-0.1}`,
+		"too high": `{"provider_type":"cohere_rerank","model_pattern":"x*","per_search_unit":100.5}`,
+		"unknown":  `{"provider_type":"nonesuch","model_pattern":"x*"}`,
+	} {
+		if w := callPrice(t, a, 0, body); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400: %s", name, w.Code, w.Body.String())
+		}
+	}
+
+	// Reset puts the shipped rate back on a built-in Cohere row.
+	row := priceRow(t, s, "cohere_rerank", "rerank-v3.5*")
+	shipped := *row.PerSearchUnit
+	w = callPrice(t, a, row.ID, `{"input_per_mtok":0,"output_per_mtok":0,"per_search_unit":9}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("edit builtin row = %d: %s", w.Code, w.Body.String())
+	}
+	rw, got := callReset(t, a, row.ID)
+	if got == nil {
+		t.Fatalf("reset returned %d: %s", rw.Code, rw.Body.String())
+	}
+	if got.PerSearchUnit == nil || *got.PerSearchUnit != shipped || got.Source != store.PriceSourceBuiltin {
+		t.Errorf("reset row = %+v, want per_search_unit %v from the built-in table", got, shipped)
 	}
 }

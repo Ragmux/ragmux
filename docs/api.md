@@ -679,8 +679,8 @@ discount and change prices without telling the gateway.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 2, "unit": "per_million_tokens"}` |
-| POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
+| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 3, "unit": "per_million_tokens", "search_unit": "per_unit"}` |
+| POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, per_search_unit?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
 | PUT | `/prices/{id}` | editor | Same body without `provider_type`/`model_pattern` (they are fixed); sets `source: "user"` → `{price}` |
 | DELETE | `/prices/{id}` | editor | `{"ok": true}`; `409 {"code":"builtin_price"}` for a built-in row — reset it instead |
 | POST | `/prices/{id}/reset` | editor | Restores the shipped values and marks the row built-in again → `{price}`; `409 {"code":"no_builtin_price"}` when the row has no shipped counterpart |
@@ -694,9 +694,20 @@ A row:
 ```json
 {"id": 4, "provider_type": "anthropic", "model_pattern": "claude-sonnet-4-5*",
  "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_write_per_mtok": 3.75,
- "cache_read_per_mtok": 0.30, "currency": "USD", "source": "builtin",
- "builtin_version": 2, "created_at": "…", "updated_at": "…"}
+ "cache_read_per_mtok": 0.30, "per_search_unit": null, "currency": "USD",
+ "source": "builtin", "builtin_version": 3, "created_at": "…", "updated_at": "…"}
 ```
+
+`per_search_unit` is the price of one search unit of a rerank API, in the row's currency
+**per unit, not per million tokens**; `null` means the model has none. Cohere bills a
+rerank call by search unit (the response's `meta.billed_units.search_units`, taken as 1
+when absent), so its rows carry it. Voyage bills rerank by token and uses
+`input_per_mtok`. The value is 0 to 100. A row with a `cohere_rerank` or `voyage_rerank`
+`provider_type` prices the rerank connection of that type; a spend whose connection has
+no matching row adds 0 to `cost_micros`. A row whose `per_search_unit` is set (not `null`,
+`0` included) prices a rerank by search units alone: its token prices are never added for
+that call, so a token price typed into a Cohere row has no effect on rerank spend, and an
+explicit `0` makes the rerank free.
 
 Prices are **per million tokens** and prices are between 0 and 100000. The two cache
 prices are **absolute prices, not multipliers** of `input_per_mtok` — every provider
@@ -709,8 +720,9 @@ type. An exact `model_pattern` wins; otherwise the pattern with the **longest li
 prefix** (the text before its first `*`) that matches, ties going to the lowest `id`.
 `*` stands for any run of characters, `/` included, so `deepseek-ai/DeepSeek-V3*` works.
 Longest prefix is why `gpt-4o-mini*` beats `gpt-4o*` for `gpt-4o-mini-2024-07-18`. With
-no match the request is logged with `cost_micros: 0` and `cost_source: "none"` — a
-missing price is reported as missing, never guessed.
+no match the main call adds 0 and the request is logged with `cost_source: "none"` — a
+missing price is reported as missing, never guessed. A rerank that ran on another
+connection inside the same request is priced by its own row and still adds its cost.
 
 `source` plays no part in matching. Your own row wins where its pattern is the more
 specific one, and you override a shipped number by **editing that row** (which keeps its
@@ -1018,8 +1030,9 @@ cannot override them (the dashboard's [search endpoint](rag.md#search-endpoint) 
 ran. `usage` counts the query's embedding tokens, plus the tokens of the rerank call when
 the store reranks with the LLM backend (that call goes to the project's chat connection, so a
 key with only `retrieve` can cause it; it is counted on the request row and against the
-project's limits, and priced at the embedding connection's rate, the row's model; the
-tokens of an API reranker are counted but not priced). A project without a RAG store answers
+project's limits, and priced at the rerank connection's rate, not the embedding
+connection's; an API reranker is priced at its own connection's price, Cohere by search
+unit). A project without a RAG store answers
 `400` with code `no_rag_store`. The call is recorded with `endpoint = retrieve`,
 `rag_used`, `rag_hits`, and the embedding connection's model, tokens and price. An
 embedding failure at the provider answers with the provider's status as in chat.
@@ -1063,12 +1076,13 @@ The call is recorded with `endpoint = rerank`: the connection's model, the token
 provider reported (an estimate from the text, flagged `estimated`, when it reports none),
 the price, and the usual limits and budgets apply. Rerank tokens spent inside a RAG chat or
 `/v1/retrieve` request are added to that request's own row instead. An API reranker
-(`cohere_rerank`, `voyage_rerank`) bills by search unit, not by token, and its token count
-is optional in the response, so the estimate (characters divided by 4, over the passages
-as sent: each is capped at 4000 characters) is a measure of usage for limits only. Inside a
-chat or retrieve request those tokens are counted on the row and against the limits but are
-left out of its `cost_micros`; the `llm` backend's tokens are priced, because the chat
-model did the work.
+(`cohere_rerank`, `voyage_rerank`) has a token count that is optional in the response, so
+the estimate (characters divided by 4, over the passages as sent: each is capped at 4000
+characters) is a measure of usage for limits. Its cost follows its price row: Cohere by
+search unit (a row with a `per_search_unit` never adds token prices), Voyage by token.
+Inside a chat or retrieve request that cost is added to the row's `cost_micros`, priced
+with the rerank connection; the `llm` backend's tokens are priced with the chat connection
+that ran the rerank. A rerank connection with no price row adds 0.
 
 ### `GET /v1/models` and `GET /v1/models/{id}`
 

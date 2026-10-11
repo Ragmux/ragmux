@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -817,8 +818,12 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 			q := rag.LastUserQuery(req.Messages)
 			// The rerank of this retrieval is a side call of the chat request:
 			// its tokens (an LLM rerank is a chat call, an API rerank a scoring
-			// call) go on this request's log row through c.sideSpend.
+			// call) go on this request's log row through c.sideCharges.
 			var rerankSpend *rerankUsageProvider
+			// The LLM rerank runs on the first target's adapter, so that
+			// target's price covers it even when the walk later answers from
+			// a fallback. Captured now: c.conn moves with the walk.
+			rerankType, rerankModel := c.conn.ProviderType, c.conn.ModelName
 			searchProv := prov
 			if prov != nil {
 				rerankSpend = &rerankUsageProvider{Provider: prov}
@@ -828,7 +833,8 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 			var hits []store.SearchHit
 			if res != nil {
 				hits = res.Hits
-				c.sideSpend.add(rerankSpend, res.RerankSpend)
+				c.addSideCharge(llmCharge(rerankSpend, rerankType, rerankModel, false))
+				c.addSideCharge(apiCharge(res.RerankSpend, false))
 			}
 			if err != nil {
 				c.log.Warn("rag retrieval failed; continuing without context", "err", err)
@@ -1225,7 +1231,12 @@ func providerError(err error) (int, *provider.Error) {
 // table. A model nobody priced, or a table that cannot be read, leaves the
 // cost at zero with cost_source "none" — a missing price is reported as
 // missing, never guessed.
-func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLog) {
+//
+// searchUnits is what the call billed in search units, priced with the
+// connection's per_search_unit; it is zero for every call but a Cohere rerank.
+// A row that has a per_search_unit rate prices such a call by search units
+// alone, never by tokens as well.
+func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLog, searchUnits int) {
 	rec.CostSource = store.CostSourceNone
 	if g.Prices == nil || conn == nil {
 		return
@@ -1237,11 +1248,41 @@ func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLo
 	if !ok {
 		return
 	}
-	rec.CostMicros = p.CostMicros(rec.PromptTokens, rec.CachedPromptTokens, rec.CacheWriteTokens, rec.CompletionTokens)
+	rec.CostMicros = p.BilledMicros(rec.PromptTokens, rec.CachedPromptTokens, rec.CacheWriteTokens, rec.CompletionTokens, searchUnits)
 	rec.CostSource = p.Source
 	// The row stores micros (exact in BIGINT); CostUSD is the same figure in
 	// dollars, which is what the cost counter adds up.
 	rec.CostUSD = float64(rec.CostMicros) / 1e6
+}
+
+// priceSideCharges adds the cost of each side charge to the finished row, every
+// one priced with the connection that did the work. A charge whose connection
+// has no price adds nothing: the request still succeeded, and the row's
+// cost_source stays what the main call's price gave it, so a missing price on
+// a rerank connection never reads as a priced zero on the whole row.
+func (g *Gateway) priceSideCharges(rec *store.RequestLog, charges []sideCharge) {
+	if g.Prices == nil {
+		return
+	}
+	for _, ch := range charges {
+		if ch.providerType == "" {
+			continue
+		}
+		p, ok := g.Prices.Lookup(context.Background(), ch.providerType, ch.model)
+		if !ok {
+			continue
+		}
+		rec.CostMicros = addMicros(rec.CostMicros, p.BilledMicros(ch.prompt, 0, 0, ch.completion, ch.searchUnits))
+	}
+	rec.CostUSD = float64(rec.CostMicros) / 1e6
+}
+
+// addMicros is a + b saturated at the int64 ceiling; both are non-negative.
+func addMicros(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 // fillUsage copies the upstream's token counts onto the log row, falling

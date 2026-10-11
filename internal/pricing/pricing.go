@@ -31,8 +31,16 @@ type Price struct {
 	Output     float64
 	CacheWrite float64
 	CacheRead  float64
-	Currency   string
-	Pattern    string
+	// PerSearchUnit is the price of one search unit of a rerank API, in the
+	// currency itself (not per million): Cohere bills a rerank call by search
+	// unit. Zero when the provider has no such charge.
+	PerSearchUnit float64
+	// HasSearchUnit is true when the row sets a search-unit rate at all,
+	// zero included. It is what marks a row as billing by search unit
+	// (ADR-021); PerSearchUnit alone cannot tell NULL from an explicit 0.
+	HasSearchUnit bool
+	Currency      string
+	Pattern       string
 	// Source is "builtin" or "user"; it is recorded on the request log as
 	// cost_source so a figure can be traced back to where it came from.
 	Source string
@@ -138,6 +146,34 @@ func (p Price) CostMicros(promptTokens, cachedPrompt, cacheWrite, completionToke
 	return math.MaxInt64
 }
 
+// SearchUnitMicros is the cost of searchUnits search units in millionths of a
+// currency unit: the unit price scaled by 10^6, rounded and saturated like
+// CostMicros. A price without a search-unit rate, and a count that is zero or
+// negative, cost nothing.
+func (p Price) SearchUnitMicros(searchUnits int) int64 {
+	micros := float64(nonNegative(searchUnits)) * nonNegativeRate(p.PerSearchUnit) * 1e6
+	if !(micros > 0) {
+		return 0
+	}
+	if rounded := math.Round(micros); rounded < maxMicros {
+		return int64(rounded)
+	}
+	return math.MaxInt64
+}
+
+// BilledMicros is the cost of one call under this price row. A row whose
+// search-unit rate is set (not NULL, zero included) bills a call that reports
+// search units by those units alone: the token counts of such a call are a
+// measure of usage, not a second charge (ADR-021), so an explicit 0 makes the
+// call free rather than falling back to tokens. Every other call, including
+// one on a row with no search-unit rate, is billed by tokens.
+func (p Price) BilledMicros(prompt, cached, cacheWrite, completion, searchUnits int) int64 {
+	if searchUnits > 0 && p.HasSearchUnit {
+		return p.SearchUnitMicros(searchUnits)
+	}
+	return p.CostMicros(prompt, cached, cacheWrite, completion)
+}
+
 func nonNegative(n int) int {
 	if n < 0 {
 		return 0
@@ -206,6 +242,9 @@ type builtinItem struct {
 	Output       float64  `json:"output"`
 	CacheWrite   *float64 `json:"cache_write"`
 	CacheRead    *float64 `json:"cache_read"`
+	// PerSearchUnit is the price of one search unit of a rerank API; absent
+	// means the provider has none.
+	PerSearchUnit *float64 `json:"per_search_unit"`
 }
 
 func parseBuiltin(raw []byte) (*builtinFile, error) {
@@ -229,7 +268,7 @@ func parseBuiltin(raw []byte) (*builtinFile, error) {
 			return nil, fmt.Errorf("built-in price table lists %s/%s twice", m.ProviderType, m.Model)
 		}
 		seen[key] = true
-		if m.Input < 0 || m.Output < 0 || negative(m.CacheWrite) || negative(m.CacheRead) {
+		if m.Input < 0 || m.Output < 0 || negative(m.CacheWrite) || negative(m.CacheRead) || negative(m.PerSearchUnit) {
 			return nil, fmt.Errorf("built-in price for %s/%s is negative", m.ProviderType, m.Model)
 		}
 	}
@@ -248,6 +287,10 @@ func (m builtinItem) resolve(currency string) Price {
 	}
 	if m.CacheRead != nil {
 		p.CacheRead = *m.CacheRead
+	}
+	if m.PerSearchUnit != nil {
+		p.PerSearchUnit = *m.PerSearchUnit
+		p.HasSearchUnit = true
 	}
 	return p
 }

@@ -188,6 +188,9 @@ func (in *rerankInvocation) attempt(c *call, conn *store.ModelConnection) error 
 	ctx, cancel := c.attemptContext()
 	defer cancel()
 	upstreamStart := time.Now()
+	// An earlier attempt at another target may have billed search units that
+	// this one does not.
+	c.searchUnits = 0
 	var ranked []provider.RerankResult
 	var err error
 	switch {
@@ -248,6 +251,11 @@ func (in *rerankInvocation) viaRerankAPI(ctx context.Context, c *call, conn *sto
 		out = out[:in.topN]
 	}
 	fillUsage(c.rec, usage, in.chars, 0)
+	// Cohere bills this call by search unit; the row is priced with it. Zero
+	// for Voyage, which reports tokens only.
+	if usage != nil {
+		c.searchUnits = max(usage.SearchUnits, 0)
+	}
 	return out, nil
 }
 

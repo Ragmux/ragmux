@@ -383,16 +383,17 @@ budget, a request is never refused because a spend figure was reached, and the e
 never feeds `rate_limit_tpm`, `budget_daily_tokens` or `budget_monthly_tokens` — those
 stay token counters. To cap spend, cap tokens.
 
-One known gap in the estimate: the tokens of an API reranker (`cohere_rerank`,
-`voyage_rerank`) count toward the limits above but are not priced, because those services
-bill by search unit, so they never enter `cost_micros`. The tokens of an LLM rerank inside
-`/v1/retrieve` are priced at the embedding connection's price. See
-[Rerank cost](rag.md#reranking).
+A rerank is priced with the connection that ran it: an API reranker (`cohere_rerank`,
+`voyage_rerank`) at its own price row (Cohere per search unit, Voyage per token), and the
+tokens of an LLM rerank at the chat connection that did the work. A rerank connection with
+no price row adds 0 to `cost_micros`. The rerank tokens count toward the limits above as
+before. See [Rerank cost](rag.md#reranking).
 
 The estimate comes from the [price table](api.md#model-prices), which ships current
 public list prices and is editable per model. It is not a bill: providers round,
 discount and change prices without telling the gateway, and a model with no matching
-price row is logged with `cost_source: "none"` and a cost of zero rather than a guess.
+price row adds a cost of zero and is logged with `cost_source: "none"` rather than a guess
+(a rerank that ran on another connection with a price row still adds its own cost).
 
 ## Metrics and retention
 

@@ -21,16 +21,24 @@ import (
 // astronomical figure on the dashboard. Nothing real comes near it.
 const maxPricePerMTok = 100000.0
 
+// maxPricePerSearchUnit bounds per_search_unit the same way. It is a price per
+// unit, not per million, so the ceiling is far lower; Cohere charges USD
+// 0.002.
+const maxPricePerSearchUnit = 100.0
+
 // priceInput is the create/update body. The cache prices are pointers: an
 // omitted one means "charge the input rate", which is not the same as zero.
+// per_search_unit is the price of one search unit of a rerank API (Cohere),
+// in the row's currency per unit; omitted means the provider has none.
 type priceInput struct {
-	ProviderType string   `json:"provider_type"`
-	ModelPattern string   `json:"model_pattern"`
-	Input        float64  `json:"input_per_mtok"`
-	Output       float64  `json:"output_per_mtok"`
-	CacheWrite   *float64 `json:"cache_write_per_mtok"`
-	CacheRead    *float64 `json:"cache_read_per_mtok"`
-	Currency     string   `json:"currency"`
+	ProviderType  string   `json:"provider_type"`
+	ModelPattern  string   `json:"model_pattern"`
+	Input         float64  `json:"input_per_mtok"`
+	Output        float64  `json:"output_per_mtok"`
+	CacheWrite    *float64 `json:"cache_write_per_mtok"`
+	CacheRead     *float64 `json:"cache_read_per_mtok"`
+	PerSearchUnit *float64 `json:"per_search_unit"`
+	Currency      string   `json:"currency"`
 }
 
 // validate checks the body and normalises it. create is false for updates,
@@ -46,7 +54,9 @@ func (in *priceInput) validate(create bool) error {
 	if create {
 		in.ProviderType = strings.TrimSpace(in.ProviderType)
 		in.ModelPattern = strings.TrimSpace(in.ModelPattern)
-		if _, err := provider.New(provider.Config{ProviderType: in.ProviderType}); err != nil {
+		// A rerank-only type (cohere_rerank, voyage_rerank) has no chat
+		// adapter but bills like any other, so it is a valid price row.
+		if caps := provider.CapabilitiesFor(in.ProviderType); !caps.Chat && !caps.Rerank {
 			return errors.New("provider_type must be one of the supported provider types")
 		}
 		if in.ModelPattern == "" || len(in.ModelPattern) > 128 {
@@ -61,20 +71,25 @@ func (in *priceInput) validate(create bool) error {
 			return errors.New("prices must be between 0 and 100000 per million tokens")
 		}
 	}
+	if v := in.PerSearchUnit; v != nil && (*v < 0 || *v > maxPricePerSearchUnit) {
+		return errors.New("per_search_unit must be between 0 and 100")
+	}
 	return nil
 }
 
 func (in priceInput) row() *store.ModelPrice {
 	return &store.ModelPrice{ProviderType: in.ProviderType, ModelPattern: in.ModelPattern,
 		InputPerMTok: in.Input, OutputPerMTok: in.Output,
-		CacheWritePerMTok: in.CacheWrite, CacheReadPerMTok: in.CacheRead, Currency: in.Currency}
+		CacheWritePerMTok: in.CacheWrite, CacheReadPerMTok: in.CacheRead,
+		PerSearchUnit: in.PerSearchUnit, Currency: in.Currency}
 }
 
 // priceDetails is the audit payload: enough to see what a price became
 // without reading the row back.
 func priceDetails(p *store.ModelPrice) map[string]any {
 	return map[string]any{"provider_type": p.ProviderType, "model_pattern": p.ModelPattern,
-		"input_per_mtok": p.InputPerMTok, "output_per_mtok": p.OutputPerMTok, "source": p.Source}
+		"input_per_mtok": p.InputPerMTok, "output_per_mtok": p.OutputPerMTok,
+		"per_search_unit": p.PerSearchUnit, "source": p.Source}
 }
 
 // invalidatePrices drops the gateway's cached table after a mutation so the
@@ -97,7 +112,7 @@ func (a *Admin) listPrices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"prices": list, "builtin_version": version,
-		"unit": "per_million_tokens"})
+		"unit": "per_million_tokens", "search_unit": "per_unit"})
 }
 
 func (a *Admin) createPrice(w http.ResponseWriter, r *http.Request) {
@@ -197,7 +212,8 @@ func (a *Admin) resetPrice(w http.ResponseWriter, r *http.Request) {
 	p, err := a.Store.ResetModelPrice(r.Context(), id, &store.ModelPrice{
 		InputPerMTok: shipped.Input, OutputPerMTok: shipped.Output,
 		CacheWritePerMTok: shipped.CacheWrite, CacheReadPerMTok: shipped.CacheRead,
-		Currency: shipped.Currency, BuiltinVersion: version})
+		PerSearchUnit: shipped.PerSearchUnit,
+		Currency:      shipped.Currency, BuiltinVersion: version})
 	if err != nil {
 		a.fail(w, err)
 		return

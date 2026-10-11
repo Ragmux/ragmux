@@ -52,7 +52,8 @@ func (g *Gateway) retrieve(w http.ResponseWriter, r *http.Request) {
 	g.openRecord(c, false, nil)
 	defer g.record(c)
 
-	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: req.Query, topK: req.TopK, prov: g.rerankProvider(c, rs)})
+	prov, rerankConn := g.rerankProvider(c, rs)
+	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: req.Query, topK: req.TopK, prov: prov, rerankConn: rerankConn})
 }
 
 // decodeRetrieve reads and validates the request body, answering the client
@@ -113,21 +114,23 @@ func (g *Gateway) retrieveTargets(c *call) (*store.RAGStore, bool) {
 // rerankProvider is the chat adapter the LLM rerank backend asks, built from
 // the project's own chat connection like the chat endpoint's retrieval does.
 // It is nil when the store does not use that backend or the adapter cannot be
-// built; a nil provider makes the search keep the fused order.
-func (g *Gateway) rerankProvider(c *call, rs *store.RAGStore) provider.Provider {
+// built; a nil provider makes the search keep the fused order. The connection
+// comes back with the adapter: it is the one that does the rerank, so it is
+// the one whose price covers the rerank's tokens.
+func (g *Gateway) rerankProvider(c *call, rs *store.RAGStore) (provider.Provider, *store.ModelConnection) {
 	if !rs.Rerank || rs.RerankBackend == store.RerankCohere || rs.RerankBackend == store.RerankVoyage || g.Providers == nil {
-		return nil
+		return nil, nil
 	}
 	conn, err := g.Store.GetConnection(c.ctx(), c.project.ModelConnectionID)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	prov, err := g.Providers(conn)
 	if err != nil {
 		c.log.Warn("rerank provider setup", "connection", conn.ID, "err", err)
-		return nil
+		return nil, nil
 	}
-	return prov
+	return prov, conn
 }
 
 // retrieveInvocation is the retrieve endpoint's upstreamCall. The "upstream"
@@ -139,6 +142,8 @@ type retrieveInvocation struct {
 	query string
 	topK  int
 	prov  provider.Provider
+	// rerankConn is the chat connection prov was built from; nil with prov.
+	rerankConn *store.ModelConnection
 }
 
 // attempt is one retrieval. It writes nothing until the search has finished,
@@ -150,7 +155,7 @@ func (in *retrieveInvocation) attempt(c *call, conn *store.ModelConnection) erro
 	var prov provider.Provider
 	var rerankSpend *rerankUsageProvider
 	if in.prov != nil {
-		model = in.gw.rerankModel(c)
+		model = in.rerankConn.ModelName
 		rerankSpend = &rerankUsageProvider{Provider: in.prov}
 		prov = rerankSpend
 	}
@@ -168,15 +173,25 @@ func (in *retrieveInvocation) attempt(c *call, conn *store.ModelConnection) erro
 		fillUsage(c.rec, res.EmbedUsage, len(in.query), 0)
 	}
 	// An LLM rerank is a chat call on the project's chat connection that a
-	// retrieve-only key opens; its tokens are counted on the row so the limits
-	// and the usage figures see them.
+	// retrieve-only key opens; an API rerank (Cohere, Voyage) is a call on the
+	// store's rerank connection. Their tokens are counted on the row so the
+	// limits and the usage figures see them, and priced apart with the
+	// connection that did the work, not the embedding connection the row names.
+	//
+	// The charges of an earlier attempt are dropped: a retried retrieval
+	// repeats the rerank, and the row carries the tokens of the last attempt.
+	c.sideCharges = c.sideCharges[:0]
+	var llm sideCharge
+	if in.rerankConn != nil {
+		llm = llmCharge(rerankSpend, in.rerankConn.ProviderType, in.rerankConn.ModelName, true)
+	}
+	api := apiCharge(res.RerankSpend, true)
 	rerankSpend.addTo(c.rec)
-	// An API rerank (Cohere, Voyage) is counted the same way.
-	var apiSpend tokenTally
-	apiSpend.add(nil, res.RerankSpend)
-	apiSpend.addTo(c.rec)
-	// Counted, not priced: see call.unpriced.
-	c.unpriced = apiSpend
+	c.rec.PromptTokens += api.prompt
+	c.rec.CompletionTokens += api.completion
+	c.rec.Estimated = c.rec.Estimated || api.estimated
+	c.addSideCharge(llm)
+	c.addSideCharge(api)
 	c.rec.RAGUsed, c.rec.RAGHits = true, len(res.Hits)
 	c.rec.StatusCode = http.StatusOK
 
@@ -228,16 +243,6 @@ func (p *rerankUsageProvider) addTo(rec *store.RequestLog) {
 	rec.PromptTokens += p.prompt
 	rec.CompletionTokens += p.completion
 	rec.Estimated = rec.Estimated || p.estimated
-}
-
-// rerankModel is the model name of the project's chat connection, the one the
-// LLM reranker prompts.
-func (g *Gateway) rerankModel(c *call) string {
-	conn, err := g.Store.GetConnection(c.ctx(), c.project.ModelConnectionID)
-	if err != nil {
-		return ""
-	}
-	return conn.ModelName
 }
 
 // retrievalError turns a failed search into the error invoke classifies. An

@@ -247,6 +247,10 @@ type Usage struct {
 	// top-level spelling of the same split; normalize folds them in.
 	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens,omitempty"`
 	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens,omitempty"`
+	// SearchUnits is what a rerank API billed in search units (Cohere's
+	// meta.billed_units.search_units). It is filled by the rerank adapters
+	// only, never sent to a client, and is not a token count.
+	SearchUnits int `json:"-"`
 }
 
 // PromptTokensDetails breaks the prompt down by how it was billed.

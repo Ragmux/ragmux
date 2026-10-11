@@ -47,17 +47,23 @@ type RerankInput struct {
 	Ranked *int
 }
 
-// RerankSpend is the token count of an API rerank call. Estimated is set when
-// the upstream reported none and the figure comes from the text sent.
+// RerankSpend is what an API rerank call used: its token count and, for an
+// API that bills by search unit (Cohere), the search units. Estimated is set
+// when the upstream reported no tokens and the figure comes from the text
+// sent. ProviderType and Model name the rerank connection that did the work,
+// which is the connection the spend is priced with.
 type RerankSpend struct {
 	PromptTokens     int
 	CompletionTokens int
+	SearchUnits      int
 	Estimated        bool
+	ProviderType     string
+	Model            string
 }
 
 // IsZero reports whether nothing was spent.
 func (s *RerankSpend) IsZero() bool {
-	return s == nil || (s.PromptTokens == 0 && s.CompletionTokens == 0)
+	return s == nil || (s.PromptTokens == 0 && s.CompletionTokens == 0 && s.SearchUnits == 0)
 }
 
 // RerankerFactory builds the reranker a store is configured for. It returns
@@ -179,6 +185,10 @@ type APIReranker struct {
 	Client provider.Reranker
 	// Timeout bounds the call; zero selects apiRerankTimeout.
 	Timeout time.Duration
+	// ProviderType and Model identify the rerank connection; they are copied
+	// onto RerankInput.Spend so the gateway prices the spend with it.
+	ProviderType string
+	Model        string
 }
 
 func (rr *APIReranker) Name() string { return rr.Backend }
@@ -214,6 +224,7 @@ func (rr *APIReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 		return hits[:topK], fmt.Errorf("rerank: %w", err)
 	}
 	if in.Spend != nil {
+		in.Spend.ProviderType, in.Spend.Model = rr.ProviderType, rr.Model
 		in.Spend.add(usage, provider.RerankRequestChars(query, docs))
 	}
 	order := make([]int, 0, len(res))
@@ -235,6 +246,9 @@ func (rr *APIReranker) Rerank(ctx context.Context, in RerankInput) ([]store.Sear
 // otherwise an estimate from the characters sent (four per token, rounded up,
 // the same rule the gateway's fillUsage applies).
 func (s *RerankSpend) add(u *provider.Usage, promptChars int) {
+	if u != nil {
+		s.SearchUnits += max(u.SearchUnits, 0)
+	}
 	if u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
 		s.PromptTokens += max(u.PromptTokens, 0)
 		s.CompletionTokens += max(u.CompletionTokens, 0)

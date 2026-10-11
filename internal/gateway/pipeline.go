@@ -99,42 +99,52 @@ var rerankOperation = operation{
 	endpoint: "rerank",
 }
 
-// tokenTally is a count of tokens spent by a side call (a rerank inside a chat
-// request) that the endpoint's own usage figures do not include.
-//
-// The apiPrompt and apiCompletion fields hold the part that an API reranker
-// (Cohere, Voyage) spent. It is in prompt and completion, so limits and usage
-// figures see it, but record leaves it out of the price: the row's model is not
-// the model that did the work, and a rerank API bills by search unit.
-type tokenTally struct {
+// sideCharge is what one side call spent, with the connection that did the
+// work. A side call is a call made outside the upstream attempts that the
+// endpoint's own usage figures do not include: the rerank inside a chat or
+// retrieve request. Its tokens count toward limits and usage on the row, but
+// the row's connection is not the one that did the work, so record prices the
+// charge on its own, with the price of providerType/model (ADR-021), and adds
+// the result to the request's cost.
+type sideCharge struct {
 	prompt, completion int
-	estimated          bool
-	// api is the part of prompt and completion that came from an API reranker.
-	apiPrompt, apiCompletion int
+	// searchUnits is what a rerank API billed per search unit (Cohere).
+	searchUnits int
+	estimated   bool
+	// providerType and model name the connection that did the work; empty
+	// when it is unknown, which prices the charge at zero.
+	providerType, model string
+	// inRow reports that the endpoint already added the tokens to the row
+	// (/v1/retrieve does, so its response can show them); record then leaves
+	// them alone when it adds the rest.
+	inRow bool
 }
 
-// add counts the tokens of one search's rerank: the chat calls the LLM backend
-// made (llm) and the API backend's call (api). Either may be nil.
-func (t *tokenTally) add(llm *rerankUsageProvider, api *rag.RerankSpend) {
-	if llm != nil {
-		t.prompt += llm.prompt
-		t.completion += llm.completion
-		t.estimated = t.estimated || llm.estimated
-	}
-	if !api.IsZero() {
-		t.prompt += api.PromptTokens
-		t.completion += api.CompletionTokens
-		t.apiPrompt += api.PromptTokens
-		t.apiCompletion += api.CompletionTokens
-		t.estimated = t.estimated || api.Estimated
-	}
+// isZero reports whether the charge spent nothing.
+func (s sideCharge) isZero() bool {
+	return s.prompt == 0 && s.completion == 0 && s.searchUnits == 0
 }
 
-// addTo adds the tally to the request row.
-func (t tokenTally) addTo(rec *store.RequestLog) {
-	rec.PromptTokens += t.prompt
-	rec.CompletionTokens += t.completion
-	rec.Estimated = rec.Estimated || t.estimated
+// llmCharge is the charge of an LLM rerank: the chat calls counted by spend,
+// run on the connection providerType/model. A nil spend, a search without an
+// LLM rerank, spent nothing.
+func llmCharge(spend *rerankUsageProvider, providerType, model string, inRow bool) sideCharge {
+	if spend == nil {
+		return sideCharge{}
+	}
+	return sideCharge{prompt: spend.prompt, completion: spend.completion, estimated: spend.estimated,
+		providerType: providerType, model: model, inRow: inRow}
+}
+
+// apiCharge is the charge of an API rerank call (Cohere, Voyage): the tokens
+// and search units it spent, on the connection the reranker names.
+func apiCharge(spend *rag.RerankSpend, inRow bool) sideCharge {
+	if spend.IsZero() {
+		return sideCharge{}
+	}
+	return sideCharge{prompt: spend.PromptTokens, completion: spend.CompletionTokens,
+		searchUnits: spend.SearchUnits, estimated: spend.Estimated,
+		providerType: spend.ProviderType, model: spend.Model, inRow: inRow}
 }
 
 // call is the state one request carries from step to step. Nothing in it is
@@ -178,14 +188,22 @@ type call struct {
 	// invoke when the budget is limited; the zero time is no limit. Attempts
 	// read it through attemptContext and budgetLeft.
 	deadline time.Time
-	// sideSpend is what calls made outside the upstream attempts spent, such as
-	// the rerank of a chat request's retrieval. fillUsage overwrites the row's
-	// counts when the attempt finishes, so record adds this on top.
-	sideSpend tokenTally
-	// unpriced is the API rerank spend already added to the row by the
-	// endpoint itself (/v1/retrieve), which record leaves out of the price like
-	// the one in sideSpend.
-	unpriced tokenTally
+	// sideCharges is what calls made outside the upstream attempts spent, such
+	// as the rerank of a chat request's retrieval. fillUsage overwrites the
+	// row's counts when the attempt finishes, so record adds the tokens of the
+	// ones that are not already in the row on top, then prices each charge
+	// with its own connection.
+	sideCharges []sideCharge
+	// searchUnits is what the call itself billed in search units, set by the
+	// /v1/rerank attempt that went through a Cohere connection.
+	searchUnits int
+}
+
+// addSideCharge records a side call's spend; one that spent nothing is dropped.
+func (c *call) addSideCharge(ch sideCharge) {
+	if !ch.isZero() {
+		c.sideCharges = append(c.sideCharges, ch)
+	}
 }
 
 func (c *call) ctx() context.Context { return c.r.Context() }
@@ -625,16 +643,25 @@ func (g *Gateway) failInvoke(c *call, err error) {
 func (g *Gateway) record(c *call) {
 	rec, conn, obsv := c.rec, c.conn, c.obs
 	rec.LatencyMs = time.Since(c.start).Milliseconds()
-	c.sideSpend.addTo(rec)
-	// An API rerank's tokens count toward limits and usage but are not priced
-	// at the row's model: that is not the model that did the work.
-	unpricedPrompt := c.sideSpend.apiPrompt + c.unpriced.apiPrompt
-	unpricedCompletion := c.sideSpend.apiCompletion + c.unpriced.apiCompletion
-	rec.PromptTokens -= unpricedPrompt
-	rec.CompletionTokens -= unpricedCompletion
-	g.priceRequest(conn, rec)
-	rec.PromptTokens += unpricedPrompt
-	rec.CompletionTokens += unpricedCompletion
+	// Side tokens count toward limits and usage, so they go on the row; they
+	// are priced apart, with the price of the connection that did the work,
+	// because the row's connection is not that one.
+	var sidePrompt, sideCompletion int
+	for _, ch := range c.sideCharges {
+		if !ch.inRow {
+			rec.PromptTokens += ch.prompt
+			rec.CompletionTokens += ch.completion
+			rec.Estimated = rec.Estimated || ch.estimated
+		}
+		sidePrompt += ch.prompt
+		sideCompletion += ch.completion
+	}
+	rec.PromptTokens -= sidePrompt
+	rec.CompletionTokens -= sideCompletion
+	g.priceRequest(conn, rec, c.searchUnits)
+	rec.PromptTokens += sidePrompt
+	rec.CompletionTokens += sideCompletion
+	g.priceSideCharges(rec, c.sideCharges)
 	if err := g.Store.InsertRequestLog(context.Background(), rec); err != nil {
 		c.log.Error("write request log", "err", err)
 	}

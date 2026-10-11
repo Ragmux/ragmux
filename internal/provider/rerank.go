@@ -80,7 +80,11 @@ func (r *cohereReranker) Rerank(ctx context.Context, query string, docs []string
 	return res, err
 }
 
-// RerankUsage is Rerank plus the token counts Cohere reports in meta.tokens.
+// RerankUsage is Rerank plus what Cohere reports in meta: the token counts
+// (meta.tokens) and the billed search units (meta.billed_units.search_units).
+// Search units are what Cohere charges for, so the reply to a successful call
+// always carries at least one: when the field is missing, a call is billed as
+// one search unit.
 func (r *cohereReranker) RerankUsage(ctx context.Context, query string, docs []string, topN int) ([]RerankResult, *Usage, error) {
 	body := map[string]any{
 		"model":     r.cfg.Model,
@@ -98,6 +102,9 @@ func (r *cohereReranker) RerankUsage(ctx context.Context, query string, docs []s
 				InputTokens  int `json:"input_tokens"`
 				OutputTokens int `json:"output_tokens"`
 			} `json:"tokens"`
+			BilledUnits struct {
+				SearchUnits int `json:"search_units"`
+			} `json:"billed_units"`
 		} `json:"meta"`
 	}
 	headers := map[string]string{"Authorization": "Bearer " + r.cfg.APIKey}
@@ -108,9 +115,13 @@ func (r *cohereReranker) RerankUsage(ctx context.Context, query string, docs []s
 	for _, x := range out.Results {
 		res = append(res, RerankResult{Index: x.Index, Score: x.RelevanceScore})
 	}
-	var usage *Usage
+	usage := &Usage{SearchUnits: out.Meta.BilledUnits.SearchUnits}
+	if usage.SearchUnits < 1 {
+		usage.SearchUnits = 1
+	}
 	if t := out.Meta.Tokens; t.InputTokens > 0 || t.OutputTokens > 0 {
-		usage = &Usage{PromptTokens: t.InputTokens, CompletionTokens: t.OutputTokens, TotalTokens: t.InputTokens + t.OutputTokens}
+		usage.PromptTokens, usage.CompletionTokens = t.InputTokens, t.OutputTokens
+		usage.TotalTokens = t.InputTokens + t.OutputTokens
 	}
 	res, err := filterRerankResults(res, len(docs))
 	return res, usage, err

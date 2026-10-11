@@ -142,3 +142,51 @@ func TestModelPricesCRUD(t *testing.T) {
 		}
 	}
 }
+
+// TestModelPricesSearchUnit walks per_search_unit through the price API: the
+// shipped Cohere rate is listed, a rerank-only provider type takes a row of its
+// own, an edit and a reset move the rate, and out-of-range values are refused.
+func TestModelPricesSearchUnit(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, testdb.Config(t))
+	status := func(r map[string]any) int { return int(r["_status"].(float64)) }
+	if _, err := pricing.Seed(ctx, e.store.DB(), slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	e.call("POST", "/admin/api/users", map[string]any{"username": "ed", "password": "editor-pass-1", "role": "editor"}, "")
+	editor := e.login("ed", "editor-pass-1")
+
+	list := e.call("GET", "/admin/api/prices", nil, editor)
+	cohere := findPriceRow(t, list["prices"].([]any), "cohere_rerank", "rerank-v3.5*")
+	shipped, _ := cohere["per_search_unit"].(float64)
+	if shipped <= 0 {
+		t.Fatalf("shipped cohere row has no per_search_unit: %v", cohere)
+	}
+	if voyage := findPriceRow(t, list["prices"].([]any), "voyage_rerank", "rerank-2.5*"); voyage["per_search_unit"] != nil {
+		t.Errorf("voyage row carries a search unit rate: %v", voyage)
+	}
+	id := int64(cohere["id"].(float64))
+
+	upd := e.call("PUT", fmt.Sprintf("/admin/api/prices/%d", id),
+		map[string]any{"input_per_mtok": 0, "output_per_mtok": 0, "per_search_unit": 0.01}, editor)
+	if status(upd) != 200 || upd["per_search_unit"] != 0.01 || upd["source"] != "user" {
+		t.Fatalf("update: %v", upd)
+	}
+	reset := e.call("POST", fmt.Sprintf("/admin/api/prices/%d/reset", id), map[string]any{}, editor)
+	if status(reset) != 200 || reset["per_search_unit"] != shipped || reset["source"] != "builtin" {
+		t.Fatalf("reset: %v, want per_search_unit %v", reset, shipped)
+	}
+
+	own := e.call("POST", "/admin/api/prices", map[string]any{"provider_type": "cohere_rerank",
+		"model_pattern": "rerank-house*", "per_search_unit": 0.003}, editor)
+	if status(own) != 201 || own["per_search_unit"] != 0.003 {
+		t.Fatalf("create: %v", own)
+	}
+	for _, bad := range []float64{-0.001, 100.5} {
+		r := e.call("POST", "/admin/api/prices", map[string]any{"provider_type": "cohere_rerank",
+			"model_pattern": "rerank-bad*", "per_search_unit": bad}, editor)
+		if status(r) != 400 {
+			t.Errorf("per_search_unit %v accepted: %v", bad, r)
+		}
+	}
+}

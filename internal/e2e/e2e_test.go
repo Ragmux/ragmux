@@ -226,7 +226,8 @@ func newEnvOpts(t *testing.T, cfg store.OpenConfig, opts envOpts) *env {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", rag.ErrRerankUnavailable, err)
 		}
-		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client}, nil
+		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client,
+			ProviderType: conn.ProviderType, Model: conn.ModelName}, nil
 	}
 	authSvc := &auth.Service{Store: st, TTL: time.Hour}
 	usage := &limits.Limiter{Store: st}

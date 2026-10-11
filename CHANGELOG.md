@@ -6,7 +6,22 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **Rerank spend is priced with the connection that did the rerank.** The `cost_micros`
+  of a request row used to be priced by the row's own connection only: the tokens of a
+  Cohere or Voyage reranker were never priced, `llm` rerank on `/v1/retrieve` was priced
+  at the embedding connection's rate, and in a routed chat a rerank run through the first
+  target was priced at the fallback target that answered. Each rerank spend is now priced
+  by the `model_prices` row of the connection that ran it and added to the main cost;
+  a spend with no price adds 0 and `cost_source` stays the main call's. A price row with
+  a `per_search_unit` rate (an explicit 0 included) prices a rerank by search units alone; its token prices are
+  never added on top. Token counts and limit accounting are unchanged.
+
 ### Changed
+- **`model_prices.per_search_unit`** (migration `0020`, additive) and the price API's
+  `per_search_unit` field: the price of one Cohere search unit, per unit rather than per
+  million tokens. The built-in table is version 3 and now prices the Cohere and Voyage
+  rerank models; a built-in row you have not edited is refreshed on upgrade.
 - **The span names of the four `/v1` endpoints, and `gen_ai.operation.name` of
   `/v1/retrieve`.** `gateway.chat_completion` and its siblings are replaced by the GenAI
   names listed under Added, so a dashboard or alert that filters on the old names needs updating. The

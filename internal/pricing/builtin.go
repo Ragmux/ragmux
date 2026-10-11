@@ -5,6 +5,14 @@ import (
 	"sync"
 )
 
+// Rerank rows (version 3, figures taken from the providers' published price
+// lists as known on 2026-10-11, not fetched live while writing; re-check them
+// before a release): Cohere bills a rerank call per search unit, USD 2.00 per
+// 1,000 searches, so its rows carry per_search_unit (a price per unit, not per
+// million). Voyage bills rerank by token, so its rows carry an input price per
+// million tokens. A row with a per_search_unit rate prices a call by search
+// units alone: the token prices on such a row are never added for rerank.
+//
 // builtinJSON is the shipped price table. It is JSON rather than YAML
 // because encoding/json is in the standard library and Ragmux adds no
 // module dependency for a file it reads once at start.
@@ -63,7 +71,10 @@ type Shipped struct {
 	Output     float64
 	CacheWrite *float64
 	CacheRead  *float64
-	Currency   string
+	// PerSearchUnit stays nil when the file leaves it out, which Seed stores
+	// as NULL.
+	PerSearchUnit *float64
+	Currency      string
 }
 
 // ShippedPrice returns the unresolved shipped entry for one exact
@@ -83,7 +94,8 @@ func ShippedPrice(providerType, pattern string) (Shipped, bool) {
 		// once and handed to every caller.
 		return Shipped{Input: m.Input, Output: m.Output,
 			CacheWrite: copyFloat(m.CacheWrite), CacheRead: copyFloat(m.CacheRead),
-			Currency: f.Currency}, true
+			PerSearchUnit: copyFloat(m.PerSearchUnit),
+			Currency:      f.Currency}, true
 	}
 	return Shipped{}, false
 }

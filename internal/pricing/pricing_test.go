@@ -20,6 +20,7 @@ import (
 var pricesSHA256 = map[int]string{
 	1: "45c8ce28eca57e738c77666c9dfbb336febe84c3dae031f2ac091da46c3c24af",
 	2: "317856df091340f07a0c632c829fd2dee56dc4bc473b5b277d7abd4721054948",
+	3: "920637082e48334bee70488eef521330d9ec09bef0fbbc0af203ad0ea6142731",
 }
 
 func TestPricesVersionPinned(t *testing.T) {
@@ -243,5 +244,90 @@ func TestCostMicrosSaturates(t *testing.T) {
 	}
 	if got := (Price{Input: math.Inf(1)}).CostMicros(10, 0, 0, 0); got != math.MaxInt64 {
 		t.Errorf("infinite price cost = %d, want saturation", got)
+	}
+}
+
+func TestSearchUnitMicros(t *testing.T) {
+	cases := []struct {
+		name  string
+		price Price
+		units int
+		want  int64
+	}{
+		{name: "cohere list price", price: Price{PerSearchUnit: 0.002}, units: 1, want: 2000},
+		{name: "several units", price: Price{PerSearchUnit: 0.002}, units: 3, want: 6000},
+		{name: "no search unit rate", price: Price{Input: 3, Output: 15}, units: 5, want: 0},
+		{name: "zero units", price: Price{PerSearchUnit: 0.002}, units: 0, want: 0},
+		{name: "negative units", price: Price{PerSearchUnit: 0.002}, units: -4, want: 0},
+		{name: "negative rate", price: Price{PerSearchUnit: -0.002}, units: 2, want: 0},
+		{name: "NaN rate", price: Price{PerSearchUnit: math.NaN()}, units: 2, want: 0},
+		// 0.0000004 x 1e6 = 0.4 micros: rounded, not floored into a free call.
+		{name: "rounds to nearest micro", price: Price{PerSearchUnit: 0.0000006}, units: 1, want: 1},
+		{name: "sub-micro rounds down", price: Price{PerSearchUnit: 0.0000004}, units: 1, want: 0},
+		{name: "overflow saturates", price: Price{PerSearchUnit: 1e18}, units: 1 << 40, want: math.MaxInt64},
+	}
+	for _, c := range cases {
+		got := c.price.SearchUnitMicros(c.units)
+		if got != c.want {
+			t.Errorf("%s: SearchUnitMicros = %d, want %d", c.name, got, c.want)
+		}
+		if got < 0 {
+			t.Errorf("%s: SearchUnitMicros returned a negative cost", c.name)
+		}
+	}
+}
+
+// A row with a search unit rate prices a call that reports search units by
+// those units alone (ADR-021); token prices on the same row are never added.
+func TestBilledMicros(t *testing.T) {
+	cohere := Price{Input: 5, Output: 7, PerSearchUnit: 0.002, HasSearchUnit: true}
+	cases := []struct {
+		name  string
+		price Price
+		units int
+		want  int64
+	}{
+		{name: "units alone when the row has a rate", price: cohere, units: 3, want: 6000},
+		{name: "tokens are not added", price: cohere, units: 1, want: 2000},
+		{name: "no units falls back to tokens", price: cohere, units: 0, want: 100*5 + 10*7},
+		{name: "unset rate falls back to tokens", price: Price{Input: 5, Output: 7}, units: 3, want: 100*5 + 10*7},
+		// An explicit 0 is a rate that is set: the call is free, not billed by tokens.
+		{name: "explicit zero rate bills units alone", price: Price{Input: 5, Output: 7, HasSearchUnit: true}, units: 3, want: 0},
+		{name: "explicit zero rate with no units uses tokens", price: Price{Input: 5, Output: 7, HasSearchUnit: true}, units: 0, want: 100*5 + 10*7},
+		{name: "unset rate ignores a stray value", price: Price{Input: 5, Output: 7, PerSearchUnit: 0.002}, units: 3, want: 100*5 + 10*7},
+		{name: "NaN rate that is set is floored to zero", price: Price{Input: 5, Output: 7, PerSearchUnit: math.NaN(), HasSearchUnit: true}, units: 3, want: 0},
+	}
+	for _, c := range cases {
+		if got := c.price.BilledMicros(100, 0, 0, 10, c.units); got != c.want {
+			t.Errorf("%s: BilledMicros = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// The shipped table prices the rerank APIs the way each one bills: Cohere per
+// search unit, Voyage per token.
+func TestBuiltinRerankPrices(t *testing.T) {
+	rows, err := Builtin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := NewTable(rows)
+	for _, model := range []string{"rerank-v3.5", "rerank-english-v3.0", "rerank-multilingual-v3.0"} {
+		p, ok := table.Lookup("cohere_rerank", model)
+		if !ok || p.PerSearchUnit <= 0 {
+			t.Errorf("cohere_rerank/%s: price %+v (ok=%v), want a per_search_unit rate", model, p, ok)
+		}
+	}
+	for _, model := range []string{"rerank-2.5", "rerank-2.5-lite", "rerank-2", "rerank-2-lite"} {
+		p, ok := table.Lookup("voyage_rerank", model)
+		if !ok || p.Input <= 0 || p.PerSearchUnit != 0 {
+			t.Errorf("voyage_rerank/%s: price %+v (ok=%v), want a token price and no search unit rate", model, p, ok)
+		}
+	}
+	// The lite model must not fall into the broader rerank-2.5* row.
+	lite, _ := table.Lookup("voyage_rerank", "rerank-2.5-lite")
+	full, _ := table.Lookup("voyage_rerank", "rerank-2.5")
+	if lite.Input >= full.Input {
+		t.Errorf("rerank-2.5-lite input %v is not below rerank-2.5 %v", lite.Input, full.Input)
 	}
 }

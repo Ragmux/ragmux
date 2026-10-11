@@ -286,7 +286,8 @@ func run(cfg config.Config) error {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", rag.ErrRerankUnavailable, err)
 		}
-		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client, Timeout: cfg.RerankTimeout}, nil
+		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client, Timeout: cfg.RerankTimeout,
+			ProviderType: conn.ProviderType, Model: conn.ModelName}, nil
 	}
 
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",

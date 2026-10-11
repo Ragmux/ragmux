@@ -1453,7 +1453,7 @@ const priceState = { q: '', provider: 'all' };
 // A per-million-token rate. "—" means the row has no own cache price and
 // falls back to the input rate, which is what the API returns as null.
 const rate = v => v == null ? '<span class="muted" title="falls back to the input rate">—</span>' : `<span class="mono">${Number(v).toFixed(v && Math.abs(v) < 0.01 ? 4 : 2)}</span>`;
-const priceNum = (name, val, label, hint = '') => field(name, label, input(name, val == null ? '' : String(val), 'type=number min=0 max=100000 step=any inputmode=decimal'), hint);
+const priceNum = (name, val, label, hint = '', max = 100000) => field(name, label, input(name, val == null ? '' : String(val), `type=number min=0 max=${max} step=any inputmode=decimal`), hint);
 // An empty numeric field means "unset": null for the cache rates, which is
 // not the same as 0, and 0 for the two required ones.
 const numOrNull = v => String(v).trim() === '' ? null : Number(v);
@@ -1473,20 +1473,21 @@ async function renderPrices() {
     <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:280px">${ICON.search}<label for="p-q" class="sr">Search prices</label><input id="p-q" class="input" placeholder="Search model pattern" value="${esc(s.q)}" style="min-height:38px" autocomplete="off"></div>
         <div class="tabs" role="tablist" aria-label="Provider">${['all', ...providers].map(t => `<button class="tab" role="tab" data-provider="${esc(t)}" aria-selected="${s.provider === t}">${esc(t)}</button>`).join('')}</div></div>
         <span class="hint">${rows.length} of ${all.length} · ${edited} edited by hand</span></div>
-      <div class="tbl"><table><thead><tr><th>Provider</th><th>Model pattern</th><th class="right">Input</th><th class="right">Output</th><th class="right">Cache write</th><th class="right">Cache read</th><th>Source</th><th></th></tr></thead><tbody>
+      <div class="tbl"><table><thead><tr><th>Provider</th><th>Model pattern</th><th class="right">Input</th><th class="right">Output</th><th class="right">Cache write</th><th class="right">Cache read</th><th class="right">Search unit</th><th>Source</th><th></th></tr></thead><tbody>
       ${rows.map(p => `<tr><td><div class="row" style="gap:10px">${providerBadge(p.provider_type, 'sm')}<span class="dim">${esc(p.provider_type)}</span></div></td>
         <td class="mono">${esc(p.model_pattern)}</td><td class="right">${rate(p.input_per_mtok)}</td><td class="right">${rate(p.output_per_mtok)}</td>
-        <td class="right">${rate(p.cache_write_per_mtok)}</td><td class="right">${rate(p.cache_read_per_mtok)}</td>
+        <td class="right">${rate(p.cache_write_per_mtok)}</td><td class="right">${rate(p.cache_read_per_mtok)}</td><td class="right">${p.per_search_unit == null ? '<span class="muted">—</span>' : `<span class="mono">${Number(p.per_search_unit).toFixed(4)}</span>`}</td>
         <td><span class="pill ${p.source === 'user' ? 'info' : ''}">${esc(p.source)}</span> <span class="muted mono">${esc(p.currency)}</span></td>
-        <td class="right nowrap">${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button> ${p.source === 'user' ? `<button class="btn sm ghost" data-reset="${p.id}">Reset</button> <button class="btn sm ghost danger" data-del="${p.id}">Delete</button>` : ''}` : ''}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No prices match.</td></tr>'}</tbody></table></div></section>`;
+        <td class="right nowrap">${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button> ${p.source === 'user' ? `<button class="btn sm ghost" data-reset="${p.id}">Reset</button> <button class="btn sm ghost danger" data-del="${p.id}">Delete</button>` : ''}` : ''}</td></tr>`).join('') || '<tr><td colspan="9" class="muted">No prices match.</td></tr>'}</tbody></table></div></section>`;
   let qTimer; $('#p-q').oninput = e => { s.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(renderPrices, 200); };
   on(app, '[data-provider]', 'click', b => { s.provider = b.dataset.provider; renderPrices(); });
   if (!w) return;
   const priceBody = p => `${twoCol(priceNum('input_per_mtok', p ? p.input_per_mtok : 0, 'Input / Mtok'), priceNum('output_per_mtok', p ? p.output_per_mtok : 0, 'Output / Mtok'))}
     ${twoCol(priceNum('cache_write_per_mtok', p ? p.cache_write_per_mtok : null, 'Cache write / Mtok', 'Empty: charged at the input rate'), priceNum('cache_read_per_mtok', p ? p.cache_read_per_mtok : null, 'Cache read / Mtok', 'Empty: charged at the input rate'))}
+    ${priceNum('per_search_unit', p ? p.per_search_unit : null, 'Search unit price', 'Per unit, not per million. Cohere rerank bills per search unit; empty for token-priced models.', 100)}
     ${field('currency', 'Currency', input('currency', p ? p.currency : 'USD', 'maxlength=3 autocapitalize=characters'), 'Three-letter code; the dashboard labels every figure as an estimate.')}`;
   const payload = d => ({ input_per_mtok: Number(d.input_per_mtok || 0), output_per_mtok: Number(d.output_per_mtok || 0),
-    cache_write_per_mtok: numOrNull(d.cache_write_per_mtok), cache_read_per_mtok: numOrNull(d.cache_read_per_mtok), currency: d.currency });
+    cache_write_per_mtok: numOrNull(d.cache_write_per_mtok), cache_read_per_mtok: numOrNull(d.cache_read_per_mtok), per_search_unit: numOrNull(d.per_search_unit), currency: d.currency });
   $('#addPrice').onclick = () => drawer({ eyebrow: 'New', title: 'Model price', submitLabel: 'Add price', body: `
       ${twoCol(field('provider_type', 'Provider type', select('provider_type', state.providerTypes.map(t => ({ value: t.type, label: t.label || t.type })), 'openai')),
         field('model_pattern', 'Model pattern', input('model_pattern', '', 'required maxlength=128 autocomplete=off spellcheck=false'), 'An exact model name, or a prefix with <code>*</code> (e.g. <code>gpt-4o-mini*</code>). The longest literal prefix wins.'))}
