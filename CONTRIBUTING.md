@@ -18,7 +18,7 @@ decisions are recorded.
 
 Requirements:
 
-- Go 1.27.1 or newer
+- Go 1.27.2 or newer
 - Docker, for the test database
 
 Clone the repository, start the test database and run the gateway:

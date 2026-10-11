@@ -1,6 +1,6 @@
 module github.com/ragmux/ragmux
 
-go 1.27.1
+go 1.27.2
 
 require (
 	github.com/go-chi/chi/v5 v5.3.2
@@ -9,7 +9,7 @@ require (
 	github.com/pgvector/pgvector-go v0.4.1
 	github.com/pgvector/pgvector-go/pgx v0.4.1
 	golang.org/x/crypto v0.57.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 )
 
 require (
