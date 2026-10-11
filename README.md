@@ -1,77 +1,44 @@
-# Ragmux — self-hosted AI gateway
+# Ragmux
+
+A self-hosted AI gateway that exposes one OpenAI-compatible API for several LLM providers and adds retrieval from uploaded documents.
 
 [![Designed & Maintained with Tan](https://muhammetsafak.com/badges/designed-maintained-with-tan.svg)](https://muhammetsafak.com/tan/)
 
-<https://ragmux.com>
-
-Ragmux is a single-binary AI gateway written in Go. It sits between your applications
-and LLM providers, exposes one **OpenAI-compatible API**, and can augment every request
-with **retrieval (RAG)** from documents you upload. All state — users, model
-connections, projects, documents, chunks, vectors and metrics — lives in one
-**PostgreSQL** database with the [pgvector](https://github.com/pgvector/pgvector)
-extension. One container, no Redis, no separate vector database.
-
-```
-client  ──►  POST /v1/chat/completions (Bearer sk-proj-…)
-             │
-             ├─ project → model connection (provider credentials stay server-side)
-             ├─ project → RAG store (optional): embed query → top-k chunks → inject context
-             └─ adapter: OpenAI · Anthropic · Gemini · DeepSeek · Ollama · custom OpenAI (vLLM…)
-                          JSON and SSE streaming, normalised to the OpenAI schema
-             │
-             └─ PostgreSQL + pgvector: users, connections (AES-256-GCM keys), projects,
-                documents (bytea), chunks, HNSW vector indexes, request logs
-```
+Ragmux sits between your applications and LLM providers. Provider credentials stay on the
+server, and a request can be augmented with passages retrieved from documents you upload
+(RAG). All state lives in one PostgreSQL database with the
+[pgvector](https://github.com/pgvector/pgvector) extension: no Redis and no separate vector
+database. More at <https://ragmux.com>.
 
 ## Features
 
-- **Providers:** `openai`, `azure_openai`, `anthropic`, `gemini`, `deepseek`, `ollama`
-  (native `/api/chat`) and `custom_openai` for vLLM, LM Studio, LiteLLM or any
-  OpenAI-compatible server, plus `cohere_rerank` and `voyage_rerank` for reranking. Ready-made
-  presets cover Mistral, xAI and Groq; see [Providers](docs/providers.md).
-- **OpenAI-compatible proxy:** `/v1/chat/completions` (JSON + SSE streaming) and
-  `/v1/models`; works with the official SDKs by changing `base_url` and `api_key`.
-  Anthropic and Gemini requests and streams are translated, tool calls included, and remote
-  images are fetched for the providers that cannot follow a URL themselves.
-- **More `/v1` endpoints:** `POST /v1/embeddings`, `POST /v1/retrieve` (search a RAG store
-  without calling a model) and `POST /v1/rerank` (Cohere-shaped), each behind its own key
-  scope. See the [API reference](docs/api.md#client-api-v1).
-- **Routes, retry and fallback:** a project can define named routes whose targets are
-  ordered by priority and weight; the request's `model` then selects a route, and an unknown
-  name is `404 model_not_found`. A chat call that fails before the first byte is retried or
-  handed to the next target, and a connection that keeps failing is taken out of rotation by
-  a circuit breaker. See [Routing](docs/providers.md#routing) and
-  [Retry and fallback](docs/providers.md#retry-and-fallback).
-- **RAG stores:** PDF / DOCX / HTML / TXT / Markdown, section-aware chunking with contextual
-  embeddings, hybrid search fusing pgvector with either Postgres full-text ranking or
-  ParadeDB BM25, reranking by your own model or the Cohere / Voyage APIs, distance threshold.
-- **Projects:** one `sk-proj-…` key per project mapped to a model connection, a system prompt
-  and an optional RAG store; provider credentials are encrypted at rest and never exposed.
-- **API keys:** per-user `sk-user-…` keys for `/v1` scoped to the projects you grant them and
-  `sk-mgmt-…` keys for the management API, both with scopes (`/v1` keys: `chat`, `models`,
-  `embeddings`, `retrieve`, `rerank`), expiry, revocation and optional limits under the
-  project's.
-- **Users and roles:** `admin`, `editor`, `viewer`, project membership, login rate limiting
-  with lockout, audit log of every management action, and `ragmux reset-password` when the
-  last administrator is locked out.
-- **Cost:** prompt-caching passthrough, cache-aware token accounting and an editable price
-  table that estimates what each request cost.
-- **Rate limits and budgets:** per-project requests / tokens per minute and daily / monthly
-  token budgets shared across replicas, OpenAI-style `429` and `x-ratelimit-*` headers.
-- **Observability:** per-request logs (tokens, latency, status, streaming, RAG use, cost),
-  summaries, daily series, configurable retention, an authenticated Prometheus `/metrics`
-  endpoint and OpenTelemetry traces over OTLP (HTTP/JSON, or gRPC on request) with GenAI
-  span names and one child span per upstream attempt.
-- **Scale:** run several replicas against one PostgreSQL — ingestion is claimed under a
-  lease, the retention pass elects a leader, and streaming needs no session affinity.
-- **Dashboard:** embedded UI at `/admin/` for models, RAG stores, documents, projects and
-  their routes, API keys, metrics, users, audit log and a playground; everything is also a
-  REST API.
+- **Providers:** `openai`, `azure_openai`, `anthropic`, `gemini`, `deepseek`, `ollama` and
+  `custom_openai` (vLLM, LM Studio, LiteLLM or any OpenAI-compatible server), plus
+  `cohere_rerank` and `voyage_rerank`. Presets cover Mistral, xAI and Groq; see
+  [Providers](docs/providers.md).
+- **OpenAI-compatible API:** `/v1/chat/completions` (JSON and SSE streaming), `/v1/models`,
+  `/v1/embeddings`, `/v1/retrieve` and `/v1/rerank`. The official SDKs work after changing
+  `base_url` and `api_key`; Anthropic and Gemini requests are translated, tool calls included.
+- **Routes, retry and fallback:** named routes with prioritised, weighted targets, retries
+  before the first byte and a circuit breaker per connection; see
+  [Routing](docs/providers.md#routing).
+- **RAG stores:** PDF, DOCX, HTML, TXT and Markdown, section-aware chunking, hybrid search
+  (pgvector with Postgres full-text ranking or ParadeDB BM25) and reranking; see
+  [Retrieval](docs/rag.md).
+- **Projects and API keys:** one `sk-proj-` key per project, mapped to a model connection, a
+  system prompt and an optional RAG store; scoped `sk-user-` and `sk-mgmt-` keys with expiry
+  and revocation.
+- **Access control:** `admin`, `editor` and `viewer` roles, project membership, login
+  lockout and an audit log of every management action.
+- **Limits and cost:** per-project rate limits and token budgets shared across replicas,
+  prompt-caching passthrough and an editable price table that estimates request cost.
+- **Observability and scale:** request logs, an authenticated Prometheus `/metrics`
+  endpoint, OpenTelemetry traces, and several replicas against one PostgreSQL; see
+  [Observability](docs/observability.md) and [Scaling](docs/scaling.md).
 
-## Quick start
+## Quick Start
 
-Nothing to clone — one container with the gateway and its own PostgreSQL 17 + pgvector
-server inside:
+Requires Docker. One container runs the gateway with its own PostgreSQL 17 and pgvector:
 
 ```bash
 docker run -d --name ragmux \
@@ -84,32 +51,24 @@ docker run -d --name ragmux \
 Open <http://localhost:8765/admin/>. On a fresh database the dashboard asks you to
 **create the first administrator** (username and a password of at least 12 characters);
 that form only works while no user exists. For unattended installs pass
-`-e ADMIN_USER=admin -e ADMIN_PASSWORD=...` instead and the account is created on first
-start. `ADMIN_PASSWORD` follows the same rule (at least 12 characters, at most 72 bytes);
-on an empty database a shorter one stops the start with an error (see
-[Configuration](docs/configuration.md#environment-variables)).
+`-e ADMIN_USER=admin -e ADMIN_PASSWORD=<ADMIN_PASSWORD>` instead and the account is
+created on first start (the password is 12 characters at least, 72 bytes at most; on an
+empty database a shorter one stops the start with an error).
 
-Two things worth knowing about that command:
+- **`SECRET_KEY` encrypts the provider credentials.** Without it the gateway generates
+  `/data/ragmux/secret.key` inside the volume, which you then have to back up together
+  with the database. Keep the key with your backups.
+- **The port is published on loopback only.** Put a TLS-terminating reverse proxy in front
+  for network access; see [Deployment](#deployment). Change the mapping to `-p 8765:8765`
+  only deliberately.
+- **Local models:** provider URLs on private networks (Ollama on the Docker host, a vLLM
+  service on the same Docker network) are refused by default as an SSRF guard. Add
+  `-e PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama` to the command above; see
+  [Private upstreams](docs/configuration.md#private-upstreams).
 
-- **`SECRET_KEY` encrypts the provider credentials.** Nothing is required to start, but
-  without it the gateway generates `/data/ragmux/secret.key` inside the volume, which you
-  then have to back up together with the database. Keep the key with your backups.
-- **The port is published on loopback only.** Put a TLS-terminating reverse proxy in
-  front for network access and set `TRUST_PROXY_HEADERS` / `SECURE_COOKIES`; see
-  [Configuration](docs/configuration.md#behind-a-reverse-proxy). Change the mapping to
-  `-p 8765:8765` only deliberately.
+`latest` is for trying it out. Pin a version in production; see [Which image](#which-image).
 
-Everything persistent is under `/data`: `/data/pg` is the PostgreSQL cluster (`PGDATA`)
-and `/data/ragmux` holds the `secret.key` fallback (`DATA_DIR`). That volume plus
-`SECRET_KEY` is the whole state. The embedded PostgreSQL has no TCP listener at all, so
-`8765` is the only port.
-
-Running models locally? Provider URLs on private networks (Ollama on the Docker host, a
-vLLM service on the same Docker network) are refused by default as an SSRF guard. Allow
-them by hostname before you add the connection — add
-`-e PRIVATE_UPSTREAM_ALLOWLIST=host.docker.internal,ollama` to the command above, or put
-the same variable in `.env` under Compose (or `ALLOW_PRIVATE_UPSTREAMS=true` on a trusted
-network — see [Configuration](docs/configuration.md#private-upstreams)).
+## Installation
 
 ### Which image
 
@@ -117,68 +76,60 @@ Three variants are published from every release:
 
 | Tag | What it is | Choose it when |
 |---|---|---|
-| `ragmux/ragmux:latest` | **All-in-one:** the gateway plus its own PostgreSQL 17 + pgvector in one container, supervised by a single entrypoint (`Dockerfile.aio`). | You want one container and no database to operate. The default, and the right answer for most installations. |
-| `ragmux/ragmux:latest-app` | **Gateway only**, on a distroless base, with no database inside; you point it at your own PostgreSQL with `DATABASE_URL` (`Dockerfile`). | You already run PostgreSQL (managed service, your own cluster, a separate container), or you want **several gateway replicas** against one database — the all-in-one image cannot be scaled that way. |
-| `ragmux/ragmux:latest-paradedb` | **All-in-one on ParadeDB:** same gateway and same data layout, but its PostgreSQL carries `pg_search` (BM25) as well as `pgvector` (`Dockerfile.aio.paradedb`). | You want the lexical half of hybrid retrieval answered by **BM25** instead of PostgreSQL full-text ranking. Swapping from the default all-in-one image needs no reprocessing. |
+| `ragmux/ragmux:latest` | **All-in-one:** the gateway plus its own PostgreSQL 17 + pgvector in one container (`Dockerfile.aio`). | You want one container and no database to operate. The default for most installations. |
+| `ragmux/ragmux:latest-app` | **Gateway only**, on a distroless base; you point it at your own PostgreSQL with `DATABASE_URL` (`Dockerfile`). | You already run PostgreSQL, or you want **several gateway replicas** against one database. |
+| `ragmux/ragmux:latest-paradedb` | **All-in-one on ParadeDB:** its PostgreSQL carries `pg_search` (BM25) as well as `pgvector` (`Dockerfile.aio.paradedb`). | You want the lexical half of hybrid retrieval answered by BM25. |
 
-The `-paradedb` image takes exactly the same command and the same volume layout as the
-default one. Docker Hub is the primary registry; the full tag matrix, the GHCR mirror and
-the platforms are listed under
+The `-paradedb` image takes the same command and volume layout as the default one. Docker
+Hub is the primary registry; the tag matrix, the GHCR mirror and the platforms are under
 [Published images](docs/configuration.md#published-images).
 
-**`latest` is for trying it out; pin a version in production.** The commands here use
-`latest` so they keep working as you read them, but a deployment you care about should
-name the release it was tested against (`ragmux/ragmux:<version>`), or better the
-manifest digest that `cosign verify` reports (`ragmux/ragmux@sha256:…`), which no later
-tag move can change. Images are signed from v0.3.1 onward; see
+A deployment you care about should name the release it was tested against
+(`ragmux/ragmux:<version>`), or the manifest digest that `cosign verify` reports. Images
+are signed from v0.3.1 onward; see
 [Verifying the container image](SECURITY.md#verifying-the-container-image).
 
 ### Docker Compose
 
-Compose is the second way in, and the better one once you want more than the single
-container gives you: **your own PostgreSQL**, the **split layout** (the gateway next to a
-`pgvector/pgvector:pg17` service you can back up and upgrade on its own schedule), the
-**ParadeDB** variant, a **multi-replica** setup behind a load balancer, or the scheduled
-**backup** profile and the `scripts/` helpers. It works from a clone of the repository:
+Compose works from a clone of the repository and is the better route for your own
+PostgreSQL, the split layout, ParadeDB, several replicas or the scheduled backup profile:
 
 ```bash
 git clone https://github.com/ragmux/ragmux.git
 cd ragmux
 cp .env.example .env
-echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env   # keep it with your backups
+echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env
 docker compose up -d
 ```
 
-That is the same all-in-one image and the same `/data` volume as the `docker run` above,
-with `.env` as the one place configuration lives. The other files layer on top:
+That is the same all-in-one image and `/data` volume as the `docker run` above, with `.env`
+as the one place configuration lives. Keep the generated `SECRET_KEY` with your backups.
+The other files layer on top:
 
 | File | What it runs |
 |---|---|
 | [`docker-compose.yml`](docker-compose.yml) | the default all-in-one container, plus a `backup` profile |
 | [`docker-compose.split.yml`](docker-compose.split.yml) | the gateway (`-app`) next to its own `pgvector/pgvector:pg17`; needs `SECRET_KEY`, `POSTGRES_PASSWORD` and `RAGMUX_DB_PASSWORD` in `.env` |
 | [`docker-compose.paradedb.yml`](docker-compose.paradedb.yml) | the split layout with ParadeDB in place of pgvector, for BM25 lexical retrieval |
-| [`docker-compose.scale.yml`](docker-compose.scale.yml) | an overlay on the split file: several gateway replicas behind nginx — see [Scaling](docs/scaling.md) |
-| [`docker-compose.otel.yml`](docker-compose.otel.yml) | an overlay adding an OpenTelemetry Collector — see [Observability](docs/observability.md) |
+| [`docker-compose.scale.yml`](docker-compose.scale.yml) | an overlay on the split file: several gateway replicas behind nginx; see [Scaling](docs/scaling.md) |
+| [`docker-compose.otel.yml`](docker-compose.otel.yml) | an overlay adding an OpenTelemetry Collector; see [Observability](docs/observability.md) |
 
 For a PostgreSQL you already operate, set `DATABASE_URL` and the default container skips
-its embedded server, or run the gateway-only `-app` image with `DATABASE_URL` and
-`SECRET_KEY`. The two layouts, the `/data` volume and how to move between them are
-described in [Deployment layouts](docs/configuration.md#deployment-layouts).
+its embedded server, or run the `-app` image with `DATABASE_URL` and `SECRET_KEY`. See
+[Deployment layouts](docs/configuration.md#deployment-layouts).
 
-**Where state lives.** With the default layout everything is in the `ragmux-data`
-volume (`/data/pg`: the database, `/data/ragmux`: the `secret.key` fallback) plus
-`SECRET_KEY`. With the split layout the gateway container is stateless and the state is
-the `pgdata` volume plus `SECRET_KEY`. Either way, back up with `scripts/backup.sh`
-(`pg_dump -Fc`, works with both layouts) or the scheduled `backup` Compose profile — see
-[Backup and restore](docs/backup-restore.md).
+## Usage
 
-## Using the gateway
+The steps below use the management API; the dashboard at `/admin/` does the same through
+forms. It is a single-page UI embedded in the binary: viewers get read-only screens,
+editors the forms, administrators the user and audit screens. Every screen is listed in
+[Dashboard](docs/dashboard.md).
 
 **1. Log in** and keep the session token:
 
 ```bash
 TOKEN=$(curl -s localhost:8765/admin/api/login -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"YOUR_PASSWORD","bearer":true}' | jq -r .token)
+  -d '{"username":"admin","password":"<ADMIN_PASSWORD>","bearer":true}' | jq -r .token)
 AUTH="Authorization: Bearer $TOKEN"
 ```
 
@@ -186,9 +137,9 @@ AUTH="Authorization: Bearer $TOKEN"
 
 ```bash
 curl -s localhost:8765/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
-  "name": "claude", "provider_type": "anthropic", "api_key": "sk-ant-...", "model_name": "claude-sonnet-4-5"}'
+  "name": "claude", "provider_type": "anthropic", "api_key": "<ANTHROPIC_API_KEY>", "model_name": "claude-sonnet-4-5"}'
 curl -s localhost:8765/admin/api/models -H "$AUTH" -H 'Content-Type: application/json' -d '{
-  "name": "openai-embed", "provider_type": "openai", "api_key": "sk-...", "model_name": "text-embedding-3-small"}'
+  "name": "openai-embed", "provider_type": "openai", "api_key": "<OPENAI_API_KEY>", "model_name": "text-embedding-3-small"}'
 ```
 
 **3. Create a RAG store and upload documents** (optional):
@@ -200,7 +151,7 @@ curl -s localhost:8765/admin/api/rag-stores/1/documents -H "$AUTH" -F file=@hand
 curl -s localhost:8765/admin/api/rag-stores/1/documents -H "$AUTH"    # status: pending → processing → ready
 ```
 
-**4. Create a project** and get its `sk-proj-…` key (shown only once):
+**4. Create a project** and get its `sk-proj-` key (shown only once):
 
 ```bash
 curl -s localhost:8765/admin/api/projects -H "$AUTH" -H 'Content-Type: application/json' -d '{
@@ -209,135 +160,140 @@ curl -s localhost:8765/admin/api/projects -H "$AUTH" -H 'Content-Type: applicati
 ```
 
 **5. Call it like OpenAI.** The `model` field is echoed back but the project decides the
-real model (a project with [routes](docs/providers.md#routing) uses it to pick one);
-retrieved passages are injected into the system prompt and counted in the
+real model (a project with [routes](docs/providers.md#routing) uses it to pick one).
+Retrieved passages are injected into the system prompt and counted in the
 `x-ragmux-rag-hits` header.
 
 ```bash
 curl -N localhost:8765/v1/chat/completions \
-  -H "Authorization: Bearer sk-proj-..." -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer <PROJECT_KEY>" -H 'Content-Type: application/json' \
   -d '{"model":"default","stream":true,"messages":[{"role":"user","content":"How many vacation days do I get?"}]}'
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-proj-...")
+client = OpenAI(base_url="http://localhost:8765/v1", api_key="<PROJECT_KEY>")
 resp = client.chat.completions.create(model="default", stream=True,
     messages=[{"role": "user", "content": "How many vacation days do I get?"}])
 for chunk in resp:
-    # Guard the array: an upstream may send a frame of its own with no
-    # choices (a content filter result, a proxy keep-alive), and asking for
-    # usage adds a final chunk that carries only the token counts.
+    # Guard the array: an upstream may send a frame with no choices, and
+    # asking for usage adds a final chunk that carries only the token counts.
     if chunk.choices:
         print(chunk.choices[0].delta.content or "", end="")
 ```
 
-## Dashboard
+Endpoints, roles per endpoint and the error envelope are in the
+[API reference](docs/api.md).
 
-`/admin/` serves a single-page dashboard (vanilla JavaScript, no build step, embedded in
-the binary) over the same REST API. On a fresh database it shows the first-run setup
-form; afterwards a sign-in screen that reports remaining attempts and lockouts. Screens:
+## How It Works
 
-- **Overview:** 24h / 7d / 30d window with deltas against the previous period, requests
-  per day, traffic by project, budget watch with exhaustion forecasts, recent requests
-  and a CSV export.
-- **Models:** connection cards with provider capabilities, last test result and private
-  upstream flag; the form can test a connection before saving it, start from a preset and
-  takes an Azure OpenAI endpoint, deployment and API version.
-- **RAG stores:** quota meters, drag-and-drop upload, ingestion progress, per-document
-  reprocess and a retrieval tester (hybrid / vector, rerank, per-stage latencies); the rerank
-  connection list follows the chosen backend.
-- **Projects:** usage rings for the minute, day and month windows with reset countdowns,
-  budget forecast banner, members, key rotation, a route editor (kind, up to eight targets
-  with model override, weight and priority) and a project CSV export.
-- **API keys:** mint and revoke your own `sk-user-…` and `sk-mgmt-…` keys with a scope
-  checklist, grants and limits.
-- **Playground:** real `/v1/chat/completions` calls with a project key, streaming or JSON,
-  optional extra system prompt, RAG sources as citations and the response headers.
-- **Users** and **Audit log** (admins): role and failed-login tiles, filters, NDJSON export.
+```text
+client  ──►  POST /v1/chat/completions (Bearer <PROJECT_KEY>)
+             │
+             ├─ project → model connection (provider credentials stay server-side)
+             ├─ project → RAG store (optional): embed query → top-k chunks → inject context
+             └─ adapter: OpenAI · Anthropic · Gemini · DeepSeek · Ollama · custom OpenAI (vLLM…)
+                          JSON and SSE streaming, normalised to the OpenAI schema
+             │
+             └─ PostgreSQL + pgvector: users, connections (AES-256-GCM keys), projects,
+                documents (bytea), chunks, HNSW vector indexes, request logs
+```
 
-What a user sees follows their role: viewers get read-only screens, editors the forms,
-admins the user and audit screens. The page ships its own fonts (Bricolage Grotesque,
-IBM Plex Sans, JetBrains Mono, all SIL OFL, `web/fonts/`) and runs under a strict
-`Content-Security-Policy`, so it makes no third-party requests.
+The binary is pure Go and ships as a static executable. Schema changes are embedded SQL
+files applied at startup under an advisory lock, so several replicas can start against one
+database.
+
+## Configuration
+
+Configuration is environment variables. The ones most installations touch:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | required for `-app` image | PostgreSQL connection string; the all-in-one image uses its embedded server when unset |
+| `SECRET_KEY` | `DATA_DIR/secret.key` fallback | 64 hex characters; encrypts provider credentials at rest |
+| `PORT` | `8765` | HTTP listen port |
+| `ADMIN_USER`, `ADMIN_PASSWORD` | `admin`, none | Create the first administrator on an empty database |
+| `TRUST_PROXY_HEADERS` | `false` | Take the client address from `X-Forwarded-For`; enable only behind a reverse proxy |
+| `TRUSTED_PROXY_CIDRS` | none | Networks whose proxy headers are honoured |
+| `SECURE_COOKIES` | `false` | Mark the session cookie `Secure` unconditionally |
+| `ALLOW_PRIVATE_UPSTREAMS` | `false` | Let provider URLs point at private networks |
+| `PRIVATE_UPSTREAM_ALLOWLIST` | none | Hostnames allowed to resolve to private addresses |
+
+Every variable, default and the `-healthcheck` / `-version` flags are in
+[Configuration](docs/configuration.md).
+
+## Deployment
+
+- **State is the `/data` volume plus `SECRET_KEY`.** In the all-in-one image `/data/pg` is
+  the PostgreSQL cluster and `/data/ragmux` holds the `secret.key` fallback. With the split
+  layout the gateway is stateless and the state is the `pgdata` volume plus `SECRET_KEY`.
+- **Terminate TLS in front.** Put a reverse proxy before the gateway and set
+  `TRUST_PROXY_HEADERS` and `SECURE_COOKIES`; see
+  [Behind a reverse proxy](docs/configuration.md#behind-a-reverse-proxy).
+- **Back up.** Use `scripts/backup.sh` (`pg_dump -Fc`, both layouts) or the scheduled
+  `backup` Compose profile; see [Backup and restore](docs/backup-restore.md).
+- **Scale out** with the `-app` image and an external PostgreSQL; see
+  [Scaling](docs/scaling.md).
+
+## Upgrading
+
+Back up first, then pull and restart:
+
+```bash
+scripts/backup.sh && docker compose pull && docker compose up -d
+```
+
+With `docker run`, `scripts/backup.sh` does not apply; dump the database directly, then pull,
+recreate the container on the same volume with the **same** `SECRET_KEY` (a new key cannot
+decrypt stored credentials). See [Backup and restore](docs/backup-restore.md).
+
+```bash
+docker exec -u postgres ragmux pg_dump -Fc --no-owner --no-privileges -d ragmux > ragmux.dump
+```
+
+Migrations run at gateway start. The PostgreSQL major version inside the all-in-one image
+never changes within a minor series, and pulling a newer image never runs `pg_upgrade`; see
+[Deployment layouts](docs/configuration.md#deployment-layouts). Release notes are in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation
 
+Reference pages are on <https://ragmux.com> and in this repository.
+
 | Page | Contents |
 |---|---|
-| [Configuration](docs/configuration.md) | every environment variable and default, `-healthcheck` / `-version` flags, Compose variables, reverse-proxy notes |
-| [API reference](docs/api.md) | authentication, roles per endpoint, request/response examples, error envelope, routes, the `/v1` surface (chat, embeddings, retrieve, rerank, models), `/healthz`, `/admin/api/system` |
-| [Retrieval (RAG)](docs/rag.md) | supported formats, chunking and contextual chunks, hybrid search and `fts_config`, `max_distance`, reranking, context format |
-| [Users, roles and limits](docs/users-and-limits.md) | roles matrix, project membership, login protection, audit log, rate limits and budgets, metrics and retention |
-| [Providers](docs/providers.md) | provider types and presets, Azure OpenAI, rerank providers, Anthropic / Gemini / Ollama translation details, request passthrough, model echo, routing, retry, fallback and the circuit breaker |
-| [Backup and restore](docs/backup-restore.md) | what to back up, `scripts/backup.sh` and `scripts/restore.sh`, scheduled backups, PITR, restore runbook |
-| [Scaling](docs/scaling.md) | running several replicas, what state is already shared, SECRET_KEY and connection pooling, leased ingestion, rolling restarts, Kubernetes notes |
-| [Observability](docs/observability.md) | `/metrics` and why it is authenticated, the metric table, the cardinality checklist, `/readyz` vs `/healthz`, tracing spans (GenAI names, per-attempt spans) and sampling, exporting over gRPC, running a Collector |
+| [Configuration](docs/configuration.md) | every environment variable and default, flags, subcommands, Compose variables, reverse-proxy notes |
+| [API reference](docs/api.md) | authentication, roles per endpoint, the `/v1` surface, error envelope, `/healthz` |
+| [Retrieval (RAG)](docs/rag.md) | formats, chunking, hybrid search, reranking, context format |
+| [Users, roles and limits](docs/users-and-limits.md) | roles matrix, login protection, audit log, rate limits, budgets, retention |
+| [Providers](docs/providers.md) | provider types and presets, translation details, routing, retry, fallback |
+| [Backup and restore](docs/backup-restore.md) | what to back up, scripts, scheduled backups, restore runbook |
+| [Scaling](docs/scaling.md) | several replicas, shared state, leased ingestion, rolling restarts |
+| [Observability](docs/observability.md) | `/metrics`, the metric table, `/readyz` vs `/healthz`, tracing |
 | [Changelog](CHANGELOG.md) | release notes |
+
+## Project Status
+
+**Beta.** Ragmux is pre-1.0: the public API, configuration keys and metric names can still
+change between minor versions, and each change is listed in the
+[CHANGELOG](CHANGELOG.md). The direction after the current release is in
+[ROADMAP.md](ROADMAP.md); OCR for scanned PDFs, SSO / OIDC login, cost-denominated budgets
+and an import tool for 0.1 databases are not scheduled.
+
+## Contributing
+
+Bug reports, documentation fixes and pull requests are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and the pull request process.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for supported versions, how to report a vulnerability
-(GitHub private reporting or `security@ragmux.com`) and hardening pointers.
-
-## Development
-
-Requires Go 1.27+ and Docker for the database.
-
-```bash
-make dev-db               # pgvector Postgres on localhost:5433 (docker-compose.dev.yml)
-make test                 # unit + end-to-end tests (mock upstream, real Postgres)
-make run                  # builds and runs on :8765 against the dev database
-make docker-build         # local all-in-one image, VERSION from git describe
-make docker-build-app     # local gateway-only (distroless) image
-make backup               # scripts/backup.sh against the compose stack
-make restore FILE=backups/ragmux-<stamp>.dump YES=1   # without YES=1: plan only
-```
-
-Tests read `TEST_DATABASE_URL` (the Makefile defaults it to
-`postgres://ragmux:ragmux@localhost:5433/ragmux_test?sslmode=disable`) and create a
-throwaway schema per test, so they run in parallel against one server; they are skipped
-when the variable is unset. CI also runs `gofmt`, `go vet`, `golangci-lint run ./...`
-(v2, config in `.golangci.yml`) and `govulncheck`. The binary is pure Go
-(`CGO_ENABLED=0`, `pgx`), shipped as a static executable: on a `pgvector/pgvector:pg17`
-base with the entrypoint `docker/aio/entrypoint.sh` supervising both processes
-(`Dockerfile.aio`, the default image) and on a distroless base (`Dockerfile`, the
-`-app` image). Schema
-changes are embedded SQL files in `internal/store/migrations/` applied at startup under
-an advisory lock.
-
-```
-cmd/ragmux/           entrypoint, HTTP server, admin bootstrap
-internal/config/      environment configuration
-internal/store/       PostgreSQL schema, migrations, encryption, pgvector search
-internal/provider/    OpenAI-compatible, Anthropic, Gemini, Ollama adapters + embedders
-internal/rag/         parsing, chunking, ingestion worker, retrieval, reranking
-internal/gateway/     /v1 proxy, RAG injection, metrics
-internal/limits/      per-project rate limits, token budgets, usage counters
-internal/maintenance/ hourly retention job
-internal/admin/       /admin REST API + dashboard hosting
-internal/metrics/     dependency-free Prometheus registry and text exposition
-internal/tracing/     OTLP/HTTP span exporter over the standard library
-internal/obs/         the metric set, its labels and the HTTP middlewares
-web/                  dashboard (index.html, vanilla JS) and its fonts, embedded in the binary
-docker/aio/           entrypoint of the all-in-one image (Postgres + gateway supervision)
-docker/postgres-init/ ragmux_app role and vector extension SQL shared by both layouts
-```
-
-## Roadmap
-
-Not in this release: an import tool for 0.1 (pre-PostgreSQL) databases, OCR for scanned
-PDFs, SSO / OIDC login, cost-denominated budgets, and a cache breakpoint on the gateway's
-own system prompt and RAG context block.
-
-The direction after this release is in [ROADMAP.md](ROADMAP.md); to help, see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Do not report security vulnerabilities in public issues; see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Ragmux is free software licensed under the **GNU Affero General Public License v3.0 or
-later** (AGPL-3.0-or-later); see [LICENSE](LICENSE). The AGPL's network-service clause
-applies: if you run a modified version as a service that users interact with over a
-network, you must offer those users the corresponding source of your modified version.
+Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE)
+(AGPL-3.0-or-later). If you run a modified version as a network service, the AGPL requires
+you to offer its users the corresponding source.
 
-Website and further material: <https://ragmux.com>
+The fonts in `web/fonts/` are third-party and licensed under the SIL Open Font License 1.1;
+the licence texts sit next to them.

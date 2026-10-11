@@ -6,51 +6,7 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.5.0] — 2026-10-11
-
-### Fixed
-- **Rerank spend is priced with the connection that did the rerank.** The `cost_micros`
-  of a request row used to be priced by the row's own connection only: the tokens of a
-  Cohere or Voyage reranker were never priced, `llm` rerank on `/v1/retrieve` was priced
-  at the embedding connection's rate, and in a routed chat a rerank run through the first
-  target was priced at the fallback target that answered. Each rerank spend is now priced
-  by the `model_prices` row of the connection that ran it and added to the main cost;
-  a spend with no price adds 0 and `cost_source` stays the main call's. A price row with
-  a `per_search_unit` rate (an explicit 0 included) prices a rerank by search units alone; its token prices are
-  never added on top. Token counts and limit accounting are unchanged.
-
-### Changed
-- **`model_prices.per_search_unit`** (migration `0020`, additive) and the price API's
-  `per_search_unit` field: the price of one Cohere search unit, per unit rather than per
-  million tokens. The built-in table is version 3 and now prices the Cohere and Voyage
-  rerank models; a built-in row you have not edited is refreshed on upgrade.
-- **The span names of the four `/v1` endpoints, and `gen_ai.operation.name` of
-  `/v1/retrieve`.** `gateway.chat_completion` and its siblings are replaced by the GenAI
-  names listed under Added, so a dashboard or alert that filters on the old names needs updating. The
-  retrieve endpoint's `gen_ai.operation.name` is `retrieval` (the convention's registered
-  value) instead of `retrieve`. Metrics and their labels are unchanged.
-- **The dashboard search reranks through the store's `rerank_connection_id`.** The
-  "first project linked to the store" heuristic is gone, so projects sharing a store rerank
-  the same way. A store without that id searches unreranked and the response carries
-  `rerank_skipped: true` and `rerank_skipped_reason`. The `llm` backend may now keep a
-  chat connection in `rerank_connection_id` (it used to be cleared); existing `llm` stores
-  need one set to rerank in the dashboard. A skipped search leaves `rerank_fallback` at
-  `false` (a skip is not a failure) and no longer counts as a rerank failure in metrics.
-- **`/v1` accepts the client's `X-Request-Id` again.** 0.4.x ignored the header entirely.
-  A `/v1` request may now send 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; Ragmux uses it
-  as the response's `X-Request-Id`, stores it in `request_logs.request_id` and logs it as
-  `client_req_id`. Anything else is replaced by a generated id, never rejected. The span
-  attribute `ragmux.request_id`, metric labels and the `req_id` log field stay generated,
-  and `/admin/api` is unchanged. A value shaped like a credential is accepted, so it can
-  reach your database and logs; see
-  [Observability](docs/observability.md#cardinality-checklist).
-- **A project with routes treats `model` as a selector.** In a project that has a chat
-  route, the request's `model` has to be a route name, the project's default model name or
-  empty; anything else is `404 model_not_found` instead of being replaced by the connection's
-  model name and echoed back to the client.
-  `GET /v1/models` lists the project's route names and the implicit route. A project
-  without routes behaves exactly as in 0.4.x. See
-  [Routes](docs/api.md#routes) and [Providers](docs/providers.md#routing).
+## [0.5.0] - 2026-10-11
 
 ### Added
 - **OpenTelemetry GenAI span names and per-attempt spans.** The request span is now named
@@ -135,6 +91,50 @@ All notable changes to Ragmux are documented here. The format follows
   without a line in the docs, or left in the docs after it was removed, fails the build.
   Fields left out on purpose are listed in the test with a reason each.
 
+### Changed
+- **`model_prices.per_search_unit`** (migration `0020`, additive) and the price API's
+  `per_search_unit` field: the price of one Cohere search unit, per unit rather than per
+  million tokens. The built-in table is version 3 and now prices the Cohere and Voyage
+  rerank models; a built-in row you have not edited is refreshed on upgrade.
+- **The span names of the four `/v1` endpoints, and `gen_ai.operation.name` of
+  `/v1/retrieve`.** `gateway.chat_completion` and its siblings are replaced by the GenAI
+  names listed under Added, so a dashboard or alert that filters on the old names needs updating. The
+  retrieve endpoint's `gen_ai.operation.name` is `retrieval` (the convention's registered
+  value) instead of `retrieve`. Metrics and their labels are unchanged.
+- **The dashboard search reranks through the store's `rerank_connection_id`.** The
+  "first project linked to the store" heuristic is gone, so projects sharing a store rerank
+  the same way. A store without that id searches unreranked and the response carries
+  `rerank_skipped: true` and `rerank_skipped_reason`. The `llm` backend may now keep a
+  chat connection in `rerank_connection_id` (it used to be cleared); existing `llm` stores
+  need one set to rerank in the dashboard. A skipped search leaves `rerank_fallback` at
+  `false` (a skip is not a failure) and no longer counts as a rerank failure in metrics.
+- **`/v1` accepts the client's `X-Request-Id` again.** 0.4.x ignored the header entirely.
+  A `/v1` request may now send 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; Ragmux uses it
+  as the response's `X-Request-Id`, stores it in `request_logs.request_id` and logs it as
+  `client_req_id`. Anything else is replaced by a generated id, never rejected. The span
+  attribute `ragmux.request_id`, metric labels and the `req_id` log field stay generated,
+  and `/admin/api` is unchanged. A value shaped like a credential is accepted, so it can
+  reach your database and logs; see
+  [Observability](docs/observability.md#cardinality-checklist).
+- **A project with routes treats `model` as a selector.** In a project that has a chat
+  route, the request's `model` has to be a route name, the project's default model name or
+  empty; anything else is `404 model_not_found` instead of being replaced by the connection's
+  model name and echoed back to the client.
+  `GET /v1/models` lists the project's route names and the implicit route. A project
+  without routes behaves exactly as in 0.4.x. See
+  [Routes](docs/api.md#routes) and [Providers](docs/providers.md#routing).
+
+### Fixed
+- **Rerank spend is priced with the connection that did the rerank.** The `cost_micros`
+  of a request row used to be priced by the row's own connection only: the tokens of a
+  Cohere or Voyage reranker were never priced, `llm` rerank on `/v1/retrieve` was priced
+  at the embedding connection's rate, and in a routed chat a rerank run through the first
+  target was priced at the fallback target that answered. Each rerank spend is now priced
+  by the `model_prices` row of the connection that ran it and added to the main cost;
+  a spend with no price adds 0 and `cost_source` stays the main call's. A price row with
+  a `per_search_unit` rate (an explicit 0 included) prices a rerank by search units alone; its token prices are
+  never added on top. Token counts and limit accounting are unchanged.
+
 ### Security
 - **Existing `chat` gateway keys gain the `embeddings`, `retrieve` and `rerank` scopes.**
   Migration `0018` adds the three new scopes to every gateway key that carries `chat`,
@@ -144,7 +144,7 @@ All notable changes to Ragmux are documented here. The format follows
   endpoints. The project's default `sk-proj-…` key carries no scopes and reaches them
   automatically. See [Users, roles and limits](docs/users-and-limits.md#api-keys).
 
-## [0.4.2] — 2026-10-02
+## [0.4.2] - 2026-10-02
 
 Bug fixes, observability and documentation. No schema change.
 
@@ -231,7 +231,7 @@ Bug fixes, observability and documentation. No schema change.
   `docs/observability.md` no longer lists the tracing export metrics as gauges (they are
   counters).
 
-## [0.4.1] — 2026-09-19
+## [0.4.1] - 2026-09-19
 
 Documentation and release plumbing only. No Go code changed since 0.4.0, so the `v0.4.1`
 images carry the same gateway binary as `v0.4.0`; nothing about the runtime behaviour,
@@ -268,7 +268,7 @@ the API or the database schema is different. Upgrading is optional.
   [Configuration](docs/configuration.md) and
   [Backup and restore](docs/backup-restore.md).
 
-## [0.4.0] — 2026-09-19
+## [0.4.0] - 2026-09-19
 
 ### Added
 - **User-owned API keys** (`api_keys`, migration `0010`): a key now belongs to a dashboard
@@ -472,38 +472,6 @@ the API or the database schema is different. Upgrading is optional.
 - **An inline `data:` URL is recognised whatever the case of its scheme.** `DATA:image/png`
   used to be forwarded as a remote URL.
 
-### Fixed
-- Ollama tool calls spread over several streaming lines were all given index `0` and
-  merged by clients into one corrupt call; they are now numbered across the whole stream.
-- Browser clients could not read `x-ratelimit-*`, `x-ragmux-*` or `Retry-After`: the
-  responses never carried `Access-Control-Expose-Headers`.
-- A document whose file type is unsupported no longer has the rejected extension quoted
-  into its error; the message names the supported types instead, so a piece of a
-  user-supplied filename no longer travels into the error or onto the `ingest.document`
-  span.
-
-### Security
-- A management key is accepted **only** from the `Authorization` header. One pasted into
-  the session cookie is refused before it is even looked up, which is what keeps the
-  existing CSRF exemption for bearer requests sound: a browser cannot attach an
-  `Authorization` header cross-origin without a preflight, while it will attach a cookie
-  to any cross-site request on its own.
-- Changing a password, resetting another user's password and minting a management key
-  require an interactive session, so a leaked key cannot take over the account it belongs
-  to.
-- An expired, revoked or deactivated-owner key answers `401` with a `code` explaining
-  which; an unknown key keeps the previous opaque message, so nothing can be enumerated by
-  a caller who does not already hold a valid key.
-- `GET /admin/api/setup` stops describing the installation once setup is done. The
-  endpoint is unauthenticated by design, and it used to answer in full whether or not
-  setup was still pending, handing an anonymous request the migrations version, the
-  PostgreSQL role, where `SECRET_KEY` came from and — since the wizard landed —
-  `has_connections` and `has_projects`. No one field is an opening; together they are a
-  free reconnaissance call on an internet-facing install. **Once any user exists the
-  response is `{"needs_setup": false}` and nothing else.** While setup is still pending
-  nothing changes: the wizard's first screen gets everything it shows. The dashboard now
-  resumes a reloaded wizard from its own stored step instead of from this endpoint.
-
 ### Upgrade notes
 - **Moving an existing store to `search_backend: "pg_search"` builds the BM25 index inside
   a request.** The first hybrid search of such a store indexes every row in `chunks` before
@@ -542,7 +510,39 @@ the API or the database schema is different. Upgrading is optional.
   one.** Dropping `idx_chunks_bm25` first is not enough; see
   [Backup and restore](docs/backup-restore.md#restoring-a-paradedb-dump-onto-a-plain-pgvector-server).
 
-## [0.3.1] — 2026-09-18
+### Fixed
+- Ollama tool calls spread over several streaming lines were all given index `0` and
+  merged by clients into one corrupt call; they are now numbered across the whole stream.
+- Browser clients could not read `x-ratelimit-*`, `x-ragmux-*` or `Retry-After`: the
+  responses never carried `Access-Control-Expose-Headers`.
+- A document whose file type is unsupported no longer has the rejected extension quoted
+  into its error; the message names the supported types instead, so a piece of a
+  user-supplied filename no longer travels into the error or onto the `ingest.document`
+  span.
+
+### Security
+- A management key is accepted **only** from the `Authorization` header. One pasted into
+  the session cookie is refused before it is even looked up, which is what keeps the
+  existing CSRF exemption for bearer requests sound: a browser cannot attach an
+  `Authorization` header cross-origin without a preflight, while it will attach a cookie
+  to any cross-site request on its own.
+- Changing a password, resetting another user's password and minting a management key
+  require an interactive session, so a leaked key cannot take over the account it belongs
+  to.
+- An expired, revoked or deactivated-owner key answers `401` with a `code` explaining
+  which; an unknown key keeps the previous opaque message, so nothing can be enumerated by
+  a caller who does not already hold a valid key.
+- `GET /admin/api/setup` stops describing the installation once setup is done. The
+  endpoint is unauthenticated by design, and it used to answer in full whether or not
+  setup was still pending, handing an anonymous request the migrations version, the
+  PostgreSQL role, where `SECRET_KEY` came from and — since the wizard landed —
+  `has_connections` and `has_projects`. No one field is an opening; together they are a
+  free reconnaissance call on an internet-facing install. **Once any user exists the
+  response is `{"needs_setup": false}` and nothing else.** While setup is still pending
+  nothing changes: the wizard's first screen gets everything it shows. The dashboard now
+  resumes a reloaded wizard from its own stored step instead of from this endpoint.
+
+## [0.3.1] - 2026-09-18
 
 ### Added
 - **All-in-one container image** (`Dockerfile.aio`, published as `ghcr.io/ragmux/ragmux:<version>`
@@ -611,7 +611,7 @@ the API or the database schema is different. Upgrading is optional.
   rejected. A fuzz target (`FuzzExtractPDF`) and regression cases for truncated,
   cyclic, zero-page and oversized inputs cover the parser.
 
-## [0.3.0] — 2026-09-18
+## [0.3.0] - 2026-09-18
 
 ### Added
 - **RAG sources on chat responses.** Responses whose prompt received retrieved context
@@ -693,7 +693,11 @@ the API or the database schema is different. Upgrading is optional.
   `database.pgvector_version` to admins only; editors and viewers receive the
   `database` object without those two keys.
 
-## [0.2.3] — 2026-09-18
+## [0.2.3] - 2026-09-18
+
+### Added
+- `SECURITY.md`: supported versions, how to report a vulnerability, response targets,
+  scope and hardening pointers.
 
 ### Changed
 - **First-run setup replaces the generated password.** A fresh database no longer gets an
@@ -705,10 +709,6 @@ the API or the database schema is different. Upgrading is optional.
   limit and the result is audited as `setup.complete`. `ADMIN_USER` / `ADMIN_PASSWORD`
   still pre-create the account for unattended installs; without `ADMIN_PASSWORD` the log
   says `no users yet: open /admin/ to create the first administrator`.
-
-### Added
-- `SECURITY.md`: supported versions, how to report a vulnerability, response targets,
-  scope and hardening pointers.
 
 ### Security
 - **Provider keys are bound to their connection.** `api_key_enc` is now sealed with the
@@ -741,7 +741,7 @@ the API or the database schema is different. Upgrading is optional.
   form has "Max documents" / "Max size (MB)" fields and the store table shows usage
   against the quotas. Bounds the storage and embedding cost an editor can cause.
 
-## [0.2.2] — 2026-09-18
+## [0.2.2] - 2026-09-18
 
 ### Security
 - **SSRF guard for provider URLs.** Outbound provider connections are dialled through a
@@ -801,7 +801,7 @@ the API or the database schema is different. Upgrading is optional.
   on the command line. Dependabot, image provenance/SBOM and a pinned golangci-lint
   version were added to CI.
 
-## [0.2.1] — 2026-09-18
+## [0.2.1] - 2026-09-18
 
 ### Fixed
 - OpenAI-compatible requests carried a stray `"Extra": null` field, which OpenAI rejects with
@@ -816,22 +816,7 @@ Verified live against OpenAI (`gpt-4o-mini`, `text-embedding-3-small`), Anthropi
 (`claude-opus-5`), Gemini (`gemini-3.6-flash`) and a local Ollama `gemma4:12b`: JSON and
 streaming chat, tool calls (OpenAI, Anthropic), hybrid RAG with reranking over MD/DOCX/HTML.
 
-## [0.2.0] — 2026-09-18
-
-### Breaking
-- **Storage moved from embedded SQLite/sqlite-vec to PostgreSQL + pgvector.** `DATABASE_URL`
-  is now required and the gateway is deployed together with a Postgres instance
-  (`docker-compose.yml` bundles `pgvector/pgvector:pg17`). There is no migration tool for
-  a 0.1 SQLite database.
-- Uploaded documents are stored in the database as `bytea`; the `uploads/` directory is gone.
-- The provider credential encryption key should be supplied via `SECRET_KEY` (64 hex
-  characters). The on-disk `DATA_DIR/secret.key` fallback remains for development only.
-- `GET /admin/api/system` returns `database` (Postgres, pgvector and migration versions,
-  size), `backup` and `secret_key_source` instead of `data_dir`, `db_size_bytes` and
-  `vector_engine`.
-- Proxy headers are no longer trusted by default: the client IP for login limits and the
-  audit log is the TCP peer address unless `TRUST_PROXY_HEADERS=true`.
-- License changed to AGPL-3.0-or-later.
+## [0.2.0] - 2026-09-18
 
 ### Added
 - Roles (`admin`, `editor`, `viewer`), a user management API (`/admin/api/users…`) and a
@@ -884,6 +869,19 @@ streaming chat, tool calls (OpenAI, Anthropic), hybrid RAG with reranking over M
   limits, providers, backup and restore).
 
 ### Changed
+- **BREAKING:** **Storage moved from embedded SQLite/sqlite-vec to PostgreSQL + pgvector.** `DATABASE_URL`
+  is now required and the gateway is deployed together with a Postgres instance
+  (`docker-compose.yml` bundles `pgvector/pgvector:pg17`). There is no migration tool for
+  a 0.1 SQLite database.
+- **BREAKING:** Uploaded documents are stored in the database as `bytea`; the `uploads/` directory is gone.
+- **BREAKING:** The provider credential encryption key should be supplied via `SECRET_KEY` (64 hex
+  characters). The on-disk `DATA_DIR/secret.key` fallback remains for development only.
+- **BREAKING:** `GET /admin/api/system` returns `database` (Postgres, pgvector and migration versions,
+  size), `backup` and `secret_key_source` instead of `data_dir`, `db_size_bytes` and
+  `vector_engine`.
+- **BREAKING:** Proxy headers are no longer trusted by default: the client IP for login limits and the
+  audit log is the TCP peer address unless `TRUST_PROXY_HEADERS=true`.
+- **BREAKING:** License changed to AGPL-3.0-or-later.
 - `docker-compose.dev.yml` and `make dev-db` start a local pgvector Postgres for tests;
   tests read `TEST_DATABASE_URL` and use a throwaway schema each.
 - Migrations run at startup under an advisory lock so several replicas can start against
@@ -897,7 +895,7 @@ streaming chat, tool calls (OpenAI, Anthropic), hybrid RAG with reranking over M
 - No Prometheus metrics endpoint; metrics are available through the admin API and dashboard.
 - No SSO / OIDC; authentication is username and password only.
 
-## [0.1.0] — 2026-09-18
+## [0.1.0] - 2026-09-18
 
 Initial release: single-container gateway with SQLite + sqlite-vec, OpenAI-compatible proxy
 for OpenAI, Anthropic, Gemini, DeepSeek, Ollama and custom endpoints, RAG over PDF/TXT/MD,

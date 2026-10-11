@@ -1,36 +1,43 @@
-# Security policy
+# Security Policy
 
-Ragmux sits between your users and your provider API keys, so we treat reports
-seriously and fix them quickly. Thank you for helping keep it safe.
+Ragmux sits between your users and your provider API keys, so security reports are
+taken seriously. Thank you for helping keep it safe.
 
-## Supported versions
+## Supported Versions
 
 | Version | Supported |
 |---|---|
-| 0.4.x | yes |
-| < 0.4 | no, upgrade to the latest 0.4.x |
+| 0.5.0 (latest release) | Yes |
+| Older versions | No |
 
-Fixes ship as patch releases of the current minor version; older lines do not receive
-backports.
+Ragmux is at 0.y.z: only the latest release receives security fixes, and older lines are
+not backported.
 
-## Reporting a vulnerability
+## Reporting a Vulnerability
 
-Please do **not** open a public issue for security problems. Use one of:
+Do not report security vulnerabilities through public issues, pull requests or discussions.
 
-- GitHub private vulnerability reporting:
-  <https://github.com/ragmux/ragmux/security/advisories/new>
-- Email: <security@ragmux.com>
+Report vulnerabilities privately through GitHub Private Vulnerability Reporting:
+[open a private security advisory](https://github.com/Ragmux/ragmux/security/advisories/new).
 
-Include the version (`ragmux -version` or `/healthz`), the deployment shape (Docker
-Compose, bare binary, reverse proxy), steps to reproduce and the impact you see. Proof
-of concept code is welcome; please keep testing to systems you own.
+If you cannot use GitHub, send an email to `info@muhammetsafak.com` with the subject line `[SECURITY] ragmux`.
 
-## What to expect
+Please include:
 
-- Acknowledgement within **3 business days**.
-- A fix or a documented mitigation within **30 days** for high and critical issues;
-  lower severities are scheduled into the next release.
-- We keep you updated while the report is open and tell you when the fix ships.
+- the affected version or versions (`ragmux -version` or `/healthz`),
+- the deployment shape (Docker Compose, bare binary, reverse proxy) and the steps to reproduce the issue,
+- the impact of the vulnerability,
+- a suggested fix, if you have one.
+
+Proof of concept code is welcome; please keep testing to systems you own.
+
+## Response Process
+
+- You will receive a response within 7 days of your report.
+- The report is assessed and you are informed of the result.
+- After a fix is released, a GitHub Security Advisory is published.
+- If you wish, you are credited for the report in the advisory.
+- Please give the maintainers time to ship a fix before you publish details.
 
 ## Scope
 
@@ -44,6 +51,7 @@ In scope:
 
 Out of scope:
 
+- vulnerabilities in third-party dependencies (report them to their maintainers)
 - vulnerabilities in third-party providers (OpenAI, Anthropic, Gemini, Ollama, ...) or
   in the models themselves
 - deployments that ignore the documented hardening: the gateway exposed without TLS or a
@@ -54,13 +62,11 @@ Out of scope:
 - denial of service that requires a valid project API key and stays within the
   configured rate limits and budgets
 
-## Disclosure
+## Container Images and Hardening
 
-We follow coordinated disclosure: the fix is released first, then the advisory is
-published with credit to the reporter in the release notes (unless you prefer to stay
-anonymous). Please give us the response window above before publishing details.
+The sections below are guidance for operators, not part of the scope above.
 
-## Verifying the container image
+### Verifying the container image
 
 Images published from **v0.3.1 onward** are signed with [cosign](https://docs.sigstore.dev/)
 (keyless, Sigstore/Fulcio through the release workflow's GitHub OIDC identity). Verify
@@ -80,10 +86,11 @@ all-in-one image under `:<version>` / `:latest` and the gateway-only image under
 so it also covers the `:<major>.<minor>` and `:latest` (`-app`) tags that point at the
 same release. Pinning deployments to the digest reported by `cosign verify` (or by
 `docker buildx imagetools inspect`) protects against a tag being moved later. The same
-check works for `docker.io/ragmux/ragmux` when the Docker Hub mirror is published.
+check works for `docker.io/ragmux/ragmux`: the release workflow signs the Docker Hub
+image the same way whenever it publishes there.
 Releases before 0.3.1 carry no signature.
 
-## The all-in-one image
+### The all-in-one image
 
 The default image (`ghcr.io/ragmux/ragmux:<version>`) bundles PostgreSQL 17 with
 pgvector next to the gateway on a Debian base (`pgvector/pgvector:pg17`, pinned by
@@ -110,7 +117,7 @@ digest in `Dockerfile.aio`). Two consequences for your threat model:
 The `-app` image stays distroless (`gcr.io/distroless/static-debian12:nonroot`, a
 single static binary, no shell) for environments where that matters.
 
-## Hardening pointers
+### Hardening pointers
 
 The defaults are conservative, but a production deployment should read these sections
 of [Configuration](docs/configuration.md):
@@ -126,7 +133,6 @@ of [Configuration](docs/configuration.md):
 - [Environment variables](docs/configuration.md#environment-variables) and
   [Docker Compose variables](docs/configuration.md#docker-compose-variables): keeping
   `SECRET_KEY` and `DATABASE_URL` in secrets files (`*_FILE`) instead of `.env`
-
 - [Formats and parsing](docs/rag.md#formats-and-parsing): uploaded documents are parsed
   under size, page and time caps and PDFs in a disposable child process; keep
   `MAX_UPLOAD_MB` modest and give upload rights only to members you trust
