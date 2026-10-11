@@ -73,10 +73,12 @@ Images published from **v0.3.1 onward** are signed with [cosign](https://docs.si
 a tag before pulling it into production:
 
 ```sh
-cosign verify ghcr.io/ragmux/ragmux:<tag> \
+cosign verify docker.io/ragmux/ragmux:<tag> \
   --certificate-identity-regexp '^https://github.com/[Rr]agmux/ragmux/.github/workflows/release.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+For the GHCR mirror, run the same command against `ghcr.io/ragmux/ragmux:<tag>`.
 
 A successful run prints the signature payload and the certificate's identity, which must
 be `release.yml` in this repository running for a `v*` tag; anything else means the image
@@ -85,14 +87,14 @@ all-in-one image under `:<version>` / `:latest` and the gateway-only image under
 `:<version>-app` / `:latest-app`. The signature is attached to the manifest digest,
 so it also covers the `:<major>.<minor>` and `:latest` (`-app`) tags that point at the
 same release. Pinning deployments to the digest reported by `cosign verify` (or by
-`docker buildx imagetools inspect`) protects against a tag being moved later. The same
-check works for `docker.io/ragmux/ragmux`: the release workflow signs the Docker Hub
-image the same way whenever it publishes there.
+`docker buildx imagetools inspect`) protects against a tag being moved later. Verify the
+image from the registry you actually pull from: a signature on one registry's copy does
+not vouch for the other.
 Releases before 0.3.1 carry no signature.
 
 ### The all-in-one image
 
-The default image (`ghcr.io/ragmux/ragmux:<version>`) bundles PostgreSQL 17 with
+The default image (`ragmux/ragmux:<version>`) bundles PostgreSQL 17 with
 pgvector next to the gateway on a Debian base (`pgvector/pgvector:pg17`, pinned by
 digest in `Dockerfile.aio`). Two consequences for your threat model:
 
