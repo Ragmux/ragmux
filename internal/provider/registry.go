@@ -16,6 +16,8 @@ func New(cfg Config) (Provider, error) {
 		return newAnthropic(cfg), nil
 	case "gemini":
 		return newGemini(cfg), nil
+	case AzureProviderType:
+		return newAzure(cfg), nil
 	case "cohere_rerank", "voyage_rerank":
 		return nil, fmt.Errorf("%s connections only offer a rerank API; they cannot back a project's chat model", cfg.ProviderType)
 	}
@@ -36,6 +38,8 @@ func NewEmbedder(cfg Config) (Embedder, error) {
 		return &ollamaEmbedder{cfg: cfg, base: base}, nil
 	case "gemini":
 		return &geminiEmbedder{cfg: cfg, base: cfg.baseURL(geminiBase)}, nil
+	case AzureProviderType:
+		return &azureEmbedder{t: newAzureTarget(cfg)}, nil
 	case "anthropic":
 		return nil, fmt.Errorf("anthropic does not offer an embeddings API; choose another connection for embeddings")
 	case "deepseek":

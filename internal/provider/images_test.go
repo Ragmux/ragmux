@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1037,5 +1038,31 @@ func TestImageFetcherWithoutClientRefuses(t *testing.T) {
 	var perr *Error
 	if !errors.As(err, &perr) || perr.Status != 400 {
 		t.Fatalf("err = %v, want a 400 provider error", err)
+	}
+}
+
+// A download that fails on the wire is the client's doing (it chose the host):
+// the client still sees the transport error's status and text, but nothing
+// marks it as an attempt that was never sent or is worth repeating.
+func TestImageFetchTransportFailureIsClientInput(t *testing.T) {
+	dnsFail := &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, &net.DNSError{Err: "no such host", Name: "images.invalid", IsNotFound: true}
+		}}}
+	f := &ImageFetcher{Client: dnsFail}
+	_, _, err := f.Fetch(context.Background(), "http://images.invalid/a.png", "t", imageMediaTypesDefault)
+	var pe *Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	if !pe.ClientInput || pe.NotSent || pe.Retryable {
+		t.Errorf("ClientInput = %v NotSent = %v Retryable = %v, want true, false, false", pe.ClientInput, pe.NotSent, pe.Retryable)
+	}
+	if pe.Status != http.StatusBadGateway || strings.Contains(pe.Message, "/a.png") {
+		t.Errorf("status = %d message = %q", pe.Status, pe.Message)
+	}
+	// An adapter's own dial failure is still the target's.
+	if own := transportError(Config{ProviderType: "x"}, "http://images.invalid/a.png", &net.DNSError{Err: "no such host", IsNotFound: true}); own.ClientInput || !own.NotSent {
+		t.Errorf("adapter dial failure: ClientInput = %v NotSent = %v", own.ClientInput, own.NotSent)
 	}
 }

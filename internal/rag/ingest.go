@@ -519,16 +519,18 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 		chunks[i] = c
 	}
 	ing.progress(ctx, docID, progressChunked, nil)
+	tokens := 0
 	for i := 0; i < len(chunks); i += ing.batchSize {
 		end := i + ing.batchSize
 		if end > len(chunks) {
 			end = len(chunks)
 		}
 		inputs := inputs[i:end]
-		vecs, err := embedder.Embed(ctx, inputs)
+		vecs, usage, err := embedder.Embed(ctx, inputs)
 		if err != nil {
 			return 0, fmt.Errorf("embed batch %d: %w", i/ing.batchSize, err)
 		}
+		tokens += ing.recordEmbedUsage(usage, inputs)
 		for j := range vecs {
 			chunks[i+j].Embedding = vecs[j]
 		}
@@ -542,8 +544,24 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 		return 0, fmt.Errorf("store chunks: %w", err)
 	}
 	ing.log.Info("document ingested", "doc", docID, "file", doc.Filename, "chunks", len(chunks),
-		"dims", len(chunks[0].Embedding), "took", time.Since(start).Round(time.Millisecond))
+		"dims", len(chunks[0].Embedding), "embed_tokens", tokens, "took", time.Since(start).Round(time.Millisecond))
 	return len(chunks), nil
+}
+
+// recordEmbedUsage counts the tokens one embedding batch spent and returns
+// them. The upstream's own count is used when it sent one; otherwise the
+// tokens are estimated from the input text with EstimateTokens.
+func (ing *Ingester) recordEmbedUsage(usage *provider.Usage, inputs []string) int {
+	if usage != nil && usage.PromptTokens > 0 {
+		ing.metrics.RecordIngestEmbedTokens(obs.EmbedTokensReported, usage.PromptTokens)
+		return usage.PromptTokens
+	}
+	est := 0
+	for _, in := range inputs {
+		est += EstimateTokens(in)
+	}
+	ing.metrics.RecordIngestEmbedTokens(obs.EmbedTokensEstimated, est)
+	return est
 }
 
 // Progress milestones of the pipeline, in percent; embedding batches fill

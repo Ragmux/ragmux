@@ -4,6 +4,146 @@ All notable changes to Ragmux are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.5.0] — 2026-10-11
+
+### Fixed
+- **Rerank spend is priced with the connection that did the rerank.** The `cost_micros`
+  of a request row used to be priced by the row's own connection only: the tokens of a
+  Cohere or Voyage reranker were never priced, `llm` rerank on `/v1/retrieve` was priced
+  at the embedding connection's rate, and in a routed chat a rerank run through the first
+  target was priced at the fallback target that answered. Each rerank spend is now priced
+  by the `model_prices` row of the connection that ran it and added to the main cost;
+  a spend with no price adds 0 and `cost_source` stays the main call's. A price row with
+  a `per_search_unit` rate (an explicit 0 included) prices a rerank by search units alone; its token prices are
+  never added on top. Token counts and limit accounting are unchanged.
+
+### Changed
+- **`model_prices.per_search_unit`** (migration `0020`, additive) and the price API's
+  `per_search_unit` field: the price of one Cohere search unit, per unit rather than per
+  million tokens. The built-in table is version 3 and now prices the Cohere and Voyage
+  rerank models; a built-in row you have not edited is refreshed on upgrade.
+- **The span names of the four `/v1` endpoints, and `gen_ai.operation.name` of
+  `/v1/retrieve`.** `gateway.chat_completion` and its siblings are replaced by the GenAI
+  names listed under Added, so a dashboard or alert that filters on the old names needs updating. The
+  retrieve endpoint's `gen_ai.operation.name` is `retrieval` (the convention's registered
+  value) instead of `retrieve`. Metrics and their labels are unchanged.
+- **The dashboard search reranks through the store's `rerank_connection_id`.** The
+  "first project linked to the store" heuristic is gone, so projects sharing a store rerank
+  the same way. A store without that id searches unreranked and the response carries
+  `rerank_skipped: true` and `rerank_skipped_reason`. The `llm` backend may now keep a
+  chat connection in `rerank_connection_id` (it used to be cleared); existing `llm` stores
+  need one set to rerank in the dashboard. A skipped search leaves `rerank_fallback` at
+  `false` (a skip is not a failure) and no longer counts as a rerank failure in metrics.
+- **`/v1` accepts the client's `X-Request-Id` again.** 0.4.x ignored the header entirely.
+  A `/v1` request may now send 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; Ragmux uses it
+  as the response's `X-Request-Id`, stores it in `request_logs.request_id` and logs it as
+  `client_req_id`. Anything else is replaced by a generated id, never rejected. The span
+  attribute `ragmux.request_id`, metric labels and the `req_id` log field stay generated,
+  and `/admin/api` is unchanged. A value shaped like a credential is accepted, so it can
+  reach your database and logs; see
+  [Observability](docs/observability.md#cardinality-checklist).
+- **A project with routes treats `model` as a selector.** In a project that has a chat
+  route, the request's `model` has to be a route name, the project's default model name or
+  empty; anything else is `404 model_not_found` instead of being replaced by the connection's
+  model name and echoed back to the client.
+  `GET /v1/models` lists the project's route names and the implicit route. A project
+  without routes behaves exactly as in 0.4.x. See
+  [Routes](docs/api.md#routes) and [Providers](docs/providers.md#routing).
+
+### Added
+- **OpenTelemetry GenAI span names and per-attempt spans.** The request span is now named
+  `chat {model}`, `embeddings {model}`, `rerank {model}` or `retrieval {store id}` once the
+  request is routed (a request refused earlier keeps `gateway.*`). Every upstream attempt,
+  retry or fallback, is a `gateway.attempt` child span carrying `ragmux.attempt`,
+  `ragmux.retry`, `ragmux.fallback`, the route and the failure class; provider spans hang
+  beneath it. The request span adds `ragmux.route`, `ragmux.attempts` and
+  `ragmux.fallback.from_connection`. See
+  [Observability](docs/observability.md#the-spans).
+- **Optional OTLP/gRPC trace exporter.** `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` (or
+  `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`) sends traces to a collector's gRPC port. HTTP/JSON
+  stays the default, and the gRPC client is built on the standard library, so there is no
+  new dependency. `OTEL_EXPORTER_OTLP_INSECURE=true` makes a scheme-less endpoint
+  plaintext. See [Observability](docs/observability.md#exporting-over-grpc).
+- **`POST /v1/rerank`.** Cohere-shaped rerank endpoint (`query`, `documents`, `top_n`,
+  `model`; `results[{index, relevance_score}]`), behind the new-style pipeline with scope
+  `rerank` and `endpoint = rerank` in the request log. `model` resolves to a `kind = rerank`
+  route, else to the RAG store's `rerank_connection_id` (the implicit route), else
+  `404 model_not_found`. A rerank API connection (`cohere_rerank`, `voyage_rerank`) or a
+  chat connection can serve it. See [`POST /v1/rerank`](docs/api.md#post-v1rerank).
+- **Rerank tokens are counted.** The tokens of an LLM or API rerank inside a RAG chat or
+  `/v1/retrieve` request are added to that request's row, and a `/v1/rerank` call logs its
+  own tokens. An API reranker's tokens count toward limits and usage but are not priced
+  (it bills by search unit); the estimate is made over the passages as sent (capped at 4000
+  characters each), not the full text. LLM rerank tokens are priced at the row's model.
+- **`/v1/rerank` through a chat model scores only what the model ranked.** The documents
+  the model ranked get `1.0` down to `1/r`; the others follow in request order with a
+  score of `0`, and an empty answer scores every document `0`.
+- **`RERANK_MAX_TOKENS`** sets the reply cap of the LLM reranker (default `200`, as before).
+- **Retry and route-internal fallback.** A chat call that fails before the first byte is
+  sent is retried on the same target (connection never established, `429`, `503`) and then
+  handed to the route's next target; `UPSTREAM_MAX_RETRIES` (default `2`, `0` disables)
+  sets the retries per target. `UPSTREAM_TIMEOUT` is now the budget of all attempts
+  together. A request is still one `request_logs` row, with `attempt` and `fallback_from`
+  filled in. New metrics `ragmux_upstream_retries_total` and
+  `ragmux_upstream_fallbacks_total`. See [Retry and fallback](docs/providers.md#retry-and-fallback).
+- **Circuit breaker per model connection.** A connection that fails `BREAKER_FAILURE_THRESHOLD`
+  times in a row (default `5`, `0` disables) is skipped by fallback for `BREAKER_OPEN_DURATION`
+  (default `30s`), then probed with a single call. When every target of a route is open the
+  first one is called once, without retries. State is in memory and per replica. New metric
+  `ragmux_upstream_breaker_state{connection}` (`0` closed, `1` open, `2` half-open). See
+  [Retry and fallback](docs/providers.md#retry-and-fallback).
+- `request_logs` gains `request_id`, `endpoint`, `requested_model`, `route`, `attempt` and
+  `fallback_from` (migrations `0016`, `0017`); see
+  [the request log](docs/observability.md#the-request-log). `0017` builds its index
+  `CONCURRENTLY`, outside a transaction. `requested_model` is cut to 256 bytes.
+- **Routes.** A project can hold named routes of 1 to 8 targets, each a model connection
+  with an optional upstream model name, a `weight` (1-1000) and a `priority` (0-100). A call
+  tries the targets by priority group, in weighted random order inside a group. Managed
+  through `/admin/api/projects/{id}/routes` (migration `0019`: `project_routes`,
+  `route_targets`); audit events `route.create`, `route.update` and `route.delete`. A
+  connection that a route target uses cannot be deleted (`409`). See
+  [Routes](docs/api.md#routes) and [Providers](docs/providers.md#routing).
+- **`POST /v1/embeddings`.** OpenAI-shaped embeddings endpoint (`float` and `base64`
+  encodings) behind scope `embeddings`, with `endpoint = embeddings` in the request log.
+  `model` resolves to a `kind = embeddings` route, else to the RAG store's embedding
+  connection, else `404 model_not_found`. See
+  [`POST /v1/embeddings`](docs/api.md#post-v1embeddings).
+- **`POST /v1/retrieve`.** Returns the chunks a RAG store would put in a chat prompt, with
+  scores, distances, metadata, the search mode and backend, rerank information and usage,
+  behind scope `retrieve`. It runs the store's own search settings. A `viewer` member's key
+  with the scope may call it, because `/v1` does not read roles. See
+  [`POST /v1/retrieve`](docs/api.md#post-v1retrieve).
+- **`ragmux_ingest_embed_tokens_total{source}`.** Embedding tokens spent by ingestion, split
+  into `reported` (the provider's count) and `estimated` (characters divided by 4). The
+  "document ingested" log line carries `embed_tokens`. Embedding calls of `/v1/embeddings`
+  and `/v1/retrieve` are logged in `request_logs` like any other request.
+- **Azure OpenAI.** Provider type `azure_openai` (chat, streaming and embeddings), with the
+  resource endpoint in `base_url`, the deployment in `model_name` and an optional
+  `api-version` query on the `base_url` (default `2024-10-21`). The key is sent as
+  `api-key` and is covered by `rotate-key`. See [Providers](docs/providers.md#azure-openai).
+- **Provider presets.** Mistral, xAI and Groq are offered as `custom_openai` presets through
+  `GET /admin/api/provider-presets`. A preset is a template for the form, not a stored
+  object, and carries no price. See [Providers](docs/providers.md#presets).
+- **Dashboard.** The project page has a route editor, the RAG store form filters the rerank
+  connection by backend, the connection form offers the presets and the Azure fields, and
+  the API key form lists the `embeddings`, `retrieve` and `rerank` scopes. A key edited in
+  the dashboard keeps the scopes it already had.
+- **Docs drift test.** `internal/admin/docs_drift_test.go` compares the JSON field names of
+  the admin API with `docs/api.md` in both directions, so a field added to the code
+  without a line in the docs, or left in the docs after it was removed, fails the build.
+  Fields left out on purpose are listed in the test with a reason each.
+
+### Security
+- **Existing `chat` gateway keys gain the `embeddings`, `retrieve` and `rerank` scopes.**
+  Migration `0018` adds the three new scopes to every gateway key that carries `chat`,
+  revoked and expired keys included, so those keys can call the new `/v1` endpoints after
+  the upgrade. It only adds scopes and is safe to run twice; keys with only `models`, and
+  management keys, are untouched. Edit a key's scopes afterwards to keep it out of the new
+  endpoints. The project's default `sk-proj-…` key carries no scopes and reaches them
+  automatically. See [Users, roles and limits](docs/users-and-limits.md#api-keys).
+
 ## [0.4.2] — 2026-10-02
 
 Bug fixes, observability and documentation. No schema change.
@@ -766,7 +906,8 @@ projects with `sk-proj-` keys, metrics and an embedded dashboard.
 No git tag was created for this release, so there is no release page for it. The first
 tagged release is [0.2.0](https://github.com/ragmux/ragmux/releases/tag/v0.2.0).
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ragmux/ragmux/releases/tag/v0.5.0
 [0.4.2]: https://github.com/ragmux/ragmux/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ragmux/ragmux/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ragmux/ragmux/releases/tag/v0.4.0

@@ -158,7 +158,7 @@ Management endpoints answer errors as
 ```
 
 where `type` is the HTTP status text: `Bad Request` (validation), `Not Found`,
-`Conflict` (duplicate name, or an item still referenced by a project or RAG store),
+`Conflict` (duplicate name, or an item still referenced by a project, RAG store or route),
 `Forbidden`, `Internal Server Error`. Login limiting and the auth middleware use the
 lower-case types shown above.
 
@@ -200,7 +200,28 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
 | POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
-| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
+| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`chat`, `streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
+| GET | `/provider-presets` | viewer | Ready-made `custom_openai` setups for hosted OpenAI-compatible providers (Mistral, xAI, Groq), each with `id`, `label`, `provider_type`, `base_url`, suggested `models`, an optional `embedding_model` and `requires_api_key`. A preset is not stored: create the connection with `POST /models` using its `provider_type` and `base_url`. No preset carries a price — see [Presets](providers.md#presets) |
+
+`GET /provider-types` answers an array with one object per type:
+
+```json
+[{"type": "openai", "label": "OpenAI", "default_base_url": "https://api.openai.com/v1",
+  "supports_embeddings": true, "requires_api_key": true,
+  "supports_tools": true, "supports_streaming": true,
+  "capabilities": {"chat": true, "streaming": true, "embeddings": true, "tools": true,
+                   "tool_streaming": true, "vision": true, "remote_images": true,
+                   "prompt_caching": false, "cached_token_usage": true, "rerank": false}}]
+```
+
+`GET /provider-presets` answers an array:
+
+```json
+[{"id": "mistral", "label": "Mistral AI", "provider_type": "custom_openai",
+  "base_url": "https://api.mistral.ai/v1",
+  "models": ["mistral-large-latest", "mistral-small-latest"],
+  "embedding_model": "mistral-embed", "requires_api_key": true}]
+```
 
 ### Model connections
 
@@ -210,8 +231,8 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | POST | `/models` | editor | Create → `201` connection |
 | GET | `/models/{id}` | viewer | Read one |
 | PUT | `/models/{id}` | editor | Update; an empty `api_key` keeps the stored key |
-| DELETE | `/models/{id}` | editor | Delete → `{"ok": true}`; `409` while a project or RAG store uses it |
-| POST | `/models/{id}/test` | editor | `{"mode": "chat"}` (default) or `{"mode": "embedding"}`; spends provider quota, so it is a write; the outcome is recorded on the connection |
+| DELETE | `/models/{id}` | editor | Delete → `{"ok": true}`; `409` while a project, RAG store or route target uses it |
+| POST | `/models/{id}/test` | editor | `{mode?}`, where `mode` is `"chat"` (default) or `"embedding"`; spends provider quota, so it is a write; the outcome is recorded on the connection |
 | POST | `/models/test` | editor | Test an unsaved connection: the create body plus `mode` and optionally `connection_id` (reuse that connection's stored key when `api_key` is empty); nothing is recorded |
 
 Request body for create and update:
@@ -222,8 +243,14 @@ Request body for create and update:
 ```
 
 `provider_type` is one of `openai`, `anthropic`, `gemini`, `deepseek`, `ollama`,
-`custom_openai`; `base_url` must be an `http://` or `https://` URL with a host and
-without credentials, query string or fragment, and is required for `custom_openai`; a
+`custom_openai`, `azure_openai`, `cohere_rerank` or `voyage_rerank`. `azure_openai` needs
+a `base_url` (the resource endpoint, which may carry an `api-version` query parameter) and
+`model_name` is its deployment name, see [Azure OpenAI](providers.md#azure-openai); the
+two rerank types can serve only rerank targets and RAG store reranking, see
+[Rerank providers](providers.md#rerank-providers-cohere_rerank-voyage_rerank). `base_url`
+must be an `http://` or `https://` URL with a host and without credentials or fragment
+(and without a query string, except the `api-version` of `azure_openai`), and is required
+for `custom_openai` and `azure_openai`; a
 host that resolves only to private or local addresses is rejected with `400` unless
 allowed by `PRIVATE_UPSTREAM_ALLOWLIST` / `ALLOW_PRIVATE_UPSTREAMS` (see
 [Configuration](configuration.md#private-upstreams)). `model_name` may contain letters,
@@ -299,7 +326,8 @@ Validation: `chunk_size` 200-20000, `chunk_overlap` ≥ 0 and smaller than `chun
 (anything but `simple` is accepted and, on the `pgvector` backend, logged as a warning,
 see [Search modes](rag.md#search-modes)), `rerank_backend` `llm`, `cohere` or `voyage`
 (`cohere` and `voyage` need a `rerank_connection_id` of the matching `cohere_rerank` /
-`voyage_rerank` type; `llm` takes none), `rerank_candidates` 1-100, `max_distance` 0-2,
+`voyage_rerank` type; `llm` may name a chat connection, see
+[Reranking](rag.md#reranking)), `rerank_candidates` 1-100, `max_distance` 0-2,
 `max_documents` and `max_bytes` ≥ 0 (`0` = unlimited, see
 [Unlimited (`0`)](configuration.md#zero-means-unlimited)). The embedding
 connection must be of a type that supports embeddings, must produce vectors of at most
@@ -308,19 +336,38 @@ fails the document, see [Embedding width](rag.md#embedding-width)) and
 cannot be changed while the store has chunks (`400`). Responses carry the usage the
 quotas are checked against: `document_count` and `bytes_used`.
 
+A store as the API returns it:
+
+```json
+{"id": 1, "name": "handbook", "embedding_connection_id": 2,
+ "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
+ "search_mode": "hybrid", "search_backend": "pgvector", "fts_config": "simple",
+ "rerank": false, "rerank_candidates": 15, "rerank_backend": "llm", "rerank_connection_id": null,
+ "max_distance": 0, "contextual_chunks": true, "max_documents": 0, "max_bytes": 0,
+ "dimensions": 1536, "document_count": 3, "bytes_used": 3145728, "chunk_count": 126,
+ "created_at": "2026-09-18T10:00:00.000Z"}
+```
+
+`dimensions` is the width of the store's vectors (`0` until the first ingest), and
+`chunk_count` the number of chunks across its documents. `PUT` adds
+`reprocess_recommended` to the object: `true` when a changed setting only takes effect
+for documents after they are re-chunked or re-embedded.
+
 Documents look like
 
 ```json
 {"id": 7, "rag_store_id": 1, "filename": "handbook.pdf", "mime": "application/pdf",
  "size_bytes": 1048576, "status": "ready", "error": "", "chunk_count": 42,
- "page_count": 12, "progress_percent": 100, "created_at": "…", "updated_at": "…"}
+ "page_count": 12, "progress_percent": 100, "attempts": 1, "created_at": "…", "updated_at": "…"}
 ```
 
 with `status` moving `pending` → `processing` → `ready` (or `failed` with `error` set).
 `progress_percent` follows ingestion: `10` once parsed, `20` once chunked, then the share
 of embedding batches completed, `100` when ready; a failed document keeps the value it
 reached. `page_count` is the number of pages of a PDF and `null` for other formats (and
-until the document has been parsed).
+until the document has been parsed). `attempts` counts how often a replica claimed the
+document for ingestion since it was last queued; a document past the cap is skipped
+rather than retried forever.
 Accepted extensions: `.pdf`, `.docx`, `.html`, `.htm`, `.md`, `.markdown`, `.txt`; the
 request body is limited to `MAX_UPLOAD_MB`. Upload and reprocess answer
 `503 the ingestion backlog is full (MAX_PENDING_DOCUMENTS), retry later` when the queue
@@ -339,8 +386,12 @@ POST /admin/api/rag-stores/1/search
  "retrieval_latency_ms": 180, "rerank_latency_ms": 230,
  "hits": [{"chunk_id": 8, "document_id": 2, "filename": "handbook.pdf", "index": 3,
            "section": "Leave > Vacation", "page": 12, "content": "…",
-           "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2}]}
+           "distance": 0.18, "score": 0.0325, "vector_rank": 1, "fts_rank": 2,
+           "lex_score": 7.43}]}
 ```
+
+`lex_score` is the raw BM25 score under the `pg_search` backend and is absent under
+`pgvector` ([Search endpoint](rag.md#search-endpoint)).
 
 Everything but `query` is optional and overrides the store setting for this call only
 (`mode`, `backend`, `rerank`, `rerank_backend`, `rerank_connection_id`, `max_distance`
@@ -348,8 +399,11 @@ and `top_k`; the full list and the meaning of the response fields are in
 [Search endpoint](rag.md#search-endpoint)); `top_k` is clamped to 1-50 (`0` or absent
 uses the store's `top_k`). `latency_ms` is the whole call, `retrieval_latency_ms` covers
 embedding the query and the database search, and `rerank_latency_ms` the reranker
-(`null` only when `rerank` is off; when reranking was requested but skipped, a number,
-often `0`, and `rerank_fallback: true`).
+(`null` when `rerank` is off or was skipped; a number, often `0`, when the reranker was
+tried and fell back, with `rerank_fallback: true`).
+When `rerank` is on but the store has no `rerank_connection_id` (and so nothing to rerank
+with), the search runs unreranked and the response says so with `"rerank_skipped": true`
+and a `rerank_skipped_reason`; both are `false` / `""` otherwise.
 A `502` is returned when the embedding call fails.
 
 ### Projects
@@ -363,7 +417,7 @@ A `502` is returned when the embedding call fails.
 | DELETE | `/projects/{id}` | member + editor | Delete with its request logs → `{"ok": true}` |
 | POST | `/projects/{id}/rotate-key` | member + editor | New key → `{"project": …, "api_key": "sk-proj-…"}`; the old key stops working immediately |
 | GET | `/projects/{id}/members` | member | `[{id, username, role, added_at}]` |
-| PUT | `/projects/{id}/members` | member + editor | `{"user_ids": [1, 4]}` replaces the member set; an editor cannot remove themselves |
+| PUT | `/projects/{id}/members` | member + editor | `{user_ids}` (an array such as `[1, 4]`) replaces the member set; an editor cannot remove themselves |
 | GET | `/projects/{id}/metrics?window=24h` | member | Metrics for one project (see below; takes the same `compare`, `days` and `by_project` options as the summary) |
 | GET | `/projects/{id}/metrics.csv?window=24h` | member | The project's request logs in the window as a CSV download (see below) |
 | GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
@@ -380,9 +434,16 @@ Project body:
 `rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
 [Zero means unlimited](configuration.md#zero-means-unlimited)).
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
-project object contains `api_key_prefix` (the first characters of the key for
-identification), `member_ids` and the limit fields; the full key is never returned
-again.
+full key is never returned again. The project object:
+
+```json
+{"id": 3, "name": "support-bot", "model_connection_id": 1, "rag_store_id": 1,
+ "api_key_prefix": "sk-proj-ab12", "system_prompt": "You are the company support assistant.",
+ "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "member_ids": [4], "created_at": "…", "updated_at": "…"}
+```
+
+`api_key_prefix` holds the first characters of the key for identification.
 
 `GET /projects/{id}/usage`:
 
@@ -400,6 +461,65 @@ again.
 each budget would run out at that pace. A value is `null` when the budget is not set,
 nothing was consumed in the last hour, or the projection lands after the window resets
 (`resets_at`); an already exhausted budget projects to `generated_at`.
+
+### Routes
+
+A route is a named entry point inside a project: the client's `model` field selects it,
+and the route spreads requests over its targets. A project without chat routes works as
+before (see [Model field echo](providers.md#model-field-echo)). Adding the first chat route
+changes what an unknown `model` string gets: read
+[Before your first chat route](providers.md#before-your-first-chat-route) first.
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| GET | `/projects/{id}/routes` | member | List the project's routes with their targets |
+| POST | `/projects/{id}/routes` | member + editor | Create → `201` route |
+| GET | `/projects/{id}/routes/{routeId}` | member | Read one |
+| PUT | `/projects/{id}/routes/{routeId}` | member + editor | Replace the route and all of its targets in one transaction |
+| DELETE | `/projects/{id}/routes/{routeId}` | member + editor | Delete → `{"ok": true}` |
+
+Route body:
+
+```json
+{"name": "smart", "kind": "chat", "strategy": "weighted",
+ "targets": [
+   {"connection_id": 1, "model": "gpt-4.1", "weight": 3, "priority": 0},
+   {"connection_id": 2, "weight": 1, "priority": 0}]}
+```
+
+- `name` is 1 to 256 characters without control characters and is unique within the
+  project (`409` otherwise).
+- `kind` is `chat` (default), `embeddings` or `rerank`. `strategy` is `weighted`
+  (default), the only one.
+- `targets` holds 1 to 8 entries. `connection_id` must exist and its provider type must
+  support the route's `kind`. `model` is optional: when set it replaces the connection's
+  model name for calls through that target. `weight` is 1 to 1000 (default 1) and
+  `priority` is 0 to 100 (default 0, lower first). The same connection and `model` pair may
+  appear only once per route.
+- Invalid input is `400`. The response lists `targets` ordered by `priority`, then `id`,
+  each with `connection_name` and `provider_type` next to the stored fields.
+
+A route as the API returns it (`model` is `null` for a target that keeps the
+connection's model name):
+
+```json
+{"id": 5, "project_id": 3, "name": "smart", "kind": "chat", "strategy": "weighted",
+ "targets": [
+   {"id": 11, "connection_id": 1, "connection_name": "openai-main", "provider_type": "openai",
+    "model": "gpt-4.1", "weight": 3, "priority": 0},
+   {"id": 12, "connection_id": 2, "connection_name": "claude", "provider_type": "anthropic",
+    "model": null, "weight": 1, "priority": 0}],
+ "created_at": "…", "updated_at": "…"}
+```
+
+Candidate order for a call: groups by `priority` ascending; inside a group a weighted
+random order without replacement. The first candidate is called; a failure before the
+first byte is retried on it or hands the request to the next candidate, as
+[Retry and fallback](providers.md#retry-and-fallback) describes, and a connection whose
+circuit breaker is open is skipped.
+Deleting a project removes its routes; a connection that a route target still uses cannot
+be deleted (`409`). Create, update and delete are audited as `route.create`,
+`route.update` and `route.delete`. Route and target names are never metric labels.
 
 ### API keys
 
@@ -421,17 +541,19 @@ itself a management key.
 Request body:
 
 ```json
-{"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models"],
+{"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models", "retrieve"],
  "project_ids": [1, 2], "default_project_id": 1, "expires_at": "2027-01-01T00:00:00Z",
  "user_id": 4,
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
 ```
 
 `kind` is `gateway` (default) or `management`. `name` is required, at most 64 characters
-and unique per owner (`409` otherwise). `scopes` defaults to `["chat","models"]` for a
-gateway key and is required for a management key; an unknown scope, or one the caller's
-own role does not cover, is a `400`. `expires_at` is RFC 3339, and `null` or `""` clears
-it. `user_id` mints the key for another account and needs the `admin` role; the grants
+and unique per owner (`409` otherwise). A gateway key's `scopes` may name `chat`, `models`,
+`embeddings`, `retrieve` and `rerank` and defaults to all five when omitted or empty; a
+management key's `scopes` may name `read`, `write`, `admin` and `keys` and are required. An
+unknown scope (the message lists the valid values for the kind), or one the caller's own
+role does not cover, is a `400`. `expires_at` is RFC 3339, and `null` or `""` clears it.
+`user_id` mints the key for another account and needs the `admin` role; the grants
 are then checked against *that* account, not the admin's.
 
 For a `gateway` key, every id in `project_ids` must be a project the **owner** can access
@@ -444,7 +566,7 @@ The key object never contains the credential:
 
 ```json
 {"id": 7, "kind": "gateway", "name": "ci-pipeline", "key_prefix": "sk-user-Wg8TwBF",
- "user_id": 1, "created_by": 1, "scopes": ["chat", "models"], "project_ids": [1, 2],
+ "user_id": 1, "created_by": 1, "scopes": ["chat", "models", "retrieve"], "project_ids": [1, 2],
  "default_project_id": null, "rate_limit_rpm": 0, "rate_limit_tpm": 0,
  "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "expires_at": null, "revoked_at": null, "last_used_at": "2026-09-19T03:41:00Z",
@@ -487,7 +609,8 @@ The summary response (also used by `/projects/{id}/metrics`):
              "streamed": true, "rag_used": true, "rag_hits": 3, "cached_prompt_tokens": 200,
              "cache_write_tokens": 0, "cost_micros": 1860, "cost_usd": 0.00186,
              "cost_source": "builtin", "error": "", "api_key_id": 7, "user_id": 4,
-             "created_at": "…"}],
+             "request_id": "3f2a9c1e", "endpoint": "chat.completions", "requested_model": "smart",
+             "route": "smart", "attempt": 2, "fallback_from": 1, "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
                "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70,
@@ -498,7 +621,12 @@ The summary response (also used by `/projects/{id}/metrics`):
 `rag_hits` is the number of retrieved passages injected into that request (`0` when
 `rag_used` is false). `api_key_id` and `user_id` attribute the request to the user-owned
 key that made it and are `null` for a project's default key; the owner is denormalised so
-deleting the key later leaves `user_id` in place. Status semantics (`429`, `499`,
+deleting the key later leaves `user_id` in place. `request_id`, `endpoint`,
+`requested_model`, `route`, `attempt` and `fallback_from` identify how the request ran and
+are left out of a row when empty (always for rows written before migration `0016`);
+`attempt` is the number of upstream calls, `fallback_from` the connection id of the first
+target when the request moved to another one, and `route` is absent for the implicit
+route. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
 `502`, `503`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
@@ -539,6 +667,10 @@ Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
 
+The CSV carries the columns above only: `request_id`, `endpoint`, `requested_model`,
+`route`, `attempt` and `fallback_from` are in the JSON log and the database, not in the
+export.
+
 ### Model prices
 
 The price table turns the token counts of a finished request into the estimated
@@ -547,8 +679,8 @@ discount and change prices without telling the gateway.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 2, "unit": "per_million_tokens"}` |
-| POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
+| GET | `/prices` | viewer | `{"prices": [...], "builtin_version": 3, "unit": "per_million_tokens", "search_unit": "per_unit"}` |
+| POST | `/prices` | editor | `{provider_type, model_pattern, input_per_mtok, output_per_mtok, cache_write_per_mtok?, cache_read_per_mtok?, per_search_unit?, currency?}` → `201 {price}`; always created with `source: "user"`. `409` when that provider/pattern pair already exists |
 | PUT | `/prices/{id}` | editor | Same body without `provider_type`/`model_pattern` (they are fixed); sets `source: "user"` → `{price}` |
 | DELETE | `/prices/{id}` | editor | `{"ok": true}`; `409 {"code":"builtin_price"}` for a built-in row — reset it instead |
 | POST | `/prices/{id}/reset` | editor | Restores the shipped values and marks the row built-in again → `{price}`; `409 {"code":"no_builtin_price"}` when the row has no shipped counterpart |
@@ -562,9 +694,20 @@ A row:
 ```json
 {"id": 4, "provider_type": "anthropic", "model_pattern": "claude-sonnet-4-5*",
  "input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_write_per_mtok": 3.75,
- "cache_read_per_mtok": 0.30, "currency": "USD", "source": "builtin",
- "builtin_version": 2, "created_at": "…", "updated_at": "…"}
+ "cache_read_per_mtok": 0.30, "per_search_unit": null, "currency": "USD",
+ "source": "builtin", "builtin_version": 3, "created_at": "…", "updated_at": "…"}
 ```
+
+`per_search_unit` is the price of one search unit of a rerank API, in the row's currency
+**per unit, not per million tokens**; `null` means the model has none. Cohere bills a
+rerank call by search unit (the response's `meta.billed_units.search_units`, taken as 1
+when absent), so its rows carry it. Voyage bills rerank by token and uses
+`input_per_mtok`. The value is 0 to 100. A row with a `cohere_rerank` or `voyage_rerank`
+`provider_type` prices the rerank connection of that type; a spend whose connection has
+no matching row adds 0 to `cost_micros`. A row whose `per_search_unit` is set (not `null`,
+`0` included) prices a rerank by search units alone: its token prices are never added for
+that call, so a token price typed into a Cohere row has no effect on rerank spend, and an
+explicit `0` makes the rerank free.
 
 Prices are **per million tokens** and prices are between 0 and 100000. The two cache
 prices are **absolute prices, not multipliers** of `input_per_mtok` — every provider
@@ -577,8 +720,9 @@ type. An exact `model_pattern` wins; otherwise the pattern with the **longest li
 prefix** (the text before its first `*`) that matches, ties going to the lowest `id`.
 `*` stands for any run of characters, `/` included, so `deepseek-ai/DeepSeek-V3*` works.
 Longest prefix is why `gpt-4o-mini*` beats `gpt-4o*` for `gpt-4o-mini-2024-07-18`. With
-no match the request is logged with `cost_micros: 0` and `cost_source: "none"` — a
-missing price is reported as missing, never guessed.
+no match the main call adds 0 and the request is logged with `cost_source: "none"` — a
+missing price is reported as missing, never guessed. A rerank that ran on another
+connection inside the same request is priced by its own row and still adds its cost.
 
 `source` plays no part in matching. Your own row wins where its pattern is the more
 specific one, and you override a shipped number by **editing that row** (which keeps its
@@ -621,6 +765,14 @@ already knows.
 | GET | `/audit` | admin | Audit entries, newest first, with the total for the filter |
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
 | GET | `/security/logins` | admin | Failed-login counters and active lockouts |
+
+`GET /users` answers an array of user objects with the two counters:
+
+```json
+[{"id": 1, "username": "admin", "role": "admin", "is_active": true,
+  "last_login_at": "2026-09-18T10:00:00Z", "created_at": "…",
+  "project_count": 2, "active_sessions": 1}]
+```
 
 `PUT`/`DELETE` on users refuse to demote, deactivate or delete the last active admin
 (`409`) and to deactivate or delete the caller's own account (`400`).
@@ -665,7 +817,7 @@ lockout ends (empty when the lockout is disabled).
 whatever the running build reports:
 
 ```json
-{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "migrations_version": N, "size_bytes": 8787635},
+{"database": {"postgres_version": "17.11", "pgvector_version": "0.8.6", "pg_search_version": "", "migrations_version": N, "size_bytes": 8787635},
  "backup": {"tables": 1, "documents_bytes": 1048576, "last_migration_at": "2026-09-18T12:34:41Z"},
  "secret_key_source": "env",
  "version": "<x.y.z>"}
@@ -673,8 +825,10 @@ whatever the running build reports:
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
 bytes of uploaded files stored in the database, `secret_key_source` is `env` or `file`.
-`database.postgres_version` and `database.pgvector_version` are only returned to admins;
-editors and viewers receive the `database` object without those two keys.
+`database.pg_search_version` is the installed ParadeDB `pg_search` extension, empty when it
+is absent (see [Search backends](rag.md#search-backends)). `database.postgres_version`,
+`database.pgvector_version` and `database.pg_search_version` are only returned to admins;
+editors and viewers receive the `database` object without those three keys.
 
 ## Health
 
@@ -714,10 +868,14 @@ What happens to a request, in order:
    `x-ragmux-rag-hits: <n>` and, when passages were injected, `x-ragmux-rag-sources`
    listing them. Retrieval failures are logged and the request continues without
    context.
-4. The request is translated for the provider and sent. The `model` field is **not**
-   used for routing; the project's connection decides. The value you send is echoed
-   back in the response (`model` of the completion and every stream chunk); an empty
-   value is replaced with the connection's model name.
+4. The request is translated for the provider and sent. A project without chat
+   [routes](#routes) ignores `model` for selection: the project's connection decides.
+   Once a project has a chat route, `model` selects what runs and an unknown value is
+   `404 model_not_found` (see [`GET /v1/models`](#get-v1models-and-get-v1modelsid)). The
+   value you send is echoed back in the response (`model` of the completion and every
+   stream chunk); an empty value is replaced with the connection's model name.
+   A failure before the first byte can be retried and handed to the route's next target
+   ([Retry and fallback](providers.md#retry-and-fallback)).
 
 Non-streaming responses are the provider's answer normalised to the OpenAI schema
 (`choices[].message`, `finish_reason`, `usage`). Streaming responses are
@@ -783,6 +941,7 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
+| `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
 | `Warning` | `299 ragmux "<text>"` when the connection accepted the request but ignored part of it — today only `response_format` (`json_schema`/`json_object`) on an Anthropic connection. Set before the first byte, so a stream carries it too. See [Anthropic](providers.md#anthropic) |
 
@@ -799,6 +958,7 @@ Status codes:
 | `400` | malformed JSON, missing `messages`, a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
+| `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
@@ -808,15 +968,143 @@ Status codes:
 | `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
 
+### `POST /v1/embeddings`
+
+OpenAI's `embeddings.create`, so an SDK's `client.embeddings.create(...)` works against the
+gateway. Needs the key's `embeddings` scope (`403` otherwise).
+
+```json
+{"model": "text-embedding-3-small", "input": ["first text", "second text"], "encoding_format": "float"}
+```
+
+- `input` is a string or an array of up to 2048 non-empty strings. Arrays of token ids are
+  refused (`400`); the providers behind the gateway embed text.
+- `encoding_format` is `float` (default) or `base64`, the little-endian `float32` bytes
+  base64-encoded, as OpenAI's SDKs expect.
+- `dimensions` is not supported and answers `400`: the adapters cannot shorten a vector.
+
+```json
+{"object": "list", "model": "text-embedding-3-small",
+ "data": [{"object": "embedding", "index": 0, "embedding": [0.01, -0.02, …]}],
+ "usage": {"prompt_tokens": 9, "total_tokens": 9}}
+```
+
+`model` is resolved in this order: a route of kind `embeddings` with exactly that name
+(see [Routes](#routes), which also gives it retries and fallback targets); the implicit
+route, which is the embedding connection of the project's RAG store and answers to that
+connection's model name and to an empty `model`; anything else is `404`
+`{"error": {"type": "invalid_request_error", "code": "model_not_found", …}}`. It never
+falls back to the project's chat connection, a model that cannot embed, and a project with
+no RAG store has no implicit route. The response `model` is the client's value (the
+connection's model name when none was sent).
+
+Each call goes through the same steps as chat: limits and budgets are checked first, the
+call is recorded in the request log with `endpoint = embeddings`, the upstream's
+`prompt_tokens` and the price. An upstream that reports no usage gets an estimate
+(characters divided by 4), flagged `estimated` in the log. Errors use the
+[error envelope](#error-envelope) and the status mapping of chat completions.
+
+### `POST /v1/retrieve`
+
+Searches the project's RAG store and returns the passages, without calling a chat model.
+Needs the key's `retrieve` scope. The scope decides, not the owner's role: a key a viewer
+minted for the project works.
+
+```json
+{"query": "how many vacation days do I get?", "top_k": 5}
+```
+
+`query` is required. `top_k` is optional, 1 to 50; omitted or `0` uses the store's
+`top_k`. The store's search mode, backend, rerank and distance settings apply; a request
+cannot override them (the dashboard's [search endpoint](rag.md#search-endpoint) can).
+
+```json
+{"object": "retrieval", "mode": "hybrid", "backend": "pg_search", "reranked": false,
+ "rerank_backend": "", "rerank_fallback": false, "retrieval_latency_ms": 41, "rerank_latency_ms": null,
+ "hits": [{"chunk_id": 8, "document_id": 2, "content": "…", "score": 0.0325, "distance": 0.18,
+           "metadata": {"filename": "handbook.pdf", "section": "Leave > Vacation", "page": 12, "chunk_index": 3}}],
+ "usage": {"prompt_tokens": 7, "total_tokens": 7}}
+```
+
+`hits` is always an array, empty when nothing matched. `backend` is the one that actually
+ran. `usage` counts the query's embedding tokens, plus the tokens of the rerank call when
+the store reranks with the LLM backend (that call goes to the project's chat connection, so a
+key with only `retrieve` can cause it; it is counted on the request row and against the
+project's limits, and priced at the rerank connection's rate, not the embedding
+connection's; an API reranker is priced at its own connection's price, Cohere by search
+unit). A project without a RAG store answers
+`400` with code `no_rag_store`. The call is recorded with `endpoint = retrieve`,
+`rag_used`, `rag_hits`, and the embedding connection's model, tokens and price. An
+embedding failure at the provider answers with the provider's status as in chat.
+
+### `POST /v1/rerank`
+
+Reorders documents by relevance to a query, in Cohere's request and response shape, so a
+Cohere SDK pointed at Ragmux works. Needs the key's `rerank` scope.
+
+```json
+{"model": "rerank-v3.5", "query": "vacation days", "top_n": 2,
+ "documents": ["Leave policy: 25 days.", "Parking rules.", {"text": "Sick leave: 10 days."}]}
+```
+
+`query` and a non-empty `documents` array (at most 1000; each entry a string or an object
+with a `text` string) are required. `top_n` is optional and at least `1`; omitted returns
+every document. `return_documents: true` adds the document text to each result. `model` is
+optional.
+
+```json
+{"id": "5c1e…", "results": [{"index": 0, "relevance_score": 0.92}, {"index": 2, "relevance_score": 0.31}],
+ "meta": {"tokens": {"input_tokens": 42, "output_tokens": 0}}}
+```
+
+`results` holds at most `top_n` entries sorted by `relevance_score`, highest first;
+`index` points into the request's `documents`.
+
+`model` resolves as for the other endpoints (ADR-018): a `kind = rerank` [route](#routes)
+with exactly that name; else the implicit route, the project's RAG store's
+`rerank_connection_id`, when `model` is empty or equals that connection's model name; else
+`404` with code `model_not_found`. A store without a `rerank_connection_id` has no implicit
+route. A route target or the implicit connection may be a `cohere_rerank` / `voyage_rerank`
+connection (their scores are returned as the provider gives them) or a chat connection,
+which is asked to rank the documents (at most 100 of them). With a chat model,
+`relevance_score` is derived from the rank, not a model-reported number: the `r` documents
+the model ranked get `r/r` (`1.0`) down to `1/r`, and the others follow in their request
+order with a score of `0`. A model that answers with an empty list ("none is relevant")
+therefore yields every document at `0`, not the client's own order passed off as a ranking.
+
+The call is recorded with `endpoint = rerank`: the connection's model, the tokens the
+provider reported (an estimate from the text, flagged `estimated`, when it reports none),
+the price, and the usual limits and budgets apply. Rerank tokens spent inside a RAG chat or
+`/v1/retrieve` request are added to that request's own row instead. An API reranker
+(`cohere_rerank`, `voyage_rerank`) has a token count that is optional in the response, so
+the estimate (characters divided by 4, over the passages as sent: each is capped at 4000
+characters) is a measure of usage for limits. Its cost follows its price row: Cohere by
+search unit (a row with a `per_search_unit` never adds token prices), Voyage by token.
+Inside a chat or retrieve request that cost is added to the row's `cost_micros`, priced
+with the rerank connection; the `llm` backend's tokens are priced with the chat connection
+that ran the rerank. A rerank connection with no price row adds 0.
+
 ### `GET /v1/models` and `GET /v1/models/{id}`
 
-Return the project's single model in OpenAI's shape so SDK model listings work:
+Return the project's models in OpenAI's shape so SDK model listings work:
 
 ```json
 {"object": "list", "data": [{"id": "claude-sonnet-4-5", "object": "model", "created": 1758190800, "owned_by": "anthropic"}]}
 ```
 
-With one project resolved, `{id}` is ignored and both routes describe that project's
-connection. A `sk-user-…` key that grants several projects and names none lists one entry
+A project without chat routes lists its connection's model, as above. When the project
+has chat routes, the list holds each chat route's name (`owned_by: "ragmux"`) plus the
+implicit route's name, the default connection's model name, unless a route already has
+that name. With more than one entry, `{id}` has to match one of them (`404` otherwise).
+
+When the project has chat routes, `POST /v1/chat/completions` resolves `model` in this
+order: an exact route name; the default connection's model name (the implicit route); an
+empty `model` (the implicit route). Anything else is `404`
+`{"error": {"type": "invalid_request_error", "code": "model_not_found", "message": …}}`.
+The message repeats the requested value (cut to 128 characters) and does not list the
+valid names. The response `model` is always the client's value.
+
+For a project without chat routes, with one project resolved, `{id}` is ignored and both
+routes describe that project's connection. A `sk-user-…` key that grants several projects and names none lists one entry
 per granted project's connection instead, deduplicated by model name; `{id}` then has to
 match one of them (`404` otherwise). Both routes need the key's `models` scope.

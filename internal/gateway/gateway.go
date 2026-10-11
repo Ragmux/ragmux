@@ -4,20 +4,23 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/ragmux/ragmux/internal/httpx"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/pricing"
@@ -45,9 +48,34 @@ type Gateway struct {
 	// Metrics records the gateway counters at the deferred chokepoint of a
 	// finished request; nil records nothing.
 	Metrics *obs.Metrics
-	// Tracer opens the gateway.chat_completion span every downstream span
-	// hangs beneath; nil is a disabled tracer.
+	// Tracer opens the request span every downstream span hangs beneath
+	// (named "{operation} {model}" once the request is routed, per the GenAI
+	// conventions) and one gateway.attempt child span per upstream attempt;
+	// nil is a disabled tracer.
 	Tracer *tracing.Tracer
+	// Rand is the random source of weighted target selection: it returns a
+	// value in [0, 1). Nil uses math/rand/v2's concurrency-safe generator;
+	// tests inject a seeded one.
+	Rand func() float64
+	// UpstreamTimeout is the total time budget of one request's upstream
+	// attempts, retries and fallbacks together. Zero means no budget.
+	UpstreamTimeout time.Duration
+	// MaxRetries is how often a transient failure is repeated on the same
+	// target before the route moves on. Zero disables retries; fallback to the
+	// next target is not affected.
+	MaxRetries int
+	// Sleep waits between a failed attempt and its retry. Nil uses a timer;
+	// tests inject one that records the wait instead of taking it.
+	Sleep func(ctx context.Context, d time.Duration) error
+	// Breakers holds the per-connection circuit breakers (ADR-020); nil
+	// disables them.
+	Breakers *Breakers
+	// Rerankers builds the rerank API adapter of a connection (POST /v1/rerank
+	// on a Cohere or Voyage connection); nil leaves such a connection unusable.
+	Rerankers func(*store.ModelConnection) (provider.Reranker, error)
+	// LLMRerank configures the chat-model reranker, used by POST /v1/rerank
+	// when the connection that serves it is a chat connection.
+	LLMRerank rag.LLMReranker
 }
 
 // requestObs collects the facts about one chat completion that the request
@@ -124,6 +152,7 @@ func (o *requestObs) noteFinishReason(reason *string) {
 
 type ctxKey struct{}
 type principalKey struct{}
+type requestIDKey struct{}
 
 // principal is the identity behind a /v1 request. A project key resolves to
 // nothing but its project; a user key adds the key row, its owner and the
@@ -195,15 +224,83 @@ const projectHeader = "X-Ragmux-Project"
 const projectsHeader = "X-Ragmux-Projects"
 
 // Routes mounts /v1 handlers on the router. Scopes are enforced per route so
-// a key can be issued for model listings without chat, and requireProject
-// only guards chat: the listings answer across every granted project.
+// a key can be issued for model listings without chat. Pipeline endpoints
+// check their own scope and project in the authenticate step; the listings
+// answer across every granted project and only need the scope middleware.
 func (g *Gateway) Routes(r chi.Router) {
-	r.Use(g.authenticate)
-	r.With(g.requireScope(store.ScopeChat, "chat completions"), g.requireProject).
-		Post("/chat/completions", g.chatCompletions)
+	r.Use(g.requestID)
+	r.Use(g.identify)
+	r.Post("/chat/completions", g.chatCompletions)
+	r.Post("/embeddings", g.embeddings)
+	r.Post("/retrieve", g.retrieve)
+	r.Post("/rerank", g.rerank)
 	models := r.With(g.requireScope(store.ScopeModels, "model listings"))
 	models.Get("/models", g.listModels)
 	models.Get("/models/{id}", g.getModel)
+}
+
+// maxRequestIDLen bounds a client-supplied X-Request-Id.
+const maxRequestIDLen = 128
+
+// validRequestID reports whether a client-supplied X-Request-Id may be used
+// as is: 1 to maxRequestIDLen bytes of ASCII letters, digits and . _ : -. The
+// set excludes whitespace, control characters, quotes and separators, so the
+// value is safe in a header, a log line and a SQL text column.
+func validRequestID(v string) bool {
+	if v == "" || len(v) > maxRequestIDLen {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == ':', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// requestID gives every /v1 request one id and returns it in the X-Request-Id
+// response header, errors included: it runs before identify, so a 401 carries
+// it too. A valid X-Request-Id from the client is used; an absent or invalid
+// one is replaced, never rejected, by the id obs.RequestID generated for the
+// request (or a fresh one when that middleware is not installed).
+//
+// The id is kept in this package's own context key and nowhere else: the
+// generated id that obs.RequestID stores for spans, metrics and the access
+// log is left alone, so no client-chosen byte reaches a span or a label
+// (PRD rule 10). The client's value reaches only the response header that
+// echoes it back, the request log row and, as client_req_id beside the
+// generated req_id, log lines.
+func (g *Gateway) requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-Id")
+		if !validRequestID(id) {
+			id = middleware.GetReqID(r.Context())
+			if id == "" {
+				id = newRequestID()
+			}
+		}
+		w.Header().Set("X-Request-Id", id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+	})
+}
+
+// newRequestID is the fallback id for a router without obs.RequestID.
+func newRequestID() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "req-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// requestIDFrom is the id requestID settled on for this request.
+func requestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
 }
 
 func writeError(w http.ResponseWriter, status int, typ, msg string) {
@@ -234,7 +331,11 @@ func invalidKey(w http.ResponseWriter, code, msg string) {
 	writeErrorCode(w, http.StatusUnauthorized, "invalid_api_key", code, msg)
 }
 
-func (g *Gateway) authenticate(next http.Handler) http.Handler {
+// identify resolves the bearer credential into a principal on the request
+// context. It stays a router middleware so every /v1 path, including unknown
+// ones, answers 401 before anything else; the pipeline's authenticate step
+// then applies scope and project selection to the principal found here.
+func (g *Gateway) identify(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
 		if !strings.HasPrefix(h, "Bearer ") {
@@ -341,40 +442,47 @@ func (g *Gateway) selectProject(w http.ResponseWriter, r *http.Request, pr *prin
 	return true
 }
 
-// requireProject refuses a request that could not be routed: either the key
+// checkProject refuses a request that could not be routed: either the key
 // grants several projects and named none, or its last grant was removed, in
-// which case it fails closed rather than falling back to anything.
-func (g *Gateway) requireProject(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pr := principalFrom(r.Context())
-		if pr != nil && pr.project == nil {
-			if len(pr.grants) == 0 {
-				writeErrorCode(w, http.StatusForbidden, "invalid_request_error", "project_not_granted",
-					"this api key is not authorised for the requested project")
-				return
-			}
-			names := make([]string, len(pr.grants))
-			for i, p := range pr.grants {
-				names[i] = p.Name
-			}
-			w.Header().Set(projectsHeader, strings.Join(names, ","))
-			writeErrorCode(w, http.StatusBadRequest, "invalid_request_error", "project_required",
-				"this api key grants several projects; name one in the "+projectHeader+" header")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// which case it fails closed rather than falling back to anything. It
+// answers the client itself and reports whether the request may proceed.
+func checkProject(w http.ResponseWriter, pr *principal) bool {
+	if pr == nil || pr.project != nil {
+		return true
+	}
+	if len(pr.grants) == 0 {
+		writeErrorCode(w, http.StatusForbidden, "invalid_request_error", "project_not_granted",
+			"this api key is not authorised for the requested project")
+		return false
+	}
+	names := make([]string, len(pr.grants))
+	for i, p := range pr.grants {
+		names[i] = p.Name
+	}
+	w.Header().Set(projectsHeader, strings.Join(names, ","))
+	writeErrorCode(w, http.StatusBadRequest, "invalid_request_error", "project_required",
+		"this api key grants several projects; name one in the "+projectHeader+" header")
+	return false
 }
 
-// requireScope enforces one gateway scope. It is a no-op for a project's
-// default key, which has no scopes and is not narrowed by any.
+// checkScope enforces one gateway scope. It is a no-op for a project's
+// default key, which has no scopes and is not narrowed by any. It answers
+// the client itself and reports whether the request may proceed.
+func checkScope(w http.ResponseWriter, pr *principal, scope, what string) bool {
+	if pr != nil && pr.key != nil && !pr.key.HasScope(scope) {
+		writeErrorCode(w, http.StatusForbidden, "insufficient_scope", "insufficient_scope",
+			"api key is not authorised for "+what)
+		return false
+	}
+	return true
+}
+
+// requireScope is checkScope as a route middleware, for the endpoints that
+// do not run the pipeline.
 func (g *Gateway) requireScope(scope, what string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			pr := principalFrom(r.Context())
-			if pr != nil && pr.key != nil && !pr.key.HasScope(scope) {
-				writeErrorCode(w, http.StatusForbidden, "insufficient_scope", "insufficient_scope",
-					"api key is not authorised for "+what)
+			if !checkScope(w, principalFrom(r.Context()), scope, what) {
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -438,6 +546,20 @@ func (g *Gateway) visibleModels(w http.ResponseWriter, r *http.Request) ([]map[s
 	out := []map[string]any{}
 	seen := map[string]bool{}
 	for _, p := range projects {
+		routed, isRouted, err := g.routedModels(r, p)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+			return nil, false
+		}
+		if isRouted {
+			for _, m := range routed {
+				if id, _ := m["id"].(string); !seen[id] {
+					seen[id] = true
+					out = append(out, m)
+				}
+			}
+			continue
+		}
 		conn, err := g.Store.GetConnection(ctx, p.ModelConnectionID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
@@ -460,92 +582,212 @@ func modelObject(conn *store.ModelConnection) map[string]any {
 	return map[string]any{"id": conn.ModelName, "object": "model", "created": created, "owned_by": conn.ProviderType}
 }
 
+// chatCompletions is POST /v1/chat/completions: the pipeline steps in order,
+// with the chat-specific parts (body decoding, provider adapter, the
+// prepareChat hook) between them.
 func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	// Every span below -- rag.retrieve, rag.embed_query, rag.rerank and the
-	// provider client spans -- hangs beneath this one, so the traced context
-	// replaces the request's.
-	ctx, span := g.Tracer.Start(r.Context(), "gateway.chat_completion", tracing.KindInternal)
-	defer span.End()
-	r = r.WithContext(ctx)
-	p := projectFrom(ctx)
-	log := g.Log.With("project", p.ID)
-	projectID := strconv.FormatInt(p.ID, 10)
-	obsv := &requestObs{}
+	c, ok := g.authenticate(w, r, chatOperation)
+	if !ok {
+		return
+	}
+	defer c.span.End()
 
-	max := g.MaxBodyBytes
-	if max <= 0 {
-		max = 4 << 20
-	}
-	httpx.Deadline(w, bodyReadDeadline)
-	body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
-	httpx.Deadline(w, 0)
-	if err != nil || int64(len(body)) > max {
-		writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
+	req, ok := g.decodeChat(c)
+	if !ok {
 		return
 	}
+	// What the client asked for, before an empty model is defaulted below.
+	c.requestedModel = req.Model
+	if !g.resolveRoute(c, req.Model) {
+		return
+	}
+	prov, ok, buildErr := g.chatProvider(c)
+	if !ok {
+		return
+	}
+	if req.Model == "" {
+		req.Model = c.conn.ModelName
+	}
+
+	// The token estimate covers the client's messages and the project prompt;
+	// retrieved context is not included.
+	estimate := (len(c.project.SystemPrompt) + messageChars(req.Messages) + 3) / 4
+	if !g.checkLimits(c, estimate, req.Stream) {
+		return
+	}
+
+	prep := g.prepareChat(c, prov, &req)
+	g.openRecord(c, req.Stream, prep.apply)
+	defer g.record(c)
+
+	// A nil prov (the first target's adapter could not be built) leaves provConn
+	// unset and records the connection and its error as failedConn and
+	// failedErr: providerFor hands that error back without building again, and
+	// the walk falls back.
+	var provConn, failedConn *store.ModelConnection
+	if prov != nil {
+		provConn = c.conn
+	} else {
+		failedConn = c.conn
+	}
+	g.invoke(c, &chatInvocation{gw: g, prov: prov, provConn: provConn, failedConn: failedConn, failedErr: buildErr, req: req, promptChars: messageChars(req.Messages),
+		opts: prep.opts, sources: prep.sources, contextBlock: prep.contextBlock})
+}
+
+// chatInvocation is the chat endpoint's upstreamCall.
+type chatInvocation struct {
+	gw *Gateway
+	// prov is the adapter for provConn, the connection it was built for: the
+	// first target to begin with, then whichever target was tried last. A
+	// target is only given a new adapter when invoke moves to another one.
+	prov     provider.Provider
+	provConn *store.ModelConnection
+	// failedConn is the connection whose adapter could not be built before the
+	// walk began, and failedErr the target_config error that stands for it:
+	// the build is tried once per request, not again at the walk.
+	failedConn *store.ModelConnection
+	failedErr  error
+	// req is the request as it goes upstream; req.Model is the client's model
+	// string, which the response is rewritten back to.
+	req provider.ChatRequest
+	// promptChars is the size of the prompt after context injection, the basis
+	// of the usage estimate when the upstream reports none.
+	promptChars int
+	// opts, sources and contextBlock come from prepareChat and only shape the
+	// non-streaming response body.
+	opts         ragmuxRequest
+	sources      []ragSource
+	contextBlock string
+}
+
+// providerFor returns the adapter of conn, building it the first time invoke
+// reaches a target other than the one prov was made for. A connection whose
+// adapter cannot be built is that target's own fault, so the walk may go on.
+func (in *chatInvocation) providerFor(c *call, conn *store.ModelConnection) (provider.Provider, error) {
+	if conn == in.provConn {
+		return in.prov, nil
+	}
+	if conn == in.failedConn && in.failedErr != nil {
+		return nil, in.failedErr
+	}
+	prov, err := in.gw.Providers(conn)
+	if err != nil {
+		// The factory error names the provider type or URL; it stays in the
+		// log, as in chatProvider.
+		c.log.Error("provider setup", "connection", conn.ID, "err", err)
+		return nil, newTargetConfigError()
+	}
+	in.prov, in.provConn = prov, conn
+	// The warnings prepareChat set describe what the first adapter ignores;
+	// nothing has been written yet, so they can still be replaced.
+	c.w.Header().Del("Warning")
+	setRequestWarnings(c.w.Header(), prov, in.req)
+	return prov, nil
+}
+
+// attempt is one chat call, streamed or not. A stream answers the client
+// itself once its first chunk arrives and is settled from then on; before that,
+// like a plain call, it returns the provider's error untouched when it fails.
+func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
+	req := in.req
+	prov, err := in.providerFor(c, conn)
+	if err != nil {
+		return err
+	}
+	if req.Stream {
+		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars)
+	}
+
+	ctx, cancel := c.attemptContext()
+	defer cancel()
+	upstreamStart := time.Now()
+	resp, err := prov.Chat(ctx, req)
+	c.obs.upstream = time.Since(upstreamStart)
+	if err != nil {
+		return err
+	}
+	c.obs.noteResponseModel(resp.Model, req.Model, conn.ModelName)
+	for i := range resp.Choices {
+		c.obs.noteFinishReason(resp.Choices[i].FinishReason)
+	}
+	resp.Model = req.Model
+	fillUsage(c.rec, resp.Usage, in.promptChars, completionChars(resp))
+	c.rec.StatusCode = http.StatusOK
+	c.w.Header().Set("Content-Type", "application/json")
+	if in.opts.IncludeContext {
+		if b, err := withRagmuxField(resp, in.sources, in.contextBlock); err == nil {
+			_, _ = c.w.Write(b)
+			return nil
+		}
+	}
+	_ = json.NewEncoder(c.w).Encode(resp)
+	return nil
+}
+
+// decodeChat reads and validates the chat request body, answering the client
+// itself when it cannot.
+func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, bool) {
 	var req provider.ChatRequest
+	body, ok := g.readBody(c)
+	if !ok {
+		return req, false
+	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
-		return
+		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
+		return req, false
 	}
 	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "messages is required")
-		return
+		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "messages is required")
+		return req, false
 	}
-	clientModel := req.Model
+	return req, true
+}
 
-	conn, err := g.Store.GetConnection(ctx, p.ModelConnectionID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
-		return
-	}
-	prov, err := g.Providers(conn)
+// chatProvider builds the chat adapter for the routed connection. A route with
+// other targets does not fail on it (ADR-020's target_config class): it
+// returns a nil adapter and the target_config error, which invoke reports as
+// that target's attempt before moving on to the next one.
+func (g *Gateway) chatProvider(c *call) (provider.Provider, bool, error) {
+	prov, err := g.Providers(c.conn)
 	if err != nil {
 		// The factory error names the provider type or URL; clients only
 		// need to know the project is misconfigured.
-		log.Error("provider setup", "connection", conn.ID, "err", err)
-		writeError(w, http.StatusInternalServerError, "server_error", "model connection unavailable")
-		return
+		c.log.Error("provider setup", "connection", c.conn.ID, "err", err)
+		if len(c.targets) > 1 {
+			return nil, true, newTargetConfigError()
+		}
+		writeError(c.w, http.StatusInternalServerError, "server_error", "model connection unavailable")
+		return nil, false, nil
 	}
-	if clientModel == "" {
-		clientModel = conn.ModelName
-	}
-	req.Model = clientModel
+	return prov, true, nil
+}
 
-	// Limits are checked before RAG retrieval so throttled clients do not
-	// cost an embedding call. The token estimate covers the client's
-	// messages and the project prompt; retrieved context is not included.
-	pr := principalFrom(ctx)
-	subject := limits.Subject{Project: p}
-	if pr != nil {
-		subject = pr.subject()
-	}
-	var decision limits.Decision
-	if g.Limiter != nil {
-		est := (len(p.SystemPrompt) + messageChars(req.Messages) + 3) / 4
-		decision, err = g.Limiter.CheckSubject(ctx, subject, est)
-		if err != nil {
-			log.Error("limit check", "err", err)
-			writeError(w, http.StatusInternalServerError, "server_error", "limit check failed")
-			return
-		}
-		setLimitHeaders(w.Header(), decision)
-		if !decision.Allowed {
-			// Reason is one of the limits.Reason* constants, a closed set.
-			g.Metrics.RecordLimitDenied(projectID, decision.Reason)
-			// Nothing was sent upstream, so the row costs nothing.
-			rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, Streamed: req.Stream,
-				StatusCode: http.StatusTooManyRequests, Error: decision.Reason, CostSource: store.CostSourceNone,
-				LatencyMs: time.Since(start).Milliseconds()}
-			pr.attribute(rec)
-			if err := g.Store.InsertRequestLog(ctx, rec); err != nil {
-				log.Error("write request log", "err", err)
-			}
-			writeLimitError(w, decision)
-			return
-		}
-	}
+// newTargetConfigError is the error of a target whose adapter cannot be built.
+func newTargetConfigError() error {
+	return &targetConfigError{pe: &provider.Error{
+		Status: http.StatusInternalServerError, Type: "server_error", Message: "model connection unavailable"}}
+}
+
+// chatPrep is what prepareChat hands on to invoke and the request log.
+type chatPrep struct {
+	opts         ragmuxRequest
+	ragUsed      bool
+	ragHits      int
+	sources      []ragSource
+	contextBlock string
+}
+
+// apply sets the RAG columns of the request log row.
+func (p chatPrep) apply(rec *store.RequestLog) {
+	rec.RAGUsed, rec.RAGHits = p.ragUsed, p.ragHits
+}
+
+// prepareChat is the chat-only hook between checkLimits and invoke: it shapes
+// the messages that go upstream with the project's system prompt and the RAG
+// context. Other endpoints have no such step.
+func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.ChatRequest) chatPrep {
+	p, ctx, w := c.project, c.ctx(), c.w
+	var prep chatPrep
 
 	// Project-level system prompt, if configured, goes first.
 	//
@@ -560,140 +802,60 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The ragmux request object is ours; it must not reach the upstream.
-	opts := ragmuxOptions(req.Extra)
+	prep.opts = ragmuxOptions(req.Extra)
 	delete(req.Extra, "ragmux")
 
 	// RAG pipeline. The hit count and sources headers are set here, before
 	// either the JSON or the streaming path writes the status line.
-	var (
-		ragUsed      bool
-		ragHits      int
-		sources      []ragSource
-		contextBlock string
-	)
+	//
+	// prov may be nil when the first target's adapter could not be built.
+	// Retrieval embeds through the store's own connection and uses prov only
+	// for the LLM rerank backend, which a nil prov skips; the walk still
+	// answers from another target with the same context (ADR-020).
 	if p.RAGStoreID != nil && g.Retriever != nil {
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
 			q := rag.LastUserQuery(req.Messages)
-			hits, err := g.Retriever.Search(ctx, rs, q, rs.TopK, prov, conn.ModelName)
+			// The rerank of this retrieval is a side call of the chat request:
+			// its tokens (an LLM rerank is a chat call, an API rerank a scoring
+			// call) go on this request's log row through c.sideCharges.
+			var rerankSpend *rerankUsageProvider
+			// The LLM rerank runs on the first target's adapter, so that
+			// target's price covers it even when the walk later answers from
+			// a fallback. Captured now: c.conn moves with the walk.
+			rerankType, rerankModel := c.conn.ProviderType, c.conn.ModelName
+			searchProv := prov
+			if prov != nil {
+				rerankSpend = &rerankUsageProvider{Provider: prov}
+				searchProv = rerankSpend
+			}
+			res, err := g.Retriever.SearchWith(ctx, rs, q, rs.TopK, searchProv, c.conn.ModelName)
+			var hits []store.SearchHit
+			if res != nil {
+				hits = res.Hits
+				c.addSideCharge(llmCharge(rerankSpend, rerankType, rerankModel, false))
+				c.addSideCharge(apiCharge(res.RerankSpend, false))
+			}
 			if err != nil {
-				log.Warn("rag retrieval failed; continuing without context", "err", err)
+				c.log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
-				contextBlock = rag.FormatContext(hits)
+				prep.contextBlock = rag.FormatContext(hits)
 				// Drops the client's cache_control in that system message:
 				// a per-query prefix can never be read back from the cache.
-				req.Messages = rag.InjectRetrievedContext(req.Messages, contextBlock)
-				ragUsed, ragHits = true, len(hits)
-				sources = ragSources(hits)
-				w.Header().Set("x-ragmux-rag-sources", sourcesHeader(sources))
+				req.Messages = rag.InjectRetrievedContext(req.Messages, prep.contextBlock)
+				prep.ragUsed, prep.ragHits = true, len(hits)
+				prep.sources = ragSources(hits)
+				w.Header().Set("x-ragmux-rag-sources", sourcesHeader(prep.sources))
 			}
 			w.Header().Set("x-ragmux-rag-hits", strconv.Itoa(len(hits)))
 		} else {
-			log.Warn("rag store missing", "id", *p.RAGStoreID, "err", err)
+			c.log.Warn("rag store missing", "id", *p.RAGStoreID, "err", err)
 		}
 	}
-
-	rec := &store.RequestLog{ProjectID: p.ID, ModelName: conn.ModelName, RAGUsed: ragUsed, RAGHits: ragHits, Streamed: req.Stream}
-	pr.attribute(rec)
-	promptChars := messageChars(req.Messages)
-	defer func() {
-		rec.LatencyMs = time.Since(start).Milliseconds()
-		// This is the one place the success, error, mid-stream-failure and
-		// 499 paths all pass with final token counts, so cost is priced
-		// here rather than in fillUsage, which stays a pure function.
-		g.priceRequest(conn, rec)
-		if err := g.Store.InsertRequestLog(context.Background(), rec); err != nil {
-			log.Error("write request log", "err", err)
-		}
-		if g.Limiter != nil {
-			// The minute request slot was already reserved by Check when an
-			// RPM limit is set; otherwise count the request here.
-			if err := g.Limiter.RecordSubject(context.Background(), subject, rec.PromptTokens, rec.CompletionTokens, !decision.Reserved); err != nil {
-				log.Error("record usage", "err", err)
-			}
-		}
-		if pr != nil && pr.key != nil {
-			// At most one write per key per minute; the statement itself
-			// throttles, so a busy key does not rewrite its row per request.
-			if err := g.Store.TouchAPIKeyUsed(context.Background(), pr.key.ID); err != nil {
-				log.Error("touch api key", "key", pr.key.ID, "err", err)
-			}
-		}
-		// The model label is conn.ModelName, never the model string the
-		// client sent: that value is attacker-controlled and would make the
-		// label unbounded. The project label is the numeric id.
-		g.Metrics.RecordGateway(obs.GatewayRequest{
-			Project: projectID, Model: conn.ModelName, Provider: conn.ProviderType,
-			Status: rec.StatusCode, Streamed: rec.Streamed,
-			Duration: time.Since(start), Upstream: obsv.upstream, TimeToFirstToken: obsv.ttft,
-			PromptTokens: rec.PromptTokens, CompletionTokens: rec.CompletionTokens,
-			Estimated: rec.Estimated, CostUSD: rec.CostUSD, ErrorType: obsv.errType,
-			ClientDisconnected: rec.StatusCode == statusClientClosed,
-			Unpriced:           rec.CostSource == store.CostSourceNone,
-		})
-		if span.IsRecording() {
-			span.SetAttributes(
-				tracing.Int64("ragmux.project.id", p.ID),
-				tracing.String("gen_ai.operation.name", "chat"),
-				tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(conn.ProviderType)),
-				tracing.String("gen_ai.request.model", conn.ModelName),
-				tracing.Bool("ragmux.stream", rec.Streamed),
-				tracing.Int("gen_ai.usage.input_tokens", rec.PromptTokens),
-				tracing.Int("gen_ai.usage.output_tokens", rec.CompletionTokens),
-				tracing.Int("gen_ai.usage.cache_read.input_tokens", rec.CachedPromptTokens),
-			)
-			if obsv.responseModel != "" {
-				span.SetAttributes(tracing.String("gen_ai.response.model", obsv.responseModel))
-			}
-			if len(obsv.finishReasons) > 0 {
-				span.SetAttributes(tracing.StringSlice("gen_ai.response.finish_reasons", obsv.finishReasons))
-			}
-			if rec.StatusCode < 500 {
-				span.SetStatusOK()
-			}
-		}
-	}()
-
 	// Warnings go out before the first byte of either response shape; a
 	// stream's headers are only written once its first chunk arrives.
-	setRequestWarnings(w.Header(), prov, req)
-
-	if req.Stream {
-		g.stream(w, r, prov, conn, req, rec, obsv, promptChars)
-		return
-	}
-
-	upstreamStart := time.Now()
-	resp, err := prov.Chat(ctx, req)
-	obsv.upstream = time.Since(upstreamStart)
-	if err != nil {
-		if ctx.Err() != nil {
-			// The client went away while the upstream call was running; the
-			// provider already saw the cancellation through ctx.
-			rec.StatusCode, rec.Error = statusClientClosed, errClientClosed
-			return
-		}
-		status, pe := providerError(err)
-		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
-		log.Warn("upstream error", "status", status, "msg", pe.Message)
-		writeProviderError(w, status, pe)
-		return
-	}
-	obsv.noteResponseModel(resp.Model, clientModel, conn.ModelName)
-	for i := range resp.Choices {
-		obsv.noteFinishReason(resp.Choices[i].FinishReason)
-	}
-	resp.Model = clientModel
-	fillUsage(rec, resp.Usage, promptChars, completionChars(resp))
-	rec.StatusCode = http.StatusOK
-	w.Header().Set("Content-Type", "application/json")
-	if opts.IncludeContext {
-		if b, err := withRagmuxField(resp, sources, contextBlock); err == nil {
-			_, _ = w.Write(b)
-			return
-		}
-	}
-	_ = json.NewEncoder(w).Encode(resp)
+	setRequestWarnings(w.Header(), prov, *req)
+	return prep
 }
 
 // ragmuxRequest is the optional "ragmux" object clients may add to a chat
@@ -795,15 +957,32 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 	return append(b, '\n'), nil
 }
 
-func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.Provider, conn *store.ModelConnection,
-	req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) {
+// stream relays one streamed chat call to the client.
+//
+// It returns an error only when the upstream failed before the first chunk, so
+// that nothing has been written and rec is untouched: the caller may then try
+// another target. Once a chunk has arrived the response is the stream's own
+// and every outcome is settled in rec. firstByte, if positive, is how long the
+// upstream has to produce that first chunk; it does not limit the stream
+// afterwards.
+func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.Duration, prov provider.Provider,
+	conn *store.ModelConnection, req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by server")
-		return
+		return nil
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	var budgetHit atomic.Bool
+	var budgetTimer *time.Timer
+	if firstByte > 0 {
+		budgetTimer = time.AfterFunc(firstByte, func() {
+			budgetHit.Store(true)
+			cancel()
+		})
+		defer budgetTimer.Stop()
+	}
 
 	// The chunk counter is resolved once, here: the registry's With costs an
 	// allocation, and a per-chunk lookup in a streaming handler is exactly
@@ -836,6 +1015,9 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 			return
 		}
 		headersSent = true
+		if budgetTimer != nil {
+			budgetTimer.Stop()
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -902,14 +1084,17 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 		// request through ctx; nothing can be written to the client.
 		rec.StatusCode, rec.Error = statusClientClosed, errClientClosed
 		fillUsage(rec, usage, promptChars, compChars)
-		return
+		return nil
+	}
+	if budgetHit.Load() && !headersSent {
+		// The first-byte budget cut the call off; the context error that
+		// reached us is ours, not the client's.
+		err = &provider.Error{Status: http.StatusGatewayTimeout, Type: "timeout", Message: "upstream request cancelled or timed out"}
 	}
 	if err != nil && !headersSent {
-		status, pe := providerError(err)
-		rec.StatusCode, rec.Error, obsv.errType = status, pe.Message, pe.Type
-		g.Log.Warn("upstream error", "project", rec.ProjectID, "status", status, "msg", pe.Message)
-		writeProviderError(w, status, pe)
-		return
+		// Nothing was written: the caller decides whether to try another
+		// target or to answer with this error.
+		return err
 	}
 	sendHeaders()
 	if err != nil {
@@ -924,6 +1109,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, prov provider.P
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	fillUsage(rec, usage, promptChars, compChars)
+	return nil
 }
 
 func messageChars(msgs []provider.Message) int {
@@ -1045,7 +1231,12 @@ func providerError(err error) (int, *provider.Error) {
 // table. A model nobody priced, or a table that cannot be read, leaves the
 // cost at zero with cost_source "none" — a missing price is reported as
 // missing, never guessed.
-func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLog) {
+//
+// searchUnits is what the call billed in search units, priced with the
+// connection's per_search_unit; it is zero for every call but a Cohere rerank.
+// A row that has a per_search_unit rate prices such a call by search units
+// alone, never by tokens as well.
+func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLog, searchUnits int) {
 	rec.CostSource = store.CostSourceNone
 	if g.Prices == nil || conn == nil {
 		return
@@ -1057,11 +1248,41 @@ func (g *Gateway) priceRequest(conn *store.ModelConnection, rec *store.RequestLo
 	if !ok {
 		return
 	}
-	rec.CostMicros = p.CostMicros(rec.PromptTokens, rec.CachedPromptTokens, rec.CacheWriteTokens, rec.CompletionTokens)
+	rec.CostMicros = p.BilledMicros(rec.PromptTokens, rec.CachedPromptTokens, rec.CacheWriteTokens, rec.CompletionTokens, searchUnits)
 	rec.CostSource = p.Source
 	// The row stores micros (exact in BIGINT); CostUSD is the same figure in
 	// dollars, which is what the cost counter adds up.
 	rec.CostUSD = float64(rec.CostMicros) / 1e6
+}
+
+// priceSideCharges adds the cost of each side charge to the finished row, every
+// one priced with the connection that did the work. A charge whose connection
+// has no price adds nothing: the request still succeeded, and the row's
+// cost_source stays what the main call's price gave it, so a missing price on
+// a rerank connection never reads as a priced zero on the whole row.
+func (g *Gateway) priceSideCharges(rec *store.RequestLog, charges []sideCharge) {
+	if g.Prices == nil {
+		return
+	}
+	for _, ch := range charges {
+		if ch.providerType == "" {
+			continue
+		}
+		p, ok := g.Prices.Lookup(context.Background(), ch.providerType, ch.model)
+		if !ok {
+			continue
+		}
+		rec.CostMicros = addMicros(rec.CostMicros, p.BilledMicros(ch.prompt, 0, 0, ch.completion, ch.searchUnits))
+	}
+	rec.CostUSD = float64(rec.CostMicros) / 1e6
+}
+
+// addMicros is a + b saturated at the int64 ceiling; both are non-negative.
+func addMicros(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 // fillUsage copies the upstream's token counts onto the log row, falling

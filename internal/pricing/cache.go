@@ -101,6 +101,7 @@ func loadRows(ctx context.Context, pool *pgxpool.Pool) ([]Row, error) {
 		input_per_mtok::float8, output_per_mtok::float8,
 		COALESCE(cache_write_per_mtok, input_per_mtok)::float8,
 		COALESCE(cache_read_per_mtok, input_per_mtok)::float8,
+		COALESCE(per_search_unit, 0)::float8, per_search_unit IS NOT NULL,
 		currency, source FROM model_prices`)
 	if err != nil {
 		return nil, err
@@ -110,7 +111,7 @@ func loadRows(ctx context.Context, pool *pgxpool.Pool) ([]Row, error) {
 	for rows.Next() {
 		var r Row
 		if err := rows.Scan(&r.ID, &r.ProviderType, &r.Pattern, &r.Price.Input, &r.Price.Output,
-			&r.Price.CacheWrite, &r.Price.CacheRead, &r.Price.Currency, &r.Price.Source); err != nil {
+			&r.Price.CacheWrite, &r.Price.CacheRead, &r.Price.PerSearchUnit, &r.Price.HasSearchUnit, &r.Price.Currency, &r.Price.Source); err != nil {
 			return nil, err
 		}
 		r.Price.Pattern = r.Pattern

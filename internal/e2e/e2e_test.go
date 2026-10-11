@@ -125,7 +125,7 @@ func loopbackEmbeddingWidth(embedders func(*store.ModelConnection) (provider.Emb
 		if err != nil {
 			return 0, err
 		}
-		vecs, err := emb.Embed(ctx, []string{"ping"})
+		vecs, _, err := emb.Embed(ctx, []string{"ping"})
 		if err != nil {
 			return 0, err
 		}
@@ -157,6 +157,9 @@ type envOpts struct {
 	// tracer, when set, is wired through every span site the way main.go
 	// wires it.
 	tracer *tracing.Tracer
+	// gwTune, when set, adjusts the gateway before it is served (the retry
+	// and budget settings main.go takes from the configuration).
+	gwTune func(*gateway.Gateway)
 }
 
 // newEnv wires the whole application against the schema described by cfg.
@@ -206,10 +209,34 @@ func newEnvOpts(t *testing.T, cfg store.OpenConfig, opts envOpts) *env {
 	ing.Kick()
 	ret := rag.NewRetriever(st, embedders)
 	ret.Metrics, ret.Tracer = met, tracer
+	// The same reranker factory main wires: llm by default, an API reranker
+	// built from the store's rerank connection for cohere and voyage.
+	ret.Rerankers = func(ctx context.Context, rs *store.RAGStore) (rag.Reranker, error) {
+		if rs.RerankBackend == "" || rs.RerankBackend == store.RerankLLM {
+			return &rag.LLMReranker{}, nil
+		}
+		if rs.RerankConnectionID == nil {
+			return nil, rag.ErrRerankUnavailable
+		}
+		conn, err := st.GetConnection(ctx, *rs.RerankConnectionID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", rag.ErrRerankUnavailable, err)
+		}
+		client, err := provider.NewReranker(provCfg(conn))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", rag.ErrRerankUnavailable, err)
+		}
+		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client,
+			ProviderType: conn.ProviderType, Model: conn.ModelName}, nil
+	}
 	authSvc := &auth.Service{Store: st, TTL: time.Hour}
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: ret, Log: log, Limiter: usage,
-		Metrics: met, Tracer: tracer}
+		Metrics: met, Tracer: tracer,
+		Rerankers: func(c *store.ModelConnection) (provider.Reranker, error) { return provider.NewReranker(provCfg(c)) }}
+	if opts.gwTune != nil {
+		opts.gwTune(gw)
+	}
 	// The mock upstreams listen on loopback, which the save-time base_url
 	// check would otherwise reject.
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ing, Retriever: ret, Providers: providers, Log: log,
@@ -874,7 +901,10 @@ func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
 		t.Fatalf("unknown search_mode should be rejected: %v", r)
 	}
 	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "docs", "embedding_connection_id": connID,
-		"chunk_size": 200, "chunk_overlap": 0, "top_k": 2, "fts_config": "english"}, "")
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 2, "fts_config": "english",
+		// The dashboard search reranks through the store's own connection (no
+		// "first project" guess), so the llm backend needs one.
+		"rerank_connection_id": connID}, "")
 	if status(rs) != 201 || rs["search_mode"] != "hybrid" || rs["fts_config"] != "english" || rs["contextual_chunks"] != true || rs["rerank_candidates"] != float64(15) || rs["max_distance"] != float64(0) {
 		t.Fatalf("create store: %v", rs)
 	}

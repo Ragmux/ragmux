@@ -23,6 +23,24 @@ type Reranker interface {
 	Rerank(ctx context.Context, query string, docs []string, topN int) ([]RerankResult, error)
 }
 
+// UsageReranker is implemented by rerankers that can report what a call
+// consumed. Rerank on the same type drops the figure, so existing callers and
+// test fakes keep working; accounting code goes through RerankWithUsage.
+type UsageReranker interface {
+	RerankUsage(ctx context.Context, query string, docs []string, topN int) ([]RerankResult, *Usage, error)
+}
+
+// RerankWithUsage runs r and returns the upstream's usage report. The usage is
+// nil when the reranker cannot report one or the upstream sent none; the
+// caller then estimates from the text it sent.
+func RerankWithUsage(ctx context.Context, r Reranker, query string, docs []string, topN int) ([]RerankResult, *Usage, error) {
+	if ur, ok := r.(UsageReranker); ok {
+		return ur.RerankUsage(ctx, query, docs, topN)
+	}
+	res, err := r.Rerank(ctx, query, docs, topN)
+	return res, nil, err
+}
+
 // RerankResult is one reranked passage: Index is a position in the docs
 // slice the caller passed in, Score the provider's relevance score.
 type RerankResult struct {
@@ -58,6 +76,16 @@ type cohereReranker struct {
 }
 
 func (r *cohereReranker) Rerank(ctx context.Context, query string, docs []string, topN int) ([]RerankResult, error) {
+	res, _, err := r.RerankUsage(ctx, query, docs, topN)
+	return res, err
+}
+
+// RerankUsage is Rerank plus what Cohere reports in meta: the token counts
+// (meta.tokens) and the billed search units (meta.billed_units.search_units).
+// Search units are what Cohere charges for, so the reply to a successful call
+// always carries at least one: when the field is missing, a call is billed as
+// one search unit.
+func (r *cohereReranker) RerankUsage(ctx context.Context, query string, docs []string, topN int) ([]RerankResult, *Usage, error) {
 	body := map[string]any{
 		"model":     r.cfg.Model,
 		"query":     query,
@@ -69,16 +97,34 @@ func (r *cohereReranker) Rerank(ctx context.Context, query string, docs []string
 			Index          int     `json:"index"`
 			RelevanceScore float64 `json:"relevance_score"`
 		} `json:"results"`
+		Meta struct {
+			Tokens struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"tokens"`
+			BilledUnits struct {
+				SearchUnits int `json:"search_units"`
+			} `json:"billed_units"`
+		} `json:"meta"`
 	}
 	headers := map[string]string{"Authorization": "Bearer " + r.cfg.APIKey}
 	if err := doJSON(ctx, r.cfg, opRerank, r.base+"/v2/rerank", headers, body, &out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	res := make([]RerankResult, 0, len(out.Results))
 	for _, x := range out.Results {
 		res = append(res, RerankResult{Index: x.Index, Score: x.RelevanceScore})
 	}
-	return filterRerankResults(res, len(docs))
+	usage := &Usage{SearchUnits: out.Meta.BilledUnits.SearchUnits}
+	if usage.SearchUnits < 1 {
+		usage.SearchUnits = 1
+	}
+	if t := out.Meta.Tokens; t.InputTokens > 0 || t.OutputTokens > 0 {
+		usage.PromptTokens, usage.CompletionTokens = t.InputTokens, t.OutputTokens
+		usage.TotalTokens = t.InputTokens + t.OutputTokens
+	}
+	res, err := filterRerankResults(res, len(docs))
+	return res, usage, err
 }
 
 type voyageReranker struct {
@@ -87,6 +133,12 @@ type voyageReranker struct {
 }
 
 func (r *voyageReranker) Rerank(ctx context.Context, query string, docs []string, topN int) ([]RerankResult, error) {
+	res, _, err := r.RerankUsage(ctx, query, docs, topN)
+	return res, err
+}
+
+// RerankUsage is Rerank plus the total token count Voyage reports in usage.
+func (r *voyageReranker) RerankUsage(ctx context.Context, query string, docs []string, topN int) ([]RerankResult, *Usage, error) {
 	body := map[string]any{
 		"model":     r.cfg.Model,
 		"query":     query,
@@ -102,16 +154,25 @@ func (r *voyageReranker) Rerank(ctx context.Context, query string, docs []string
 			Index          int     `json:"index"`
 			RelevanceScore float64 `json:"relevance_score"`
 		} `json:"data"`
+		Usage struct {
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	headers := map[string]string{"Authorization": "Bearer " + r.cfg.APIKey}
 	if err := doJSON(ctx, r.cfg, opRerank, r.base+"/v1/rerank", headers, body, &out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	res := make([]RerankResult, 0, len(out.Data))
 	for _, x := range out.Data {
 		res = append(res, RerankResult{Index: x.Index, Score: x.RelevanceScore})
 	}
-	return filterRerankResults(res, len(docs))
+	var usage *Usage
+	if n := out.Usage.TotalTokens; n > 0 {
+		// Voyage bills one figure for query and passages; it is all input.
+		usage = &Usage{PromptTokens: n, TotalTokens: n}
+	}
+	res, err := filterRerankResults(res, len(docs))
+	return res, usage, err
 }
 
 // filterRerankResults drops indexes outside 0..n-1 and repeats of one the
@@ -147,6 +208,18 @@ func truncatePassages(docs []string) []string {
 		out[i] = truncateRunes(d, rerankPassageChars)
 	}
 	return out
+}
+
+// RerankRequestChars is the size in bytes of the text a rerank call sends:
+// the query and every passage cut to the length the adapters cut it to. It is
+// the basis of a usage estimate when the upstream reports no tokens, so the
+// estimate matches what is actually sent rather than what the client posted.
+func RerankRequestChars(query string, docs []string) int {
+	n := len(query)
+	for _, d := range truncatePassages(docs) {
+		n += len(d)
+	}
+	return n
 }
 
 func truncateRunes(s string, n int) string {

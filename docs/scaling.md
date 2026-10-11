@@ -350,6 +350,14 @@ None of these need to be, but it is worth knowing why:
   with idle upstream connections. Both are derived, not authoritative: the
   worst a cold replica does is one extra `CREATE TABLE IF NOT EXISTS` or one
   extra TLS handshake. Nothing invalidates across replicas, and nothing has to.
+- **Circuit breaker state.** Each replica keeps the breaker of every model
+  connection in memory ([Retry and fallback](providers.md#retry-and-fallback)).
+  A replica opens a breaker from the failures it saw itself, so replicas notice
+  a bad upstream at different moments, and a fleet of `N` replicas sends up to
+  `N` probes to a recovering one. A restarted replica starts with every breaker
+  closed. `ragmux_upstream_breaker_state` is per replica; read it per instance,
+  not as a fleet-wide value. Sharing the state would put a write on the request
+  path for what is only a hint, so it is deliberately not shared.
 - **The one-second ingestion backlog count.** Each replica caches the pending
   count for about a second, so a burst of uploads arriving at different
   replicas within the same second can overshoot `MAX_PENDING_DOCUMENTS` by the

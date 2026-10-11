@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -362,4 +364,154 @@ func TestAPIKeyProjectsIsAGatewayOnlyTable(t *testing.T) {
 	if _, err := f.st.GetAPIKey(f.ctx, k.ID); err == nil {
 		t.Error("the key survived its own deletion")
 	}
+}
+
+// TestScopeBackfillMigration runs the 0018 SQL against keys shaped like the
+// ones a v0.4 database holds. A fresh test schema has no such keys by the time
+// the migration runs, so the file is re-executed on seeded rows; the migration
+// is idempotent by contract, which is what makes that a faithful replay.
+func TestScopeBackfillMigration(t *testing.T) {
+	f := newKeyFixture(t)
+	db := f.st.DB()
+	old := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	insert := func(kind, name string, scopes []string, extra string) int64 {
+		t.Helper()
+		var id int64
+		err := db.QueryRow(f.ctx, `INSERT INTO api_keys (kind, name, key_hash, key_prefix, user_id, scopes, updated_at`+
+			extraCols(extra)+`) VALUES ($1, $2, $3, 'sk-', $4, $5, $6`+extraVals(extra)+`) RETURNING id`,
+			kind, name, "hash-"+name, f.user.ID, scopes, old).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert %s: %v", name, err)
+		}
+		return id
+	}
+	chatOnly := insert("gateway", "chat-only", []string{"chat"}, "")
+	chatModels := insert("gateway", "chat-models", []string{"chat", "models"}, "")
+	partial := insert("gateway", "partial", []string{"chat", "retrieve"}, "")
+	full := insert("gateway", "full", []string{"chat", "models", "embeddings", "retrieve", "rerank"}, "")
+	revoked := insert("gateway", "revoked", []string{"chat"}, "revoked")
+	expired := insert("gateway", "expired", []string{"chat"}, "expired")
+	modelsOnly := insert("gateway", "models-only", []string{"models"}, "")
+	none := insert("gateway", "no-scopes", []string{}, "")
+	mgmt := insert("management", "mgmt", []string{"read", "write", "admin", "keys"}, "")
+
+	type row struct {
+		Scopes    []string
+		UpdatedAt time.Time
+	}
+	snapshot := func() map[int64]row {
+		t.Helper()
+		rows, err := db.Query(f.ctx, "SELECT id, scopes, updated_at FROM api_keys")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[int64]row{}
+		for rows.Next() {
+			var id int64
+			var r row
+			if err := rows.Scan(&id, &r.Scopes, &r.UpdatedAt); err != nil {
+				t.Fatal(err)
+			}
+			out[id] = r
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	body, err := os.ReadFile("migrations/0018_backfill_v05_scopes.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func() int64 {
+		t.Helper()
+		tag, err := db.Exec(f.ctx, string(body))
+		if err != nil {
+			t.Fatalf("run 0018: %v", err)
+		}
+		return tag.RowsAffected()
+	}
+	before := snapshot()
+	// chat-only, chat-models, partial, revoked and expired need scopes; full,
+	// models-only, no-scopes and the management key do not match.
+	if n := run(); n != 5 {
+		t.Errorf("first run matched %d rows, want 5", n)
+	}
+	after := snapshot()
+
+	all := []string{"embeddings", "retrieve", "rerank"}
+	want := map[int64][]string{
+		chatOnly:   append([]string{"chat"}, all...),
+		chatModels: append([]string{"chat", "models"}, all...),
+		partial:    {"chat", "retrieve", "embeddings", "rerank"},
+		full:       {"chat", "models", "embeddings", "retrieve", "rerank"},
+		revoked:    append([]string{"chat"}, all...),
+		expired:    append([]string{"chat"}, all...),
+		modelsOnly: {"models"},
+		none:       {},
+		mgmt:       {"read", "write", "admin", "keys"},
+	}
+	for id, w := range want {
+		if !reflect.DeepEqual(after[id].Scopes, w) {
+			t.Errorf("key %d scopes = %v, want %v", id, after[id].Scopes, w)
+		}
+		if !after[id].UpdatedAt.Equal(old) {
+			t.Errorf("key %d updated_at = %v, want it untouched (%v)", id, after[id].UpdatedAt, old)
+		}
+	}
+	if reflect.DeepEqual(before, after) {
+		t.Fatal("backfill changed nothing")
+	}
+
+	// HasScope through the real read path.
+	k, err := f.st.GetAPIKey(f.ctx, chatOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{store.ScopeChat, store.ScopeEmbeddings, store.ScopeRetrieve, store.ScopeRerank} {
+		if !k.HasScope(s) {
+			t.Errorf("chat key lacks %q after the backfill: %v", s, k.Scopes)
+		}
+	}
+	m, err := f.st.GetAPIKey(f.ctx, modelsOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{store.ScopeEmbeddings, store.ScopeRetrieve, store.ScopeRerank} {
+		if m.HasScope(s) {
+			t.Errorf("models-only key gained %q", s)
+		}
+	}
+
+	// A second run matches no row at all, which is stronger than leaving the
+	// values equal: it fails if the migration's guard is dropped and every chat
+	// key is rewritten with the same value.
+	if n := run(); n != 0 {
+		t.Errorf("second run matched %d rows, want 0", n)
+	}
+	if again := snapshot(); !reflect.DeepEqual(after, again) {
+		t.Errorf("second run changed rows:\nfirst  %v\nsecond %v", after, again)
+	}
+}
+
+func extraCols(extra string) string {
+	switch extra {
+	case "revoked":
+		return ", revoked_at"
+	case "expired":
+		return ", expires_at"
+	}
+	return ""
+}
+
+func extraVals(extra string) string {
+	switch extra {
+	case "revoked":
+		return ", now() - interval '1 day'"
+	case "expired":
+		return ", now() - interval '1 day'"
+	}
+	return ""
 }

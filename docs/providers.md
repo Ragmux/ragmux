@@ -17,6 +17,7 @@ gateway. Connections are managed with `POST /admin/api/models` (see the
 | `deepseek` | `https://api.deepseek.com/v1` | `POST {base}/chat/completions` | reported as unsupported (`supports_embeddings: false`) | `Authorization: Bearer <api_key>` |
 | `ollama` | `http://localhost:11434` | `POST {base}/api/chat` (native API) | yes — `POST {base}/api/embed` | none; an `api_key` is sent as `Authorization: Bearer` for a proxy in front of Ollama |
 | `custom_openai` | *(required; dashboard suggests `http://localhost:8000/v1`)* | `POST {base}/chat/completions` | yes — `POST {base}/embeddings` | `Authorization: Bearer <api_key>` (optional) |
+| `azure_openai` | *(required; dashboard suggests `https://your-resource.openai.azure.com`)* | `POST {endpoint}/openai/deployments/{deployment}/chat/completions?api-version=…` | yes — `POST {endpoint}/openai/deployments/{deployment}/embeddings?api-version=…` | `api-key: <api_key>` (no `Authorization` header) |
 | `cohere_rerank` | `https://api.cohere.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
 | `voyage_rerank` | `https://api.voyageai.com` | none — reranking only | no | `Authorization: Bearer <api_key>` |
 
@@ -27,7 +28,8 @@ trailing `/v1` is removed because the native endpoints live at the root. When th
 runs in Docker, local servers on the host are reachable as `http://host.docker.internal:<port>`.
 
 A `base_url` must be a plain `http://` or `https://` URL with a host and without
-credentials, query string or fragment. Hosts on private or local networks (the Docker
+credentials, query string or fragment (`azure_openai` alone may carry an `api-version`
+query parameter, see [Azure OpenAI](#azure-openai)). Hosts on private or local networks (the Docker
 host, a Compose service, `localhost`) are refused unless they are listed in
 `PRIVATE_UPSTREAM_ALLOWLIST` or `ALLOW_PRIVATE_UPSTREAMS=true` is set — see
 [Private upstreams](configuration.md#private-upstreams). `model_name` may contain letters,
@@ -44,33 +46,67 @@ whose stored key is reused. Each connection also reports `private_upstream`: whe
 `base_url` pointed at a loopback, private or link-local address when it was saved. See
 [REST API reference](api.md#model-connections).
 
+## Presets
+
+Hosted providers that speak the OpenAI Chat Completions format need no adapter of their
+own: they are `custom_openai` connections with a known base URL. `GET
+/admin/api/provider-presets` lists the ready-made ones, each with the `provider_type`,
+`base_url` and model names to use, so a client can offer them as a one-step choice:
+
+| Preset `id` | Provider | `provider_type` | `base_url` | Suggested `model_name` |
+|---|---|---|---|---|
+| `mistral` | Mistral AI | `custom_openai` | `https://api.mistral.ai/v1` | `mistral-large-latest`, `mistral-medium-latest`, `mistral-small-latest`, `codestral-latest`; embeddings: `mistral-embed` |
+| `xai` | xAI | `custom_openai` | `https://api.x.ai/v1` | `grok-4`, `grok-3`, `grok-3-mini` |
+| `groq` | Groq | `custom_openai` | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `openai/gpt-oss-120b`, `openai/gpt-oss-20b` |
+
+Every preset needs an API key (`requires_api_key: true`), sent as `Authorization: Bearer`.
+A preset is a convenience, not a stored type: send its `provider_type` and `base_url`,
+and a `model_name` of your choice, to `POST /admin/api/models`. The result is an ordinary
+`custom_openai` connection that is validated and tested like one typed by hand. The model names are suggestions; any name the
+provider serves works, and a provider that retires one does not break existing
+connections.
+
+In the dashboard the same list is the **Start from a preset** select on the new-connection
+form: picking one fills in the provider type, base URL and a model name, and nothing is
+saved until you press **Save connection**. The preset itself is never sent.
+
+Presets carry **no price**. `custom_openai` ships no built-in price rows, because the type
+names a URL rather than a vendor and a row keyed on it would price every self-hosted
+server like the hosted service. Add the models you use to the
+[price table](api.md#model-prices) (provider type `custom_openai`) to get cost figures;
+until then usage is counted and a request is logged with `cost_source: "none"` and a cost
+of zero.
+
 ## Capabilities
 
 What each adapter can do with a provider type. These describe the **adapter**, not the
 upstream model: a model that cannot see images still shows `vision` for its provider
 type, because the translation exists — the model's own refusal is relayed as it comes.
 
-| | `openai` | `anthropic` | `gemini` | `deepseek` | `ollama` | `custom_openai` |
-|---|---|---|---|---|---|---|
-| `streaming` | yes | yes | yes | yes | yes | yes |
-| `embeddings` | yes | no | yes | no | yes | yes |
-| `tools` | yes | yes | yes | yes | yes | yes |
-| `tool_streaming` | yes | yes | no ¹ | yes | no ¹ | yes |
-| `vision` | yes | yes | yes | no | yes | yes |
-| `remote_images` | yes | yes | no ² | no | no ² | yes |
-| `prompt_caching` | no ³ | yes | no | no | no | no |
-| `cached_token_usage` | yes | yes | yes | yes | no | no |
-| `rerank` | no | no | no | no | no | no |
+| | `openai` | `anthropic` | `gemini` | `deepseek` | `ollama` | `custom_openai` | `azure_openai` |
+|---|---|---|---|---|---|---|---|
+| `chat` | yes | yes | yes | yes | yes | yes | yes |
+| `streaming` | yes | yes | yes | yes | yes | yes | yes |
+| `embeddings` | yes | no | yes | no | yes | yes | yes |
+| `tools` | yes | yes | yes | yes | yes | yes | yes |
+| `tool_streaming` | yes | yes | no ¹ | yes | no ¹ | yes | yes |
+| `vision` | yes | yes | yes | no | yes | yes | yes |
+| `remote_images` | yes | yes | no ² | no | no ² | yes | yes |
+| `prompt_caching` | no ³ | yes | no | no | no | no | no ³ |
+| `cached_token_usage` | yes | yes | yes | yes | no | no | yes |
+| `rerank` | no | no | no | no | no | no | no |
 
 `cohere_rerank` and `voyage_rerank` sit outside that table: `rerank` is the only
-capability they have, and `chat` and `embeddings` are both `no`.
+capability they have, and `chat` and `embeddings` are both `no`. `chat` is what the
+dashboard's model picker filters on: a connection whose type has it can back a project
+or a chat route target.
 
 ¹ Tool calls still work in streams; they arrive as one complete delta per call instead of
 argument fragments, because that is how the upstream sends them — see
 [Ollama](#ollama-native-api) and [Gemini](#gemini).
 ² The upstream cannot fetch an image URL, so the gateway downloads it and sends the bytes;
 see [Images](#images).
-³ OpenAI caches prompts automatically, so there is no marker to send.
+³ OpenAI and Azure OpenAI cache prompts automatically, so there is no marker to send.
 
 The table gates nothing: an adapter answers for itself with a typed error when a request
 asks for something it cannot do, and a second copy of those rules in front of it would
@@ -88,7 +124,8 @@ RAG store's embeddings.** `provider.New` and `NewEmbedder` reject them, the dash
 model and embedding pickers filter them out, and saving a project or a store that names
 one is refused with `400` (`provider "cohere_rerank" cannot be used for chat`,
 `... cannot be used for embeddings`). The only place a connection of these types belongs
-is a RAG store's `rerank_connection_id` — see [Reranking](rag.md#reranking).
+is a RAG store's `rerank_connection_id` or a `kind = rerank` route target (served by
+`POST /v1/rerank`) — see [Reranking](rag.md#reranking).
 
 | | `cohere_rerank` | `voyage_rerank` |
 |---|---|---|
@@ -160,6 +197,64 @@ the upstream unchanged, so provider-specific options (`seed`, a request-side `lo
 `reasoning_effort`, vLLM's `guided_json`, …) work without gateway support. For `ollama` a
 defined subset is
 mapped (below); `anthropic` and `gemini` ignore unknown fields.
+
+## Azure OpenAI
+
+`azure_openai` talks to an Azure OpenAI resource. It uses the Chat Completions body and
+response, so streaming, tool calls, images and embeddings behave as they do for `openai`;
+what differs is how the request is addressed and authenticated:
+
+```
+POST {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}
+POST {endpoint}/openai/deployments/{deployment}/embeddings?api-version={version}
+api-key: <api_key>
+```
+
+The key travels in the `api-key` header; no `Authorization: Bearer` header is sent. A
+model connection has no column for the version, so the four settings map onto the
+existing fields:
+
+| Setting | Field | Example |
+|---|---|---|
+| Endpoint | `base_url` | `https://my-resource.openai.azure.com` |
+| Deployment | `model_name` | `my-gpt4o` (the deployment name you chose in Azure, not the model family) |
+| API version | `api-version` query parameter of `base_url`, optional | `https://my-resource.openai.azure.com?api-version=2025-04-01-preview` |
+| Key | `api_key` | one of the resource's two keys |
+
+`$AUTH` is the bearer header from the login example in [the API reference](api.md).
+
+```bash
+curl -X POST http://localhost:8765/admin/api/models \
+  -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"name":"azure-gpt4o","provider_type":"azure_openai",
+       "base_url":"https://my-resource.openai.azure.com",
+       "model_name":"my-gpt4o","api_key":"<azure key>"}'
+```
+
+Without an `api-version` the gateway uses `2024-10-21`. Pass another one when a feature
+you need (a newer model, a preview capability) requires it. The same connection can serve
+a RAG store's embeddings when its deployment is an embedding model; chat and embedding
+deployments are separate connections.
+
+The dashboard's connection form shows these settings under their Azure names (endpoint,
+**Deployment name**, **API version**) and joins them into `base_url` and `model_name` on
+save. Leave the API version blank to use the default.
+
+Validation on save: `base_url` is required and takes no credentials or fragment, and its
+only allowed query parameter is a single `api-version` (letters, digits, `.`, `_`, `-`);
+a pasted trailing `/` or `/openai` is accepted and removed. `model_name` is the deployment
+name: letters, digits, `.`, `_` and `-`, starting with a letter or digit, up to 64
+characters. The endpoint goes through the same private-address check as every other
+`base_url`; use `PRIVATE_UPSTREAM_ALLOWLIST` for a private endpoint such as an Azure
+Private Link address.
+
+The key sits in the same encrypted `api_key` field as every other provider key: AES-256-GCM
+at rest, masked in the API, and re-encrypted by `ragmux rotate-key` along with the rest.
+Upstream errors are relayed and redacted like any other provider's, so the key never
+appears in one.
+
+Azure prices are not built in; add them to the [price table](api.md#model-prices) with
+provider type `azure_openai`.
 
 ## Anthropic
 
@@ -573,12 +668,144 @@ prefix most worth a breakpoint, but the gateway does not mark one: a project-lev
 
 ## Model field echo
 
-The `model` value in a client request never selects the upstream model — the project's
-connection does. The gateway replaces it with the connection's model name before calling
-the provider and echoes the client's original value back in the response (and in every
-stream chunk) so SDKs that compare the field stay happy. When the client sends an empty
-`model`, the connection's model name is returned instead. `GET /v1/models` lists that
+A project without chat routes ignores the client's `model` for selection: the project's
+connection decides. The gateway replaces the value with the connection's model name before
+calling the provider and echoes the client's original value back in the response (and in
+every stream chunk) so SDKs that compare the field stay happy. When the client sends an
+empty `model`, the connection's model name is returned instead. `GET /v1/models` lists that
 model name with `owned_by` set to the provider type.
+
+## Routing
+
+A project can define named routes (see [Routes](api.md#routes)). Each route has one to
+eight targets: a connection, an optional `model` override, a `weight` and a `priority`.
+Once a project has at least one chat route, the client's `model` selects what runs:
+
+1. A route name matches exactly: the route's targets are ordered (priority groups
+   ascending, weighted random inside a group) and the first one is called.
+2. Otherwise the default connection's model name selects the implicit route: the project's
+   own connection, as before.
+3. An empty `model` also selects the implicit route.
+4. Anything else is `404` `model_not_found`.
+
+The target's `model` replaces the connection's model name for the call; the provider,
+pricing, request log and trace all see that effective model. The response `model` still
+echoes the client's value (for an empty `model`, the connection's model name). In
+`request_logs`, `model_name` is the effective model, `requested_model` is the client's
+value and `route` is the route name, empty for the implicit route. Routes of kind
+`embeddings` or `rerank` do not switch chat routing on.
+
+The project page has a route editor for all of this: a route's kind (`chat`, `embeddings`
+or `rerank`) and up to eight targets, each with its connection, optional `model`, `weight`
+and `priority`.
+
+### Before your first chat route
+
+Without chat routes the gateway answers whatever `model` string a client sends (it echoes
+it back). The first chat route ends that: any string that is neither a route name nor the
+default connection's model name becomes `404 model_not_found`. Check what your clients
+actually send before you create it:
+
+```sql
+SELECT requested_model, count(*) FROM request_logs
+WHERE project_id = <project id> GROUP BY requested_model ORDER BY count(*) DESC;
+```
+
+Create a route for every value that matters, or point those clients at the default
+connection's model name. Rolling back is deleting the route: with no chat routes left the
+project echoes any `model` again.
+
+## Retry and fallback
+
+A chat call that fails before the first byte reached the client can be repeated on the
+same target (retry) or handed to the route's next target (fallback). The order of targets
+is the one [Routing](#routing) describes; a project without routes has one target, so only
+retries apply. What happens is decided by the kind of failure:
+
+| Failure | Retry | Fallback |
+|---|---|---|
+| The request never left: DNS, refused connection, TLS handshake | yes | yes |
+| Connection reset or cut after the request was sent | no | yes |
+| `429`, `503` (and Anthropic's `529`) with no `Retry-After`, or one of 2 s or less | yes | yes |
+| `429`, `503` (and Anthropic's `529`) with `Retry-After` above 2 s | no | yes |
+| `500`, `502`, other `5xx` | no | yes |
+| `504` or a timeout | no | only if budget is left |
+| `401`, `403`, `404` (the key or model is wrong for that target) | no | yes |
+| `400`, `413`, `422` and other `4xx`, a client that went away | no | no |
+
+A reset after the request was sent is never retried on the same target: the provider may
+already have processed it, and a repeat could be billed twice. A `529` from a provider
+other than Anthropic is not retried either; it only hands the request to the next target.
+A failure to download an image URL the client sent is the client's, not the target's: it
+is answered as it is, with neither retry nor fallback.
+
+**Retries.** Each target is retried up to `UPSTREAM_MAX_RETRIES` times (default `2`, `0`
+turns them off). The wait before a retry is exponential with full jitter: a random time
+below 250 ms, 500 ms, 1 s and so on, capped at 2 s. When the upstream sent `Retry-After`
+of 2 s or less, the longer of the two is waited. A longer `Retry-After` is not waited for:
+the next target takes over, and when there is none the client gets the error with
+`Retry-After` set to the upstream's value.
+
+**Budget.** `UPSTREAM_TIMEOUT` is the budget of the whole request, not of one attempt.
+Each attempt runs with what is left of it, and a wait that would use up the remainder is
+skipped, so the attempts of a non-streaming request never add up to more than
+`UPSTREAM_TIMEOUT`.
+A streaming attempt is held to what is left of the budget only until its first chunk
+arrives; once the stream is flowing `UPSTREAM_TIMEOUT` no longer limits it, and
+`STREAM_MAX_DURATION` and `STREAM_MAX_BYTES_MB` do.
+The rate-limit check, the system prompt and retrieval run once before the first attempt,
+and usage is recorded once.
+
+**Streams.** Retry and fallback apply only until the first chunk is sent, including an
+upstream that answers `2xx` and fails before it sends anything. After the response headers
+went out the stream is never restarted or joined to another one: a cut stream ends the way
+it did before.
+
+**Circuit breaker.** A connection that keeps failing is taken out of the candidate list for
+a while, so retries and fallbacks do not spend the budget on a dead target. Every
+connection has its own breaker, held in memory by each replica; it is never written to the
+database, so replicas do not share it. A breaker has three states:
+
+- `closed`: calls pass and consecutive failures are counted. A success resets the count.
+- `open`: reached after `BREAKER_FAILURE_THRESHOLD` failures in a row (default `5`, `0`
+  turns breaking off). The connection is skipped for `BREAKER_OPEN_DURATION` (default
+  `30s`), and a target that opens in the middle of a request is not retried any more.
+- `half-open`: once the duration has passed, one call goes through as a probe. If it
+  succeeds the breaker closes; if it fails the breaker opens again for a full duration.
+  Other requests keep skipping the connection while the probe is in flight, and a probe
+  that ends in a way that says nothing about the upstream, such as a client that went
+  away, frees the slot for the next request.
+
+What counts as a failure is what the table above calls an upstream fault: the request
+never left (DNS, refused connection, TLS handshake), a reset after it was sent, `429`,
+`503` and `529`, other `5xx`, and `504` or a timeout. `401`, `403` and `404` do not count,
+although they still hand the request to the next target, and neither do other `4xx` or a
+client that went away. Such an attempt leaves the count where it was. The same holds for
+a stream: a client that leaves before or during it, or an upstream that fails after its
+first byte (the client already got a `200`), is neither a success nor a failure, so it
+neither resets the count nor closes a half-open breaker.
+
+An open connection is skipped when the route's targets are walked, so a request goes
+straight to the next healthy one. When every target of a route is open, the first one is
+called exactly once, without retries; there is no immediate `503`, so a recovered upstream
+is noticed by the first request that reaches it. A project without routes has one target
+and behaves as before. The state is per replica, so a fleet of `N` replicas sends up to `N`
+probes to a bad upstream, and a restart starts every breaker `closed`. Opening and closing
+are logged at `warn` and `info` level with the connection name, and
+`ragmux_upstream_breaker_state` reports the state per connection
+([Observability](observability.md#the-metric-set)).
+
+**What the client sees.** The error of the last attempt, in the format of
+[Error relay and redaction](#error-relay-and-redaction). A fallback that succeeds is
+invisible apart from the request log: one row per request, `attempt` is the number of
+upstream calls in total, `fallback_from` is the connection id of the first target whenever
+the request moved past it (also when no target answered), and `model_name` is the model of
+the last target tried. A target whose adapter cannot be built is skipped without counting
+as a call; on a route with several targets that includes the first one. Each failed
+attempt is logged at `warn` level with its connection id and class. Retries and fallbacks
+are counted in `ragmux_upstream_retries_total` and `ragmux_upstream_fallbacks_total`
+([Observability](observability.md#the-metric-set)); a failure that is neither retried nor
+handed on, such as a `400`, reaches neither.
 
 ## Error relay and redaction
 

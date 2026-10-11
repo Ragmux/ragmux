@@ -3,7 +3,7 @@ package provider
 import "testing"
 
 // providerTypes is every type New and NewEmbedder know about.
-var providerTypes = []string{"openai", "deepseek", "custom_openai", "anthropic", "gemini", "ollama"}
+var providerTypes = []string{"openai", "deepseek", "custom_openai", "anthropic", "gemini", "ollama", "azure_openai"}
 
 // The table is written by hand, so it has to be checked against the code it
 // describes: Embeddings must agree with NewEmbedder, and Streaming holds for

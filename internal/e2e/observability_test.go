@@ -161,7 +161,7 @@ func (c *collector) payload() string {
 	return string(c.body)
 }
 
-var spanNameRe = regexp.MustCompile(`"name":"([a-z_.]+)"`)
+var spanNameRe = regexp.MustCompile(`"name":"([A-Za-z0-9_. -]+)"`)
 
 func (c *collector) spanNames() map[string]int {
 	out := map[string]int{}
@@ -247,7 +247,7 @@ func TestSpansCarryNoSecrets(t *testing.T) {
 	// And the spans that should exist, do. Without this the test above
 	// would pass on an exporter that sent nothing useful.
 	names := col.spanNames()
-	for _, want := range []string{"http.server", "gateway.chat_completion", "rag.retrieve",
+	for _, want := range []string{"http.server", "chat mock-model", "rag.retrieve",
 		"rag.embed_query", "rag.rerank", "provider.chat", "provider.embed", "ingest.document"} {
 		if names[want] == 0 {
 			t.Errorf("no %s span was exported; got %v", want, names)

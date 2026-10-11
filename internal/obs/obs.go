@@ -106,6 +106,9 @@ type Metrics struct {
 
 	limitsDenied *metrics.CounterVec
 
+	upstreamRetries   *metrics.CounterVec
+	upstreamFallbacks *metrics.CounterVec
+
 	ragRetrieval    *metrics.HistogramVec
 	ragEmbed        *metrics.HistogramVec
 	ragRerank       *metrics.HistogramVec
@@ -117,6 +120,7 @@ type Metrics struct {
 	ingestJobs      *metrics.CounterVec
 	ingestDuration  *metrics.HistogramVec
 	ingestChunks    *metrics.CounterVec
+	ingestEmbedTok  *metrics.CounterVec
 	ingestClaims    *metrics.CounterVec
 	ingestLeaseLost *metrics.CounterVec
 
@@ -177,6 +181,13 @@ func New(reg *metrics.Registry) *Metrics {
 		"Requests refused by a rate limit or a token budget, by project and deny reason.",
 		"project", "reason")
 
+	m.upstreamRetries = reg.Counter("ragmux_upstream_retries_total",
+		"Repeat calls the gateway made to the same upstream target after a transient failure, by failure class.",
+		"reason")
+	m.upstreamFallbacks = reg.Counter("ragmux_upstream_fallbacks_total",
+		"Moves to the next target of a route after a failure, by failure class of the target it left.",
+		"reason")
+
 	m.ragRetrieval = reg.Histogram("ragmux_rag_retrieval_duration_seconds",
 		"Query embedding plus the database search, by store, effective backend and search mode.",
 		ragBuckets, "store", "backend", "mode")
@@ -201,6 +212,8 @@ func New(reg *metrics.Registry) *Metrics {
 		"Wall time of one document's parse, chunk, embed and store cycle.", ingestBuckets)
 	m.ingestChunks = reg.Counter("ragmux_ingest_chunks_total",
 		"Chunks written by ingestion.")
+	m.ingestEmbedTok = reg.Counter("ragmux_ingest_embed_tokens_total",
+		"Embedding tokens spent by ingestion, by whether the upstream reported them.", "source")
 	m.ingestClaims = reg.Counter("ragmux_ingest_claims_total",
 		"Dispatcher claim attempts by outcome.", "outcome")
 	m.ingestLeaseLost = reg.Counter("ragmux_ingest_lease_lost_total",
@@ -383,6 +396,56 @@ func (m *Metrics) RecordLimitDenied(project, reason string) {
 	m.limitsDenied.With(project, reason).Inc()
 }
 
+// Upstream failure classes, the values of the reason label of
+// ragmux_upstream_retries_total and ragmux_upstream_fallbacks_total. The set
+// is closed on purpose: the label may never carry err.Error() or a status text
+// (ADR-002).
+const (
+	UpstreamDial         = "dial"
+	UpstreamRateLimited  = "rate_limited"
+	UpstreamUnavailable  = "unavailable"
+	UpstreamServerError  = "server_error"
+	UpstreamTimeout      = "timeout"
+	UpstreamTargetConfig = "target_config"
+)
+
+// RecordUpstreamRetry counts one repeat call on the same target. reason is one
+// of the Upstream* constants.
+func (m *Metrics) RecordUpstreamRetry(reason string) {
+	if m == nil {
+		return
+	}
+	m.upstreamRetries.With(reason).Inc()
+}
+
+// RecordUpstreamFallback counts one move to the next target of a route.
+// reason is one of the Upstream* constants.
+func (m *Metrics) RecordUpstreamFallback(reason string) {
+	if m == nil {
+		return
+	}
+	m.upstreamFallbacks.With(reason).Inc()
+}
+
+// RegisterBreakers exports the state of the circuit breakers (ADR-020) as
+// ragmux_upstream_breaker_state{connection}: 0 closed, 1 open, 2 half-open.
+// snapshot returns the state by connection name and runs inline while a scrape
+// is built, so it must be cheap and in memory. The connection label is the
+// configured connection name -- owned by the control plane, not derived from
+// traffic, but it grows with the installation like the project label of the
+// budget gauge, so each new name takes a slot under the series cap (ADR-002).
+// A connection appears once this replica has called it.
+func (m *Metrics) RegisterBreakers(snapshot func() (map[string]float64, error)) {
+	if m == nil || snapshot == nil {
+		return
+	}
+	m.reg.CappedCachedGaugeFunc("ragmux_upstream_breaker_state",
+		"Circuit breaker state of a model connection on this replica: 0 closed, 1 open, 2 half-open. "+
+			"State is per replica and not shared. Absent until the replica has called the connection, "+
+			"and while the breaker is disabled (BREAKER_FAILURE_THRESHOLD=0).",
+		"connection", 0, snapshot)
+}
+
 // ---- rag ----
 
 // RecordRetrieval records one completed retrieval. backend is the backend
@@ -436,6 +499,24 @@ func (m *Metrics) RecordIngestJob(outcome string, chunks int, d time.Duration) {
 	if outcome == IngestLeaseLost {
 		m.ingestLeaseLost.With().Inc()
 	}
+}
+
+// Sources of the ingest embedding token count.
+const (
+	// EmbedTokensReported marks tokens the embedding upstream reported.
+	EmbedTokensReported = "reported"
+	// EmbedTokensEstimated marks tokens estimated from the input text because
+	// the upstream reported none.
+	EmbedTokensEstimated = "estimated"
+)
+
+// RecordIngestEmbedTokens records the embedding tokens one ingestion batch
+// spent. source is EmbedTokensReported or EmbedTokensEstimated.
+func (m *Metrics) RecordIngestEmbedTokens(source string, tokens int) {
+	if m == nil || tokens <= 0 {
+		return
+	}
+	m.ingestEmbedTok.With(source).Add(uint64(tokens))
 }
 
 // RecordIngestClaim records one dispatcher claim attempt. outcome is one of

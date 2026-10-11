@@ -45,18 +45,19 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (int64, err
 		// later version may fill it in without looking like an edit.
 		tag, err := tx.Exec(ctx, `INSERT INTO model_prices
 			(provider_type, model_pattern, input_per_mtok, output_per_mtok,
-			 cache_write_per_mtok, cache_read_per_mtok, currency, source, builtin_version)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, 'builtin', $8)
+			 cache_write_per_mtok, cache_read_per_mtok, per_search_unit, currency, source, builtin_version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'builtin', $9)
 			ON CONFLICT (provider_type, model_pattern) DO UPDATE SET
 				input_per_mtok = EXCLUDED.input_per_mtok,
 				output_per_mtok = EXCLUDED.output_per_mtok,
 				cache_write_per_mtok = EXCLUDED.cache_write_per_mtok,
 				cache_read_per_mtok = EXCLUDED.cache_read_per_mtok,
+				per_search_unit = EXCLUDED.per_search_unit,
 				currency = EXCLUDED.currency,
 				builtin_version = EXCLUDED.builtin_version,
 				updated_at = now()
 			WHERE model_prices.source = 'builtin' AND model_prices.builtin_version < EXCLUDED.builtin_version`,
-			m.ProviderType, m.Model, m.Input, m.Output, m.CacheWrite, m.CacheRead, f.Currency, f.Version)
+			m.ProviderType, m.Model, m.Input, m.Output, m.CacheWrite, m.CacheRead, m.PerSearchUnit, f.Currency, f.Version)
 		if err != nil {
 			return 0, err
 		}

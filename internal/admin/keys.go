@@ -153,7 +153,7 @@ func clipScopes(want []string, kind string, role auth.Role) ([]string, error) {
 	out := make([]string, 0, len(want))
 	for _, s := range want {
 		if !containsString(valid, s) {
-			return nil, errors.New("unknown scope " + strconv.Quote(s) + " for a " + kind + " key")
+			return nil, errors.New("unknown scope " + strconv.Quote(s) + " for a " + kind + " key; valid scopes: " + strings.Join(valid, ", "))
 		}
 		switch {
 		case s == store.ScopeAdmin && !role.AtLeast(auth.RoleAdmin):

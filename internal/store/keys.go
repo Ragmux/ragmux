@@ -22,11 +22,16 @@ const (
 	KindManagement = "management"
 )
 
-// Scopes a gateway key may carry. They name the two /v1 route groups that
-// exist; there are deliberately no scopes for endpoints Ragmux does not have.
+// Scopes a gateway key may carry. Each names one /v1 route group; there are
+// deliberately no scopes for endpoints Ragmux does not have. ScopeEmbeddings,
+// ScopeRetrieve and ScopeRerank guard POST /v1/embeddings, /v1/retrieve and
+// /v1/rerank (ADR-019).
 const (
-	ScopeChat   = "chat"
-	ScopeModels = "models"
+	ScopeChat       = "chat"
+	ScopeModels     = "models"
+	ScopeEmbeddings = "embeddings"
+	ScopeRetrieve   = "retrieve"
+	ScopeRerank     = "rerank"
 )
 
 // Scopes a management key may carry. They mirror the role matrix of
@@ -47,13 +52,15 @@ const (
 // allocation on a path that already talks to the database.
 
 // GatewayScopes lists the scopes a gateway key may carry.
-func GatewayScopes() []string { return []string{ScopeChat, ScopeModels} }
+func GatewayScopes() []string {
+	return []string{ScopeChat, ScopeModels, ScopeEmbeddings, ScopeRetrieve, ScopeRerank}
+}
 
 // ManagementScopes lists the scopes a management key may carry.
 func ManagementScopes() []string { return []string{ScopeRead, ScopeWrite, ScopeAdmin, ScopeKeys} }
 
 // DefaultGatewayScopes is what a gateway key gets when none are given: every
-// scope a gateway key can hold, since there are only the two.
+// scope a gateway key can hold.
 func DefaultGatewayScopes() []string { return GatewayScopes() }
 
 // ValidScopes returns the scopes a key of this kind may carry.

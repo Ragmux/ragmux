@@ -1,0 +1,9 @@
+{
+  "object": "list",
+  "model": "text-embedding-3-small",
+  "data": [
+    {"object": "embedding", "index": 1, "embedding": [0.0, 1.0, 0.0]},
+    {"object": "embedding", "index": 0, "embedding": [1.0, 0.0, 0.5]}
+  ],
+  "usage": {"prompt_tokens": 6, "total_tokens": 6}
+}

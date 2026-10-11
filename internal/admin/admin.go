@@ -133,6 +133,7 @@ func (a *Admin) authenticated(r chi.Router) {
 	r.Post("/api/me/password", a.changePassword)
 
 	read.Get("/api/provider-types", a.providerTypes)
+	read.Get("/api/provider-presets", a.providerPresets)
 	read.Get("/api/search-backends", a.searchBackends)
 
 	// Model connections: viewers may read, editors mutate and test (a
@@ -172,6 +173,11 @@ func (a *Admin) authenticated(r chi.Router) {
 	read.Get("/api/projects/{id}/usage", a.projectUsage)
 	read.Get("/api/projects/{id}/members", a.listMembers)
 	editor.Put("/api/projects/{id}/members", a.setMembers)
+	read.Get("/api/projects/{id}/routes", a.listRoutes)
+	editor.Post("/api/projects/{id}/routes", a.createRoute)
+	read.Get("/api/projects/{id}/routes/{routeId}", a.getRoute)
+	editor.Put("/api/projects/{id}/routes/{routeId}", a.updateRoute)
+	editor.Delete("/api/projects/{id}/routes/{routeId}", a.deleteRoute)
 
 	// API keys: ownership is checked inside the handlers (404 for someone
 	// else's key). Deleting one is admin-only; everyone else revokes.
@@ -254,7 +260,7 @@ func (a *Admin) fail(w http.ResponseWriter, err error) {
 	case store.IsUniqueViolation(err):
 		writeErr(w, http.StatusConflict, "an item with that name already exists")
 	case store.IsForeignKeyViolation(err):
-		writeErr(w, http.StatusConflict, "item is still referenced by a project or RAG store")
+		writeErr(w, http.StatusConflict, "item is still referenced by a project, RAG store or route")
 	default:
 		reqID := w.Header().Get("X-Request-Id")
 		a.Log.Error("admin request failed", "err", err, "req_id", reqID)
@@ -541,6 +547,7 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", true},
 		{"ollama", "Ollama", "http://localhost:11434", false},
 		{"custom_openai", "Custom OpenAI-compatible (vLLM, LM Studio, ...)", "http://localhost:8000/v1", false},
+		{provider.AzureProviderType, "Azure OpenAI", "https://your-resource.openai.azure.com", true},
 		{"cohere_rerank", "Cohere Rerank (reranking only)", "https://api.cohere.com", true},
 		{"voyage_rerank", "Voyage Rerank (reranking only)", "https://api.voyageai.com", true},
 	}
@@ -607,6 +614,11 @@ func (in connInput) validateEndpoint(ctx context.Context, a *Admin) error {
 	if in.ProviderType == "custom_openai" && in.BaseURL == "" {
 		return errors.New("base_url is required for custom_openai")
 	}
+	if in.ProviderType == provider.AzureProviderType {
+		if err := in.validateAzure(); err != nil {
+			return err
+		}
+	}
 	if in.BaseURL == "" {
 		return nil
 	}
@@ -620,7 +632,10 @@ func (in connInput) validateEndpoint(ctx context.Context, a *Admin) error {
 	if u.User != nil {
 		return errors.New("base_url must not contain credentials")
 	}
-	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
+	// An Azure base_url may carry the api-version query parameter and nothing
+	// else; validateAzure has already checked it.
+	azureQuery := in.ProviderType == provider.AzureProviderType && u.RawQuery != "" && !u.ForceQuery
+	if (u.RawQuery != "" && !azureQuery) || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
 		return errors.New("base_url must not contain a query string or fragment")
 	}
 	// Reject a host that only resolves to private addresses now so the
@@ -706,6 +721,13 @@ func (a *Admin) updateConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := in.validate(r.Context(), a); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if msg, err := a.routeKindConflict(r.Context(), id, in.ProviderType); err != nil {
+		a.fail(w, err)
+		return
+	} else if msg != "" {
+		writeErr(w, http.StatusConflict, msg)
 		return
 	}
 	c, err := a.Store.UpdateConnection(r.Context(), in.connection(r.Context(), id))
@@ -820,7 +842,7 @@ func (a *Admin) runConnectionTest(ctx context.Context, c *store.ModelConnection,
 		if err != nil {
 			return nil, err
 		}
-		vecs, err := emb.Embed(ctx, []string{"ping"})
+		vecs, _, err := emb.Embed(ctx, []string{"ping"})
 		if err != nil {
 			return failed(err), nil
 		}
@@ -979,8 +1001,22 @@ func (a *Admin) validateRerank(r *http.Request, in *ragInput) error {
 		return fmt.Errorf("rerank_backend must be one of %s", strings.Join(store.RerankBackends, ", "))
 	}
 	want := store.RerankConnectionType(in.RerankBackend)
-	if want == "" {
+	if in.RerankConnectionID != nil && *in.RerankConnectionID == 0 {
 		in.RerankConnectionID = nil
+	}
+	if want == "" {
+		// The llm backend prompts a chat model. The connection is optional: it
+		// names the model the admin search and /v1/rerank use for this store.
+		if in.RerankConnectionID == nil {
+			return nil
+		}
+		conn, err := a.Store.GetConnection(r.Context(), *in.RerankConnectionID)
+		if err != nil {
+			return errors.New("rerank_connection_id does not reference an existing model connection")
+		}
+		if !provider.SupportsChat(conn.ProviderType) {
+			return fmt.Errorf("cannot use connection %q for llm reranking: it is a %s connection", conn.Name, conn.ProviderType)
+		}
 		return nil
 	}
 	if in.RerankConnectionID == nil || *in.RerankConnectionID == 0 {
@@ -1193,7 +1229,7 @@ func (a *Admin) probeEmbeddingWidth(ctx context.Context, conn *store.ModelConnec
 	if err != nil {
 		return 0, err
 	}
-	vecs, err := emb.Embed(ctx, []string{"ping"})
+	vecs, _, err := emb.Embed(ctx, []string{"ping"})
 	if err != nil {
 		return 0, err
 	}
@@ -1319,20 +1355,40 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		}
 		rs.MaxDistance = *in.MaxDistance
 	}
-	// The llm rerank backend uses the chat model of a project linked to this
-	// store; the embedding connection cannot chat. The API backends carry
-	// their own connection and need none of this.
+	// The rerank connection is the store's own setting (rerank_connection_id),
+	// never a guess from the projects that use the store. The llm backend
+	// prompts it as a chat model; the API backends build their reranker from it
+	// inside the retriever. Without a usable connection the search runs
+	// unreranked and the response says so.
 	var prov provider.Provider
 	model := ""
-	if rs.Rerank && rs.RerankBackend != store.RerankCohere && rs.RerankBackend != store.RerankVoyage {
-		if conn, err := a.rerankConnection(r, rs.ID); err == nil {
-			if p, err := a.Providers(conn); err == nil {
+	skipped := ""
+	if rs.Rerank {
+		conn, err := a.rerankConnection(r, rs)
+		switch {
+		case err != nil:
+			skipped = "the store has no rerank connection (set rerank_connection_id)"
+		case rs.RerankBackend == store.RerankCohere || rs.RerankBackend == store.RerankVoyage:
+			// The retriever's factory reads rs.RerankConnectionID itself.
+		default:
+			if p, perr := a.Providers(conn); perr == nil {
 				prov, model = p, conn.ModelName
+			} else {
+				skipped = "the rerank connection cannot be used for chat"
 			}
 		}
 	}
+	searchStore := rs
+	if skipped != "" {
+		// Search a copy with rerank off: a skipped rerank is a configuration
+		// state shown through rerank_skipped, not a failed attempt, so it must
+		// not set rerank_fallback or count as a rerank failure.
+		cp := *rs
+		cp.Rerank = false
+		searchStore = &cp
+	}
 	start := time.Now()
-	res, err := a.Retriever.SearchWith(r.Context(), rs, in.Query, in.TopK, prov, model)
+	res, err := a.Retriever.SearchWith(r.Context(), searchStore, in.Query, in.TopK, prov, model)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1343,23 +1399,22 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		// Returning it makes that visible instead of surprising.
 		"fts_config": rs.FTSConfig, "reranked": res.Reranked, "rerank_backend": res.RerankBackend,
 		"rerank_fallback": res.RerankFallback,
-		"latency_ms":      time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
+		// rerank_skipped is true when rerank was requested but the store has no
+		// usable rerank connection, so the hits are the fused order and
+		// rerank_fallback stays false: nothing was attempted, so nothing failed.
+		"rerank_skipped": skipped != "", "rerank_skipped_reason": skipped,
+		"latency_ms": time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
 		"rerank_latency_ms": res.RerankLatencyMS})
 }
 
-// rerankConnection finds a chat connection for reranking searches from the
-// admin API: the model connection of the first project using the store.
-func (a *Admin) rerankConnection(r *http.Request, storeID int64) (*store.ModelConnection, error) {
-	projects, err := a.Store.ListProjects(r.Context())
-	if err != nil {
-		return nil, err
+// rerankConnection returns the store's rerank connection, the one named by
+// rerank_connection_id. It is store.ErrNotFound when the store names none or
+// the connection is gone (ON DELETE SET NULL clears the column).
+func (a *Admin) rerankConnection(r *http.Request, rs *store.RAGStore) (*store.ModelConnection, error) {
+	if rs.RerankConnectionID == nil {
+		return nil, store.ErrNotFound
 	}
-	for _, p := range projects {
-		if p.RAGStoreID != nil && *p.RAGStoreID == storeID {
-			return a.Store.GetConnection(r.Context(), p.ModelConnectionID)
-		}
-	}
-	return nil, store.ErrNotFound
+	return a.Store.GetConnection(r.Context(), *rs.RerankConnectionID)
 }
 
 // ---- documents ----

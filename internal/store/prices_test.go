@@ -360,3 +360,89 @@ func TestNoPriceForAPaidCustomOpenAI(t *testing.T) {
 		t.Errorf("after adding a row: %+v (ok=%v)", p, ok)
 	}
 }
+
+func TestModelPricePerSearchUnitRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The seed writes the shipped rate, and a token-priced row keeps NULL.
+	cohere := findPrice(t, s, "cohere_rerank", "rerank-v3.5*")
+	if cohere.PerSearchUnit == nil || *cohere.PerSearchUnit <= 0 {
+		t.Fatalf("seeded cohere row per_search_unit = %v, want a positive rate", cohere.PerSearchUnit)
+	}
+	if voyage := findPrice(t, s, "voyage_rerank", "rerank-2.5*"); voyage.PerSearchUnit != nil || voyage.InputPerMTok <= 0 {
+		t.Errorf("seeded voyage row = %+v, want a token price and NULL per_search_unit", voyage)
+	}
+	shipped := *cohere.PerSearchUnit
+
+	// An operator edit changes it and flips the row to "user".
+	edit := *cohere
+	rate := 0.0035
+	edit.PerSearchUnit = &rate
+	edited, err := s.UpdateModelPrice(ctx, &edit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edited.Source != store.PriceSourceUser || edited.PerSearchUnit == nil || *edited.PerSearchUnit != rate {
+		t.Errorf("edited row = %+v", edited)
+	}
+
+	// Clearing it stores NULL, not zero.
+	edit.PerSearchUnit = nil
+	cleared, err := s.UpdateModelPrice(ctx, &edit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.PerSearchUnit != nil {
+		t.Errorf("cleared per_search_unit = %v, want NULL", *cleared.PerSearchUnit)
+	}
+
+	// Reset restores the shipped rate.
+	back, err := s.ResetModelPrice(ctx, cleared.ID, cohere)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Source != store.PriceSourceBuiltin || back.PerSearchUnit == nil || *back.PerSearchUnit != shipped {
+		t.Errorf("reset row = %+v, want per_search_unit %v", back, shipped)
+	}
+
+	// A new row carries its own rate; a negative one is refused by the CHECK.
+	created, err := s.CreateModelPrice(ctx, &store.ModelPrice{ProviderType: "cohere_rerank",
+		ModelPattern: "rerank-custom*", PerSearchUnit: &rate, Currency: "USD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.PerSearchUnit == nil || *created.PerSearchUnit != rate {
+		t.Errorf("created row per_search_unit = %v, want %v", created.PerSearchUnit, rate)
+	}
+	neg := -0.001
+	if _, err := s.CreateModelPrice(ctx, &store.ModelPrice{ProviderType: "cohere_rerank",
+		ModelPattern: "rerank-negative*", PerSearchUnit: &neg, Currency: "USD"}); err == nil {
+		t.Error("a negative per_search_unit was accepted")
+	}
+}
+
+// A release that changes a shipped search-unit rate reaches rows nobody edited.
+func TestSeedRefreshesPerSearchUnit(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	row := findPrice(t, s, "cohere_rerank", "rerank-v3.5*")
+	shipped := *row.PerSearchUnit
+	seedAsOlderVersion(t, s, row.ID, 1)
+	if _, err := s.DB().Exec(ctx, "UPDATE model_prices SET per_search_unit = NULL WHERE id = $1", row.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pricing.Seed(ctx, s.DB(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	after := findPrice(t, s, "cohere_rerank", "rerank-v3.5*")
+	if after.PerSearchUnit == nil || *after.PerSearchUnit != shipped {
+		t.Errorf("per_search_unit after refresh = %v, want %v", after.PerSearchUnit, shipped)
+	}
+}

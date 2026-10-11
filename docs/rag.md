@@ -18,7 +18,7 @@ listed in the [API reference](api.md#rag-stores-and-documents).
 | `fts_config` | `simple` | PostgreSQL text search configuration used to parse the query in hybrid mode. **Ignored when `search_backend` is `pg_search`** |
 | `rerank` | `false` | Reranking of the candidates |
 | `rerank_backend` | `llm` | `llm` (the project's chat model), `cohere` or `voyage` |
-| `rerank_connection_id` | `null` | Model connection holding the rerank API credentials. Required by `cohere` and `voyage`, must be `null` for `llm` |
+| `rerank_connection_id` | `null` | Model connection used for reranking outside a chat request. For `cohere` and `voyage` it holds the rerank API credentials and is required. For `llm` it is optional and names a chat connection. It is also the connection the dashboard search and the implicit `/v1/rerank` route use; see [Reranking](#reranking) |
 | `rerank_candidates` | `15` | Candidates sent to the reranker (1-100) |
 | `max_distance` | `0` | Cosine distance cut-off (0-2, `0` = off) |
 | `contextual_chunks` | `true` | Prefix the file name and section to the text that is embedded |
@@ -297,8 +297,9 @@ they are cut to `top_k`. `rerank_backend` picks who does it.
 `RERANK_TIMEOUT` (a Go duration, e.g. `3s`) overrides both defaults.
 
 **`llm`** sends the candidates in one listwise prompt (each passage cut to 800
-characters, `temperature 0`, `max_tokens 200`); the model answers with the passage
-numbers ordered by relevance.
+characters, `temperature 0`); the model answers with the passage numbers ordered by
+relevance. The reply is capped at 200 tokens unless `RERANK_MAX_TOKENS` sets another cap
+(see [Configuration](configuration.md)).
 
 **`cohere` and `voyage`** send the passages (each cut to 4000 characters) to a dedicated
 rerank API through the model connection named by `rerank_connection_id`. That connection
@@ -308,6 +309,9 @@ hardened outbound path. The connection's `provider_type` must match the backend
 (`cohere` → `cohere_rerank`, `voyage` → `voyage_rerank`); anything else is refused on
 save with `cannot use connection "x" for reranking: it is a <type> connection`. See
 [Rerank providers](providers.md#rerank-providers-cohere_rerank-voyage_rerank).
+
+In the dashboard, the store form offers only the connections whose `provider_type` fits
+the chosen backend.
 
 **The fallback contract is the same for all three.** Passages the reranker omits are
 appended in their original order, so nothing is lost. Anything that goes wrong — a
@@ -319,9 +323,44 @@ level. The search response then carries `"reranked": false` with
 finding out) so a skipped rerank reads as "0 ms, skipped" rather than as a blank field.
 Reranking is skipped, without the fallback flag, when fewer than two candidates remain.
 
-From the admin search endpoint the `llm` backend uses the chat model of the first project
-linked to the store; without such a project that search runs unreranked. The API backends
-need no project.
+**Which connection reranks where.** In a chat or `/v1/retrieve` request the `llm` backend
+asks the requesting project's own chat model, and the API backends use the connection named
+by `rerank_connection_id`. The dashboard's search endpoint and `POST /v1/rerank` have no
+project chat model to borrow, so they use the store's `rerank_connection_id` for every
+backend: a `cohere_rerank` / `voyage_rerank` connection, or, for `llm`, a chat connection.
+Several projects sharing one store therefore rerank through the same connection. A store
+without a `rerank_connection_id` does not guess one from its projects: the dashboard
+search runs unreranked and says so (`rerank_skipped`, below), and `/v1/rerank` answers
+`404 model_not_found` unless a `kind = rerank` route matches the requested `model`. Stores
+saved before 0.5 with the `llm` backend carry no id; set one to rerank in the dashboard.
+
+**Tokens are counted.** The tokens of an `llm` rerank in a chat or retrieve request are
+added to that request's row, and so are those an API reranker reports (Cohere
+`meta.tokens`, Voyage `usage.total_tokens`; characters divided by 4, over the passages as
+sent, when none are reported). A `/v1/rerank` call is one row of its own with
+`endpoint = rerank`. See the [API reference](api.md#post-v1rerank).
+
+**Rerank is priced with the connection that did it.** The `cost_micros` of a row is the
+cost of the main call plus the cost of each rerank spend, and each rerank spend is priced
+by the `model_prices` row of the connection that ran it, never by the row's own model:
+
+- An API reranker is priced with its rerank connection. Cohere bills by search unit, so
+  the spend adds `search_units x per_search_unit` (the response's
+  `meta.billed_units.search_units`, 1 when absent) and nothing else: a row that has a
+  `per_search_unit` rate never adds its token prices to a rerank, even if an operator typed
+  one in. Voyage bills by token, so the reported tokens are priced at the `voyage_rerank`
+  row's `input_per_mtok`.
+- An `llm` rerank is priced with the chat connection that ran it: on `POST /v1/retrieve`
+  that is the project's chat connection, not the store's embedding connection, and in a routed
+  chat it is the target that ran the rerank, even if a fallback target answers.
+- A rerank spend with no price row, or a price of zero, adds 0 and the request still
+  succeeds. `cost_source` stays that of the main call; the figure is an estimate, like
+  every cost the gateway writes.
+
+Token counts, limits, budgets and the usage report are unaffected: they count the rerank
+tokens exactly as before. Prices are managed under [Model
+prices](api.md#model-prices); add a `cohere_rerank` or `voyage_rerank` row for a model
+the built-in table does not know.
 
 ## Context injection
 
@@ -418,11 +457,47 @@ only get the header. Every request also records the number of injected passages 
 backend that **actually ran**, which differs from the one asked for when it is not
 available here; `fts_config` is echoed because `pg_search` ignores it.
 `retrieval_latency_ms` covers the query embedding and the database search,
-`rerank_latency_ms` the reranker (`null` when `rerank` was off; present, often `0`, when
-reranking was requested but skipped — `rerank_fallback` then says so).
+`rerank_latency_ms` the reranker (`null` when `rerank` was off or skipped; present, often
+`0`, when the reranker was tried and fell back, with `rerank_fallback: true`).
+`rerank_skipped` is `true`, with a `rerank_skipped_reason`, when `rerank` was on but the
+store has no `rerank_connection_id` (or its connection cannot serve the backend) and the
+search therefore ran without reranking; it is not a failure, so `rerank_fallback` stays
+`false`.
 
 The overrides only affect this call, and they now cover the backend settings too, so two
 configurations can be compared on the same query before either is saved. That is what
 makes these settings usable: run `{"backend":"pgvector"}` and `{"backend":"pg_search"}`,
 or `{"rerank_backend":"llm"}` and `{"rerank_backend":"cohere","rerank_connection_id":3}`,
 and read the orders off against each other.
+
+## Client retrieve endpoint
+
+`POST /v1/retrieve` is the search endpoint for applications: a gateway key with the
+`retrieve` scope sends `{query, top_k}` and gets the hits back, with their scores and
+metadata, the search `mode` and the `backend` that ran. It calls the same function as the
+dashboard search and as context injection (`SearchWith`), so a query ranks the same way in
+all three; the difference is that it uses the store's saved settings and takes no
+per-request overrides. Wire format and errors are in the
+[API reference](api.md#post-v1retrieve).
+
+Each call embeds the query once through the store's embedding connection. Its tokens (the
+upstream's count, or an estimate of characters divided by 4 when it reports none) and
+price are written to the request log with `endpoint = retrieve`.
+When the store reranks with the LLM backend, that chat call's tokens (reported, or estimated
+from characters) are added to the same row and to the response `usage`, and priced at the
+rate of the connection that ran the rerank, not the embedding connection's; an API
+reranker's spend is priced at its own connection's price (see
+[Rerank is priced with the connection that did it](#reranking)).
+
+## Embedding token accounting
+
+Ingestion embeds every chunk, and since 0.5 the tokens it spends are counted. Each
+embedding batch records the upstream's `usage` when the provider reports it (OpenAI-style
+`usage.prompt_tokens`, Ollama's `prompt_eval_count`) and an estimate otherwise (Gemini
+reports none). The totals are the `ragmux_ingest_embed_tokens_total` counter, labelled
+`source="reported"` or `source="estimated"`, and the `embed_tokens` field of the
+`document ingested` log line.
+
+Ingestion belongs to a store, not to a project, and `request_logs` rows carry a project,
+so these tokens are not part of any project's usage, budgets or request log. Query-time
+embeddings are: they are charged to the project that made the call.

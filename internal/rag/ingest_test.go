@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ragmux/ragmux/internal/metrics"
+	"github.com/ragmux/ragmux/internal/obs"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/testdb"
@@ -53,9 +55,9 @@ func awaitStatus(t *testing.T, ing *Ingester, id int64, want string) *store.Docu
 
 type noEmbedder struct{ t *testing.T }
 
-func (n noEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+func (n noEmbedder) Embed(context.Context, []string) ([][]float32, *provider.Usage, error) {
 	n.t.Error("embedder must not be called for a document over the chunk limit")
-	return nil, errors.New("unexpected")
+	return nil, nil, errors.New("unexpected")
 }
 
 func TestIngestRejectsTooManyChunks(t *testing.T) {
@@ -157,14 +159,14 @@ func (p *progressEmbedder) recorded() []int {
 	return append([]int(nil), p.seen...)
 }
 
-func (p *progressEmbedder) Embed(ctx context.Context, in []string) ([][]float32, error) {
+func (p *progressEmbedder) Embed(ctx context.Context, in []string) ([][]float32, *provider.Usage, error) {
 	p.mu.Lock()
 	doc := p.doc
 	p.mu.Unlock()
 	d, err := p.st.GetDocument(ctx, doc)
 	if err != nil {
 		p.t.Errorf("read document %d: %v", doc, err)
-		return nil, err
+		return nil, nil, err
 	}
 	p.mu.Lock()
 	p.seen = append(p.seen, d.ProgressPercent)
@@ -173,7 +175,7 @@ func (p *progressEmbedder) Embed(ctx context.Context, in []string) ([][]float32,
 	for i := range in {
 		out[i] = []float32{1, 0, 0}
 	}
-	return out, nil
+	return out, nil, nil
 }
 
 func TestIngestReportsProgressAndPageCount(t *testing.T) {
@@ -250,5 +252,61 @@ func TestIngestReportsProgressAndPageCount(t *testing.T) {
 	}
 	if got.ProgressPercent != 10 {
 		t.Errorf("progress after failing at chunking = %d, want 10", got.ProgressPercent)
+	}
+}
+
+// usageEmbedder reports the given usage on every call (nil: none).
+type usageEmbedder struct{ usage *provider.Usage }
+
+func (u usageEmbedder) Embed(_ context.Context, in []string) ([][]float32, *provider.Usage, error) {
+	out := make([][]float32, len(in))
+	for i := range in {
+		out[i] = []float32{1, 0, 0}
+	}
+	return out, u.usage, nil
+}
+
+// TestIngestRecordsEmbedUsage pins the ingest accounting: the tokens the
+// upstream reports are counted as reported, and an upstream that reports
+// none is counted as an estimate from the chunk text.
+func TestIngestRecordsEmbedUsage(t *testing.T) {
+	cases := []struct {
+		name   string
+		usage  *provider.Usage
+		wantRe string
+	}{
+		{"reported", &provider.Usage{PromptTokens: 11, TotalTokens: 11}, `ragmux_ingest_embed_tokens_total{source="reported"} 11`},
+		{"estimated", nil, `ragmux_ingest_embed_tokens_total{source="estimated"} `},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testdb.Open(t)
+			ctx := context.Background()
+			conn, err := st.CreateConnection(ctx, &store.ModelConnection{Name: "e", ProviderType: "custom_openai", BaseURL: "http://example.invalid/v1", ModelName: "m"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rs, err := st.CreateRAGStore(ctx, &store.RAGStore{Name: "s", EmbeddingConnectionID: conn.ID, ChunkSize: 200})
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := "# One\n\nA short paragraph of text to embed.\n"
+			doc, err := st.CreateDocument(ctx, &store.Document{RAGStoreID: rs.ID, Filename: "one.md", SizeBytes: int64(len(text))}, []byte(text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			reg := metrics.New(metrics.Options{})
+			factory := func(*store.ModelConnection) (provider.Embedder, error) { return usageEmbedder{tc.usage}, nil }
+			ing := NewIngester(ctx, st, factory, 1, discard(), Settings{PollInterval: time.Hour, Metrics: obs.New(reg)})
+			defer ing.Stop()
+			awaitStatus(t, ing, doc.ID, store.DocReady)
+			out := reg.Text()
+			if !strings.Contains(out, tc.wantRe) {
+				t.Errorf("metrics do not contain %q:\n%s", tc.wantRe, out)
+			}
+			if tc.usage == nil && strings.Contains(out, `source="estimated"} 0`) {
+				t.Error("estimated tokens must be positive")
+			}
+		})
 	}
 }

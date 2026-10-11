@@ -30,15 +30,19 @@ type ModelPrice struct {
 	OutputPerMTok     float64  `json:"output_per_mtok"`
 	CacheWritePerMTok *float64 `json:"cache_write_per_mtok"`
 	CacheReadPerMTok  *float64 `json:"cache_read_per_mtok"`
-	Currency          string   `json:"currency"`
-	Source            string   `json:"source"`
-	BuiltinVersion    int      `json:"builtin_version"`
-	CreatedAt         string   `json:"created_at"`
-	UpdatedAt         string   `json:"updated_at"`
+	// PerSearchUnit is what a rerank API charges per search unit, in the
+	// row's currency (Cohere bills this way). Nullable: absent means the
+	// provider has no such charge.
+	PerSearchUnit  *float64 `json:"per_search_unit"`
+	Currency       string   `json:"currency"`
+	Source         string   `json:"source"`
+	BuiltinVersion int      `json:"builtin_version"`
+	CreatedAt      string   `json:"created_at"`
+	UpdatedAt      string   `json:"updated_at"`
 }
 
 const priceColumns = `id, provider_type, model_pattern, input_per_mtok::float8, output_per_mtok::float8,
-	cache_write_per_mtok::float8, cache_read_per_mtok::float8, currency, source, builtin_version,
+	cache_write_per_mtok::float8, cache_read_per_mtok::float8, per_search_unit::float8, currency, source, builtin_version,
 	created_at, updated_at`
 
 // scanPrice reads one row in priceColumns order.
@@ -46,7 +50,7 @@ func scanPrice(row interface{ Scan(...any) error }) (*ModelPrice, error) {
 	p := &ModelPrice{}
 	var created, updated time.Time
 	if err := row.Scan(&p.ID, &p.ProviderType, &p.ModelPattern, &p.InputPerMTok, &p.OutputPerMTok,
-		&p.CacheWritePerMTok, &p.CacheReadPerMTok, &p.Currency, &p.Source, &p.BuiltinVersion,
+		&p.CacheWritePerMTok, &p.CacheReadPerMTok, &p.PerSearchUnit, &p.Currency, &p.Source, &p.BuiltinVersion,
 		&created, &updated); err != nil {
 		return nil, err
 	}
@@ -88,10 +92,10 @@ func (s *Store) GetModelPrice(ctx context.Context, id int64) (*ModelPrice, error
 func (s *Store) CreateModelPrice(ctx context.Context, p *ModelPrice) (*ModelPrice, error) {
 	out, err := scanPrice(s.pool.QueryRow(ctx, `INSERT INTO model_prices
 		(provider_type, model_pattern, input_per_mtok, output_per_mtok,
-		 cache_write_per_mtok, cache_read_per_mtok, currency, source)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'user') RETURNING `+priceColumns,
+		 cache_write_per_mtok, cache_read_per_mtok, per_search_unit, currency, source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'user') RETURNING `+priceColumns,
 		p.ProviderType, p.ModelPattern, p.InputPerMTok, p.OutputPerMTok,
-		p.CacheWritePerMTok, p.CacheReadPerMTok, p.Currency))
+		p.CacheWritePerMTok, p.CacheReadPerMTok, p.PerSearchUnit, p.Currency))
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -104,9 +108,10 @@ func (s *Store) CreateModelPrice(ctx context.Context, p *ModelPrice) (*ModelPric
 func (s *Store) UpdateModelPrice(ctx context.Context, p *ModelPrice) (*ModelPrice, error) {
 	out, err := scanPrice(s.pool.QueryRow(ctx, `UPDATE model_prices SET
 		input_per_mtok = $2, output_per_mtok = $3, cache_write_per_mtok = $4,
-		cache_read_per_mtok = $5, currency = $6, source = 'user', updated_at = now()
+		cache_read_per_mtok = $5, per_search_unit = $6, currency = $7, source = 'user', updated_at = now()
 		WHERE id = $1 RETURNING `+priceColumns,
-		p.ID, p.InputPerMTok, p.OutputPerMTok, p.CacheWritePerMTok, p.CacheReadPerMTok, p.Currency))
+		p.ID, p.InputPerMTok, p.OutputPerMTok, p.CacheWritePerMTok, p.CacheReadPerMTok, p.PerSearchUnit,
+		p.Currency))
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -118,10 +123,10 @@ func (s *Store) UpdateModelPrice(ctx context.Context, p *ModelPrice) (*ModelPric
 func (s *Store) ResetModelPrice(ctx context.Context, id int64, b *ModelPrice) (*ModelPrice, error) {
 	out, err := scanPrice(s.pool.QueryRow(ctx, `UPDATE model_prices SET
 		input_per_mtok = $2, output_per_mtok = $3, cache_write_per_mtok = $4,
-		cache_read_per_mtok = $5, currency = $6, source = 'builtin',
-		builtin_version = $7, updated_at = now()
+		cache_read_per_mtok = $5, per_search_unit = $6, currency = $7, source = 'builtin',
+		builtin_version = $8, updated_at = now()
 		WHERE id = $1 RETURNING `+priceColumns,
-		id, b.InputPerMTok, b.OutputPerMTok, b.CacheWritePerMTok, b.CacheReadPerMTok,
+		id, b.InputPerMTok, b.OutputPerMTok, b.CacheWritePerMTok, b.CacheReadPerMTok, b.PerSearchUnit,
 		b.Currency, b.BuiltinVersion))
 	if err != nil {
 		return nil, scanErr(err)

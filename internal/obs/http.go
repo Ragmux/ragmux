@@ -98,9 +98,13 @@ func init() {
 // hex or base64url token short enough to pass a length cap. A filter that
 // admits those admits exactly what it was written to exclude.
 //
-// So the header is not read at all. PRD rule 10's guarantee is then
-// structural rather than a matter of how good the filter is: there is no
-// path from a header to a label, a span or a log line.
+// So this middleware does not read the header at all. PRD rule 10's guarantee
+// for spans and labels is then structural rather than a matter of how good a
+// filter is: there is no path from a header to a label or a span. The one
+// exception lives outside this package: the /v1 gateway (internal/gateway)
+// echoes a client X-Request-Id that passes a strict character filter, and
+// that value reaches the request_logs row and the client_req_id field of log
+// lines -- never a span, a metric label or the id stored here.
 //
 // The id is stored under chi's middleware.RequestIDKey, so
 // middleware.GetReqID keeps working everywhere it is already called.

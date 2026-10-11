@@ -148,8 +148,13 @@ func run(cfg config.Config) error {
 	}
 
 	registry, met := buildMetrics(cfg, st, log)
+	if cfg.TracingEnabled {
+		if err := tracing.ValidateEndpoint(tracing.Protocol(cfg.OTLPProtocol), cfg.OTLPEndpoint); err != nil {
+			return err
+		}
+	}
 	tracer := tracing.New(tracing.Config{
-		Endpoint: cfg.OTLPEndpoint, Headers: cfg.OTLPHeaders,
+		Endpoint: cfg.OTLPEndpoint, Protocol: tracing.Protocol(cfg.OTLPProtocol), Insecure: cfg.OTLPInsecure, Headers: cfg.OTLPHeaders,
 		ServiceName: cfg.ServiceName, ServiceVersion: version, ResourceAttrs: cfg.ResourceAttrs,
 		SampleRatio: cfg.TraceSampleRatio, TrustIncoming: cfg.TracingTrustIncoming, Logger: log,
 	})
@@ -159,7 +164,7 @@ func run(cfg config.Config) error {
 		tracer = tracing.New(tracing.Config{Logger: log})
 	}
 	if tracer.Enabled() {
-		log.Info("tracing enabled", "endpoint", cfg.OTLPEndpoint, "service", cfg.ServiceName,
+		log.Info("tracing enabled", "endpoint", cfg.OTLPEndpoint, "protocol", cfg.OTLPProtocol, "service", cfg.ServiceName,
 			"sample_ratio", cfg.TraceSampleRatio, "trust_incoming", cfg.TracingTrustIncoming)
 		met.RegisterTracing(tracer)
 	}
@@ -265,7 +270,7 @@ func run(cfg config.Config) error {
 	// same hardened outbound client as every other upstream call.
 	retriever.Rerankers = func(ctx context.Context, rs *store.RAGStore) (rag.Reranker, error) {
 		if rs.RerankBackend == "" || rs.RerankBackend == store.RerankLLM {
-			return &rag.LLMReranker{Timeout: cfg.RerankTimeout}, nil
+			return &rag.LLMReranker{Timeout: cfg.RerankTimeout, MaxTokens: cfg.RerankMaxTokens}, nil
 		}
 		if rs.RerankConnectionID == nil {
 			// The connection was deleted (ON DELETE SET NULL). Reranking is
@@ -281,14 +286,20 @@ func run(cfg config.Config) error {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", rag.ErrRerankUnavailable, err)
 		}
-		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client, Timeout: cfg.RerankTimeout}, nil
+		return &rag.APIReranker{Backend: rs.RerankBackend, Client: client, Timeout: cfg.RerankTimeout,
+			ProviderType: conn.ProviderType, Model: conn.ModelName}, nil
 	}
 
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",
 		TrustProxy: cfg.TrustProxyHeaders}
 	usage := &limits.Limiter{Store: st}
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
-		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer}
+		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer,
+		Rerankers:       func(c *store.ModelConnection) (provider.Reranker, error) { return provider.NewReranker(provCfg(c)) },
+		LLMRerank:       rag.LLMReranker{Timeout: cfg.RerankTimeout, MaxTokens: cfg.RerankMaxTokens},
+		UpstreamTimeout: cfg.UpstreamTimeout, MaxRetries: cfg.UpstreamMaxRetries,
+		Breakers: gateway.NewBreakers(cfg.BreakerFailureThreshold, cfg.BreakerOpenDuration, log)}
+	met.RegisterBreakers(gw.Breakers.Snapshot)
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
 		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
 	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
@@ -508,9 +519,18 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 				// scrape is already counted in the metrics it fetches.
 				return
 			}
-			log.Info("http", "method", r.Method, "path", r.URL.Path, "status", ww.Status(),
+			reqID := middleware.GetReqID(r.Context())
+			attrs := []any{"method", r.Method, "path", r.URL.Path, "status", ww.Status(),
 				"bytes", ww.BytesWritten(), "dur_ms", time.Since(start).Milliseconds(),
-				"req_id", middleware.GetReqID(r.Context()))
+				"req_id", reqID}
+			// A /v1 response carries the id the client knows the request by
+			// (X-Request-Id). When that is the client's own value it differs
+			// from req_id, so log it beside it: it is how a client's id finds
+			// this line. The gateway validated the value before echoing it.
+			if clientID := ww.Header().Get("X-Request-Id"); clientID != "" && clientID != reqID {
+				attrs = append(attrs, "client_req_id", clientID)
+			}
+			log.Info("http", attrs...)
 		})
 	}
 }

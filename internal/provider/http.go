@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -335,6 +336,7 @@ func transportError(cfg Config, rawURL string, err error) *Error {
 	switch {
 	case errors.As(err, &guard):
 		e.Message = guard.Error()
+		e.NotSent = true
 	case errors.As(err, &redirect):
 		e.Message = redirect.Error()
 	case errors.As(err, &netErr) && netErr.Timeout():
@@ -342,9 +344,17 @@ func transportError(cfg Config, rawURL string, err error) *Error {
 	case errors.As(err, &recHdr), errors.As(err, &certErr), errors.As(err, &alert),
 		strings.Contains(err.Error(), "tls:"), strings.Contains(err.Error(), "x509:"):
 		e.Message = "upstream TLS handshake failed"
-	case errors.As(err, &dnsErr), errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.ECONNRESET),
-		errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH), errors.Is(err, io.ErrUnexpectedEOF):
+		e.NotSent, e.Retryable = true, true
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, io.ErrUnexpectedEOF):
+		// The connection was made and the request may have been read: the
+		// peer dropped it afterwards. Same message as the refused-connection
+		// class, but not NotSent, because repeating the call could be billed
+		// twice.
 		e.Message = "upstream unreachable"
+	case errors.As(err, &dnsErr), errors.Is(err, syscall.ECONNREFUSED),
+		errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		e.Message = "upstream unreachable"
+		e.NotSent, e.Retryable = true, true
 	case strings.Contains(err.Error(), "malformed HTTP"):
 		e.Message = "upstream returned a non-HTTP response"
 	}
@@ -413,8 +423,39 @@ func upstreamStatusError(cfg Config, resp *http.Response, raw []byte) *Error {
 		// Overloaded, come back later: a 503, not a broken upstream.
 		e.Status = http.StatusServiceUnavailable
 	}
+	e.UpstreamStatus = resp.StatusCode
+	e.Retryable = resp.StatusCode == http.StatusTooManyRequests || e.Status == http.StatusServiceUnavailable
 	e.UpstreamRetryAfter = upstreamRetryAfter(resp.Header)
+	e.UpstreamRetryDelay = retryDelay(e.UpstreamRetryAfter, time.Now())
 	return e
+}
+
+// maxRetryDelay caps a parsed Retry-After so a hostile value cannot overflow
+// a time.Duration; the gateway never waits anywhere near this long.
+const maxRetryDelay = 24 * time.Hour
+
+// retryDelay turns a validated Retry-After value (see upstreamRetryAfter)
+// into a duration from now. An empty value, or an HTTP-date in the past,
+// gives zero.
+func retryDelay(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if isDigits(v) {
+		if len(v) > 6 { // more than a million seconds
+			return maxRetryDelay
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0
+		}
+		return min(time.Duration(n)*time.Second, maxRetryDelay)
+	}
+	t, err := http.ParseTime(v)
+	if err != nil {
+		return 0
+	}
+	return max(min(t.Sub(now), maxRetryDelay), 0)
 }
 
 // maxRetryAfter bounds the relayed header; an HTTP-date is 29 bytes.

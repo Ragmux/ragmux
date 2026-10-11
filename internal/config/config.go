@@ -17,6 +17,10 @@ import (
 	"github.com/ragmux/ragmux/internal/bm25"
 )
 
+// MaxUpstreamRetries is the ceiling of UPSTREAM_MAX_RETRIES. Backoff is capped
+// at two seconds a wait, so a larger number only lengthens the tail.
+const MaxUpstreamRetries = 10
+
 // Config holds every tunable the gateway reads at startup.
 type Config struct {
 	// DatabaseURL is the PostgreSQL connection string (required).
@@ -35,8 +39,20 @@ type Config struct {
 	CORSOrigins   []string
 	// SessionTTL controls how long a dashboard login stays valid.
 	SessionTTL time.Duration
-	// UpstreamTimeout bounds a single non-streaming provider call.
+	// UpstreamTimeout is the total time budget of a request's upstream calls:
+	// every attempt, retry and fallback of a non-streaming call shares it, and
+	// a streaming call spends it before its first byte.
 	UpstreamTimeout time.Duration
+	// UpstreamMaxRetries is how many times the gateway repeats a failed call
+	// on the same target before moving on. 0 disables retries.
+	UpstreamMaxRetries int
+	// BreakerFailureThreshold is how many consecutive counted failures open
+	// the circuit breaker of a model connection on this replica. 0 disables
+	// the breaker.
+	BreakerFailureThreshold int
+	// BreakerOpenDuration is how long an open breaker skips its connection
+	// before one probe request is let through.
+	BreakerOpenDuration time.Duration
 	// IngestWorkers is the number of concurrent document ingestion jobs.
 	IngestWorkers int
 	// IngestLease is how long a replica owns a document it claimed without
@@ -86,6 +102,9 @@ type Config struct {
 	// default 10 s (a full chat completion) and an API backend's 5 s (a
 	// single scoring call). Zero keeps each default.
 	RerankTimeout time.Duration
+	// RerankMaxTokens caps the reply of the LLM rerank backend. Zero keeps the
+	// built-in 200.
+	RerankMaxTokens int
 	// PgSearchTokenizer names the ParadeDB analyser for the BM25 index.
 	// The index is global, so it cannot be a per-store setting.
 	PgSearchTokenizer string
@@ -142,8 +161,14 @@ type Config struct {
 	// trace and force the sampled flag on all of it.
 	TracingTrustIncoming bool
 	// OTLPEndpoint is the collector's OTLP/HTTP base URL (or the full
-	// traces URL).
+	// traces URL), or its OTLP/gRPC address when OTLPProtocol is "grpc".
 	OTLPEndpoint string
+	// OTLPProtocol is the export transport: "http" (OTLP/HTTP with JSON, the
+	// default) or "grpc" (OTLP/gRPC).
+	OTLPProtocol string
+	// OTLPInsecure makes a gRPC endpoint given without a scheme plaintext
+	// instead of TLS. An http:// or https:// scheme decides for itself.
+	OTLPInsecure bool
 	// OTLPHeaders are sent with every export request (auth for a vendor
 	// endpoint, usually nothing for a local Collector).
 	OTLPHeaders map[string]string
@@ -170,19 +195,23 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c := Config{
-		PgSearchTokenizer: "default",
-		DatabaseURL:       dbURL,
-		DBMaxConns:        10,
-		SecretKeyHex:      secretKey,
-		DataDir:           env("DATA_DIR", "/app/data"),
-		Port:              8765,
-		AdminUser:         env("ADMIN_USER", "admin"),
-		AdminPassword:     os.Getenv("ADMIN_PASSWORD"),
-		LogLevel:          env("LOG_LEVEL", "info"),
-		SessionTTL:        24 * time.Hour,
-		UpstreamTimeout:   5 * time.Minute,
-		IngestWorkers:     2,
-		MaxUploadBytes:    50 << 20,
+		PgSearchTokenizer:  "default",
+		DatabaseURL:        dbURL,
+		DBMaxConns:         10,
+		SecretKeyHex:       secretKey,
+		DataDir:            env("DATA_DIR", "/app/data"),
+		Port:               8765,
+		AdminUser:          env("ADMIN_USER", "admin"),
+		AdminPassword:      os.Getenv("ADMIN_PASSWORD"),
+		LogLevel:           env("LOG_LEVEL", "info"),
+		SessionTTL:         24 * time.Hour,
+		UpstreamTimeout:    5 * time.Minute,
+		UpstreamMaxRetries: 2,
+		IngestWorkers:      2,
+		MaxUploadBytes:     50 << 20,
+
+		BreakerFailureThreshold: 5,
+		BreakerOpenDuration:     30 * time.Second,
 
 		IngestLease:         2 * time.Minute,
 		IngestPollInterval:  5 * time.Second,
@@ -236,6 +265,13 @@ func Load() (Config, error) {
 		}
 		c.RerankTimeout = d
 	}
+	if v := strings.TrimSpace(os.Getenv("RERANK_MAX_TOKENS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return c, fmt.Errorf("RERANK_MAX_TOKENS must be a positive integer, got %q", v)
+		}
+		c.RerankMaxTokens = n
+	}
 	if v := strings.TrimSpace(os.Getenv("PG_SEARCH_TOKENIZER")); v != "" {
 		// Interpolated into the index DDL, so the shape is checked here
 		// rather than trusted at the point of use.
@@ -265,6 +301,27 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid UPSTREAM_TIMEOUT %q: %w", v, err)
 		}
 		c.UpstreamTimeout = d
+	}
+	if v := os.Getenv("UPSTREAM_MAX_RETRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > MaxUpstreamRetries {
+			return c, fmt.Errorf("invalid UPSTREAM_MAX_RETRIES %q (0 to %d)", v, MaxUpstreamRetries)
+		}
+		c.UpstreamMaxRetries = n
+	}
+	if v := os.Getenv("BREAKER_FAILURE_THRESHOLD"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return c, fmt.Errorf("invalid BREAKER_FAILURE_THRESHOLD %q (0 disables the breaker)", v)
+		}
+		c.BreakerFailureThreshold = n
+	}
+	if v := os.Getenv("BREAKER_OPEN_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return c, fmt.Errorf("invalid BREAKER_OPEN_DURATION %q (a positive duration such as 30s)", v)
+		}
+		c.BreakerOpenDuration = d
 	}
 	if v := os.Getenv("INGEST_WORKERS"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -586,6 +643,34 @@ func loadTracing(c *Config) error {
 	if c.TracingEnabled && c.OTLPEndpoint == "" {
 		return errors.New("TRACING_ENABLED=true without OTEL_EXPORTER_OTLP_ENDPOINT " +
 			"(or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT); point it at an OpenTelemetry Collector, e.g. http://otel-collector:4318")
+	}
+	// The transport follows the OpenTelemetry names too. "http/protobuf" is
+	// accepted as HTTP because a sidecar that injects it expects an OTLP/HTTP
+	// receiver, which takes the JSON body Ragmux sends on the same path.
+	protoVar := "OTEL_EXPORTER_OTLP_PROTOCOL"
+	if strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")) != "" {
+		protoVar = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"
+	}
+	switch p := strings.TrimSpace(os.Getenv(protoVar)); p {
+	case "", "http/json", "http/protobuf":
+		c.OTLPProtocol = "http"
+	case "grpc":
+		c.OTLPProtocol = "grpc"
+	default:
+		return fmt.Errorf("invalid %s %q (http/json, http/protobuf or grpc)", protoVar, p)
+	}
+	// INSECURE only matters to a gRPC endpoint written without a scheme; the
+	// default for that is TLS, and this is the specification's way to opt out.
+	insecureVar := "OTEL_EXPORTER_OTLP_INSECURE"
+	if strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_INSECURE")) != "" {
+		insecureVar = "OTEL_EXPORTER_OTLP_TRACES_INSECURE"
+	}
+	switch v := strings.TrimSpace(os.Getenv(insecureVar)); v {
+	case "true":
+		c.OTLPInsecure = true
+	case "false", "":
+	default:
+		return fmt.Errorf("invalid %s %q (true or false)", insecureVar, v)
 	}
 	c.TracingTrustIncoming = os.Getenv("TRACING_TRUST_INCOMING") == "true"
 	c.ServiceName = env("OTEL_SERVICE_NAME", "ragmux")

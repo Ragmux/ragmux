@@ -22,13 +22,13 @@ import (
 // by two replicas.
 type countingEmbedder struct{ calls atomic.Int64 }
 
-func (c *countingEmbedder) Embed(_ context.Context, in []string) ([][]float32, error) {
+func (c *countingEmbedder) Embed(_ context.Context, in []string) ([][]float32, *provider.Usage, error) {
 	c.calls.Add(1)
 	out := make([][]float32, len(in))
 	for i := range in {
 		out[i] = []float32{1, 0, 0}
 	}
-	return out, nil
+	return out, nil, nil
 }
 
 // ingestFixture opens two stores on one schema - two replicas over one

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Message is one OpenAI chat message. Content is kept raw because it may be
@@ -246,6 +247,10 @@ type Usage struct {
 	// top-level spelling of the same split; normalize folds them in.
 	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens,omitempty"`
 	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens,omitempty"`
+	// SearchUnits is what a rerank API billed in search units (Cohere's
+	// meta.billed_units.search_units). It is filled by the rerank adapters
+	// only, never sent to a client, and is not a token count.
+	SearchUnits int `json:"-"`
 }
 
 // PromptTokensDetails breaks the prompt down by how it was billed.
@@ -369,9 +374,11 @@ type RequestWarner interface {
 	RequestWarnings(req ChatRequest) []string
 }
 
-// Embedder produces vector embeddings.
+// Embedder produces vector embeddings. The returned Usage is what the
+// upstream reported for the call; it is nil when the upstream reports none
+// (callers estimate in that case).
 type Embedder interface {
-	Embed(ctx context.Context, inputs []string) ([][]float32, error)
+	Embed(ctx context.Context, inputs []string) ([][]float32, *Usage, error)
 }
 
 // Error is an upstream failure carrying an HTTP status to relay.
@@ -391,6 +398,34 @@ type Error struct {
 	// are present, because the gateway's own figure is the one it can vouch
 	// for.
 	UpstreamRetryAfter string
+
+	// The fields below classify the failure for the gateway's retry and
+	// fallback loop (ADR-020). The adapters only describe what happened;
+	// whether and how often to repeat a call is the gateway's decision, so
+	// none of them changes a message or a status the client sees.
+	//
+	// UpstreamStatus is the status the upstream answered with, before it was
+	// normalised into Status (a 500 becomes a 502, Anthropic's 529 a 503). It
+	// is zero when no response arrived.
+	UpstreamStatus int
+	// NotSent reports that the request provably never left the gateway: the
+	// connection could not be made (dial, DNS, refusal) or the TLS handshake
+	// failed. Repeating such a call cannot be billed twice.
+	NotSent bool
+	// Retryable reports that the failure is of a kind that clears by itself
+	// and may be repeated on the same target: a request that was not sent,
+	// or an upstream 429 or 503 (529 included). Whether a given Retry-After
+	// is worth waiting for is the caller's call.
+	Retryable bool
+	// UpstreamRetryDelay is the upstream's Retry-After as a duration, zero
+	// when the header was absent, malformed or already in the past.
+	UpstreamRetryDelay time.Duration
+	// ClientInput reports that the failure came from something the client
+	// supplied, not from the target: fetching an image URL from the request
+	// is the case. Such an error says nothing about the target's health, so
+	// the gateway neither retries it, nor falls back on it, nor counts it
+	// against the target. NotSent and Retryable are never set alongside it.
+	ClientInput bool
 }
 
 func (e *Error) Error() string {

@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "currency": "USD",
   "unit": "per_million_tokens",
   "models": [
@@ -37,6 +37,15 @@
 
     {"provider_type": "deepseek", "model": "deepseek-chat*", "input": 0.27, "output": 1.10, "cache_read": 0.07},
     {"provider_type": "deepseek", "model": "deepseek-reasoner*", "input": 0.55, "output": 2.19, "cache_read": 0.14},
+
+    {"provider_type": "cohere_rerank", "model": "rerank-v3.5*", "input": 0, "output": 0, "per_search_unit": 0.002},
+    {"provider_type": "cohere_rerank", "model": "rerank-english-v3.0*", "input": 0, "output": 0, "per_search_unit": 0.002},
+    {"provider_type": "cohere_rerank", "model": "rerank-multilingual-v3.0*", "input": 0, "output": 0, "per_search_unit": 0.002},
+
+    {"provider_type": "voyage_rerank", "model": "rerank-2.5-lite*", "input": 0.02, "output": 0},
+    {"provider_type": "voyage_rerank", "model": "rerank-2.5*", "input": 0.05, "output": 0},
+    {"provider_type": "voyage_rerank", "model": "rerank-2-lite*", "input": 0.02, "output": 0},
+    {"provider_type": "voyage_rerank", "model": "rerank-2*", "input": 0.05, "output": 0},
 
     {"provider_type": "ollama", "model": "*", "input": 0, "output": 0}
   ]
