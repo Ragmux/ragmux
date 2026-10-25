@@ -3,7 +3,7 @@ module github.com/ragmux/ragmux
 go 1.27.3
 
 require (
-	github.com/go-chi/chi/v5 v5.3.2
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/ledongthuc/pdf v0.0.0-20260907135840-6c8c28e0e8a0
 	github.com/pgvector/pgvector-go v0.4.1
