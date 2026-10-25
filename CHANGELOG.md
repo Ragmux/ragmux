@@ -6,6 +6,19 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The ParadeDB CI job fails instead of skipping when `pg_search` is missing.** With
+  `TEST_REQUIRE_PGSEARCH=1`, `testdb.RequirePgSearch` calls `t.Fatalf` rather than `t.Skipf`;
+  the `test-paradedb` job sets it. Local runs without the variable still skip.
+
+### Documentation
+
+- **Probe endpoints are part of the v1.0 contract.** `GET /healthz` and `GET /readyz` are now
+  documented under [Health](docs/api.md#health) as part of the v1.0 API contract: from 1.0 on,
+  their paths, methods and status meanings follow the same deprecation policy as `/v1`, and
+  their JSON bodies only gain fields.
+
 ### Security
 
 - **Go 1.27.2 and `golang.org/x/net` v0.60.0.** The minimum Go version moves from 1.27.1 to

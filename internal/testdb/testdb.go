@@ -103,11 +103,20 @@ func OpenWith(t *testing.T, cfg store.OpenConfig) *store.Store {
 // ParadeDB pg_search. CI runs the suite against a plain pgvector image on
 // purpose -- that job is what proves the fallback path -- so everything that
 // needs BM25 is capability-gated rather than assumed.
+//
+// The ParadeDB CI job sets TEST_REQUIRE_PGSEARCH=1 so that a missing extension
+// fails the run instead of skipping silently: a skipped pg_search test looks
+// green without proving anything.
 func RequirePgSearch(t *testing.T, s *store.Store) {
 	t.Helper()
-	if !s.Caps().PgSearch {
-		t.Skipf("pg_search is not available on this server; start a ParadeDB Postgres (make dev-db-paradedb) to run this test")
+	if s.Caps().PgSearch {
+		return
 	}
+	const msg = "pg_search is not available on this server; start a ParadeDB Postgres (make dev-db-paradedb) to run this test"
+	if os.Getenv("TEST_REQUIRE_PGSEARCH") == "1" {
+		t.Fatalf("%s (TEST_REQUIRE_PGSEARCH=1 forbids skipping)", msg)
+	}
+	t.Skipf("%s", msg)
 }
 
 func randHex(n int) string {

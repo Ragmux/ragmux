@@ -108,6 +108,8 @@ jobs:
       - name: go test
         env:
           TEST_DATABASE_URL: postgres://ragmux:ragmux@localhost:5432/ragmux_test?sslmode=disable
+          # Fail, do not skip, when pg_search is missing: a skipped test is green.
+          TEST_REQUIRE_PGSEARCH: "1"
         run: go test -race -count=1 ./...
 
   # promtool ships inside the Prometheus image; running it from there keeps
