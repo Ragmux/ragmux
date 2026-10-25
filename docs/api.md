@@ -836,6 +836,13 @@ editors and viewers receive the `database` object without those three keys.
 (the version of the running build) or `503 db unavailable` (plain text). No
 authentication.
 
+`GET /healthz` (liveness) and `GET /readyz` (readiness, see
+[Observability](observability.md#readyz-and-healthz)) are part of the v1.0 API contract,
+alongside `/v1` and `/admin/api/…`. From 1.0 on, their paths, methods and status meanings
+(`200` passes, `503` does not, `/readyz` answers `200` with a `degraded` entry for conditions
+that still serve traffic) follow the same deprecation policy as `/v1`, and their JSON bodies
+only gain fields.
+
 ## Client API (`/v1`)
 
 Point any OpenAI SDK at `http://<host>:8765/v1` with the project key as `api_key`.
