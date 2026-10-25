@@ -25,6 +25,8 @@ All notable changes to Ragmux are documented here. The format follows
   1.27.2 and `x/net` from v0.59.0 to v0.60.0, picking up fixes for reachable vulnerabilities in
   `net/http`, HTTP/2, `crypto/tls` and `net/textproto` (GO-2026-6603 to GO-2026-6617, reported by
   `govulncheck`).
+- **Go 1.27.3.** The minimum Go version moves from 1.27.2 to 1.27.3, picking up the fix for a
+  reachable vulnerability in `crypto/x509` (GO-2026-6809, reported by `govulncheck`).
 
 ## [0.5.0] - 2026-10-11
 
