@@ -609,8 +609,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.Model = c.conn.ModelName
 	}
 
-	// The token estimate covers the client's messages and the project prompt;
-	// retrieved context is not included.
+	// This estimate covers the client's messages and the project prompt. The
+	// retrieved context does not exist yet and is not retrieved before the
+	// check, so throttled clients do not cost an embedding call; it is added
+	// by checkContextLimits once retrieval has run.
 	estimate := (len(c.project.SystemPrompt) + messageChars(req.Messages) + 3) / 4
 	if !g.checkLimits(c, estimate, req.Stream) {
 		return
@@ -619,6 +621,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	prep := g.prepareChat(c, prov, &req)
 	g.openRecord(c, req.Stream, prep.apply)
 	defer g.record(c)
+	if !g.checkContextLimits(c, estimate, prep.contextBlock) {
+		return
+	}
 
 	// A nil prov (the first target's adapter could not be built) leaves provConn
 	// unset and records the connection and its error as failedConn and
@@ -791,12 +796,12 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 
 	// Project-level system prompt, if configured, goes first.
 	//
-	// The prompt injected here and the RAG context block injected below are
-	// the stable prefix most worth an Anthropic cache breakpoint, but the
-	// gateway does not mark one: a project-level cache_prompt flag needs a
-	// column, a migration and dashboard work of its own. Clients that mark
-	// their own content parts are relayed unchanged in the meantime, except
-	// in the system message the RAG context lands in (see below).
+	// The prompt injected here is the stable prefix most worth an Anthropic
+	// cache breakpoint, but the gateway does not mark one: a project-level
+	// cache_prompt flag needs a column, a migration and dashboard work of its
+	// own. Clients that mark their own content parts are relayed unchanged in
+	// the meantime, except in the system message the RAG context lands in
+	// under the "system" placement (see below).
 	if p.SystemPrompt != "" {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
@@ -840,9 +845,7 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 				c.log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
 				prep.contextBlock = rag.FormatContext(hits)
-				// Drops the client's cache_control in that system message:
-				// a per-query prefix can never be read back from the cache.
-				req.Messages = rag.InjectRetrievedContext(req.Messages, prep.contextBlock)
+				req.Messages = injectRetrieved(req.Messages, prep.contextBlock, p.ContextPlacement)
 				prep.ragUsed, prep.ragHits = true, len(hits)
 				prep.sources = ragSources(hits)
 				w.Header().Set("x-ragmux-rag-sources", sourcesHeader(prep.sources))
@@ -856,6 +859,22 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 	// stream's headers are only written once its first chunk arrives.
 	setRequestWarnings(w.Header(), prov, *req)
 	return prep
+}
+
+// injectRetrieved puts the retrieved-context block where the project's
+// context_placement says.
+//
+// "system" is the original behaviour: the block leads the system message and
+// the client's cache_control is dropped there, because a per-query prefix can
+// never be read back from the cache. "before_last_user" leaves the system
+// message and every breakpoint alone and puts the block at the head of the
+// last user message, behind the cached prefix. Any other value -- the store
+// already maps unknown ones to the default -- is treated as "system".
+func injectRetrieved(msgs []provider.Message, block, placement string) []provider.Message {
+	if placement == store.ContextPlacementBeforeLastUser {
+		return rag.InjectBeforeLastUser(msgs, block)
+	}
+	return rag.InjectRetrievedContext(msgs, block)
 }
 
 // ragmuxRequest is the optional "ragmux" object clients may add to a chat

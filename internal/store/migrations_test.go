@@ -44,3 +44,19 @@ func TestMigrationNumbersUniqueAndContiguous(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeRAGSettings: a setting value the build does not know reads as
+// the default; known ones pass through untouched.
+func TestNormalizeRAGSettings(t *testing.T) {
+	p := &Project{ContextPlacement: "from_the_future", RetrievalPolicy: RetrievalPolicyOff, QueryStrategy: ""}
+	p.normalizeRAGSettings()
+	if p.ContextPlacement != ContextPlacementSystem || p.RetrievalPolicy != RetrievalPolicyOff || p.QueryStrategy != QueryStrategyLastUser {
+		t.Errorf("normalized = %+v", p)
+	}
+	q := &Project{}
+	q.withRAGDefaults()
+	if q.ContextPlacement != ContextPlacementSystem || q.RetrievalPolicy != RetrievalPolicyAlways ||
+		q.QueryStrategy != QueryStrategyLastUser || q.HistoryTurnsForQuery != DefaultHistoryTurnsForQuery {
+		t.Errorf("defaults = %+v", q)
+	}
+}

@@ -353,6 +353,48 @@ func (g *Gateway) checkLimits(c *call, estimate int, streamed bool) bool {
 	return false
 }
 
+// checkContextLimits is the second half of the chat token-limit check. The
+// first (checkLimits) runs before retrieval and sees only the client's
+// messages and the project prompt; the retrieved context can add thousands of
+// tokens, so once it is known the per-minute token limit is checked again
+// against the whole prompt. estimate is the figure checkLimits used.
+//
+// This is a second, request-slot-free check rather than a move of retrieval
+// ahead of checkLimits: the first check keeps shielding the embedding and
+// rerank calls from a client that is already over RPM or a budget, and a
+// repeated CheckSubject would take a second RPM slot. It runs after
+// openRecord, so a denial leaves the row the retrieval's own spend (rerank
+// tokens) is recorded on and the request is counted once, as a 429, like any
+// denied request. Nothing has gone upstream, so the attempt count is zero.
+func (g *Gateway) checkContextLimits(c *call, estimate int, contextBlock string) bool {
+	if g.Limiter == nil || contextBlock == "" {
+		return true
+	}
+	total := estimate + (len(contextBlock)+3)/4
+	decision, err := g.Limiter.CheckTokens(c.ctx(), c.subject, c.decision, total)
+	if err != nil {
+		c.log.Error("limit check", "err", err)
+		c.rec.StatusCode, c.rec.Error = http.StatusInternalServerError, "limit check failed"
+		c.rec.Attempt = 0
+		writeError(c.w, http.StatusInternalServerError, "server_error", "limit check failed")
+		return false
+	}
+	if decision.Allowed {
+		return true
+	}
+	g.Metrics.RecordLimitDenied(c.projectID, decision.Reason)
+	// The retrieval was thrown away: no context went to the model, so neither
+	// the headers nor the row (which feeds the RAG-use figures) may say it did.
+	// Its rerank spend stays on the row as a side charge.
+	c.w.Header().Del("x-ragmux-rag-hits")
+	c.w.Header().Del("x-ragmux-rag-sources")
+	c.rec.RAGUsed, c.rec.RAGHits = false, 0
+	c.rec.StatusCode, c.rec.Error = http.StatusTooManyRequests, decision.Reason
+	c.rec.Attempt = 0
+	writeLimitError(c.w, decision)
+	return false
+}
+
 // callLogger is the logger a call's lines go through. req_id is the id
 // obs.RequestID generated: the access log, the span and the metrics carry that
 // one, so a gateway line joins to them on it. When the client's own

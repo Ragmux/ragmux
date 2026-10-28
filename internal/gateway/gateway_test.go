@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1181,5 +1182,182 @@ func TestKeySubLimitDeniesBeforeTheProjectCeiling(t *testing.T) {
 	}
 	if rec := e.lastLog(); rec.StatusCode != 429 || rec.APIKeyID == nil {
 		t.Errorf("denied request is not attributed: %+v", rec)
+	}
+}
+
+// upstreamMessage is one chat message as the upstream received it, content
+// kept as the raw bytes that crossed the wire.
+type upstreamMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// captureChat makes the upstream record the messages of every chat call and
+// answer normally. The returned func gives the calls seen so far.
+func captureChat(e *env) func() [][]upstreamMessage {
+	var mu sync.Mutex
+	var calls [][]upstreamMessage
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Messages []upstreamMessage `json:"messages"`
+		}
+		_ = json.Unmarshal(body, &req)
+		mu.Lock()
+		calls = append(calls, req.Messages)
+		mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		okChat(w, r)
+	})
+	return func() [][]upstreamMessage {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([][]upstreamMessage(nil), calls...)
+	}
+}
+
+// TestBeforeLastUserKeepsClientPrefixAcrossTurns is the point of the
+// "before_last_user" placement: over a three-turn conversation the system
+// message -- with the client's cache_control -- and every earlier turn reach
+// the upstream byte for byte as the client sent them, no system message is
+// added, and the retrieved context is the leading part of the last user
+// message only.
+func TestBeforeLastUserKeepsClientPrefixAcrossTurns(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.ContextPlacement = store.ContextPlacementBeforeLastUser })
+	e.attachRAG()
+	seen := captureChat(e)
+
+	system := `[{"type":"text","text":"You are a fruit expert.","cache_control":{"type":"ephemeral"}}]`
+	turn := func(n int) string {
+		return fmt.Sprintf(`[{"type":"text","text":"question %d about apples?","cache_control":{"type":"ephemeral"}}]`, n)
+	}
+	reply := func(n int) string { return fmt.Sprintf(`"answer %d"`, n) }
+	var messages []string
+	messages = append(messages, `{"role":"system","content":`+system+`}`)
+	for n := 1; n <= 3; n++ {
+		messages = append(messages, `{"role":"user","content":`+turn(n)+`}`)
+		body := `{"messages":[` + strings.Join(messages, ",") + `]}`
+		resp := e.post(context.Background(), "/v1/chat/completions", body, e.key)
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("turn %d: status %d", n, resp.StatusCode)
+		}
+		messages = append(messages, `{"role":"assistant","content":`+reply(n)+`}`)
+	}
+
+	calls := seen()
+	if len(calls) != 3 {
+		t.Fatalf("upstream saw %d calls, want 3", len(calls))
+	}
+	for n, msgs := range calls {
+		turnNo := n + 1
+		if want := 1 + 2*turnNo - 1; len(msgs) != want {
+			t.Fatalf("turn %d: %d messages, want %d (a message was added): %v", turnNo, len(msgs), want, msgs)
+		}
+		if msgs[0].Role != "system" || string(msgs[0].Content) != system {
+			t.Errorf("turn %d: system message changed: %s", turnNo, msgs[0].Content)
+		}
+		// Every earlier turn is the client's own bytes.
+		for i := 1; i < len(msgs)-1; i++ {
+			var want string
+			if msgs[i].Role == "user" {
+				want = turn((i + 1) / 2)
+			} else {
+				want = reply(i / 2)
+			}
+			if string(msgs[i].Content) != want {
+				t.Errorf("turn %d: message %d changed: %s, want %s", turnNo, i, msgs[i].Content, want)
+			}
+		}
+		last := msgs[len(msgs)-1]
+		var parts []struct {
+			Type         string          `json:"type"`
+			Text         string          `json:"text"`
+			CacheControl json.RawMessage `json:"cache_control"`
+		}
+		if last.Role != "user" || json.Unmarshal(last.Content, &parts) != nil || len(parts) != 2 {
+			t.Fatalf("turn %d: last message is not [context, client part]: %v", turnNo, last)
+		}
+		if !strings.Contains(parts[0].Text, "<context>") || !strings.Contains(parts[0].Text, "apples are red") || parts[0].CacheControl != nil {
+			t.Errorf("turn %d: context is not the first part: %s", turnNo, last.Content)
+		}
+		if parts[1].Text != fmt.Sprintf("question %d about apples?", turnNo) || string(parts[1].CacheControl) != `{"type":"ephemeral"}` {
+			t.Errorf("turn %d: client part changed: %s", turnNo, last.Content)
+		}
+	}
+}
+
+// TestSystemPlacementStaysTheDefault: a project that never set the placement
+// keeps the context in the system message and the last user message plain.
+func TestSystemPlacementStaysTheDefault(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	if e.proj.ContextPlacement != store.ContextPlacementSystem {
+		t.Fatalf("default placement = %q", e.proj.ContextPlacement)
+	}
+	seen := captureChat(e)
+	resp, _ := e.chat(map[string]any{"messages": []map[string]any{{"role": "user", "content": "what colour are apples?"}}})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	calls := seen()
+	if len(calls) != 1 || len(calls[0]) != 2 || calls[0][0].Role != "system" ||
+		!strings.Contains(string(calls[0][0].Content), "apples are red") || string(calls[0][1].Content) != `"what colour are apples?"` {
+		t.Errorf("messages = %v", calls)
+	}
+}
+
+// TestRetrievedContextCountsTowardTPM: the first limit check cannot see the
+// retrieved context, so a request whose own messages fit under the per-minute
+// token limit is still refused once retrieval makes the prompt exceed it. The
+// same request without a RAG store passes, nothing reaches the upstream, and
+// the request is counted once.
+func TestRetrievedContextCountsTowardTPM(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RateLimitTPM = 50; p.RateLimitRPM = 10 })
+	e.attachRAG()
+	var upstreamCalls atomic.Int32
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		okChat(w, r)
+	})
+	msgs := []map[string]any{{"role": "user", "content": "what colour are apples?"}}
+
+	before := limits.Windows(time.Now())
+	resp, out := e.chat(map[string]any{"messages": msgs})
+	if resp.StatusCode != 429 || errorField(t, out, "code") != limits.ReasonTPM || errorField(t, out, "scope") != limits.ScopeProject ||
+		resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("with context: %d %v %v", resp.StatusCode, resp.Header, out)
+	}
+	if resp.Header.Get("x-ragmux-rag-sources") != "" || resp.Header.Get("x-ragmux-rag-hits") != "" {
+		t.Errorf("retrieval headers on a denial: %v", resp.Header)
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Errorf("the denied request reached the upstream %d times", upstreamCalls.Load())
+	}
+	rec := e.lastLog()
+	if rec.StatusCode != 429 || rec.Error != limits.ReasonTPM || rec.Attempt != 0 {
+		t.Errorf("log = %+v", rec)
+	}
+	if rec.RAGUsed || rec.RAGHits != 0 {
+		t.Errorf("the denied row claims the context was used: rag_used=%v rag_hits=%d", rec.RAGUsed, rec.RAGHits)
+	}
+	minute, _, _, err := e.st.GetUsage(context.Background(), e.proj.ID, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := limits.Windows(time.Now()); after.Minute.Equal(before.Minute) && minute.Requests != 1 {
+		t.Errorf("the denied request was counted %d times, want 1", minute.Requests)
+	}
+
+	// Without a store there is no context, and the bare messages are well
+	// under the limit.
+	_, otherKey, err := e.st.CreateProject(context.Background(), &store.Project{Name: "no-rag", ModelConnectionID: e.conn.ID, RateLimitTPM: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2 := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgs}, otherKey)
+	_ = r2.Body.Close()
+	if r2.StatusCode != 200 || upstreamCalls.Load() != 1 {
+		t.Errorf("without context: %d, upstream calls %d", r2.StatusCode, upstreamCalls.Load())
 	}
 }

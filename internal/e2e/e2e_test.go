@@ -1406,3 +1406,88 @@ func TestMetricsExportAndSummaryOptions(t *testing.T) {
 		t.Errorf("viewer projects breakdown: %v", list)
 	}
 }
+
+// TestProjectRAGSettingsAdminAPI covers the ADR-024 project settings through
+// the admin API: defaults, validation, "left out keeps the current value" on
+// update, an explicit null clearing the query model, and the 409 that a
+// connection a project uses for query condensing gives on delete.
+func TestProjectRAGSettingsAdminAPI(t *testing.T) {
+	up := httptest.NewServer(http.NotFoundHandler())
+	defer up.Close()
+	e := newEnv(t, testdb.Config(t))
+	mkConn := func(name string) int64 {
+		c := e.call("POST", "/admin/api/models", map[string]any{"name": name, "provider_type": "custom_openai",
+			"base_url": up.URL + "/v1", "api_key": "k", "model_name": "m"}, "")
+		if c["_status"] != float64(201) {
+			t.Fatalf("create connection %s: %v", name, c)
+		}
+		return int64(c["id"].(float64))
+	}
+	chatConn, queryConn := mkConn("chat"), mkConn("query")
+
+	created := e.call("POST", "/admin/api/projects", map[string]any{"name": "p", "model_connection_id": chatConn}, "")
+	if created["_status"] != float64(201) {
+		t.Fatalf("create: %v", created)
+	}
+	proj := created["project"].(map[string]any)
+	if proj["context_placement"] != "system" || proj["retrieval_policy"] != "always" || proj["query_strategy"] != "last_user" ||
+		proj["history_turns_for_query"] != float64(3) || proj["query_model_connection_id"] != nil {
+		t.Errorf("defaults: %v", proj)
+	}
+	path := fmt.Sprintf("/admin/api/projects/%d", int64(proj["id"].(float64)))
+	put := func(extra map[string]any) map[string]any {
+		body := map[string]any{"name": "p", "model_connection_id": chatConn}
+		for k, v := range extra {
+			body[k] = v
+		}
+		return e.call("PUT", path, body, "")
+	}
+
+	for name, extra := range map[string]map[string]any{
+		"placement":        {"context_placement": "after_all"},
+		"policy":           {"retrieval_policy": "sometimes"},
+		"strategy":         {"query_strategy": "rewrite"},
+		"turns too low":    {"history_turns_for_query": 0},
+		"turns too high":   {"history_turns_for_query": 11},
+		"query model":      {"query_model_connection_id": 999999},
+		"query model type": {"query_model_connection_id": "abc"},
+	} {
+		if r := put(extra); r["_status"] != float64(400) {
+			t.Errorf("%s: status %v, want 400: %v", name, r["_status"], r)
+		}
+	}
+
+	r := put(map[string]any{"context_placement": "before_last_user", "retrieval_policy": "auto", "query_strategy": "condense",
+		"history_turns_for_query": 5, "query_model_connection_id": queryConn})
+	if r["_status"] != float64(200) || r["context_placement"] != "before_last_user" || r["retrieval_policy"] != "auto" ||
+		r["query_strategy"] != "condense" || r["history_turns_for_query"] != float64(5) || r["query_model_connection_id"] != float64(queryConn) {
+		t.Fatalf("update: %v", r)
+	}
+	upd := e.call("GET", "/admin/api/audit?action=project.update", nil, "")["entries"].([]any)
+	changed, _ := upd[0].(map[string]any)["details"].(map[string]any)["rag_settings_changed"].(map[string]any)
+	if changed["context_placement"] == nil || changed["query_model_connection_id"] == nil {
+		t.Errorf("rag_settings_changed: %v", upd[0])
+	}
+
+	// Saving the rest of the project without the settings leaves them alone.
+	r = put(nil)
+	if r["_status"] != float64(200) || r["context_placement"] != "before_last_user" || r["history_turns_for_query"] != float64(5) ||
+		r["query_model_connection_id"] != float64(queryConn) {
+		t.Errorf("update without the settings changed them: %v", r)
+	}
+
+	// The connection is held by the project: delete answers 409.
+	del := e.call("DELETE", fmt.Sprintf("/admin/api/models/%d", queryConn), nil, "")
+	if del["_status"] != float64(409) || !strings.Contains(errMessage(del), "still referenced") {
+		t.Errorf("delete of the query model connection: %v", del)
+	}
+
+	// An explicit null releases it.
+	r = put(map[string]any{"query_model_connection_id": nil})
+	if r["_status"] != float64(200) || r["query_model_connection_id"] != nil || r["context_placement"] != "before_last_user" {
+		t.Errorf("null did not clear the query model alone: %v", r)
+	}
+	if del = e.call("DELETE", fmt.Sprintf("/admin/api/models/%d", queryConn), nil, ""); del["_status"] != float64(200) {
+		t.Errorf("delete after release: %v", del)
+	}
+}

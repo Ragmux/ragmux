@@ -1568,14 +1568,69 @@ type projectInput struct {
 	RateLimitTPM        int     `json:"rate_limit_tpm"`
 	BudgetDailyTokens   int64   `json:"budget_daily_tokens"`
 	BudgetMonthlyTokens int64   `json:"budget_monthly_tokens"`
+
+	// RAG behaviour (ADR-024). A field left out of the body keeps the
+	// project's current value on update and takes the default on create, so a
+	// client that does not know these settings (an older dashboard, a script)
+	// never resets them by saving the rest of the project.
+	// QueryModelConnectionID is a raw value because "absent" (keep) and null
+	// (clear) are different requests.
+	ContextPlacement       *string         `json:"context_placement"`
+	RetrievalPolicy        *string         `json:"retrieval_policy"`
+	QueryStrategy          *string         `json:"query_strategy"`
+	HistoryTurnsForQuery   *int            `json:"history_turns_for_query"`
+	QueryModelConnectionID json.RawMessage `json:"query_model_connection_id"`
 }
 
 // project builds the store record from validated input (id and key aside).
-func (in *projectInput) project() *store.Project {
-	return &store.Project{Name: strings.TrimSpace(in.Name), ModelConnectionID: in.ModelConnectionID,
+// base is the project's current state on update, nil on create. Settings the
+// input leaves out stay empty and the store keeps them (create: the defaults);
+// the enum ones are deliberately not copied from base, because base holds the
+// value as this build reads it, and a value it does not know reads as the
+// default -- writing that back would erase what a newer release stored.
+// The history turns and the query model are plain values and carry over.
+func (in *projectInput) project(base *store.Project) *store.Project {
+	p := &store.Project{Name: strings.TrimSpace(in.Name), ModelConnectionID: in.ModelConnectionID,
 		RAGStoreID: in.RAGStoreID, SystemPrompt: in.SystemPrompt,
 		RateLimitRPM: in.RateLimitRPM, RateLimitTPM: in.RateLimitTPM,
 		BudgetDailyTokens: in.BudgetDailyTokens, BudgetMonthlyTokens: in.BudgetMonthlyTokens}
+	if base != nil {
+		p.HistoryTurnsForQuery, p.QueryModelConnectionID = base.HistoryTurnsForQuery, base.QueryModelConnectionID
+	}
+	if in.ContextPlacement != nil {
+		p.ContextPlacement = *in.ContextPlacement
+	}
+	if in.RetrievalPolicy != nil {
+		p.RetrievalPolicy = *in.RetrievalPolicy
+	}
+	if in.QueryStrategy != nil {
+		p.QueryStrategy = *in.QueryStrategy
+	}
+	if in.HistoryTurnsForQuery != nil {
+		p.HistoryTurnsForQuery = *in.HistoryTurnsForQuery
+	}
+	if in.QueryModelConnectionID != nil {
+		// validateProject has already parsed it; null and 0 clear the setting.
+		var id *int64
+		_ = json.Unmarshal(in.QueryModelConnectionID, &id)
+		if id != nil && *id == 0 {
+			id = nil
+		}
+		p.QueryModelConnectionID = id
+	}
+	return p
+}
+
+// ragSettingFields lists the RAG settings with their current values, for the
+// audit trail's "changed" view.
+func ragSettingFields(p *store.Project) map[string]any {
+	var query any
+	if p.QueryModelConnectionID != nil {
+		query = *p.QueryModelConnectionID
+	}
+	return map[string]any{"context_placement": p.ContextPlacement, "retrieval_policy": p.RetrievalPolicy,
+		"query_strategy": p.QueryStrategy, "history_turns_for_query": p.HistoryTurnsForQuery,
+		"query_model_connection_id": query}
 }
 
 // limitFields lists the limit columns with their current values.
@@ -1628,6 +1683,41 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	if in.RateLimitRPM < 0 || in.RateLimitTPM < 0 || in.BudgetDailyTokens < 0 || in.BudgetMonthlyTokens < 0 {
 		return errors.New("rate limits and budgets must be 0 (unlimited) or positive")
 	}
+	return a.validateRAGSettings(r, in)
+}
+
+// validateRAGSettings checks the ADR-024 settings the body carries. Every
+// value the CHECK constraints of migration 0021 allow is accepted here, even
+// those whose behaviour lands in a later phase: the setting is the project's,
+// whether or not this build acts on it yet.
+func (a *Admin) validateRAGSettings(r *http.Request, in *projectInput) error {
+	if in.ContextPlacement != nil && !store.ValidContextPlacement(*in.ContextPlacement) {
+		return errors.New(`context_placement must be "system" or "before_last_user"`)
+	}
+	if in.RetrievalPolicy != nil && !store.ValidRetrievalPolicy(*in.RetrievalPolicy) {
+		return errors.New(`retrieval_policy must be "always", "auto" or "off"`)
+	}
+	if in.QueryStrategy != nil && !store.ValidQueryStrategy(*in.QueryStrategy) {
+		return errors.New(`query_strategy must be "last_user" or "condense"`)
+	}
+	if in.HistoryTurnsForQuery != nil && (*in.HistoryTurnsForQuery < 1 || *in.HistoryTurnsForQuery > store.MaxHistoryTurnsForQuery) {
+		return fmt.Errorf("history_turns_for_query must be between 1 and %d", store.MaxHistoryTurnsForQuery)
+	}
+	if in.QueryModelConnectionID != nil {
+		var id *int64
+		if err := json.Unmarshal(in.QueryModelConnectionID, &id); err != nil {
+			return errors.New("query_model_connection_id must be a connection id or null")
+		}
+		if id != nil && *id != 0 {
+			conn, err := a.Store.GetConnection(r.Context(), *id)
+			if err != nil {
+				return errors.New("query_model_connection_id does not reference an existing model connection")
+			}
+			if !provider.SupportsChat(conn.ProviderType) {
+				return fmt.Errorf("provider %q cannot be used for chat", conn.ProviderType)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1661,7 +1751,7 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 	// The creator is always a member so editors keep access to what they
 	// made; project and members are written in one transaction.
 	members := append([]int64{u.ID}, in.MemberUserIDs...)
-	p, key, err := a.Store.CreateProjectWithMembers(r.Context(), in.project(), members)
+	p, key, err := a.Store.CreateProjectWithMembers(r.Context(), in.project(nil), members)
 	if err != nil {
 		if store.IsForeignKeyViolation(err) {
 			writeErr(w, http.StatusBadRequest, "member_user_ids contains an unknown user")
@@ -1670,7 +1760,7 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p)})
+	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p), "rag_settings": ragSettingFields(p)})
 	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
 }
 
@@ -1697,7 +1787,7 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	np := in.project()
+	np := in.project(before)
 	np.ID = id
 	p, err := a.Store.UpdateProject(r.Context(), np)
 	if err != nil {
@@ -1714,6 +1804,16 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(changed) > 0 {
 		details["limits_changed"] = changed
+	}
+	oldRAG, curRAG := ragSettingFields(before), ragSettingFields(p)
+	ragChanged := map[string]any{}
+	for k, v := range curRAG {
+		if oldRAG[k] != v {
+			ragChanged[k] = map[string]any{"from": oldRAG[k], "to": v}
+		}
+	}
+	if len(ragChanged) > 0 {
+		details["rag_settings_changed"] = ragChanged
 	}
 	a.audit(r, "project.update", "project", ptr(p.ID), details)
 	writeJSON(w, http.StatusOK, p)

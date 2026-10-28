@@ -364,6 +364,17 @@ type driftCase struct {
 	docOnly map[string]string
 }
 
+// ragSettingsPending lists the ADR-024 project settings (migration 0021). They
+// are in the admin API from the phase that added them; docs/api.md gets them
+// in the v0.6 documentation phase, which is when these exceptions go.
+var ragSettingsPending = map[string]string{
+	"context_placement":         "ADR-024 setting, documented in the v0.6 docs phase",
+	"retrieval_policy":          "ADR-024 setting, documented in the v0.6 docs phase",
+	"query_strategy":            "ADR-024 setting, documented in the v0.6 docs phase",
+	"history_turns_for_query":   "ADR-024 setting, documented in the v0.6 docs phase",
+	"query_model_connection_id": "ADR-024 setting, documented in the v0.6 docs phase",
+}
+
 // compareDrift returns the code fields the docs lack and the doc keys the code
 // lacks, plus problems with the case itself (anchor not found, stale
 // exceptions).
@@ -537,9 +548,9 @@ func driftCases(t *testing.T) []driftCase {
 
 		// Projects
 		{name: "project", code: jsonFieldNames(typeOf[store.Project]()), sections: []string{"Projects"},
-			obj: &jsonSel{"", "api_key_prefix", ""}},
+			obj: &jsonSel{"", "api_key_prefix", ""}, undocumented: ragSettingsPending},
 		{name: "project body", code: jsonFieldNames(typeOf[projectInput]()), sections: []string{"Projects"},
-			obj: &jsonSel{"", "member_user_ids", ""}},
+			obj: &jsonSel{"", "member_user_ids", ""}, undocumented: ragSettingsPending},
 		{name: "project members body", code: handlerStructFields(t, "admin.go", "setMembers"), sections: []string{"Projects"},
 			brace: []string{"user_ids"}},
 		{name: "project member", code: jsonFieldNames(typeOf[store.ProjectMember]()), sections: []string{"Projects"},

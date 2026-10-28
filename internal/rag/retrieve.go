@@ -1,6 +1,7 @@
 package rag
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -396,15 +397,88 @@ func InjectContext(msgs []provider.Message, contextBlock string) []provider.Mess
 
 // InjectRetrievedContext prepends a retrieved-passages block the way
 // InjectContext does, but strips cache_control from the client parts of the
-// message it lands in.
+// message it lands in. It is the "system" placement of a project's
+// context_placement setting.
 //
 // The block changes with every query and sits in front of the client's
 // parts, so a breakpoint there would make Anthropic write a fresh cache
 // entry (billed above the plain input rate) on each request and never read
-// one back. Dropping the marker keeps the pre-0.4.2 cost; placing the block
-// after the client's cached prefix is the real fix and is left to v0.6-1.
+// one back. Dropping the marker keeps the pre-0.4.2 cost; the
+// "before_last_user" placement (InjectBeforeLastUser) is the one that keeps
+// the client's breakpoints.
 func InjectRetrievedContext(msgs []provider.Message, contextBlock string) []provider.Message {
 	return inject(msgs, contextBlock, true)
+}
+
+// InjectBeforeLastUser puts a retrieved-passages block in front of the content
+// of the last user message, as its leading text part, and touches nothing
+// else: the system message, every earlier message and every cache_control
+// marker -- including the other parts of the last user message, which stay
+// behind the new leading part exactly as the client wrote them -- are relayed
+// byte for byte, so the prefix a client's prompt cache was built on is the
+// same on every turn. No system message is added; Anthropic
+// and Gemini pull system messages to the top of the request, which would put
+// the per-query block back in front of the cached prefix.
+//
+// A string content becomes a parts array of the block followed by the original
+// text. With no user message there is nothing to put the block in front of,
+// and it falls back to InjectRetrievedContext. It returns a copy; the input is
+// not mutated.
+func InjectBeforeLastUser(msgs []provider.Message, contextBlock string) []provider.Message {
+	if contextBlock == "" {
+		return msgs
+	}
+	last := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			last = i
+			break
+		}
+	}
+	if last < 0 {
+		return InjectRetrievedContext(msgs, contextBlock)
+	}
+	out := make([]provider.Message, len(msgs))
+	copy(out, msgs)
+	out[last].Content = leadWithTextPart(out[last], contextBlock)
+	return out
+}
+
+// leadWithTextPart returns m's content as a parts array that starts with a
+// text part holding block. A parts array keeps its parts untouched behind it;
+// a non-empty string becomes a second text part; absent or null content
+// leaves the block alone.
+func leadWithTextPart(m provider.Message, block string) json.RawMessage {
+	parts := []json.RawMessage{textPart(block)}
+	var existing []json.RawMessage
+	var text string
+	if err := json.Unmarshal(m.Content, &existing); err == nil && existing != nil {
+		parts = append(parts, existing...)
+	} else if err := json.Unmarshal(m.Content, &text); err == nil && text != "" {
+		parts = append(parts, textPart(text))
+	}
+	// The array is joined by hand: json.Marshal would compact the client's
+	// parts and escape <, > and & in them, and a part is the client's to relay
+	// as it came.
+	var b bytes.Buffer
+	b.WriteByte('[')
+	for i, part := range parts {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(part)
+	}
+	b.WriteByte(']')
+	return b.Bytes()
+}
+
+// textPart renders one OpenAI text content part.
+func textPart(text string) json.RawMessage {
+	b, _ := json.Marshal(struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{Type: "text", Text: text})
+	return b
 }
 
 func inject(msgs []provider.Message, contextBlock string, dropCacheControl bool) []provider.Message {
