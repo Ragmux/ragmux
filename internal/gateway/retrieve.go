@@ -211,10 +211,12 @@ func (in *retrieveInvocation) attempt(c *call, conn *store.ModelConnection) erro
 	return nil
 }
 
-// rerankUsageProvider wraps the chat adapter the LLM reranker uses and adds up
-// the tokens of its calls, from the upstream's report or, when it gives none,
-// from the characters sent and received. The search runs one attempt on one
-// goroutine, so the counters need no lock.
+// rerankUsageProvider wraps the chat adapter of a side call -- the LLM rerank
+// of a search, and the query condense of a chat request -- and adds up the
+// tokens of its calls, from the upstream's report or, when it gives none, from
+// the characters sent and received. A wrapper serves one request's calls
+// made in sequence on one goroutine, so the counters need no lock; do not
+// share one between concurrent calls.
 type rerankUsageProvider struct {
 	provider.Provider
 	prompt, completion int

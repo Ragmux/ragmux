@@ -22,6 +22,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -37,6 +38,10 @@ type upstream struct {
 	// embeds counts the embedding calls, which is how a test proves that
 	// retrieval did or did not run.
 	embeds atomic.Int64
+	// events is the ordered log of what the upstream was asked: "embed:<input>"
+	// for an embedding call and whatever a chat handler notes.
+	evMu   sync.Mutex
+	events []string
 	// seenCancel is closed by blocking handlers once their request context
 	// ended, which proves the gateway tore the upstream call down.
 	seenCancel chan struct{}
@@ -59,6 +64,7 @@ func newUpstream(t *testing.T) *upstream {
 			}
 			body, _ := io.ReadAll(r.Body)
 			_ = json.Unmarshal(body, &req)
+			u.note("embed:" + strings.Join(req.Input, "|"))
 			data := make([]map[string]any, len(req.Input))
 			for i := range req.Input {
 				data[i] = map[string]any{"index": i, "embedding": []float32{1, 0, 0, 0}}
@@ -79,6 +85,28 @@ func newUpstream(t *testing.T) *upstream {
 }
 
 func (u *upstream) setChat(h http.HandlerFunc) { u.chat.Store(&h) }
+
+// note appends to the ordered event log.
+func (u *upstream) note(ev string) {
+	u.evMu.Lock()
+	defer u.evMu.Unlock()
+	u.events = append(u.events, ev)
+}
+
+// seen returns the event log so far.
+func (u *upstream) seen() []string {
+	u.evMu.Lock()
+	defer u.evMu.Unlock()
+	return append([]string(nil), u.events...)
+}
+
+// resetEvents forgets the events so far, such as the embedding calls of a
+// fixture document's ingestion.
+func (u *upstream) resetEvents() {
+	u.evMu.Lock()
+	defer u.evMu.Unlock()
+	u.events = nil
+}
 
 // okChat is the default chat handler: a plain answer with usage, streamed as
 // two content chunks when requested.
@@ -1684,4 +1712,490 @@ func TestSkippedStreamCarriesTheHeaders(t *testing.T) {
 		len(resp.Header.Values("Warning")) != 1 || e.up.embeds.Load() != embedsBefore {
 		t.Errorf("status %d headers %v embeds %d", resp.StatusCode, resp.Header, e.up.embeds.Load()-embedsBefore)
 	}
+}
+
+// ---- query_strategy: condense (ADR-024) ----
+
+// condensePhrase is in every condense prompt and in nothing else a test sends.
+const condensePhrase = "standalone search query"
+
+// condenseReply answers a condense call with text and the given usage.
+func condenseReply(text string, prompt, completion int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "c", "model": "m",
+			"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": text}, "finish_reason": "stop"}},
+			"usage":   map[string]int{"prompt_tokens": prompt, "completion_tokens": completion}})
+	}
+}
+
+// scriptCondense makes the upstream hand a condense prompt to cond and answer
+// everything else normally, noting "chat:condense" and "chat:answer" in its
+// event log. last receives the body of the newest condense call.
+func (u *upstream) scriptCondense(cond http.HandlerFunc, last *atomic.Value) {
+	u.setChat(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if bytes.Contains(body, []byte(condensePhrase)) {
+			u.note("chat:condense")
+			if last != nil {
+				last.Store(string(body))
+			}
+			cond(w, r)
+			return
+		}
+		u.note("chat:answer")
+		okChat(w, r)
+	})
+}
+
+// lockedBuffer is a log sink the server goroutines and the test share.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLog sends the gateway's log to a buffer.
+func (e *env) captureLog() *lockedBuffer {
+	buf := &lockedBuffer{}
+	e.gw.Log = slog.New(slog.NewTextHandler(buf, nil))
+	return buf
+}
+
+// condenseEnv is a project on the condense strategy with a RAG store.
+func condenseEnv(t *testing.T, mutate func(p *store.Project)) *env {
+	t.Helper()
+	e := newEnv(t, func(p *store.Project) {
+		p.QueryStrategy = store.QueryStrategyCondense
+		if mutate != nil {
+			mutate(p)
+		}
+	})
+	e.attachRAG()
+	e.up.resetEvents()
+	return e
+}
+
+var followUp = msgsOf("user", "Tell me about the Apple plan", "assistant", "The Apple plan costs 5 USD.", "user", "and the second one?")
+
+func TestCondenseSearchesWithTheCondensedQuery(t *testing.T) {
+	e := condenseEnv(t, nil)
+	var last atomic.Value
+	e.up.scriptCondense(condenseReply("price of the second plan", 40, 6), &last)
+
+	resp, out := e.chat(map[string]any{"messages": followUp})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	// The condense call comes first, the embedding carries its output, then
+	// the answer is generated.
+	want := []string{"chat:condense", "embed:price of the second plan", "chat:answer"}
+	if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("upstream events = %q, want %q", got, want)
+	}
+	if resp.Header.Get("x-ragmux-rag-hits") != "1" || len(resp.Header.Values("Warning")) != 0 {
+		t.Errorf("hits %q, Warning %q", resp.Header.Get("x-ragmux-rag-hits"), resp.Header.Values("Warning"))
+	}
+
+	// What the model was asked: one user message with the conversation and the
+	// last message, run cold and short, on the first target's model.
+	var req struct {
+		Model       string  `json:"model"`
+		Temperature float64 `json:"temperature"`
+		MaxTokens   int     `json:"max_tokens"`
+		Messages    []struct {
+			Role, Content string
+		} `json:"messages"`
+	}
+	raw, _ := last.Load().(string)
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("condense request: %v: %s", err, raw)
+	}
+	if req.Model != "mock-model" || req.Temperature != 0 || req.MaxTokens != rag.CondenseMaxTokens || len(req.Messages) != 1 || req.Messages[0].Role != "user" {
+		t.Errorf("condense request = %+v", req)
+	}
+	for _, w := range []string{"User: Tell me about the Apple plan", "Assistant: The Apple plan costs 5 USD.", "Last user message:\nand the second one?"} {
+		if !strings.Contains(req.Messages[0].Content, w) {
+			t.Errorf("condense prompt lacks %q:\n%s", w, req.Messages[0].Content)
+		}
+	}
+
+	// Its tokens are on the row, on top of the answer's 5 and 1.
+	rec := e.lastLog()
+	if rec.PromptTokens != 5+40 || rec.CompletionTokens != 1+6 || !rec.RAGUsed {
+		t.Errorf("row = prompt %d completion %d rag %v, want 45, 7, true", rec.PromptTokens, rec.CompletionTokens, rec.RAGUsed)
+	}
+}
+
+// The default strategy never makes the call.
+func TestLastUserStrategyDoesNotCondense(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	e.up.resetEvents()
+	e.up.scriptCondense(condenseReply("never used", 40, 6), nil)
+	if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	want := []string{"embed:and the second one?", "chat:answer"}
+	if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("upstream events = %q, want %q", got, want)
+	}
+}
+
+// Where there is nothing to condense -- a single user message, no store, or a
+// retrieval that is skipped -- no call is made, so no tokens are spent.
+func TestCondenseIsNotCalledWithoutNeed(t *testing.T) {
+	toolTurn := append(append([]map[string]any{}, followUp...),
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
+			"id": "c1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": "{}"}}}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "red"})
+	cases := []struct {
+		name   string
+		mutate func(p *store.Project)
+		body   map[string]any
+		want   []string
+	}{
+		{"one user message", nil, map[string]any{"messages": msgsOf("user", "what colour are apples?")},
+			[]string{"embed:what colour are apples?", "chat:answer"}},
+		{"one user message after a system prompt", nil, map[string]any{"messages": msgsOf("system", "be brief", "user", "apples?")},
+			[]string{"embed:apples?", "chat:answer"}},
+		{"policy off", func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyOff },
+			map[string]any{"messages": followUp}, []string{"chat:answer"}},
+		{"client off", nil, map[string]any{"messages": followUp, "ragmux": map[string]any{"retrieval": "off"}},
+			[]string{"chat:answer"}},
+		{"tool turn", nil, map[string]any{"messages": toolTurn}, []string{"chat:answer"}},
+		{"auto skips a greeting", func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto },
+			map[string]any{"messages": msgsOf("user", "q", "assistant", "a", "user", "merhaba")}, []string{"chat:answer"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := condenseEnv(t, tc.mutate)
+			reg := e.withMetrics()
+			e.up.scriptCondense(condenseReply("condensed", 40, 6), nil)
+			if resp, out := e.chat(tc.body); resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("upstream events = %q, want %q", got, tc.want)
+			}
+			if rec := e.lastLog(); rec.PromptTokens != 5 || rec.CompletionTokens != 1 {
+				t.Errorf("row = prompt %d completion %d, want the answer's 5 and 1 only", rec.PromptTokens, rec.CompletionTokens)
+			}
+			if strings.Contains(reg.Text(), "ragmux_rag_query_condense_total{") {
+				t.Errorf("a condense was counted:\n%s", reg.Text())
+			}
+		})
+	}
+
+	t.Run("no store", func(t *testing.T) {
+		e := newEnv(t, func(p *store.Project) { p.QueryStrategy = store.QueryStrategyCondense })
+		e.up.scriptCondense(condenseReply("condensed", 40, 6), nil)
+		if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+			t.Fatalf("status %d: %v", resp.StatusCode, out)
+		}
+		if got := e.up.seen(); fmt.Sprint(got) != "[chat:answer]" {
+			t.Errorf("upstream events = %q", got)
+		}
+	})
+}
+
+// A failed condense is invisible to the client: the request completes, the
+// search runs on the last user message, and the failure is a warn log and a
+// counter. It is one attempt however many retries the gateway is set to, and
+// whatever tokens the call reported are still counted.
+func TestCondenseFailureFallsBackToTheLastUserMessage(t *testing.T) {
+	const secret = "SECRET-UPSTREAM-BODY"
+	cases := []struct {
+		name        string
+		handler     http.HandlerFunc
+		timeout     time.Duration
+		outcome     string
+		wantPrompt  int // the row's prompt tokens: the answer's 5 plus what the call reported
+		wantCompl   int
+		wantLogText string
+	}{
+		{"upstream 500", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"` + secret + `"}}`))
+		}, 0, "error", 5, 1, "status=502"},
+		{"timeout", func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+		}, 150 * time.Millisecond, "timeout", 5, 1, ""},
+		{"empty reply", condenseReply("   ", 40, 1), 0, "invalid", 45, 2, ""},
+		{"two lines", condenseReply("Here it is:\n"+secret, 40, 9), 0, "invalid", 45, 10, ""},
+		{"too long", condenseReply(strings.Repeat(secret, 30), 40, 9), 0, "invalid", 45, 10, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := condenseEnv(t, nil)
+			e.gw.MaxRetries = 3
+			e.gw.CondenseTimeout = tc.timeout
+			reg := e.withMetrics()
+			logs := e.captureLog()
+			e.up.scriptCondense(tc.handler, nil)
+
+			resp, out := e.chat(map[string]any{"messages": followUp})
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			// One condense attempt, then the search on the last user message.
+			want := []string{"chat:condense", "embed:and the second one?", "chat:answer"}
+			if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("upstream events = %q, want %q", got, want)
+			}
+			if resp.Header.Get("x-ragmux-rag-hits") != "1" || len(resp.Header.Values("Warning")) != 0 {
+				t.Errorf("hits %q, Warning %q", resp.Header.Get("x-ragmux-rag-hits"), resp.Header.Values("Warning"))
+			}
+			rec := e.lastLog()
+			if rec.PromptTokens != tc.wantPrompt || rec.CompletionTokens != tc.wantCompl {
+				t.Errorf("row = prompt %d completion %d, want %d and %d", rec.PromptTokens, rec.CompletionTokens, tc.wantPrompt, tc.wantCompl)
+			}
+
+			text := reg.Text()
+			mustContain(t, text, fmt.Sprintf(`ragmux_rag_query_condense_total{outcome="%s"} 1`, tc.outcome))
+			if n := strings.Count(text, "ragmux_rag_query_condense_total{"); n != 1 {
+				t.Errorf("%d condense series, want 1:\n%s", n, text)
+			}
+			log := logs.String()
+			if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "query condense failed") ||
+				!strings.Contains(log, "outcome="+tc.outcome) {
+				t.Errorf("no warn log for the %s outcome:\n%s", tc.outcome, log)
+			}
+			if tc.wantLogText != "" && !strings.Contains(log, tc.wantLogText) {
+				t.Errorf("log lacks %q:\n%s", tc.wantLogText, log)
+			}
+			// PRD rule 10: neither the conversation nor the reply is logged.
+			for _, banned := range []string{secret, "second one", "Apple plan", "Last user message"} {
+				if strings.Contains(log, banned) {
+					t.Errorf("the log carries %q:\n%s", banned, log)
+				}
+			}
+		})
+	}
+}
+
+func TestCondenseSuccessIsCounted(t *testing.T) {
+	e := condenseEnv(t, nil)
+	reg := e.withMetrics()
+	logs := e.captureLog()
+	e.up.scriptCondense(condenseReply(`"price of the second plan"`, 40, 6), nil)
+	if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	mustContain(t, reg.Text(), `ragmux_rag_query_condense_total{outcome="ok"} 1`)
+	if got := e.up.seen(); len(got) < 2 || got[1] != "embed:price of the second plan" {
+		t.Errorf("the model's quotes were not stripped: %q", got)
+	}
+	if strings.Contains(logs.String(), "query condense") {
+		t.Errorf("a success logged a condense line:\n%s", logs.String())
+	}
+}
+
+// history_turns_for_query bounds what the model sees.
+func TestCondenseHistoryTurnsBoundThePrompt(t *testing.T) {
+	e := condenseEnv(t, func(p *store.Project) { p.HistoryTurnsForQuery = 1 })
+	var last atomic.Value
+	e.up.scriptCondense(condenseReply("q", 1, 1), &last)
+	msgs := msgsOf("user", "OLDEST-QUESTION", "assistant", "OLDEST-ANSWER", "user", "NEWER-QUESTION", "assistant", "NEWER-ANSWER", "user", "now?")
+	if resp, out := e.chat(map[string]any{"messages": msgs}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	raw, _ := last.Load().(string)
+	for _, w := range []string{"NEWER-QUESTION", "NEWER-ANSWER", "now?"} {
+		if !strings.Contains(raw, w) {
+			t.Errorf("condense request lacks %q", w)
+		}
+	}
+	for _, w := range []string{"OLDEST-QUESTION", "OLDEST-ANSWER"} {
+		if strings.Contains(raw, w) {
+			t.Errorf("condense request has %q, one turn back is the limit", w)
+		}
+	}
+}
+
+// query_model_connection_id sends the call to that connection and prices its
+// tokens with it, not with the connection that answers the chat.
+func TestCondenseUsesTheQueryModelConnection(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	up2 := newUpstream(t)
+	qconn, err := e.st.CreateConnection(ctx, &store.ModelConnection{Name: "query", ProviderType: "openai",
+		BaseURL: up2.srv.URL + "/v1", APIKey: "sk-secretsecretsecret123", ModelName: "gpt-4o-mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pricing.Seed(ctx, e.st.DB(), slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	e.gw.Prices = pricing.NewCache(e.st.DB(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	e.proj.QueryStrategy, e.proj.QueryModelConnectionID = store.QueryStrategyCondense, &qconn.ID
+	e.attachRAG() // saves the project
+	e.up.resetEvents()
+
+	var last atomic.Value
+	// 2M prompt and 1M completion tokens at gpt-4o-mini's 0.15 and 0.60 USD
+	// per million: 300000 + 600000 micros. The chat connection is unpriced.
+	up2.scriptCondense(condenseReply("price of the second plan", 2_000_000, 1_000_000), &last)
+
+	if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	if got := up2.seen(); fmt.Sprint(got) != "[chat:condense]" {
+		t.Errorf("query model upstream events = %q", got)
+	}
+	if got := e.up.seen(); fmt.Sprint(got) != "[embed:price of the second plan]" {
+		t.Errorf("chat upstream events = %q", got)
+	}
+	if raw, _ := last.Load().(string); !strings.Contains(raw, `"model":"gpt-4o-mini"`) {
+		t.Errorf("condense request went out with another model: %s", raw)
+	}
+	rec := e.lastLog()
+	if rec.PromptTokens != 5+2_000_000 || rec.CompletionTokens != 1+1_000_000 {
+		t.Errorf("tokens = %d/%d", rec.PromptTokens, rec.CompletionTokens)
+	}
+	if rec.CostMicros != 900_000 {
+		t.Errorf("cost = %d micros, want 900000 (the call priced at the query model)", rec.CostMicros)
+	}
+}
+
+// Without a query model the call runs on the first route target, and its
+// tokens are priced with that target.
+func TestCondenseUsesTheFirstRouteTarget(t *testing.T) {
+	e := condenseEnv(t, nil)
+	conn2, up2 := e.secondConn("second", "second-model")
+	e.addRoute("smart", store.RouteTarget{ConnectionID: conn2.ID, Weight: 1})
+	up2.scriptCondense(condenseReply("price of the second plan", 40, 6), nil)
+
+	resp, out := e.chat(map[string]any{"model": "smart", "messages": followUp})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	if got := up2.seen(); fmt.Sprint(got) != "[chat:condense chat:answer]" {
+		t.Errorf("route target events = %q", got)
+	}
+	// Retrieval embeds through the store's own connection (the project's).
+	if got := e.up.seen(); fmt.Sprint(got) != "[embed:price of the second plan]" {
+		t.Errorf("store connection events = %q", got)
+	}
+}
+
+// A query model whose adapter cannot be built is a failed condense, not a
+// failed request.
+func TestCondenseWithAnUnusableQueryModelFallsBack(t *testing.T) {
+	e := newEnv(t, nil)
+	qconn, _ := e.secondConn("query", "query-model")
+	e.proj.QueryStrategy, e.proj.QueryModelConnectionID = store.QueryStrategyCondense, &qconn.ID
+	e.attachRAG()
+	e.up.resetEvents()
+	reg := e.withMetrics()
+	logs := e.captureLog()
+	real := e.gw.Providers
+	e.gw.Providers = func(c *store.ModelConnection) (provider.Provider, error) {
+		if c.ID == qconn.ID {
+			return nil, errors.New("no adapter for https://internal.example/v1")
+		}
+		return real(c)
+	}
+
+	resp, out := e.chat(map[string]any{"messages": followUp})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	// The default chat handler notes nothing: the search alone is seen, and it
+	// ran on the last user message.
+	if got := e.up.seen(); fmt.Sprint(got) != "[embed:and the second one?]" {
+		t.Errorf("upstream events = %q", got)
+	}
+	mustContain(t, reg.Text(), `ragmux_rag_query_condense_total{outcome="error"} 1`)
+	// The warn line names the connection, so the operator can tell which one.
+	var warn string
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "query condense unavailable") {
+			warn = l
+		}
+	}
+	if !strings.Contains(warn, "outcome=error") || !strings.Contains(warn, fmt.Sprintf("connection=%d", qconn.ID)) {
+		t.Errorf("warn line = %q, want outcome=error and connection=%d:\n%s", warn, qconn.ID, logs.String())
+	}
+}
+
+// The condense budget is the fixed one cut to the request's upstream budget.
+func TestCondenseTimeoutIsBoundedByTheUpstreamBudget(t *testing.T) {
+	cases := []struct {
+		name     string
+		gw       Gateway
+		deadline time.Duration // left of the budget when the call runs; 0 = not started
+		lo, hi   time.Duration
+	}{
+		{"default", Gateway{}, 0, 5 * time.Second, 5 * time.Second},
+		{"set", Gateway{CondenseTimeout: 2 * time.Second}, 0, 2 * time.Second, 2 * time.Second},
+		{"budget shorter than the default", Gateway{UpstreamTimeout: 3 * time.Second}, 0, 3 * time.Second, 3 * time.Second},
+		{"budget longer", Gateway{UpstreamTimeout: time.Minute}, 0, 5 * time.Second, 5 * time.Second},
+		{"started budget with 1s left", Gateway{UpstreamTimeout: time.Minute}, time.Second, 500 * time.Millisecond, time.Second},
+		{"spent budget", Gateway{UpstreamTimeout: time.Minute}, -time.Second, time.Nanosecond, time.Nanosecond},
+	}
+	for _, tc := range cases {
+		c := &call{}
+		if tc.deadline != 0 {
+			c.deadline = time.Now().Add(tc.deadline)
+		}
+		if got := tc.gw.condenseTimeout(c); got < tc.lo || got > tc.hi {
+			t.Errorf("%s: timeout %s, want %s..%s", tc.name, got, tc.lo, tc.hi)
+		}
+	}
+}
+
+// Under the auto policy a bare confirmation is skipped as an ack on the
+// default strategy and condensed on "condense" (ADR-024, 2026-10-28); a
+// greeting is skipped on both.
+func TestCondenseKeepsAcksUnderAutoPolicy(t *testing.T) {
+	ack := msgsOf("user", "Tell me about the Apple plan", "assistant", "Shall I list the prices?", "user", "evet")
+
+	t.Run("last_user skips the ack", func(t *testing.T) {
+		e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+		e.attachRAG()
+		e.up.resetEvents()
+		e.up.scriptCondense(condenseReply("never", 1, 1), nil)
+		resp, _ := e.chat(map[string]any{"messages": ack})
+		if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "ack" || fmt.Sprint(e.up.seen()) != "[chat:answer]" {
+			t.Errorf("status %d skip %q events %q", resp.StatusCode, resp.Header.Get("x-ragmux-rag-skip"), e.up.seen())
+		}
+		if got := e.skipReasonOf(1); got != "ack" {
+			t.Errorf("rag_skip_reason = %q", got)
+		}
+	})
+	t.Run("condense condenses the ack", func(t *testing.T) {
+		e := condenseEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+		e.up.scriptCondense(condenseReply("prices of the Apple plan", 40, 6), nil)
+		resp, _ := e.chat(map[string]any{"messages": ack})
+		want := "[chat:condense embed:prices of the Apple plan chat:answer]"
+		if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "" || fmt.Sprint(e.up.seen()) != want {
+			t.Errorf("status %d skip %q events %q, want %s", resp.StatusCode, resp.Header.Get("x-ragmux-rag-skip"), e.up.seen(), want)
+		}
+		if got := e.skipReasonOf(1); got != "" {
+			t.Errorf("rag_skip_reason = %q, want NULL", got)
+		}
+	})
+	t.Run("condense still skips a greeting", func(t *testing.T) {
+		e := condenseEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+		e.up.scriptCondense(condenseReply("never", 1, 1), nil)
+		resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "q", "assistant", "a", "user", "teşekkürler")})
+		if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "greeting" || fmt.Sprint(e.up.seen()) != "[chat:answer]" {
+			t.Errorf("status %d skip %q events %q", resp.StatusCode, resp.Header.Get("x-ragmux-rag-skip"), e.up.seen())
+		}
+	})
 }

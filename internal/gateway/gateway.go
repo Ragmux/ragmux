@@ -67,6 +67,10 @@ type Gateway struct {
 	// target before the route moves on. Zero disables retries; fallback to the
 	// next target is not affected.
 	MaxRetries int
+	// CondenseTimeout is the time budget of the query condense call (ADR-024),
+	// cut to the request's remaining upstream budget. Zero means 5 s; it is
+	// not a setting of the product, tests shorten it.
+	CondenseTimeout time.Duration
 	// Sleep waits between a failed attempt and its retry. Nil uses a timer;
 	// tests inject one that records the wait instead of taking it.
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -837,7 +841,8 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 	// project without a store never gets to it: there is nothing to skip.
 	ragOn := p.RAGStoreID != nil && g.Retriever != nil
 	if ragOn {
-		prep.skipReason = rag.SkipReason(p.RetrievalPolicy, opts.RetrievalOff, req.Messages)
+		prep.skipReason = rag.SkipReason(p.RetrievalPolicy, opts.RetrievalOff,
+			p.QueryStrategy == store.QueryStrategyCondense, req.Messages)
 	}
 	if prep.skipReason != "" {
 		g.Metrics.RecordRAGSkipped(c.projectID, prep.skipReason)
@@ -847,6 +852,11 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
 			q := rag.LastUserQuery(req.Messages)
+			if p.QueryStrategy == store.QueryStrategyCondense {
+				// A side call of the request like the rerank below: it falls
+				// back to q, and its tokens go on the row through c.sideCharges.
+				q = g.condenseQuery(c, prov, req.Messages, q)
+			}
 			// The rerank of this retrieval is a side call of the chat request:
 			// its tokens (an LLM rerank is a chat call, an API rerank a scoring
 			// call) go on this request's log row through c.sideCharges.

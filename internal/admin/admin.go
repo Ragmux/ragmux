@@ -1687,11 +1687,11 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 }
 
 // validateRAGSettings checks the ADR-024 settings the body carries. Every
-// value the CHECK constraints of migration 0021 allow is accepted here, even
-// those whose behaviour lands in a later phase: the setting is the project's,
-// whether or not this build acts on it yet. context_placement and
-// retrieval_policy are acted on by the gateway (rag.SkipReason decides on the
-// latter); query_strategy and its companions are not yet.
+// value the CHECK constraints of migration 0021 allow is accepted here: the
+// setting is the project's, whether or not this build acts on it. The gateway
+// acts on all five: rag.SkipReason decides on retrieval_policy, and
+// query_strategy "condense" uses history_turns_for_query and, when set,
+// query_model_connection_id, which must name an existing chat connection.
 func (a *Admin) validateRAGSettings(r *http.Request, in *projectInput) error {
 	if in.ContextPlacement != nil && !store.ValidContextPlacement(*in.ContextPlacement) {
 		return errors.New(`context_placement must be "system" or "before_last_user"`)

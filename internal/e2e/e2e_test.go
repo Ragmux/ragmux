@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1697,5 +1698,245 @@ func TestRetrievalPolicyEndToEnd(t *testing.T) {
 	}
 	if n := seriesWithPrefix(text, "ragmux_rag_skipped_total{"); n != len(wantReasons) {
 		t.Errorf("ragmux_rag_skipped_total has %d series, want %d:\n%s", n, len(wantReasons), grepLines(text, "ragmux_rag_skipped_total"))
+	}
+}
+
+// condenseUpstream fronts the mock upstream and plays the query model: a chat
+// call whose prompt is a query condense (it carries "standalone search query")
+// is answered here -- with reply and a 21/4 usage, or a 500 when failing --
+// and everything else is passed to the backend. It keeps the ordered log of
+// what it saw, which is how a test proves the order of the calls and what the
+// embedding was asked for.
+type condenseUpstream struct {
+	*httptest.Server
+	reply   string
+	failing atomic.Bool
+	mu      sync.Mutex
+	events  []string
+}
+
+// condenseFailureBody is what the failing query model answers with.
+const condenseFailureBody = `{"error":{"message":"SECRET-CONDENSE-FAILURE-BODY"}}`
+
+func newCondenseUpstream(t *testing.T, backend *httptest.Server, reply string) *condenseUpstream {
+	t.Helper()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	c := &condenseUpstream{reply: reply}
+	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		switch {
+		case r.URL.Path == "/v1/embeddings":
+			var req struct {
+				Input []string `json:"input"`
+			}
+			_ = json.Unmarshal(body, &req)
+			c.note("embed:" + strings.Join(req.Input, "|"))
+		case r.URL.Path == "/v1/chat/completions" && bytes.Contains(body, []byte("standalone search query")):
+			c.note("condense")
+			if c.failing.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(condenseFailureBody))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "q", "model": "mock-model",
+				"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": c.reply}, "finish_reason": "stop"}},
+				"usage":   map[string]int{"prompt_tokens": 21, "completion_tokens": 4}})
+			return
+		case r.URL.Path == "/v1/chat/completions":
+			c.note("chat")
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(c.Close)
+	return c
+}
+
+func (c *condenseUpstream) note(ev string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, ev)
+}
+
+// take returns the events since the last call and forgets them.
+func (c *condenseUpstream) take() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.events
+	c.events = nil
+	return out
+}
+
+// syncBuffer is a log sink the server goroutines and the test share.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestQueryCondenseEndToEnd drives query_strategy "condense" (ADR-024) through
+// the whole stack: the admin API sets it, the gateway calls the query model
+// before the embedding, the embedding carries the model's output, and the
+// request log shows the side call's tokens. A query model that fails costs the
+// request nothing: it completes on the last user message and a warn line says
+// why.
+func TestQueryCondenseEndToEnd(t *testing.T) {
+	backend := mockUpstream(t)
+	defer backend.Close()
+	up := newCondenseUpstream(t, backend, "What color is a banana?")
+	logs := &syncBuffer{}
+
+	e := newEnvOpts(t, testdb.Config(t), envOpts{bootstrap: true, gwTune: func(g *gateway.Gateway) {
+		g.Log = slog.New(slog.NewTextHandler(logs, nil))
+	}})
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	connID := int64(conn["id"].(float64))
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 1}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+	doc := e.upload(storeID, "fruits.md", "# Banana\n\nBananas are yellow and soft. They grow in bunches in tropical regions.")
+	if doc["_status"] != float64(202) {
+		t.Fatalf("upload: %v", doc)
+	}
+	e.waitReady(int64(doc["id"].(float64)))
+	up.take() // the ingestion's embedding calls
+
+	created := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID,
+		"rag_store_id": storeID, "query_strategy": "condense", "history_turns_for_query": 2}, "")
+	if created["_status"] != float64(201) || created["project"].(map[string]any)["query_strategy"] != "condense" {
+		t.Fatalf("create project: %v", created)
+	}
+	apiKey := created["api_key"].(string)
+	projID := int64(created["project"].(map[string]any)["id"].(float64))
+
+	followUp := []map[string]any{{"role": "user", "content": "Tell me about bananas"},
+		{"role": "assistant", "content": "Bananas are a fruit."}, {"role": "user", "content": "and the color?"}}
+	chat := func(msgs []map[string]any) (int, http.Header, string) {
+		t.Helper()
+		out, h := e.callRaw("POST", "/v1/chat/completions", map[string]any{"messages": msgs}, apiKey)
+		content := ""
+		if ch, ok := out["choices"].([]any); ok && len(ch) > 0 {
+			content, _ = ch[0].(map[string]any)["message"].(map[string]any)["content"].(string)
+		}
+		return int(out["_status"].(float64)), h, content
+	}
+	tokens := func(n int) (prompt, completion int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			err := e.store.DB().QueryRow(context.Background(),
+				`SELECT prompt_tokens, completion_tokens FROM request_logs WHERE project_id = $1 ORDER BY id OFFSET $2 LIMIT 1`,
+				projID, n-1).Scan(&prompt, &completion)
+			if err == nil {
+				return prompt, completion
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("request log row %d never appeared", n)
+		return 0, 0
+	}
+
+	// 1. The condense call goes first, the embedding carries its output, and
+	// the answer is generated from the retrieved passage.
+	status, h, content := chat(followUp)
+	if want := "condense,embed:What color is a banana?,chat"; status != 200 || strings.Join(up.take(), ",") != want {
+		t.Errorf("status %d; upstream order differs from %s", status, want)
+	}
+	if h.Get("x-ragmux-rag-hits") != "1" || !strings.Contains(content, "Bananas are yellow") || len(h.Values("Warning")) != 0 {
+		t.Errorf("hits %q Warning %q content %q", h.Get("x-ragmux-rag-hits"), h.Values("Warning"), content)
+	}
+	// The mock answers 10 + 2 tokens; the condense call adds 21 + 4 as a side charge.
+	if p, c := tokens(1); p != 10+21 || c != 2+4 {
+		t.Errorf("request_logs tokens = %d/%d, want 31/6 (answer plus the condense call)", p, c)
+	}
+
+	// 2. One user message: nothing to condense.
+	status, _, _ = chat(followUp[:1])
+	if want := "embed:Tell me about bananas,chat"; status != 200 || strings.Join(up.take(), ",") != want {
+		t.Errorf("single message: status %d; upstream order differs from %s", status, want)
+	}
+	if p, c := tokens(2); p != 10 || c != 2 {
+		t.Errorf("single message tokens = %d/%d, want 10/2", p, c)
+	}
+
+	// 3. A query model that fails: the request completes on the last user
+	// message, and the warn line carries no text of the conversation or of the
+	// failure.
+	up.failing.Store(true)
+	status, h, content = chat(followUp)
+	if want := "condense,embed:and the color?,chat"; status != 200 || strings.Join(up.take(), ",") != want {
+		t.Errorf("failing model: status %d; upstream order differs from %s", status, want)
+	}
+	if h.Get("x-ragmux-rag-hits") != "1" || !strings.Contains(content, "Bananas are yellow") || len(h.Values("Warning")) != 0 {
+		t.Errorf("failing model: hits %q Warning %q content %q", h.Get("x-ragmux-rag-hits"), h.Values("Warning"), content)
+	}
+	if p, c := tokens(3); p != 10 || c != 2 {
+		t.Errorf("failing model tokens = %d/%d, want 10/2 (the failed call reported none)", p, c)
+	}
+	log := logs.String()
+	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "query condense failed") || !strings.Contains(log, "outcome=error") {
+		t.Errorf("no warn log for the failed condense:\n%s", log)
+	}
+	for _, banned := range []string{"SECRET-CONDENSE-FAILURE-BODY", "and the color", "Tell me about bananas"} {
+		if strings.Contains(log, banned) {
+			t.Errorf("the log carries %q (PRD rule 10):\n%s", banned, log)
+		}
+	}
+	text := e.registry.Text()
+	for _, want := range []string{`ragmux_rag_query_condense_total{outcome="ok"} 1`, `ragmux_rag_query_condense_total{outcome="error"} 1`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics lack %s:\n%s", want, grepLines(text, "ragmux_rag_query_condense"))
+		}
+	}
+	if n := seriesWithPrefix(text, "ragmux_rag_query_condense_total{"); n != 2 {
+		t.Errorf("%d condense series, want 2:\n%s", n, grepLines(text, "ragmux_rag_query_condense"))
+	}
+	up.failing.Store(false)
+
+	// 4. The auto policy skips an ack on last_user and condenses it on condense.
+	put := func(fields map[string]any) {
+		t.Helper()
+		body := map[string]any{"name": "app", "model_connection_id": connID, "rag_store_id": storeID}
+		for k, v := range fields {
+			body[k] = v
+		}
+		r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d", projID), body, "")
+		if r["_status"] != float64(200) {
+			t.Fatalf("update project: %v", r)
+		}
+	}
+	ack := []map[string]any{{"role": "user", "content": "Tell me about bananas"},
+		{"role": "assistant", "content": "Want to know the color?"}, {"role": "user", "content": "evet"}}
+	put(map[string]any{"retrieval_policy": "auto"}) // query_strategy stays condense
+	status, h, _ = chat(ack)
+	if want := "condense,embed:What color is a banana?,chat"; status != 200 || h.Get("x-ragmux-rag-skip") != "" || strings.Join(up.take(), ",") != want {
+		t.Errorf("auto + condense: status %d skip %q; upstream order differs from %s", status, h.Get("x-ragmux-rag-skip"), want)
+	}
+	put(map[string]any{"query_strategy": "last_user"})
+	status, h, _ = chat(ack)
+	if status != 200 || h.Get("x-ragmux-rag-skip") != "ack" || strings.Join(up.take(), ",") != "chat" {
+		t.Errorf("auto + last_user: status %d skip %q", status, h.Get("x-ragmux-rag-skip"))
 	}
 }

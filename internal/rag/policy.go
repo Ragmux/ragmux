@@ -19,6 +19,11 @@ import (
 //  3. the last message has the "tool" role             -> tool_turn
 //  4. the policy is "auto" and the turn is small talk  -> greeting | ack
 //
+// condense says the project's query_strategy is "condense": a short
+// confirmation ("evet", "yes please") is then not small talk, because the
+// condensed query turns it into a real one using the turns before it, so the
+// ack skip of step 4 does not apply (ADR-024). Greetings are still skipped.
+//
 // Steps 2 and 3 apply under every policy; a client can only ever turn
 // retrieval off, never on, so clientOff cannot reopen a "off" project and no
 // client value exists that overrides "auto" or "off". Any other policy value
@@ -27,7 +32,7 @@ import (
 // The result is one of the obs.RAGSkip* constants: it is stored in
 // request_logs.rag_skip_reason and used as a metric label, so it must stay in
 // that closed set.
-func SkipReason(policy string, clientOff bool, msgs []provider.Message) string {
+func SkipReason(policy string, clientOff, condense bool, msgs []provider.Message) string {
 	switch {
 	case policy == store.RetrievalPolicyOff:
 		return obs.RAGSkipPolicyOff
@@ -38,7 +43,9 @@ func SkipReason(policy string, clientOff bool, msgs []provider.Message) string {
 		// already answered with context on the turn that made the tool call.
 		return obs.RAGSkipToolTurn
 	case policy == store.RetrievalPolicyAuto:
-		return classifyTurn(msgs)
+		if reason := classifyTurn(msgs); reason != obs.RAGSkipAck || !condense {
+			return reason
+		}
 	}
 	return ""
 }

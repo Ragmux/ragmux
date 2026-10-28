@@ -140,3 +140,29 @@ func TestRAGSkipReasonIsBounded(t *testing.T) {
 	var nilMetrics *Metrics
 	nilMetrics.RecordRAGSkipped("1", RAGSkipAck) // must not panic
 }
+
+// TestQueryCondenseOutcomeIsBounded: the outcome is chosen by the gateway from
+// a closed set, and RecordQueryCondense holds the line even if a caller one
+// day passes it a model reply or an error message.
+func TestQueryCondenseOutcomeIsBounded(t *testing.T) {
+	reg := metrics.New(metrics.Options{})
+	m := New(reg)
+	for _, o := range []string{CondenseOK, CondenseError, CondenseTimeout, CondenseInvalid} {
+		m.RecordQueryCondense(o)
+	}
+	for _, o := range []string{"what is the refund policy?", "OK", "", "error\nx"} {
+		m.RecordQueryCondense(o)
+	}
+	text := reg.Text()
+	if n := strings.Count(text, "ragmux_rag_query_condense_total{"); n != 5 {
+		t.Errorf("%d series, want the four outcomes plus other:\n%s", n, text)
+	}
+	if !strings.Contains(text, `ragmux_rag_query_condense_total{outcome="other"} 4`) {
+		t.Errorf("invented outcomes did not collapse into other:\n%s", text)
+	}
+	if strings.Contains(text, "refund") {
+		t.Error("a client string reached a label")
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordQueryCondense(CondenseOK) // must not panic
+}
