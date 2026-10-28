@@ -1940,3 +1940,192 @@ func TestQueryCondenseEndToEnd(t *testing.T) {
 		t.Errorf("auto + last_user: status %d skip %q", status, h.Get("x-ragmux-rag-skip"))
 	}
 }
+
+// streamBody posts a streaming chat and returns the status, the headers and
+// the raw SSE body.
+func (e *env) streamBody(apiKey string, body map[string]any) (int, http.Header, string) {
+	e.t.Helper()
+	body["stream"] = true
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/chat/completions", bytes.NewReader(mustJSON(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, resp.Header, string(raw)
+}
+
+// dataLines are the payloads of the "data:" lines of an SSE body.
+func dataLines(body string) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			out = append(out, data)
+		}
+	}
+	return out
+}
+
+// ragmuxOf is the "ragmux" object of one SSE payload, nil when it has none.
+func ragmuxOf(t *testing.T, payload string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(payload), &m); err != nil {
+		t.Fatalf("payload %q: %v", payload, err)
+	}
+	rm, _ := m["ragmux"].(map[string]any)
+	return rm
+}
+
+// plainStreamGolden is what a project without a RAG store answers a plain
+// stream with, byte for byte: the mock upstream's three chunks, the usage
+// trailer withheld because the request did not ask for it, and [DONE]. It was
+// captured before ragmux.sources existed.
+const plainStreamGolden = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"whatever\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"SYS:\"},\"finish_reason\":null}]}\n\n" +
+	"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"whatever\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+// A streaming client gets the sources in the first chunk, so a list too long
+// for the 2 KB header still arrives whole (ADR-024).
+func TestStreamSourcesEndToEnd(t *testing.T) {
+	up := mockUpstream(t)
+	defer up.Close()
+	e := newEnv(t, testdb.Config(t))
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	connID := int64(conn["id"].(float64))
+	const sourceCount = 30
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": sourceCount}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+
+	// Thirty sections, each too big to share a chunk with the next, in a file
+	// whose name and section titles are long enough that thirty sources
+	// cannot fit the header.
+	var doc strings.Builder
+	for i := 1; i <= sourceCount; i++ {
+		fmt.Fprintf(&doc, "# Banana varieties of the tropical orchard number %02d\n\nBananas are yellow and soft, and variety %02d ripens in bunches in warm and humid regions, where growers pick it green and let it turn yellow in storage.\n\n", i, i)
+	}
+	filename := strings.Repeat("orchard-", 8) + "bananas.md"
+	up1 := e.upload(storeID, filename, doc.String())
+	if up1["_status"] != float64(202) {
+		t.Fatalf("upload: %v", up1)
+	}
+	e.waitReady(int64(up1["id"].(float64)))
+
+	proj := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID, "rag_store_id": storeID}, "")
+	if proj["_status"] != float64(201) {
+		t.Fatalf("create project: %v", proj)
+	}
+	apiKey := proj["api_key"].(string)
+	msgs := []map[string]string{{"role": "user", "content": "What color is a banana?"}}
+
+	// Without the opt-in the stream carries no ragmux field anywhere, and the
+	// header is capped to whole entries.
+	status, h, plain := e.streamBody(apiKey, map[string]any{"messages": msgs})
+	if status != 200 || strings.Contains(plain, "ragmux") {
+		t.Fatalf("plain stream: %d %s", status, plain)
+	}
+	var capped []map[string]any
+	header := h.Get("x-ragmux-rag-sources")
+	if len(header) > 2048 || json.Unmarshal([]byte(header), &capped) != nil || len(capped) == 0 || len(capped) >= sourceCount {
+		t.Fatalf("sources header is %d bytes, %d entries (want a capped, valid array): %.200s", len(header), len(capped), header)
+	}
+	if h.Get("x-ragmux-rag-hits") != strconv.Itoa(sourceCount) {
+		t.Fatalf("x-ragmux-rag-hits = %q, want %d", h.Get("x-ragmux-rag-hits"), sourceCount)
+	}
+
+	// sources=inline: the first data line has the whole list, no other line has
+	// the field, and the header is the same capped one.
+	status, h2, inline := e.streamBody(apiKey, map[string]any{"messages": msgs, "ragmux": map[string]any{"sources": "inline"}})
+	if status != 200 || h2.Get("x-ragmux-rag-sources") != header || len(h2.Values("Warning")) != 0 {
+		t.Fatalf("inline stream: %d headers %v", status, h2)
+	}
+	lines := dataLines(inline)
+	if len(lines) != len(dataLines(plain)) {
+		t.Fatalf("inline stream has %d data lines, plain has %d:\n%s", len(lines), len(dataLines(plain)), inline)
+	}
+	first := ragmuxOf(t, lines[0])
+	list, _ := first["sources"].([]any)
+	if len(list) != sourceCount {
+		t.Fatalf("first line has %d sources, want %d: %.300s", len(list), sourceCount, lines[0])
+	}
+	if _, ok := first["context"]; ok {
+		t.Errorf("sources=inline leaked the context")
+	}
+	for i, s := range list {
+		src := s.(map[string]any)
+		if src["filename"] != filename || src["document_id"] == nil || src["score"] == nil {
+			t.Errorf("source %d = %v", i, src)
+		}
+	}
+	for i, l := range lines[1:] {
+		if l != "[DONE]" && ragmuxOf(t, l) != nil {
+			t.Errorf("data line %d carries ragmux: %s", i+1, l)
+		}
+	}
+	// Taking the field out of the first line gives the plain stream back.
+	var firstChunk map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(lines[0]), &firstChunk)
+	delete(firstChunk, "ragmux")
+	var plainFirst map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(dataLines(plain)[0]), &plainFirst)
+	if string(mustJSON(firstChunk)) != string(mustJSON(plainFirst)) || strings.Join(lines[1:], "\n") != strings.Join(dataLines(plain)[1:], "\n") {
+		t.Errorf("inline stream differs from the plain one beyond the field:\n%s\nvs\n%s", inline, plain)
+	}
+
+	// include_context: sources and context in the same first line.
+	status, _, withCtx := e.streamBody(apiKey, map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": true}})
+	if status != 200 {
+		t.Fatalf("include_context stream: %d", status)
+	}
+	cl := dataLines(withCtx)
+	first = ragmuxOf(t, cl[0])
+	if l, _ := first["sources"].([]any); len(l) != sourceCount {
+		t.Errorf("include_context sources = %d, want %d", len(l), sourceCount)
+	}
+	if c, _ := first["context"].(string); !strings.Contains(c, "<context>") || !strings.Contains(c, "Bananas are yellow") {
+		t.Errorf("include_context context = %.200q", first["context"])
+	}
+	for i, l := range cl[1:] {
+		if l != "[DONE]" && ragmuxOf(t, l) != nil {
+			t.Errorf("include_context data line %d carries ragmux: %s", i+1, l)
+		}
+	}
+
+	// A body that is not a stream answers the same object in its JSON.
+	body := e.call("POST", "/v1/chat/completions", map[string]any{"messages": msgs, "ragmux": map[string]any{"sources": "inline"}}, apiKey)
+	if l, _ := body["ragmux"].(map[string]any)["sources"].([]any); len(l) != sourceCount {
+		t.Errorf("non-stream sources = %d, want %d", len(l), sourceCount)
+	}
+
+	// A project without a store: the plain stream is the golden one, and the
+	// opt-in earns a Warning and an empty list.
+	bare := e.call("POST", "/admin/api/projects", map[string]any{"name": "bare", "model_connection_id": connID}, "")
+	if bare["_status"] != float64(201) {
+		t.Fatalf("create bare project: %v", bare)
+	}
+	bareKey := bare["api_key"].(string)
+	req := map[string]any{"model": "whatever", "messages": msgs}
+	status, _, got := e.streamBody(bareKey, req)
+	if status != 200 || got != plainStreamGolden {
+		t.Errorf("plain stream drifted from the golden (status %d):\n%q\nwant\n%q", status, got, plainStreamGolden)
+	}
+	status, bh, got := e.streamBody(bareKey, map[string]any{"model": "whatever", "messages": msgs, "ragmux": map[string]any{"sources": "inline"}})
+	bl := dataLines(got)
+	if status != 200 || len(bl) != 3 || len(bh.Values("Warning")) != 1 {
+		t.Fatalf("bare inline stream: %d %q warnings %q", status, got, bh.Values("Warning"))
+	}
+	if rm := ragmuxOf(t, bl[0]); rm == nil || len(rm["sources"].([]any)) != 0 {
+		t.Errorf("bare inline first line = %s", bl[0])
+	}
+}

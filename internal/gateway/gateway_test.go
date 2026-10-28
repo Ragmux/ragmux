@@ -898,19 +898,271 @@ func TestRAGSourcesHeaderAndIncludeContext(t *testing.T) {
 		t.Errorf("ragmux field reached upstream: %v", b)
 	}
 
-	// Streaming responses carry the header but the body stays plain SSE.
+	// include_context reaches a stream too: the first chunk carries the
+	// sources and the context, the header stays, and the field never goes
+	// upstream.
 	sresp := e.post(context.Background(), "/v1/chat/completions",
 		map[string]any{"messages": msgs, "stream": true, "ragmux": map[string]any{"include_context": true}}, e.key)
 	defer sresp.Body.Close()
-	raw, _ := io.ReadAll(sresp.Body)
 	if sresp.StatusCode != 200 || sresp.Header.Get("Content-Type") != "text/event-stream" || sresp.Header.Get("x-ragmux-rag-sources") == "" {
 		t.Fatalf("stream: %d %v", sresp.StatusCode, sresp.Header)
 	}
-	if strings.Contains(string(raw), "ragmux") || !strings.HasSuffix(strings.TrimSpace(string(raw)), "data: [DONE]") {
-		t.Errorf("stream body: %s", raw)
+	events := readSSE(t, sresp.Body)
+	if len(events) != 3 || events[2] != "[DONE]" {
+		t.Fatalf("stream events: %v", events)
+	}
+	rm = streamRagmux(t, events[0])
+	if list, _ := rm["sources"].([]any); len(list) != 1 || list[0].(map[string]any)["filename"] != "a.txt" {
+		t.Errorf("stream sources: %v", rm["sources"])
+	}
+	if c, _ := rm["context"].(string); !strings.Contains(c, "<context>") || !strings.Contains(c, "apples are red") {
+		t.Errorf("stream context: %q", rm["context"])
+	}
+	if rm := streamRagmux(t, events[1]); rm != nil {
+		t.Errorf("second chunk carries ragmux: %s", events[1])
 	}
 	if b := upstreamBody.Load(); b == nil || strings.Contains(*b, "ragmux") {
 		t.Errorf("ragmux field reached upstream on stream: %v", b)
+	}
+}
+
+// streamRagmux is the "ragmux" object of one SSE event, nil when it has none.
+func streamRagmux(t *testing.T, event string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(event), &m); err != nil {
+		t.Fatalf("event %q: %v", event, err)
+	}
+	rm, _ := m["ragmux"].(map[string]any)
+	return rm
+}
+
+// ragmux.sources = "inline" is the whole opt-in for the sources: no context,
+// in the JSON body and in the first chunk of a stream, and the OpenAI fields
+// stay where they were.
+func TestInlineSources(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	msgs := msgsOf("user", "what colour are apples?")
+	opt := map[string]any{"sources": "inline"}
+
+	resp, out := e.chat(map[string]any{"messages": msgs, "ragmux": opt})
+	rm, _ := out["ragmux"].(map[string]any)
+	if resp.StatusCode != 200 || rm == nil || len(resp.Header.Values("Warning")) != 0 {
+		t.Fatalf("status %d warnings %q body %v", resp.StatusCode, resp.Header.Values("Warning"), out)
+	}
+	if list, _ := rm["sources"].([]any); len(list) != 1 || list[0].(map[string]any)["filename"] != "a.txt" {
+		t.Errorf("sources: %v", rm["sources"])
+	}
+	if _, ok := rm["context"]; ok {
+		t.Errorf("sources=inline leaked the context: %v", rm)
+	}
+	if out["choices"] == nil || out["usage"] == nil || resp.Header.Get("x-ragmux-rag-sources") == "" {
+		t.Errorf("OpenAI fields or header lost: %v %v", out, resp.Header)
+	}
+
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgs, "stream": true, "ragmux": opt}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if sresp.StatusCode != 200 || len(events) != 3 || events[2] != "[DONE]" {
+		t.Fatalf("stream: %d %v", sresp.StatusCode, events)
+	}
+	rm = streamRagmux(t, events[0])
+	if list, _ := rm["sources"].([]any); len(list) != 1 || list[0].(map[string]any)["filename"] != "a.txt" {
+		t.Errorf("stream sources: %v", rm)
+	}
+	if _, ok := rm["context"]; ok {
+		t.Errorf("stream sources=inline leaked the context: %v", rm)
+	}
+	if streamRagmux(t, events[1]) != nil {
+		t.Errorf("second chunk carries ragmux: %s", events[1])
+	}
+	// The chunk keeps its own fields in front of the new one.
+	if !strings.HasPrefix(events[0], `{"id":"c","object":`) || !strings.Contains(events[0], `"delta":{"role":"assistant","content":"Hel"}`) {
+		t.Errorf("first chunk = %s", events[0])
+	}
+}
+
+// Without the opt-in, or with a sources value other than "inline", the stream
+// is exactly the plain one.
+func TestStreamWithoutInlineSources(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	msgs := msgsOf("user", "what colour are apples?")
+	raw := func(ragmux any) string {
+		t.Helper()
+		body := map[string]any{"messages": msgs, "stream": true}
+		if ragmux != nil {
+			body["ragmux"] = ragmux
+		}
+		resp := e.post(context.Background(), "/v1/chat/completions", body, e.key)
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("status %d: %s", resp.StatusCode, b)
+		}
+		return string(b)
+	}
+	plain := raw(nil)
+	if strings.Contains(plain, "ragmux") {
+		t.Fatalf("plain stream: %s", plain)
+	}
+	for _, v := range []any{"yes", "INLINE", true, 1, nil, []string{"inline"}} {
+		if got := raw(map[string]any{"sources": v}); got != plain {
+			t.Errorf("sources=%v changed the stream:\n%s\nwant\n%s", v, got, plain)
+		}
+	}
+	// include_context=false does not opt in either.
+	if got := raw(map[string]any{"include_context": false}); got != plain {
+		t.Errorf("include_context=false changed the stream: %s", got)
+	}
+}
+
+func TestInlineSourcesWarnings(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	for _, v := range []any{"yes", "INLINE", true, 1, nil, []string{"inline"}} {
+		resp, out := e.chat(map[string]any{"messages": msgsOf("user", "apples?"), "ragmux": map[string]any{"sources": v}})
+		got := resp.Header.Values("Warning")
+		if resp.StatusCode != 200 || len(got) != 1 || !strings.Contains(got[0], "ragmux.sources accepts only the value inline") {
+			t.Errorf("sources=%v: status %d Warning %q", v, resp.StatusCode, got)
+		}
+		if _, ok := out["ragmux"]; ok {
+			t.Errorf("sources=%v opted in: %v", v, out["ragmux"])
+		}
+	}
+}
+
+// A project without a RAG store has nothing to list: the request is served,
+// the narrowing earns a Warning, and the list is empty -- in a stream as well.
+func TestInlineSourcesWithoutRAGStore(t *testing.T) {
+	e := newEnv(t, nil)
+	msgs := msgsOf("user", "what colour are apples?")
+	resp, out := e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"sources": "inline"}})
+	rm, _ := out["ragmux"].(map[string]any)
+	if list, ok := rm["sources"].([]any); resp.StatusCode != 200 || !ok || len(list) != 0 {
+		t.Errorf("status %d ragmux %v", resp.StatusCode, out["ragmux"])
+	}
+	if w := resp.Header.Values("Warning"); len(w) != 1 || !strings.Contains(w[0], "ragmux.sources has no effect: this project has no RAG store") {
+		t.Errorf("Warning = %q", w)
+	}
+
+	sresp := e.post(context.Background(), "/v1/chat/completions",
+		map[string]any{"messages": msgs, "stream": true, "ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if rm := streamRagmux(t, events[0]); rm == nil || len(rm["sources"].([]any)) != 0 || len(sresp.Header.Values("Warning")) != 1 {
+		t.Errorf("stream: %v warnings %q", events, sresp.Header.Values("Warning"))
+	}
+
+	// include_context is sources=inline plus the context: the same empty answer
+	// earns its own Warning, and naming both earns one.
+	resp, out = e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": true}})
+	rm, _ = out["ragmux"].(map[string]any)
+	if w := resp.Header.Values("Warning"); len(w) != 1 || !strings.Contains(w[0], "ragmux.include_context has no effect: this project has no RAG store") {
+		t.Errorf("include_context Warning = %q", w)
+	}
+	if list, ok := rm["sources"].([]any); !ok || len(list) != 0 || rm["context"] != "" {
+		t.Errorf("include_context ragmux = %v", rm)
+	}
+	resp, _ = e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": true, "sources": "inline"}})
+	if w := resp.Header.Values("Warning"); len(w) != 1 || !strings.Contains(w[0], "ragmux.sources has no effect") {
+		t.Errorf("both fields Warning = %q", w)
+	}
+	// Neither field, no Warning.
+	resp, _ = e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": false}})
+	if len(resp.Header.Values("Warning")) != 0 {
+		t.Errorf("include_context=false earned %q", resp.Header.Values("Warning"))
+	}
+}
+
+// The bound on Warning headers holds for a warning added after parsing too.
+func TestRagmuxWarningBoundHoldsWithoutRAGStore(t *testing.T) {
+	e := newEnv(t, nil)
+	ragmux := map[string]any{"sources": "inline"}
+	for i := 0; i < 20; i++ {
+		ragmux[fmt.Sprintf("k_%c", 'a'+i)] = i
+	}
+	resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "hi"), "ragmux": ragmux})
+	got := resp.Header.Values("Warning")
+	if resp.StatusCode != 200 || len(got) != maxRagmuxWarnings || !strings.Contains(got[len(got)-1], "more ragmux warnings omitted") {
+		t.Errorf("status %d, %d warnings, last %q", resp.StatusCode, len(got), got)
+	}
+}
+
+// An upstream that never sends a chunk with choices cannot carry the field. The
+// stream stays as the upstream made it, and the log says the opt-in was lost.
+func TestInlineSourcesNotDeliveredIsLogged(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	logs := e.captureLog()
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{}, "usage": map[string]int{"prompt_tokens": 7, "completion_tokens": 0}})
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"stream_options": map[string]any{"include_usage": true}, "ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if sresp.StatusCode != 200 || len(events) != 2 || events[1] != "[DONE]" || strings.Contains(events[0], "ragmux") {
+		t.Fatalf("events = %v", events)
+	}
+	if !strings.Contains(logs.String(), "ragmux inline sources not delivered") {
+		t.Errorf("log = %q", logs.String())
+	}
+
+	// A stream that delivered says nothing.
+	e.up.setChat(okChat)
+	logs2 := e.captureLog()
+	sresp2 := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp2.Body.Close()
+	_ = readSSE(t, sresp2.Body)
+	if strings.Contains(logs2.String(), "not delivered") {
+		t.Errorf("log = %q", logs2.String())
+	}
+}
+
+// A skipped retrieval answers a stream with an empty list too.
+func TestInlineSourcesOnSkippedStream(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"ragmux": map[string]any{"sources": "inline", "include_context": true, "retrieval": "off"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	rm := streamRagmux(t, events[0])
+	if list, ok := rm["sources"].([]any); !ok || len(list) != 0 || rm["context"] != "" || sresp.Header.Get("x-ragmux-rag-skip") != "client_off" {
+		t.Errorf("ragmux = %v skip %q", rm, sresp.Header.Get("x-ragmux-rag-skip"))
+	}
+}
+
+// The field rides the first chunk that has choices: a leading chunk with an
+// empty choices array (a prompt filter result, say) is relayed as it is, and
+// no chunk of the gateway's own is added.
+func TestInlineSourcesSkipsChunksWithoutChoices(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{}})
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "a"}}}})
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "b"}, "finish_reason": "stop"}}})
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{}, "usage": map[string]int{"prompt_tokens": 7, "completion_tokens": 2}})
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"stream_options": map[string]any{"include_usage": true}, "ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if len(events) != 5 || events[4] != "[DONE]" {
+		t.Fatalf("events = %v", events)
+	}
+	for i, want := range []bool{false, true, false, false} {
+		if got := streamRagmux(t, events[i]) != nil; got != want {
+			t.Errorf("event %d has ragmux = %v, want %v: %s", i, got, want, events[i])
+		}
 	}
 }
 

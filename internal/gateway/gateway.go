@@ -665,8 +665,9 @@ type chatInvocation struct {
 	// promptChars is the size of the prompt after context injection, the basis
 	// of the usage estimate when the upstream reports none.
 	promptChars int
-	// opts, sources and contextBlock come from prepareChat and only shape the
-	// non-streaming response body.
+	// opts, sources and contextBlock come from prepareChat. They shape the
+	// "ragmux" object of the response: in the JSON body, or in the first chunk
+	// of a stream.
 	opts         ragmuxRequest
 	sources      []ragSource
 	contextBlock string
@@ -708,8 +709,15 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	if err != nil {
 		return err
 	}
+	inline, err := in.opts.inlineField(in.sources, in.contextBlock)
+	if err != nil {
+		// A marshal failure of plain strings and numbers is not expected;
+		// the answer is still worth more than the opt-in.
+		c.log.Error("ragmux response field", "err", err)
+		inline = nil
+	}
 	if req.Stream {
-		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars)
+		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars, withInlineRagmux(inline))
 	}
 
 	ctx, cancel := c.attemptContext()
@@ -728,8 +736,8 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	fillUsage(c.rec, resp.Usage, in.promptChars, completionChars(resp))
 	c.rec.StatusCode = http.StatusOK
 	c.w.Header().Set("Content-Type", "application/json")
-	if in.opts.IncludeContext {
-		if b, err := withRagmuxField(resp, in.sources, in.contextBlock); err == nil {
+	if inline != nil {
+		if b, err := withRagmuxField(resp, inline); err == nil {
 			_, _ = c.w.Write(b)
 			return nil
 		}
@@ -815,6 +823,16 @@ func (p chatPrep) apply(rec *store.RequestLog) {
 // context. Other endpoints have no such step.
 func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.ChatRequest, opts ragmuxRequest) chatPrep {
 	p, ctx, w := c.project, c.ctx(), c.w
+	// A narrowing that cannot narrow anything is not refused, because no
+	// document reaches the context anyway; it earns a warning (PRD rule 12).
+	if p.RAGStoreID == nil {
+		switch {
+		case opts.InlineSources:
+			opts.Warnings = append(opts.Warnings, "ragmux.sources has no effect: this project has no RAG store; the list is empty")
+		case opts.IncludeContext:
+			opts.Warnings = append(opts.Warnings, "ragmux.include_context has no effect: this project has no RAG store; the sources and the context are empty")
+		}
+	}
 	prep := chatPrep{opts: opts}
 
 	// Project-level system prompt, if configured, goes first.
@@ -922,8 +940,13 @@ func injectRetrieved(msgs []provider.Message, block, placement string) []provide
 // (ADR-024). Everything it asked for that cannot be honoured is in Warnings.
 type ragmuxRequest struct {
 	// IncludeContext asks for the injected sources and context block in the
-	// (non-streaming) response body.
+	// response: the body, or the first chunk of a stream. It implies
+	// InlineSources.
 	IncludeContext bool
+	// InlineSources is ragmux.sources = "inline": the sources in the response
+	// body, or in the first chunk of a stream, instead of only in the
+	// x-ragmux-rag-sources header (which stops at 2 KB).
+	InlineSources bool
 	// RetrievalOff is ragmux.retrieval = "off": skip retrieval for this request.
 	RetrievalOff bool
 	// Warnings are the texts of the Warning headers the object earns.
@@ -946,7 +969,8 @@ var ragmuxProjectSettings = map[string]bool{
 var ragmuxKeyName = regexp.MustCompile(`^[a-z_]{1,32}$`)
 
 // maxRagmuxWarnings bounds the Warning headers one request can earn: the
-// object can carry as many keys as the body limit allows.
+// object can carry as many keys as the body limit allows. addRagmuxWarnings
+// applies it.
 const maxRagmuxWarnings = 8
 
 // parseRagmux reads the "ragmux" request object. A missing one is fine; one
@@ -980,10 +1004,19 @@ func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 		}
 	}
 
+	if v, ok := fields["sources"]; ok {
+		var mode string
+		if json.Unmarshal(v, &mode) == nil && mode == "inline" {
+			o.InlineSources = true
+		} else {
+			o.Warnings = append(o.Warnings, "ragmux.sources accepts only the value inline; ignored")
+		}
+	}
+
 	// Map order is random; the headers must not be.
 	var rest []string
 	for k := range fields {
-		if k != "include_context" && k != "retrieval" {
+		if k != "include_context" && k != "retrieval" && k != "sources" {
 			rest = append(rest, k)
 		}
 	}
@@ -998,15 +1031,18 @@ func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 			o.Warnings = append(o.Warnings, "unknown ragmux field; ignored")
 		}
 	}
-	if n := len(o.Warnings); n > maxRagmuxWarnings {
-		o.Warnings = append(o.Warnings[:maxRagmuxWarnings-1],
-			strconv.Itoa(n-maxRagmuxWarnings+1)+" more ragmux warnings omitted")
-	}
 	return o, nil
 }
 
-// addRagmuxWarnings adds one `Warning: 299 ragmux "<text>"` header per text.
+// addRagmuxWarnings adds one `Warning: 299 ragmux "<text>"` header per text, at
+// most maxRagmuxWarnings of them: the last stands for the ones left out. The
+// bound is applied here, where every warning has been collected, so a warning
+// added after parsing cannot exceed it.
 func addRagmuxWarnings(h http.Header, texts []string) {
+	if n := len(texts); n > maxRagmuxWarnings {
+		kept := texts[: maxRagmuxWarnings-1 : maxRagmuxWarnings-1]
+		texts = append(kept, strconv.Itoa(n-maxRagmuxWarnings+1)+" more ragmux warnings omitted")
+	}
 	for _, text := range texts {
 		h.Add("Warning", `299 ragmux "`+warnTextEscaper.Replace(text)+`"`)
 	}
@@ -1068,9 +1104,28 @@ func asciiJSON(b []byte) string {
 	return sb.String()
 }
 
+// inlineField is the JSON value of the "ragmux" field the request asked to get
+// back, or nil when it asked for none. Both response shapes carry the same
+// object: the sources, and the context block when include_context asked for it.
+// A request without hits or without retrieval gets an empty list, not a missing
+// one.
+func (o ragmuxRequest) inlineField(sources []ragSource, contextBlock string) ([]byte, error) {
+	if !o.IncludeContext && !o.InlineSources {
+		return nil, nil
+	}
+	if sources == nil {
+		sources = []ragSource{}
+	}
+	m := map[string]any{"sources": sources}
+	if o.IncludeContext {
+		m["context"] = contextBlock
+	}
+	return json.Marshal(m)
+}
+
 // withRagmuxField adds a top-level "ragmux" object to the serialised
 // response without disturbing the OpenAI fields.
-func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBlock string) ([]byte, error) {
+func withRagmuxField(resp *provider.ChatResponse, extra []byte) ([]byte, error) {
 	base, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err
@@ -1079,19 +1134,44 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 	if err := json.Unmarshal(base, &m); err != nil {
 		return nil, err
 	}
-	if sources == nil {
-		sources = []ragSource{}
-	}
-	extra, err := json.Marshal(map[string]any{"sources": sources, "context": contextBlock})
-	if err != nil {
-		return nil, err
-	}
 	m["ragmux"] = extra
 	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
 	return append(b, '\n'), nil
+}
+
+// withRagmuxChunk adds the "ragmux" object to one serialised stream chunk. The
+// object is appended after the chunk's own fields, which keep their order and
+// bytes.
+func withRagmuxChunk(chunk, extra []byte) []byte {
+	n := len(chunk)
+	if n == 0 || chunk[n-1] != '}' {
+		return chunk
+	}
+	out := make([]byte, 0, n+len(extra)+10)
+	out = append(out, chunk[:n-1]...)
+	out = append(out, `,"ragmux":`...)
+	out = append(out, extra...)
+	return append(out, '}')
+}
+
+// streamOption tunes one stream call.
+type streamOption func(*streamConfig)
+
+type streamConfig struct {
+	// inline is the "ragmux" object for the first chunk that has choices; nil
+	// leaves every chunk as the upstream's.
+	inline []byte
+}
+
+// withInlineRagmux makes the stream carry the given "ragmux" object, once, on
+// the first chunk that has choices. The object goes there rather than in a
+// chunk of its own because a chunk with an empty choices array breaks clients
+// that index choices[0].
+func withInlineRagmux(extra []byte) streamOption {
+	return func(c *streamConfig) { c.inline = extra }
 }
 
 // stream relays one streamed chat call to the client.
@@ -1103,7 +1183,12 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 // upstream has to produce that first chunk; it does not limit the stream
 // afterwards.
 func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.Duration, prov provider.Provider,
-	conn *store.ModelConnection, req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) error {
+	conn *store.ModelConnection, req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int,
+	options ...streamOption) error {
+	var cfg streamConfig
+	for _, o := range options {
+		o(&cfg)
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by server")
@@ -1204,6 +1289,10 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 			}
 		}
 		b, _ := json.Marshal(chunk)
+		if cfg.inline != nil && len(chunk.Choices) > 0 {
+			b = withRagmuxChunk(b, cfg.inline)
+			cfg.inline = nil
+		}
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
 			// Writing to a closed client: stop the upstream call. The
 			// goroutine exits once ChatStream observes ctx and closes out.
@@ -1234,6 +1323,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 		return err
 	}
 	sendHeaders()
+	if cfg.inline != nil {
+		// No chunk with choices came, so the field had nowhere to go. A chunk of
+		// the gateway's own would break clients that index choices[0]; the
+		// headers are out, so no Warning either: the log says it.
+		g.Log.Warn("ragmux inline sources not delivered: the stream had no chunk with choices", "project", rec.ProjectID)
+	}
 	if err != nil {
 		// Mid-stream failure: surface it as an SSE error event then end.
 		_, pe := providerError(err)
