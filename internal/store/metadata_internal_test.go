@@ -105,7 +105,7 @@ func TestVectorOnlyQueryIsFilteredToo(t *testing.T) {
 	r := &RAGStore{ID: 3, Dimensions: 4}
 	p := filteredParams(t)
 	sql, args := searchStatement(pgvectorBackend{}, r, "", []float32{1, 0, 0, 0},
-		SearchOptions{Mode: SearchVector, Candidates: 5, Filter: p.Filter})
+		SearchOptions{Mode: SearchVector, Candidates: 5, Filter: p.Filter}, false)
 	if v := legBeforeLimit(t, sql, "vc"); !strings.Contains(v, "metadata @> ANY") {
 		t.Errorf("vector-only search is not filtered before its LIMIT:\n%s", sql)
 	}

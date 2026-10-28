@@ -618,8 +618,9 @@ func (m *Metrics) RegisterStore(st *store.Store) {
 	m.searchBackends.With(store.BackendPgSearch).Set(boolGauge(st.Caps().PgSearch))
 	// Unlabelled on purpose (ADR-002): the store ids are in the startup log.
 	m.reg.GaugeFunc("ragmux_rag_index_missing",
-		"RAG stores whose embedding width is above what pgvector can HNSW-index (2000); they are "+
-			"searched with an exact scan. Counted at startup, recounted when such a store is deleted or re-bound.",
+		"RAG stores whose vectors have no usable HNSW index: a width above 4000, or 2001-4000 without a valid "+
+			"halfvec index (reindex it from the dashboard); they are searched with an exact scan. Counted at "+
+			"startup, recounted when such a store is deleted or re-bound and when an index build finishes.",
 		func() float64 { return float64(st.RAGIndexMissing()) })
 
 	m.reg.CachedGaugeFunc("ragmux_documents",

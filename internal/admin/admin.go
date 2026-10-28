@@ -156,6 +156,7 @@ func (a *Admin) authenticated(r chi.Router) {
 	editor.With(httpx.ReadDeadline(uploadReadDeadline)).Post("/api/rag-stores/{id}/documents", a.uploadDocument)
 	read.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
 	editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
+	adminOnly.Post("/api/rag-stores/{id}/reindex", a.reindexStore)
 	read.Get("/api/documents/{id}", a.getDocument)
 	editor.Patch("/api/documents/{id}", a.updateDocumentMetadata)
 	editor.Delete("/api/documents/{id}", a.deleteDocument)
@@ -1098,6 +1099,9 @@ func (q *storeQuota) add(size int64) error {
 
 func (a *Admin) listRAGStores(w http.ResponseWriter, r *http.Request) {
 	list, err := a.Store.ListRAGStores(r.Context())
+	if err == nil {
+		err = a.Store.AnnotateVectorIndex(r.Context(), list...)
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1116,10 +1120,13 @@ func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.checkEmbeddingDims(r.Context(), in.EmbeddingConnectionID); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		a.dimsFail(w, err)
 		return
 	}
 	rs, err := a.Store.CreateRAGStore(r.Context(), in.toStore(0))
+	if err == nil {
+		err = a.Store.AnnotateVectorIndex(r.Context(), rs)
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1131,6 +1138,9 @@ func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
 func (a *Admin) getRAGStore(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
 	rs, err := a.Store.GetRAGStore(r.Context(), id)
+	if err == nil {
+		err = a.Store.AnnotateVectorIndex(r.Context(), rs)
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1159,7 +1169,7 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	// probe -- a billed upstream call -- only runs when the switch can happen.
 	if connChanged && before.ChunkCount == 0 {
 		if err := a.checkEmbeddingDims(r.Context(), in.EmbeddingConnectionID); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
+			a.dimsFail(w, err)
 			return
 		}
 	}
@@ -1170,6 +1180,10 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := a.Store.AnnotateVectorIndex(r.Context(), rs); err != nil {
+		a.fail(w, err)
 		return
 	}
 	// Chunking and embedding-text settings only take effect when documents
@@ -1198,10 +1212,13 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 const embeddingProbeTimeout = 10 * time.Second
 
 // checkEmbeddingDims asks for the width of the embedding model a store is
-// about to be bound to and refuses one wider than pgvector can index, so the
-// operator hears about it on save rather than from the first failed ingest.
-// The probe is best effort: if the upstream cannot be reached the save goes
-// ahead and the ingest-time check (store.CheckVectorDims) still applies.
+// about to be bound to and refuses one that cannot be indexed -- wider than
+// 4000, or wider than 2000 on a pgvector without halfvec (400) -- or whose
+// 2001..4000 table exists without a halfvec index (409, reindex first), so
+// the operator hears about it on save rather than from the first failed
+// ingest. The probe is best effort: if the upstream cannot be reached the
+// save goes ahead and the ingest-time check (Store.CheckBindable, run by the
+// first write) still applies.
 func (a *Admin) checkEmbeddingDims(ctx context.Context, connID int64) error {
 	conn, err := a.Store.GetConnection(ctx, connID)
 	if err != nil {
@@ -1219,7 +1236,21 @@ func (a *Admin) checkEmbeddingDims(ctx context.Context, connID int64) error {
 			"err", provider.RedactWith(err.Error(), conn.APIKey))
 		return nil
 	}
-	return store.CheckVectorDims(dims)
+	return a.Store.CheckBindable(ctx, dims)
+}
+
+// dimsFail answers the error of checkEmbeddingDims: an unindexable width is
+// the request's fault (400), a width that only lacks its index is a state
+// conflict the operator resolves with the reindex action (409).
+func (a *Admin) dimsFail(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrVectorIndexMissing):
+		writeErrCode(w, http.StatusConflict, "index_missing", err.Error())
+	case errors.Is(err, store.ErrVectorDimsUnsupported):
+		writeErr(w, http.StatusBadRequest, err.Error())
+	default:
+		a.fail(w, err)
+	}
 }
 
 // probeEmbeddingWidth embeds one word, the way the connection test does.
@@ -1244,6 +1275,56 @@ func (a *Admin) probeEmbeddingWidth(ctx context.Context, conn *store.ModelConnec
 type ragStoreResponse struct {
 	*store.RAGStore
 	ReprocessRecommended bool `json:"reprocess_recommended"`
+}
+
+// reindexStore builds the halfvec index of the store's embedding width
+// (ADR-026). The index belongs to the width, not to the store, so every store
+// bound to the same width is affected; the answer lists them. The build runs
+// in the background (202); progress is the vector_index field of the stores.
+func (a *Admin) reindexStore(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	rs, err := a.Store.GetRAGStore(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	info, err := a.Store.StartVectorReindex(r.Context(), rs.Dimensions)
+	switch {
+	case errors.Is(err, store.ErrVectorIndexPresent):
+		writeErrCode(w, http.StatusConflict, "already_indexed", err.Error())
+		return
+	case errors.Is(err, store.ErrVectorNotIndexable):
+		writeErrCode(w, http.StatusConflict, "not_indexable", err.Error())
+		return
+	case errors.Is(err, store.ErrVectorNotBound):
+		writeErrCode(w, http.StatusConflict, "not_bound", err.Error())
+		return
+	case err != nil:
+		a.fail(w, err)
+		return
+	}
+	affected, err := a.Store.StoresWithDimensions(r.Context(), rs.Dimensions)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	type storeRef struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+	}
+	refs := make([]storeRef, 0, len(affected))
+	ids := make([]int64, 0, len(affected))
+	for _, s := range affected {
+		refs = append(refs, storeRef{s.ID, s.Name})
+		ids = append(ids, s.ID)
+	}
+	a.audit(r, "rag_store.reindex", "rag_store", ptr(rs.ID),
+		map[string]any{"name": rs.Name, "dimensions": rs.Dimensions, "affected_store_ids": ids})
+	resp := map[string]any{"dimensions": rs.Dimensions, "vector_index": info.State, "affected_stores": refs}
+	if info.State == store.VectorIndexBuilding {
+		resp["vector_index_progress"] = info.ProgressPercent
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (a *Admin) reprocessStore(w http.ResponseWriter, r *http.Request) {

@@ -94,6 +94,13 @@ type RAGStore struct {
 	BytesUsed     int64  `json:"bytes_used"`
 	ChunkCount    int    `json:"chunk_count"`
 	CreatedAt     string `json:"created_at"`
+	// VectorIndex is the state of the store's vector index (one of the
+	// VectorIndex* values; empty while the store is not bound to a width) and
+	// VectorIndexProgress the percentage while it is being built. Neither is
+	// read by GetRAGStore, which runs on every search: AnnotateVectorIndex
+	// fills them for the admin API.
+	VectorIndex         string `json:"vector_index,omitempty"`
+	VectorIndexProgress *int   `json:"vector_index_progress,omitempty"`
 }
 
 const ragCols = `r.id, r.name, r.embedding_connection_id, r.chunk_size, r.chunk_overlap, r.top_k,
@@ -278,18 +285,21 @@ func FTSConfigWarning(ftsConfig, backend string) string {
 
 // RAGStoreAudit is what AuditRAGStores found.
 type RAGStoreAudit struct {
-	// IndexMissing counts stores whose embedding width is above
-	// MaxIndexedVectorDims: their vectors have no HNSW index.
+	// IndexMissing counts stores whose vectors have no usable HNSW index:
+	// a width above MaxHalfvecIndexedDims (or above MaxIndexedVectorDims on
+	// a pgvector without halfvec), and a width of 2001..4000 whose table has
+	// no valid halfvec index.
 	IndexMissing int
 	// FTSMismatch counts stores whose fts_config is not 'simple'.
 	FTSMismatch int
 }
 
 // AuditRAGStores logs a warning for every store the current schema cannot
-// serve as configured: a width above MaxIndexedVectorDims (searched with an
-// exact scan, no HNSW index) and an fts_config other than 'simple'. Neither
-// store is changed or disabled. The index-missing count is kept for
-// RAGIndexMissing. It runs at startup.
+// serve as configured: a vector width without a usable HNSW index (searched
+// with an exact scan) and an fts_config other than 'simple'. Neither store is
+// changed or disabled -- a 2001..4000 store without its halfvec index is not
+// migrated automatically, the warning names the reindex action. The
+// index-missing count is kept for RAGIndexMissing. It runs at startup.
 func (s *Store) AuditRAGStores(ctx context.Context) (RAGStoreAudit, error) {
 	var out RAGStoreAudit
 	stores, err := s.ListRAGStores(ctx)
@@ -298,11 +308,23 @@ func (s *Store) AuditRAGStores(ctx context.Context) (RAGStoreAudit, error) {
 	}
 	for _, r := range stores {
 		if r.Dimensions > MaxIndexedVectorDims {
-			out.IndexMissing++
-			s.log.Warn("rag store embedding is wider than pgvector can index; it keeps working with an exact "+
-				"scan but has no HNSW index -- move it to a model of 2000 dimensions or fewer, or wait for "+
-				"halfvec support in v0.6",
-				"store_id", r.ID, "store", r.Name, "dimensions", r.Dimensions, "max_indexed", MaxIndexedVectorDims)
+			info, err := s.VectorIndex(ctx, r.Dimensions)
+			if err != nil {
+				return out, err
+			}
+			switch info.State {
+			case VectorIndexNotIndexable:
+				out.IndexMissing++
+				s.log.Warn("rag store embedding is wider than an HNSW index can cover; it keeps working with an exact "+
+					"scan but has no HNSW index -- move it to a model of 4000 dimensions or fewer; binary "+
+					"quantization for wider models is planned for v0.9",
+					"store_id", r.ID, "store", r.Name, "dimensions", r.Dimensions, "max_indexed", MaxHalfvecIndexedDims)
+			case VectorIndexMissing, VectorIndexBuilding:
+				out.IndexMissing++
+				s.log.Warn("rag store has no halfvec HNSW index; it keeps working with an exact scan -- run the "+
+					"reindex action (POST /admin/api/rag-stores/{id}/reindex) to index this width",
+					"store_id", r.ID, "store", r.Name, "dimensions", r.Dimensions, "vector_index", info.State)
+			}
 		}
 		if msg := FTSConfigWarning(r.FTSConfig, r.SearchBackend); msg != "" {
 			out.FTSMismatch++
@@ -310,25 +332,81 @@ func (s *Store) AuditRAGStores(ctx context.Context) (RAGStoreAudit, error) {
 		}
 	}
 	s.indexMissing.Store(int64(out.IndexMissing))
+	s.indexMissingAt.Store(time.Now().UnixNano())
 	return out, nil
 }
 
-// RAGIndexMissing is the number of stores whose embeddings have no HNSW
-// index, as counted at startup and recounted whenever such a store is
-// deleted or moves to another embedding connection. It reads no database.
-func (s *Store) RAGIndexMissing() int64 { return s.indexMissing.Load() }
+// indexMissingMaxAge is how old the index-missing count may get before a read
+// recounts it. The count changes by events this process sees (a store deleted
+// or re-bound, a build it ran finishing) and by events it does not (another
+// replica finishing a reindex), so it cannot be kept by those alone.
+const indexMissingMaxAge = 30 * time.Second
 
-// recountIndexMissing refreshes RAGIndexMissing from the table. It is a
+// indexMissingRecountTimeout bounds the recount a stale read makes, so a slow
+// database delays one scrape by seconds at most.
+const indexMissingRecountTimeout = 3 * time.Second
+
+// RAGIndexMissing is the number of stores whose embeddings have no usable
+// HNSW index. It is counted at startup, recounted whenever such a store is
+// deleted or moves to another embedding connection and when a build this
+// process ran finishes, and -- so that a reindex another replica ran is seen
+// too -- recounted from the catalog by a read that finds the count older than
+// 30 seconds. Concurrent reads share one recount; a failed one keeps the old
+// value and is retried by the next read.
+func (s *Store) RAGIndexMissing() int64 {
+	ttl := s.indexMissingTTL
+	if ttl == 0 {
+		ttl = indexMissingMaxAge
+	}
+	if s.pool != nil && time.Since(time.Unix(0, s.indexMissingAt.Load())) >= ttl &&
+		s.indexRefreshing.CompareAndSwap(false, true) {
+		ctx, cancel := context.WithTimeout(context.Background(), indexMissingRecountTimeout)
+		s.recountIndexMissing(ctx)
+		cancel()
+		s.indexRefreshing.Store(false)
+	}
+	return s.indexMissing.Load()
+}
+
+// recountIndexMissing refreshes RAGIndexMissing from the catalog. It is a
 // recount rather than a decrement so the gauge cannot drift (or go below
 // zero) when the startup audit failed. A failed recount keeps the old value.
 func (s *Store) recountIndexMissing(ctx context.Context) {
-	var n int64
-	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM rag_stores WHERE dimensions > $1",
-		MaxIndexedVectorDims).Scan(&n); err != nil {
+	rows, err := s.pool.Query(ctx, `SELECT dimensions, COUNT(*) FROM rag_stores
+		WHERE dimensions > $1 GROUP BY dimensions`, MaxIndexedVectorDims)
+	if err != nil {
 		s.log.Warn("rag store: recount of stores without an HNSW index failed", "err", err)
 		return
 	}
+	type width struct{ dims, stores int }
+	var widths []width
+	for rows.Next() {
+		var w width
+		if err := rows.Scan(&w.dims, &w.stores); err != nil {
+			rows.Close()
+			s.log.Warn("rag store: recount of stores without an HNSW index failed", "err", err)
+			return
+		}
+		widths = append(widths, w)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		s.log.Warn("rag store: recount of stores without an HNSW index failed", "err", err)
+		return
+	}
+	var n int64
+	for _, w := range widths {
+		info, err := s.VectorIndex(ctx, w.dims)
+		if err != nil {
+			s.log.Warn("rag store: recount of stores without an HNSW index failed", "err", err)
+			return
+		}
+		if info.State != VectorIndexHalfvec {
+			n += int64(w.stores)
+		}
+	}
 	s.indexMissing.Store(n)
+	s.indexMissingAt.Store(time.Now().UnixNano())
 }
 
 // TextSearchConfigExists reports whether name is a text search configuration

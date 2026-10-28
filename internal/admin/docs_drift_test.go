@@ -386,6 +386,14 @@ var searchFilterPending = map[string]string{
 	"filter": "ADR-025 field, documented in the v0.6 docs phase",
 }
 
+// vectorIndexPending lists the ADR-026 store fields (the halfvec index state).
+// Same arrangement: docs/api.md gets them in the v0.6 documentation phase,
+// which is when these exceptions go.
+var vectorIndexPending = map[string]string{
+	"vector_index":          "ADR-026 field, documented in the v0.6 docs phase",
+	"vector_index_progress": "ADR-026 field, documented in the v0.6 docs phase",
+}
+
 // compareDrift returns the code fields the docs lack and the doc keys the code
 // lacks, plus problems with the case itself (anchor not found, stale
 // exceptions).
@@ -547,7 +555,8 @@ func driftCases(t *testing.T) []driftCase {
 
 		// RAG stores and documents
 		{name: "rag store", code: jsonFieldNames(typeOf[ragStoreResponse]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "document_count", ""}, prose: []string{"reprocess_recommended"}},
+			obj: &jsonSel{"", "document_count", ""}, prose: []string{"reprocess_recommended"},
+			undocumented: vectorIndexPending},
 		{name: "rag store body", code: jsonFieldNames(typeOf[ragInput]()), sections: []string{"RAG stores and documents"},
 			obj: &jsonSel{"", "search_backend", "document_count"}},
 		{name: "document", code: jsonFieldNames(typeOf[store.Document]()), sections: []string{"RAG stores and documents"},

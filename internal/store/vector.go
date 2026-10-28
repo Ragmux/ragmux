@@ -80,27 +80,60 @@ type SearchOptions struct {
 const maxVectorDims = 16000
 
 // MaxIndexedVectorDims is the widest vector pgvector can put an HNSW index
-// on. A wider store cannot be indexed with the vector type at all; halfvec
-// support, which lifts the ceiling to 4000, is planned for v0.6.
+// on with the vector type. Wider embeddings are indexed through a halfvec
+// expression index instead (see MaxHalfvecIndexedDims).
 const MaxIndexedVectorDims = 2000
 
+// MaxHalfvecIndexedDims is the widest embedding that can be HNSW-indexed at
+// all: pgvector builds a halfvec HNSW index up to 4000 dimensions. The
+// embedding column stays vector(N); the index is on embedding::halfvec(N)
+// (ADR-026), so nothing is copied and no table changes shape.
+const MaxHalfvecIndexedDims = 4000
+
 // ErrVectorDimsUnsupported is returned when a store would be bound to an
-// embedding wider than MaxIndexedVectorDims for the first time.
+// embedding that cannot be indexed: wider than MaxHalfvecIndexedDims, or
+// wider than MaxIndexedVectorDims on a pgvector without halfvec.
 var ErrVectorDimsUnsupported = errors.New("embedding dimension not supported")
+
+// ErrVectorIndexMissing is returned when a store would be bound to a
+// 2001..4000 wide table that has no valid halfvec index: binding to it would
+// put a new store on an exact scan. The width has to be reindexed first.
+var ErrVectorIndexMissing = errors.New("embedding width has no halfvec index")
 
 // ErrEmbeddingConnectionChanged stops an ingest whose vectors were produced
 // by an embedding connection the store no longer uses: they would be written
 // next to vectors of another model, or with the wrong width.
 var ErrEmbeddingConnectionChanged = errors.New("embedding connection of the store changed during ingestion")
 
-// CheckVectorDims rejects an embedding width a new store cannot be bound to.
-// Stores that already carry a wider dimension keep working (see
-// ensureVecTable); this only guards the first assignment.
+// CheckVectorDims rejects an embedding width no pgvector can index. Stores
+// that already carry a wider dimension keep working (see ensureVecTable);
+// this only guards the first assignment. The server-dependent limits (the
+// halfvec ceiling needs pgvector 0.7.0) and the index state of the width are
+// checked by Store.CheckBindable.
 func CheckVectorDims(dims int) error {
-	if dims > MaxIndexedVectorDims {
-		return fmt.Errorf("%w: the embedding model returns %d dimensions, but pgvector can index at most %d "+
-			"with the vector type; choose a model (or a dimensions setting) of %d or fewer -- halfvec support "+
-			"for wider models is planned for v0.6", ErrVectorDimsUnsupported, dims, MaxIndexedVectorDims, MaxIndexedVectorDims)
+	if dims > MaxHalfvecIndexedDims {
+		return fmt.Errorf("%w: the embedding model returns %d dimensions, but at most %d can be indexed "+
+			"(HNSW on halfvec); choose a model (or a dimensions setting) of %d or fewer -- binary quantization "+
+			"for wider models is planned for v0.9", ErrVectorDimsUnsupported, dims, MaxHalfvecIndexedDims, MaxHalfvecIndexedDims)
+	}
+	return nil
+}
+
+// checkVectorDims is CheckVectorDims plus what this server's pgvector can do:
+// without halfvec (before 0.7.0) the limit stays at MaxIndexedVectorDims.
+func (c Capabilities) checkVectorDims(dims int) error {
+	if err := CheckVectorDims(dims); err != nil {
+		return err
+	}
+	if dims > MaxIndexedVectorDims && !c.SupportsHalfvec() {
+		have := "pgvector " + c.PgvectorVersion
+		if c.PgvectorVersion == "" {
+			have = "the installed pgvector (its version could not be read)"
+		}
+		return fmt.Errorf("%w: the embedding model returns %d dimensions, but %s can index at most %d "+
+			"with the vector type; indexing up to %d needs halfvec, which exists from pgvector 0.7.0 -- upgrade "+
+			"pgvector or choose a model (or a dimensions setting) of %d or fewer",
+			ErrVectorDimsUnsupported, dims, have, MaxIndexedVectorDims, MaxHalfvecIndexedDims, MaxIndexedVectorDims)
 	}
 	return nil
 }
@@ -111,10 +144,18 @@ func vecTable(dims int) string { return fmt.Sprintf("chunk_embeddings_%d", dims)
 // if they do not exist yet. DDL is serialised with an advisory lock so
 // concurrent ingesters on several replicas do not race.
 //
-// Widths above MaxIndexedVectorDims get the table without the HNSW index,
-// which pgvector refuses to build for them: stores bound to such a model
-// before the limit was enforced keep working with an exact (sequential)
-// scan, and are reported at startup (see AuditRAGStores).
+// A table it creates for a width of 2001..4000 gets the halfvec HNSW index in
+// the same transaction (ADR-026), so it is born indexed. A table that already
+// exists is never indexed here -- that is the explicit reindex action
+// (StartVectorReindex), because building the index on a populated table takes
+// minutes and must not hide inside an ingest -- with one exception: a table
+// that is empty and that no store is bound to is indexed in place, since
+// there is nothing to wait for and no store left to ask for a reindex.
+//
+// Widths above MaxHalfvecIndexedDims, and widths above MaxIndexedVectorDims on
+// a pgvector without halfvec, get the table without any HNSW index: stores
+// bound to such a model before the limit was enforced keep working with an
+// exact (sequential) scan, and are reported at startup (see AuditRAGStores).
 func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 	if dims < 1 || dims > maxVectorDims {
 		return fmt.Errorf("embedding dimension %d out of range (1-%d)", dims, maxVectorDims)
@@ -131,18 +172,64 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 		return err
 	}
 	table := vecTable(dims)
-	stmts := []string{
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+	var exists bool
+	if err := tx.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", table).Scan(&exists); err != nil {
+		return err
+	}
+	// A table that exists gets no DDL here, not even an idempotent
+	// CREATE INDEX IF NOT EXISTS: that statement takes a ShareLock on the
+	// table before it looks, which waits for a running CREATE INDEX
+	// CONCURRENTLY of the halfvec index, and the build in turn waits for this
+	// transaction -- a deadlock that kills the build. The catalog is read
+	// instead, and the tables this code made always carry their indexes (the
+	// create is one transaction).
+	//
+	// Remembered as existing only when nothing is left to do for it later: a
+	// halfvec width that is not indexed is looked at again by the next write,
+	// since a reindex or the deletion of its last store changes the answer.
+	var stmts []string
+	cacheable := true
+	if !exists {
+		stmts = append(stmts, fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			chunk_id     BIGINT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
 			rag_store_id BIGINT NOT NULL,
 			embedding    vector(%d) NOT NULL
-		)`, table, dims),
+		)`, table, dims))
+		if dims <= MaxIndexedVectorDims {
+			stmts = append(stmts,
+				fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_hnsw ON %s USING hnsw (embedding vector_cosine_ops)", table, table))
+		}
+		stmts = append(stmts, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_store ON %s (rag_store_id)", table, table))
+		if halfvecIndexable(dims, s.caps) {
+			stmts = append(stmts, halfvecIndexDDL(dims, false))
+		}
+	} else if halfvecIndexable(dims, s.caps) {
+		state, _, err := s.halfvecIndexState(ctx, tx, dims)
+		if err != nil {
+			return err
+		}
+		cacheable = state == halfvecValid
+		if state == halfvecAbsent {
+			// Unreferenced and empty: index it now. The state read is the
+			// one a reindex would make, so an invalid or running build is
+			// left to that action, and the reindex lock (tried, never
+			// waited for) keeps this from meeting one that is just starting.
+			orphan, err := s.orphanVecTable(ctx, tx, dims)
+			if err != nil {
+				return err
+			}
+			var got bool
+			if orphan {
+				if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1, $2)", lockVecReindex, int32(dims)).Scan(&got); err != nil {
+					return err
+				}
+			}
+			if got {
+				stmts = append(stmts, halfvecIndexDDL(dims, false))
+				cacheable = true
+			}
+		}
 	}
-	if dims <= MaxIndexedVectorDims {
-		stmts = append(stmts,
-			fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_hnsw ON %s USING hnsw (embedding vector_cosine_ops)", table, table))
-	}
-	stmts = append(stmts, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s_store ON %s (rag_store_id)", table, table))
 	for _, q := range stmts {
 		if _, err := tx.Exec(ctx, q); err != nil {
 			return err
@@ -151,7 +238,9 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.vecTables.Store(dims, true)
+	if cacheable {
+		s.vecTables.Store(dims, true)
+	}
 	return nil
 }
 
@@ -171,8 +260,10 @@ func (s *Store) ReplaceDocumentChunks(ctx context.Context, doc *Document, chunks
 // stops with ErrEmbeddingConnectionChanged instead of writing vectors of
 // the old model into the store.
 //
-// The first write also binds the store to the vectors' width; a width above
-// MaxIndexedVectorDims is refused there (ErrVectorDimsUnsupported).
+// The first write also binds the store to the vectors' width; a width that
+// cannot be indexed is refused there (ErrVectorDimsUnsupported), and so is a
+// 2001..4000 width whose table has no valid halfvec index yet
+// (ErrVectorIndexMissing).
 func (s *Store) ReplaceDocumentChunksFrom(ctx context.Context, doc *Document, embeddingConnID int64,
 	chunks []*Chunk, owner string) error {
 	if len(chunks) == 0 {
@@ -196,6 +287,11 @@ func (s *Store) ReplaceDocumentChunksFrom(ctx context.Context, doc *Document, em
 	if err := checkStoreBinding(r.EmbeddingConnectionID, r.Dimensions, embeddingConnID, dims); err != nil {
 		return err
 	}
+	if r.Dimensions == 0 {
+		if err := s.checkBindable(ctx, s.pool, dims); err != nil {
+			return err
+		}
+	}
 	if err := s.ensureVecTable(ctx, dims); err != nil {
 		return fmt.Errorf("create embedding table: %w", err)
 	}
@@ -216,6 +312,10 @@ func (s *Store) ReplaceDocumentChunksFrom(ctx context.Context, doc *Document, em
 		return err
 	}
 	if curDims == 0 {
+		// The table exists now, so a width without a usable index shows up.
+		if err := s.checkBindable(ctx, tx, dims); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, "UPDATE rag_stores SET dimensions = $1 WHERE id = $2", dims, doc.RAGStoreID); err != nil {
 			return err
 		}
@@ -400,14 +500,30 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 	return hits, backend.Name(), err
 }
 
+// useHalfvecOrder reports whether the vector leg of a search on a table of
+// dims dimensions orders by the halfvec expression (ADR-026): the widths the
+// halfvec index covers, on a server that has halfvec. It does not look at
+// whether the index exists -- without it the same statement is answered by a
+// sequential scan, in the same order, so a store that has not been reindexed
+// yet and one that has return the same results.
+func (s *Store) useHalfvecOrder(dims int) bool { return halfvecIndexable(dims, s.caps) }
+
 // searchStatement builds the statement and arguments of one search. It is the
 // whole SQL half of runSearch, separate so tests can run it under planner
 // settings runSearch does not expose.
-func searchStatement(backend SearchBackend, r *RAGStore, query string, queryVec []float32, opts SearchOptions) (string, []any) {
+//
+// halfvec says the store's table is searched in halfvec order (see
+// useHalfvecOrder).
+func searchStatement(backend SearchBackend, r *RAGStore, query string, queryVec []float32, opts SearchOptions,
+	halfvec bool) (string, []any) {
 	table := vecTable(r.Dimensions)
 	vec := pgvector.NewVector(queryVec)
+	halfDims := 0
+	if halfvec {
+		halfDims = r.Dimensions
+	}
 	if opts.Mode != SearchVector {
-		return backend.HybridQuery(SearchParams{VecTable: table, Vector: vec, StoreID: r.ID,
+		return backend.HybridQuery(SearchParams{VecTable: table, HalfvecDims: halfDims, Vector: vec, StoreID: r.ID,
 			Candidates: opts.Candidates, MaxDistance: opts.MaxDistance, FTSConfig: opts.FTSConfig, Query: query,
 			Filter: opts.Filter})
 	}
@@ -415,7 +531,7 @@ func searchStatement(backend SearchBackend, r *RAGStore, query string, queryVec 
 	// reads a lexical index. The twelfth column is the constant lex
 	// score, so one scan loop serves both modes.
 	args := []any{vec, r.ID, opts.Candidates, opts.MaxDistance}
-	leg, filterArgs := vectorLeg(table, opts.Filter, len(args)+1)
+	leg, filterArgs := vectorLeg(table, halfDims, opts.Filter, len(args)+1)
 	args = append(args, filterArgs...)
 	return fmt.Sprintf(`
 			WITH %s
@@ -480,7 +596,7 @@ func (s *Store) runSearch(ctx context.Context, backend SearchBackend, r *RAGStor
 				"store that shares its embedding table with a larger one, can return fewer results than requested",
 			"rag_store", r.ID, "pgvector_version", s.caps.PgvectorVersion)
 	}
-	sql, args := searchStatement(backend, r, query, queryVec, opts)
+	sql, args := searchStatement(backend, r, query, queryVec, opts, s.useHalfvecOrder(r.Dimensions))
 	var rows pgx.Rows
 	// Query and rows.Err are the two places the server can reject the
 	// statement itself -- pgx reports a plan failure from either, depending

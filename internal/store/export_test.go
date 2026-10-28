@@ -102,7 +102,7 @@ func (s *Store) SearchUnderSettings(ctx context.Context, storeID int64, query st
 			return nil, "", err
 		}
 	}
-	sql, args := searchStatement(searchBackends[BackendPgvector], r, query, queryVec, opts)
+	sql, args := searchStatement(searchBackends[BackendPgvector], r, query, queryVec, opts, s.useHalfvecOrder(r.Dimensions))
 	// pgvector.Vector binds as text for EXPLAIN just as it does for the query.
 	prows, err := tx.Query(ctx, "EXPLAIN "+sql, args...)
 	if err != nil {
@@ -135,4 +135,23 @@ func (s *Store) SearchUnderSettings(ctx context.Context, storeID int64, query st
 		hits = append(hits, h)
 	}
 	return hits, plan, rows.Err()
+}
+
+// LockVecReindex is the advisory lock key of the halfvec index builds.
+const LockVecReindex = int32(lockVecReindex)
+
+// SetCaps replaces the detected server features and returns the function that
+// puts them back, so a test can act as a server with an older pgvector.
+func (s *Store) SetCaps(c Capabilities) func() {
+	prev := s.caps
+	s.caps = c
+	return func() { s.caps = prev }
+}
+
+// SetIndexMissingTTL changes how old the index-missing count may get before a
+// read recounts it, and returns the function that restores the default.
+func (s *Store) SetIndexMissingTTL(d time.Duration) func() {
+	prev := s.indexMissingTTL
+	s.indexMissingTTL = d
+	return func() { s.indexMissingTTL = prev }
 }

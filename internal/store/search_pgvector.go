@@ -33,7 +33,7 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 	// cannot support.
 	args := []any{p.Vector, p.StoreID, p.Candidates, p.MaxDistance, p.FTSConfig, ftsQuery(p.Query)}
 	first := len(args) + 1 // the filter's arguments follow the six above
-	vec, filterArgs := vectorLeg(p.VecTable, p.Filter, first)
+	vec, filterArgs := vectorLeg(p.VecTable, p.HalfvecDims, p.Filter, first)
 	args = append(args, filterArgs...)
 	// The lexical leg takes the same filter, on its own LIMIT: the documents
 	// the filter lets through, as a subquery of ids.

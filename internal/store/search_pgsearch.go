@@ -274,7 +274,7 @@ func (pgSearchBackend) HybridQuery(p SearchParams) (string, []any) {
 		args = append(args, p.Query)
 	}
 	first := len(args) + 1 // the filter's arguments follow
-	vec, filterArgs := vectorLeg(p.VecTable, p.Filter, first)
+	vec, filterArgs := vectorLeg(p.VecTable, p.HalfvecDims, p.Filter, first)
 	args = append(args, filterArgs...)
 	// The metadata filter sits next to the @@@ predicate, in the same WHERE and
 	// therefore before the LIMIT: a filter applied after it would shrink the

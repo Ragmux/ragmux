@@ -34,6 +34,14 @@ func (c Capabilities) SupportsIterativeScan() bool {
 	return versionAtLeast(c.PgvectorVersion, 0, 8, 0)
 }
 
+// SupportsHalfvec reports whether the installed pgvector has the halfvec type
+// and its HNSW operator classes (0.7.0 and later), which is what lets a
+// 2001..4000 wide embedding be indexed (ADR-026). An unreadable version says
+// no: the width limit then stays at MaxIndexedVectorDims.
+func (c Capabilities) SupportsHalfvec() bool {
+	return versionAtLeast(c.PgvectorVersion, 0, 7, 0)
+}
+
 // versionAtLeast compares a dotted numeric version ("0.8.1", "0.8.0-dev")
 // with major.minor.patch. Anything that does not start with numbers reads as
 // older.

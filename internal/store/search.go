@@ -41,6 +41,10 @@ const rrfK = 60
 type SearchParams struct {
 	// VecTable is the chunk_embeddings_<dims> table of the store.
 	VecTable string
+	// HalfvecDims, when not 0, is the width of a 2001..4000 table whose
+	// vector leg orders by the halfvec expression the HNSW index is on
+	// (ADR-026). The distances still come from the full-precision vector.
+	HalfvecDims int
 	// Vector is the query embedding, ready to bind as $1.
 	Vector any
 	// StoreID scopes both candidate lists to one rag store.
@@ -76,9 +80,19 @@ type SearchParams struct {
 // "+ 0" is pgvector's own idiom for that re-sort (an expression the planner
 // cannot match to the index order).
 //
+// halfDims, when not 0, is the width of a table that is indexed through
+// embedding::halfvec(N) (ADR-026): the leg then picks its candidates in that
+// order, which is what lets the planner use the index (and, with no index,
+// ranks them the same way by a sequential scan), and still returns the cosine
+// distance of the stored full-precision vector -- SearchHit.Distance and
+// max_distance keep their meaning. The re-sort in "v" puts the candidates in
+// exact order. The query vector is cast vector -> halfvec explicitly so the
+// parameter is always typed vector and the distance is never taken from a
+// half-precision copy of it.
+//
 // first is the number of the first free placeholder for the filter's
 // arguments; the returned arguments are for $first onwards.
-func vectorLeg(table string, f *MetadataFilter, first int) (string, []any) {
+func vectorLeg(table string, halfDims int, f *MetadataFilter, first int) (string, []any) {
 	var filter string
 	var args []any
 	if !f.Empty() {
@@ -88,15 +102,19 @@ func vectorLeg(table string, f *MetadataFilter, first int) (string, []any) {
 				  AND e.chunk_id IN (SELECT fc.id FROM chunks fc JOIN documents fd ON fd.id = fc.document_id
 				                     WHERE fc.rag_store_id = $2 AND ` + pred + `)`
 	}
+	order := "distance"
+	if halfDims > 0 {
+		order = fmt.Sprintf("e.embedding::halfvec(%[1]d) <=> $1::vector::halfvec(%[1]d)", halfDims)
+	}
 	return fmt.Sprintf(`vc AS MATERIALIZED (
 				SELECT e.chunk_id, e.embedding <=> $1::vector AS distance
 				FROM %s e
 				WHERE e.rag_store_id = $2%s
-				ORDER BY distance
+				ORDER BY %s
 				LIMIT $3),
 			v AS (
 				SELECT chunk_id, distance, ROW_NUMBER() OVER (ORDER BY distance + 0, chunk_id) AS rank
-				FROM vc)`, table, filter), args
+				FROM vc)`, table, filter, order), args
 }
 
 // SearchBackend builds the SQL for one hybrid search.

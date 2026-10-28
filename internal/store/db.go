@@ -43,6 +43,11 @@ const (
 	LockJanitor   int64 = 0x7261676d75780002 // "ragmux" + 2
 	lockVecTables int32 = 0x72616701
 	lockBM25Index int32 = 0x72616702
+	// lockVecReindex is held (session level, on the connection that runs it)
+	// for as long as a halfvec index build of one width is running, so two
+	// replicas never build the same index and a half-built one is not mistaken
+	// for an abandoned one. The second key is the width.
+	lockVecReindex int32 = 0x72616703
 )
 
 // OpenConfig carries everything Open needs.
@@ -80,6 +85,17 @@ type Store struct {
 	bm25Ready atomic.Bool
 	// indexMissing counts stores without an HNSW index (see AuditRAGStores).
 	indexMissing atomic.Int64
+	// indexMissingAt is when indexMissing was last counted (unix nanoseconds)
+	// and indexRefreshing guards the one recount a stale read may start;
+	// indexMissingTTL overrides indexMissingMaxAge (tests).
+	indexMissingAt  atomic.Int64
+	indexRefreshing atomic.Bool
+	indexMissingTTL time.Duration
+	// bg is the context of work that outlives the request that started it
+	// (the halfvec index builds); Close cancels it and waits on bgWG.
+	bg       context.Context
+	bgCancel context.CancelFunc
+	bgWG     sync.WaitGroup
 }
 
 // Open connects to PostgreSQL, ensures the vector extension exists, runs
@@ -141,6 +157,7 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	s := &Store{pool: pool, ServerVersion: version, SecretKeySource: source, cipher: c, log: log, caps: caps, pgSearchTok: cfg.PgSearchTokenizer}
+	s.bg, s.bgCancel = context.WithCancel(context.Background())
 	// Before any stored credential is read (UpgradeConnectionKeys is the
 	// first caller and would fail with a raw decrypt error): prove this
 	// process holds the key the database was written with.
@@ -155,8 +172,24 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 	return s, nil
 }
 
-// Close releases the connection pool.
+// bgDrainTimeout bounds how long Close waits for background work to notice
+// its cancellation.
+const bgDrainTimeout = 10 * time.Second
+
+// Close stops background work (a running index build is cancelled and leaves
+// an invalid index behind, which the next reindex cleans up) and releases the
+// connection pool.
 func (s *Store) Close() error {
+	if s.bgCancel != nil {
+		s.bgCancel()
+		done := make(chan struct{})
+		go func() { s.bgWG.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(bgDrainTimeout):
+			s.log.Warn("background index build did not stop in time")
+		}
+	}
 	s.pool.Close()
 	return nil
 }
