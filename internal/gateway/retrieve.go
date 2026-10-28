@@ -25,6 +25,10 @@ type retrieveRequest struct {
 	Query string `json:"query"`
 	// TopK is how many hits to return; zero uses the store's own top_k.
 	TopK int `json:"top_k"`
+	// Filter restricts the search to documents whose metadata matches
+	// (ADR-025): {"key": value, "key2": {"in": [...]}}. Kept raw here and
+	// parsed in decodeRetrieve, where a bad one is answered with a 400.
+	Filter json.RawMessage `json:"filter"`
 }
 
 // retrieve is POST /v1/retrieve: a search of the project's RAG store through
@@ -38,7 +42,7 @@ func (g *Gateway) retrieve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.span.End()
 
-	req, ok := g.decodeRetrieve(c)
+	req, filter, ok := g.decodeRetrieve(c)
 	if !ok {
 		return
 	}
@@ -53,20 +57,31 @@ func (g *Gateway) retrieve(w http.ResponseWriter, r *http.Request) {
 	defer g.record(c)
 
 	prov, rerankConn := g.rerankProvider(c, rs)
-	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: req.Query, topK: req.TopK, prov: prov, rerankConn: rerankConn})
+	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: req.Query, topK: req.TopK, filter: filter,
+		prov: prov, rerankConn: rerankConn})
 }
 
 // decodeRetrieve reads and validates the request body, answering the client
 // itself when it cannot.
-func (g *Gateway) decodeRetrieve(c *call) (retrieveRequest, bool) {
+func (g *Gateway) decodeRetrieve(c *call) (retrieveRequest, *store.MetadataFilter, bool) {
 	var req retrieveRequest
 	body, ok := g.readBody(c)
 	if !ok {
-		return req, false
+		return req, nil, false
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
-		return req, false
+		return req, nil, false
+	}
+	// An absent filter is no filter; one that is present must be in the
+	// grammar, "null" and the empty string included.
+	var filter *store.MetadataFilter
+	if req.Filter != nil {
+		var err error
+		if filter, err = store.ParseMetadataFilter(req.Filter); err != nil {
+			writeError(c.w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return req, nil, false
+		}
 	}
 	switch {
 	case strings.TrimSpace(req.Query) == "":
@@ -76,9 +91,9 @@ func (g *Gateway) decodeRetrieve(c *call) (retrieveRequest, bool) {
 	case req.TopK < 0 || req.TopK > maxRetrieveTopK:
 		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "top_k must be 0 (the store's default) or between 1 and 50")
 	default:
-		return req, true
+		return req, filter, true
 	}
-	return req, false
+	return req, nil, false
 }
 
 // retrieveTargets loads the project's RAG store and installs its embedding
@@ -141,7 +156,9 @@ type retrieveInvocation struct {
 	rs    *store.RAGStore
 	query string
 	topK  int
-	prov  provider.Provider
+	// filter is the request's metadata filter; nil restricts nothing.
+	filter *store.MetadataFilter
+	prov   provider.Provider
 	// rerankConn is the chat connection prov was built from; nil with prov.
 	rerankConn *store.ModelConnection
 }
@@ -159,7 +176,7 @@ func (in *retrieveInvocation) attempt(c *call, conn *store.ModelConnection) erro
 		rerankSpend = &rerankUsageProvider{Provider: in.prov}
 		prov = rerankSpend
 	}
-	res, err := in.gw.Retriever.SearchWith(ctx, in.rs, in.query, in.topK, prov, model)
+	res, err := in.gw.Retriever.SearchWithFilter(ctx, in.rs, in.query, in.topK, prov, model, in.filter)
 	if res != nil {
 		c.obs.upstream = time.Duration(res.RetrievalLatencyMS) * time.Millisecond
 	}
@@ -167,9 +184,9 @@ func (in *retrieveInvocation) attempt(c *call, conn *store.ModelConnection) erro
 		return retrievalError(c, err)
 	}
 	c.obs.noteResponseModel("", "", conn.ModelName)
-	// Nothing was embedded for an empty store, so there is nothing to bill or
-	// estimate.
-	if in.rs.ChunkCount > 0 {
+	// Nothing was embedded for an empty store, or for a filter that matched no
+	// document, so there is nothing to bill or estimate.
+	if in.rs.ChunkCount > 0 && !res.FilterMatchedNothing {
 		fillUsage(c.rec, res.EmbedUsage, len(in.query), 0)
 	}
 	// An LLM rerank is a chat call on the project's chat connection that a
@@ -195,11 +212,26 @@ func (in *retrieveInvocation) attempt(c *call, conn *store.ModelConnection) erro
 	c.rec.RAGUsed, c.rec.RAGHits = true, len(res.Hits)
 	c.rec.StatusCode = http.StatusOK
 
+	// The documents' own metadata (ADR-025) rides along on every hit. It is
+	// read after the search, for the hit documents only, so the search SQL and
+	// the chat path, whose sources carry no metadata, are unchanged.
+	docIDs := make([]int64, 0, len(res.Hits))
+	for _, h := range res.Hits {
+		docIDs = append(docIDs, h.DocumentID)
+	}
+	docMeta, err := in.gw.Store.DocumentMetadataByID(ctx, docIDs)
+	if err != nil {
+		return retrievalError(c, err)
+	}
 	hits := make([]retrieveHit, len(res.Hits))
 	for i, h := range res.Hits {
+		dm := docMeta[h.DocumentID]
+		if len(dm) == 0 {
+			dm = json.RawMessage("{}")
+		}
 		hits[i] = retrieveHit{ChunkID: h.ChunkID, DocumentID: h.DocumentID, Content: h.Content, Score: h.Score,
 			Distance: h.Distance, Metadata: retrieveMetadata{Filename: h.Filename, Section: h.Section, Page: h.Page,
-				ChunkIndex: h.Index}}
+				ChunkIndex: h.Index}, DocumentMetadata: dm}
 	}
 	c.w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(c.w).Encode(retrieveResponse{Object: "retrieval", Hits: hits, Mode: res.Mode,
@@ -277,6 +309,9 @@ type retrieveHit struct {
 	Score      float64          `json:"score"`
 	Distance   float64          `json:"distance"`
 	Metadata   retrieveMetadata `json:"metadata"`
+	// DocumentMetadata is the metadata of the hit's document (ADR-025), "{}"
+	// when it has none.
+	DocumentMetadata json.RawMessage `json:"document_metadata"`
 }
 
 type retrieveResponse struct {

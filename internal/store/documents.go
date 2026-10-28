@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -34,12 +35,15 @@ type Document struct {
 	// Attempts counts how often a replica has claimed this document since
 	// it was last queued. A document past the attempt cap is skipped by the
 	// claim query, so one poisonous file cannot walk the cluster.
-	Attempts  int    `json:"attempts"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	Attempts int `json:"attempts"`
+	// Metadata is the document's filterable attributes (ADR-025): a flat JSON
+	// object, '{}' when it has none. See ValidateMetadata for the shape.
+	Metadata  json.RawMessage `json:"metadata"`
+	CreatedAt string          `json:"created_at"`
+	UpdatedAt string          `json:"updated_at"`
 }
 
-const docCols = "id, rag_store_id, filename, mime, size_bytes, status, error, chunk_count, page_count, progress_percent, attempts, created_at, updated_at"
+const docCols = "id, rag_store_id, filename, mime, size_bytes, status, error, chunk_count, page_count, progress_percent, attempts, metadata, created_at, updated_at"
 
 // docColsD is docCols qualified for statements that join another relation
 // and would otherwise read ambiguously.
@@ -50,7 +54,7 @@ func scanDoc(row interface{ Scan(...any) error }) (*Document, error) {
 	var created, updated time.Time
 	var progress int16
 	err := row.Scan(&d.ID, &d.RAGStoreID, &d.Filename, &d.Mime, &d.SizeBytes, &d.Status, &d.Error,
-		&d.ChunkCount, &d.PageCount, &progress, &d.Attempts, &created, &updated)
+		&d.ChunkCount, &d.PageCount, &progress, &d.Attempts, &d.Metadata, &created, &updated)
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -60,13 +64,18 @@ func scanDoc(row interface{ Scan(...any) error }) (*Document, error) {
 }
 
 // CreateDocument records a pending document together with its raw bytes.
+// d.Metadata, when set, must come from ValidateMetadata; empty means '{}'.
 func (s *Store) CreateDocument(ctx context.Context, d *Document, content []byte) (*Document, error) {
 	if content == nil {
 		content = []byte{}
 	}
-	return scanDoc(s.pool.QueryRow(ctx, `INSERT INTO documents (rag_store_id, filename, mime, size_bytes, content, status)
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+docCols,
-		d.RAGStoreID, d.Filename, d.Mime, d.SizeBytes, content, DocPending))
+	meta := []byte(d.Metadata)
+	if len(meta) == 0 {
+		meta = []byte("{}")
+	}
+	return scanDoc(s.pool.QueryRow(ctx, `INSERT INTO documents (rag_store_id, filename, mime, size_bytes, content, status, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) RETURNING `+docCols,
+		d.RAGStoreID, d.Filename, d.Mime, d.SizeBytes, content, DocPending, meta))
 }
 
 // DocumentContent returns the raw uploaded bytes of a document.

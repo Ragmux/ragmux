@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,50 @@ type Capabilities struct {
 	PgSearch bool
 	// PgSearchVersion is the installed extension version, empty when absent.
 	PgSearchVersion string
+	// PgvectorVersion is the installed pgvector version (pg_extension
+	// extversion), empty when it cannot be read. HNSW iterative scans, which
+	// keep a filtered search full, exist from 0.8.0 (see
+	// SupportsIterativeScan).
+	PgvectorVersion string
+}
+
+// SupportsIterativeScan reports whether the installed pgvector has
+// hnsw.iterative_scan (0.8.0 and later). An unreadable version says no: the
+// setting is then left alone rather than sent to a server that may reject it.
+func (c Capabilities) SupportsIterativeScan() bool {
+	return versionAtLeast(c.PgvectorVersion, 0, 8, 0)
+}
+
+// versionAtLeast compares a dotted numeric version ("0.8.1", "0.8.0-dev")
+// with major.minor.patch. Anything that does not start with numbers reads as
+// older.
+func versionAtLeast(v string, major, minor, patch int) bool {
+	want := [3]int{major, minor, patch}
+	var got [3]int
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	for i, p := range parts {
+		end := 0
+		for end < len(p) && p[end] >= '0' && p[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return false
+		}
+		n, err := strconv.Atoi(p[:end])
+		if err != nil {
+			return false
+		}
+		got[i] = n
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return got[i] > want[i]
+		}
+	}
+	return true
 }
 
 // Caps reports the optional server features detected at Open.
@@ -32,8 +77,9 @@ func (s *Store) Caps() Capabilities { return s.caps }
 func detectCapabilities(ctx context.Context, conn *pgx.Conn, log *slog.Logger) Capabilities {
 	var caps Capabilities
 	err := conn.QueryRow(ctx,
-		`SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_search'), '')`,
-	).Scan(&caps.PgSearchVersion)
+		`SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'pg_search'), ''),
+		        COALESCE((SELECT extversion FROM pg_extension WHERE extname = 'vector'), '')`,
+	).Scan(&caps.PgSearchVersion, &caps.PgvectorVersion)
 	if err != nil {
 		log.Warn("detect search backends: query pg_extension", "err", err)
 		return Capabilities{}
@@ -50,7 +96,8 @@ func detectCapabilities(ctx context.Context, conn *pgx.Conn, log *slog.Logger) C
 	log.Info("search backends",
 		"pgvector", true,
 		"pg_search", caps.PgSearch,
-		"pg_search_version", caps.PgSearchVersion)
+		"pg_search_version", caps.PgSearchVersion,
+		"pgvector_version", caps.PgvectorVersion)
 	return caps
 }
 

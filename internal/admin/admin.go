@@ -157,6 +157,7 @@ func (a *Admin) authenticated(r chi.Router) {
 	read.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
 	editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
 	read.Get("/api/documents/{id}", a.getDocument)
+	editor.Patch("/api/documents/{id}", a.updateDocumentMetadata)
 	editor.Delete("/api/documents/{id}", a.deleteDocument)
 	editor.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
 
@@ -1301,10 +1302,21 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		RerankBackend      string   `json:"rerank_backend"`
 		RerankConnectionID *int64   `json:"rerank_connection_id"`
 		MaxDistance        *float64 `json:"max_distance"`
+		// Filter limits the search to documents whose metadata matches
+		// (ADR-025), the same grammar as /v1/retrieve.
+		Filter json.RawMessage `json:"filter"`
 	}
 	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Query) == "" {
 		writeErr(w, http.StatusBadRequest, "query is required")
 		return
+	}
+	var filter *store.MetadataFilter
+	if in.Filter != nil {
+		var err error
+		if filter, err = store.ParseMetadataFilter(in.Filter); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if in.Mode != "" {
 		if in.Mode != store.SearchVector && in.Mode != store.SearchHybrid {
@@ -1388,7 +1400,7 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		searchStore = &cp
 	}
 	start := time.Now()
-	res, err := a.Retriever.SearchWith(r.Context(), searchStore, in.Query, in.TopK, prov, model)
+	res, err := a.Retriever.SearchWithFilter(r.Context(), searchStore, in.Query, in.TopK, prov, model, filter)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1462,6 +1474,22 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "no file field in form (use 'file')")
 		return
 	}
+	// The optional metadata field (JSON) applies to every file of the request.
+	// It is validated before the first file is written, so a bad one leaves
+	// nothing behind.
+	var metadata json.RawMessage
+	var metadataKeys []string
+	if vals := r.MultipartForm.Value["metadata"]; len(vals) > 1 {
+		writeErr(w, http.StatusBadRequest, "the metadata field may be given once")
+		return
+	} else if len(vals) == 1 && strings.TrimSpace(vals[0]) != "" {
+		metadata, err = store.ValidateMetadata(json.RawMessage(vals[0]))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		metadataKeys = store.MetadataKeys(metadata)
+	}
 	var created []*store.Document
 	for _, fh := range files {
 		name := filepath.Base(fh.Filename)
@@ -1495,7 +1523,7 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		doc, err := a.Store.CreateDocument(r.Context(), &store.Document{RAGStoreID: id, Filename: name,
-			Mime: fh.Header.Get("Content-Type"), SizeBytes: int64(len(data))}, data)
+			Mime: fh.Header.Get("Content-Type"), SizeBytes: int64(len(data)), Metadata: metadata}, data)
 		if err != nil {
 			a.fail(w, err)
 			return
@@ -1506,7 +1534,12 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
-		a.audit(r, "document.upload", "document", ptr(doc.ID), map[string]any{"rag_store_id": id, "filename": name, "size_bytes": len(data)})
+		upload := map[string]any{"rag_store_id": id, "filename": name, "size_bytes": len(data)}
+		if len(metadataKeys) > 0 {
+			// Key names only: the values are the customer's data.
+			upload["metadata_keys"] = metadataKeys
+		}
+		a.audit(r, "document.upload", "document", ptr(doc.ID), upload)
 		created = append(created, doc)
 	}
 	if len(created) == 1 {
@@ -1523,6 +1556,36 @@ func (a *Admin) getDocument(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+// updateDocumentMetadata replaces a document's metadata (ADR-025). It is one
+// row update: no chunk is rewritten and the document is not reprocessed, so
+// the next filtered search sees the change.
+func (a *Admin) updateDocumentMetadata(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	var in struct {
+		Metadata json.RawMessage `json:"metadata"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "expected a JSON body {\"metadata\": {...}}")
+		return
+	}
+	if in.Metadata == nil {
+		writeErr(w, http.StatusBadRequest, "metadata is required (send {} to clear it)")
+		return
+	}
+	meta, err := store.ValidateMetadata(in.Metadata)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	d, err := a.Store.SetDocumentMetadata(r.Context(), id, meta)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.audit(r, "document.metadata_update", "document", ptr(id), map[string]any{"metadata_keys": store.MetadataKeys(meta)})
 	writeJSON(w, http.StatusOK, d)
 }
 

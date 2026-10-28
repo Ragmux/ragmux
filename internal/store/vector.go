@@ -66,6 +66,11 @@ type SearchOptions struct {
 	// Candidates caps the vector and full-text candidate lists and the
 	// number of fused results returned.
 	Candidates int
+	// Filter restricts the search to documents whose metadata it lets through
+	// (ADR-025). It is applied to every candidate list before that list's
+	// LIMIT, so a filtered search still returns Candidates rows whenever that
+	// many chunks match. Nil or empty restricts nothing.
+	Filter *MetadataFilter
 }
 
 // vecTable names the embedding table for one vector width. Embeddings of
@@ -395,6 +400,35 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 	return hits, backend.Name(), err
 }
 
+// searchStatement builds the statement and arguments of one search. It is the
+// whole SQL half of runSearch, separate so tests can run it under planner
+// settings runSearch does not expose.
+func searchStatement(backend SearchBackend, r *RAGStore, query string, queryVec []float32, opts SearchOptions) (string, []any) {
+	table := vecTable(r.Dimensions)
+	vec := pgvector.NewVector(queryVec)
+	if opts.Mode != SearchVector {
+		return backend.HybridQuery(SearchParams{VecTable: table, Vector: vec, StoreID: r.ID,
+			Candidates: opts.Candidates, MaxDistance: opts.MaxDistance, FTSConfig: opts.FTSConfig, Query: query,
+			Filter: opts.Filter})
+	}
+	// Vector-only retrieval is identical under every backend: it never
+	// reads a lexical index. The twelfth column is the constant lex
+	// score, so one scan loop serves both modes.
+	args := []any{vec, r.ID, opts.Candidates, opts.MaxDistance}
+	leg, filterArgs := vectorLeg(table, opts.Filter, len(args)+1)
+	args = append(args, filterArgs...)
+	return fmt.Sprintf(`
+			WITH %s
+			SELECT v.chunk_id, c.document_id, c.idx, c.content, d.filename,
+			       COALESCE(c.metadata->>'section', ''), COALESCE((c.metadata->>'page')::int, 0),
+			       v.distance, 1.0/(%d+v.rank), v.rank, 0, 0::float8
+			FROM v
+			JOIN chunks c ON c.id = v.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE ($4::float8 = 0 OR v.distance <= $4::float8)
+			ORDER BY v.distance, v.chunk_id`, leg, rrfK), args
+}
+
 // errLexicalQuery marks the one failure the fallback may act on: the fused
 // statement a backend built was rejected by the server. Everything else
 // runSearch can return -- a transaction that would not begin, a session
@@ -423,38 +457,31 @@ func (s *Store) runSearch(ctx context.Context, backend SearchBackend, r *RAGStor
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL hnsw.ef_search = %d", efSearch)); err != nil {
 		return nil, err
 	}
-	table := vecTable(r.Dimensions)
-	vec := pgvector.NewVector(queryVec)
-	var (
-		rows pgx.Rows
-		sql  string
-		args []any
-	)
-	if opts.Mode == SearchVector {
-		// Vector-only retrieval is identical under every backend: it never
-		// reads a lexical index. The twelfth column is the constant lex
-		// score, so one scan loop serves both modes.
-		sql = fmt.Sprintf(`
-			WITH v AS (
-				SELECT e.chunk_id, e.embedding <=> $1::vector AS distance,
-				       ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
-				FROM %s e
-				WHERE e.rag_store_id = $2
-				ORDER BY e.embedding <=> $1::vector
-				LIMIT $3)
-			SELECT v.chunk_id, c.document_id, c.idx, c.content, d.filename,
-			       COALESCE(c.metadata->>'section', ''), COALESCE((c.metadata->>'page')::int, 0),
-			       v.distance, 1.0/(%d+v.rank), v.rank, 0, 0::float8
-			FROM v
-			JOIN chunks c ON c.id = v.chunk_id
-			JOIN documents d ON d.id = c.document_id
-			WHERE ($4::float8 = 0 OR v.distance <= $4::float8)
-			ORDER BY v.distance, v.chunk_id`, table, rrfK)
-		args = []any{vec, r.ID, opts.Candidates, opts.MaxDistance}
+	// Filtered or not, every search walks the HNSW index in iterative mode.
+	// The embedding tables are shared by all stores of one width, so even an
+	// unfiltered search is filtered by rag_store_id after the index scan, and
+	// a small store beside a big one would otherwise get back only the few
+	// candidates of ef_search that happen to be its own. relaxed_order keeps
+	// scanning until LIMIT rows survive the filters; the legs re-sort by
+	// distance (see vectorLeg). hnsw.max_scan_tuples stays at its default so
+	// a filter nothing matches cannot scan the whole index.
+	if s.caps.SupportsIterativeScan() {
+		if _, err := tx.Exec(ctx, "SET LOCAL hnsw.iterative_scan = relaxed_order"); err != nil {
+			return nil, err
+		}
+	} else if s.caps.PgvectorVersion == "" {
+		s.warnBackendOnce(r.ID, warnIterativeScan,
+			"the pgvector version could not be read, so hnsw.iterative_scan is left unset: filtered searches, and "+
+				"searches in a store that shares its embedding table with a larger one, can return fewer results than requested",
+			"rag_store", r.ID)
 	} else {
-		sql, args = backend.HybridQuery(SearchParams{VecTable: table, Vector: vec, StoreID: r.ID,
-			Candidates: opts.Candidates, MaxDistance: opts.MaxDistance, FTSConfig: opts.FTSConfig, Query: query})
+		s.warnBackendOnce(r.ID, warnIterativeScan,
+			"pgvector is older than 0.8.0 and has no iterative index scan: filtered searches, and searches in a "+
+				"store that shares its embedding table with a larger one, can return fewer results than requested",
+			"rag_store", r.ID, "pgvector_version", s.caps.PgvectorVersion)
 	}
+	sql, args := searchStatement(backend, r, query, queryVec, opts)
+	var rows pgx.Rows
 	// Query and rows.Err are the two places the server can reject the
 	// statement itself -- pgx reports a plan failure from either, depending
 	// on how far the protocol got -- so both carry errLexicalQuery and

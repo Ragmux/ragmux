@@ -1,0 +1,17 @@
+-- Document-level metadata (ADR-025): the single source of truth for filtering a
+-- search by document attributes (language, product, tenant, version). Chunks
+-- carry no copy, so editing it is one row update and no reprocessing.
+--
+-- Add-only (ADR-001): the column is NOT NULL with a constant default, so
+-- PostgreSQL adds it without rewriting the table and every row written before
+-- this migration, or by a replica that predates it, reads as '{}'.
+--
+-- The shape (flat object, scalar or scalar-array values, size limits) is
+-- enforced by the application on write, not by a CHECK: a CHECK would need a
+-- migration for every limit that moves. chunks.metadata is a different thing
+-- (parser output: title, section, page) and does not change.
+--
+-- Rollback (manual, nothing else depends on the column):
+--   DROP INDEX IF EXISTS idx_documents_metadata;
+--   ALTER TABLE documents DROP COLUMN metadata;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;

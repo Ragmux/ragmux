@@ -832,6 +832,9 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 		case opts.IncludeContext:
 			opts.Warnings = append(opts.Warnings, "ragmux.include_context has no effect: this project has no RAG store; the sources and the context are empty")
 		}
+		if !opts.Filter.Empty() {
+			opts.Warnings = append(opts.Warnings, "ragmux.filter has no effect: this project has no RAG store")
+		}
 	}
 	prep := chatPrep{opts: opts}
 
@@ -863,6 +866,11 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 			p.QueryStrategy == store.QueryStrategyCondense, req.Messages)
 	}
 	if prep.skipReason != "" {
+		// A filter on a request whose retrieval does not run narrows nothing.
+		if !opts.Filter.Empty() {
+			opts.Warnings = append(opts.Warnings, "ragmux.filter has no effect: retrieval was skipped for this request ("+prep.skipReason+")")
+			prep.opts = opts
+		}
 		g.Metrics.RecordRAGSkipped(c.projectID, prep.skipReason)
 		w.Header().Set("x-ragmux-rag-skip", prep.skipReason)
 		w.Header().Set("x-ragmux-rag-hits", "0")
@@ -888,7 +896,7 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 				rerankSpend = &rerankUsageProvider{Provider: prov}
 				searchProv = rerankSpend
 			}
-			res, err := g.Retriever.SearchWith(ctx, rs, q, rs.TopK, searchProv, c.conn.ModelName)
+			res, err := g.Retriever.SearchWithFilter(ctx, rs, q, rs.TopK, searchProv, c.conn.ModelName, opts.Filter)
 			var hits []store.SearchHit
 			if res != nil {
 				hits = res.Hits
@@ -949,6 +957,9 @@ type ragmuxRequest struct {
 	InlineSources bool
 	// RetrievalOff is ragmux.retrieval = "off": skip retrieval for this request.
 	RetrievalOff bool
+	// Filter is ragmux.filter (ADR-025): retrieval is limited to the documents
+	// whose metadata matches. Nil when absent. It only narrows.
+	Filter *store.MetadataFilter
 	// Warnings are the texts of the Warning headers the object earns.
 	Warnings []string
 }
@@ -1013,10 +1024,21 @@ func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 		}
 	}
 
+	// A filter outside the grammar is refused like a malformed object, not
+	// ignored: dropping it would answer from documents the caller meant to
+	// exclude (ADR-024, ADR-025).
+	if v, ok := fields["filter"]; ok {
+		f, err := store.ParseMetadataFilter(v)
+		if err != nil {
+			return o, errors.New("ragmux.filter: " + strings.TrimPrefix(err.Error(), store.ErrInvalidMetadata.Error()+": "))
+		}
+		o.Filter = f
+	}
+
 	// Map order is random; the headers must not be.
 	var rest []string
 	for k := range fields {
-		if k != "include_context" && k != "retrieval" && k != "sources" {
+		if k != "include_context" && k != "retrieval" && k != "sources" && k != "filter" {
 			rest = append(rest, k)
 		}
 	}

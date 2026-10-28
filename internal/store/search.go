@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -55,6 +56,47 @@ type SearchParams struct {
 	FTSConfig string
 	// Query is the raw user query. Each backend prepares it its own way.
 	Query string
+	// Filter restricts the search to the documents whose metadata it lets
+	// through (ADR-025); nil or empty restricts nothing. It is applied inside
+	// every candidate leg, before that leg's LIMIT -- a filter applied to the
+	// fused result would hand back fewer than Candidates rows whenever the
+	// filtered-out documents crowd the unfiltered top.
+	Filter *MetadataFilter
+}
+
+// vectorLeg is the vector candidate list shared by every query shape: the
+// nearest chunks of the store (and of the filter's documents) as "v", with
+// rank and cosine distance.
+//
+// The nearest-neighbour scan sits in a MATERIALIZED CTE of its own and the
+// ranks are numbered in a second one. With hnsw.iterative_scan =
+// relaxed_order (see Store.runSearch) the index hands rows back only roughly
+// in distance order, so the order the scan produces must not be trusted by
+// the window function: the re-sort on distance is what makes the rank exact.
+// "+ 0" is pgvector's own idiom for that re-sort (an expression the planner
+// cannot match to the index order).
+//
+// first is the number of the first free placeholder for the filter's
+// arguments; the returned arguments are for $first onwards.
+func vectorLeg(table string, f *MetadataFilter, first int) (string, []any) {
+	var filter string
+	var args []any
+	if !f.Empty() {
+		var pred string
+		pred, args = f.predicate("fd", first)
+		filter = `
+				  AND e.chunk_id IN (SELECT fc.id FROM chunks fc JOIN documents fd ON fd.id = fc.document_id
+				                     WHERE fc.rag_store_id = $2 AND ` + pred + `)`
+	}
+	return fmt.Sprintf(`vc AS MATERIALIZED (
+				SELECT e.chunk_id, e.embedding <=> $1::vector AS distance
+				FROM %s e
+				WHERE e.rag_store_id = $2%s
+				ORDER BY distance
+				LIMIT $3),
+			v AS (
+				SELECT chunk_id, distance, ROW_NUMBER() OVER (ORDER BY distance + 0, chunk_id) AS rank
+				FROM vc)`, table, filter), args
 }
 
 // SearchBackend builds the SQL for one hybrid search.
@@ -153,6 +195,8 @@ const (
 	warnPrepare = "prepare"
 	// warnQuery: the backend built its query and the server rejected it.
 	warnQuery = "query"
+	// warnIterativeScan: pgvector is too old for hnsw.iterative_scan.
+	warnIterativeScan = "iterative_scan"
 )
 
 // warnBackendOnce logs a backend warning unless the same one is already

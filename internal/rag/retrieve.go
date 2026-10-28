@@ -81,6 +81,10 @@ type Result struct {
 	// EmbedUsage is what the embedding upstream reported for the query; nil
 	// when it reported none or no embedding call was made.
 	EmbedUsage *provider.Usage
+	// FilterMatchedNothing is true when the metadata filter matched no
+	// document of the store, so the search ended before the query was
+	// embedded: nothing was spent and nothing should be billed or estimated.
+	FilterMatchedNothing bool
 	// RerankSpend is what an API reranker's call used; nil when no such call
 	// was made. The LLM backend is not counted here: it spends through the
 	// chat provider the caller passed in.
@@ -102,6 +106,16 @@ func (r *Retriever) Search(ctx context.Context, rs *store.RAGStore, query string
 // SearchWith is Search plus the mode, the effective backend and the rerank
 // outcome.
 func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query string, k int, prov provider.Provider, model string) (*Result, error) {
+	return r.SearchWithFilter(ctx, rs, query, k, prov, model, nil)
+}
+
+// SearchWithFilter is SearchWith restricted to the documents whose metadata
+// the filter lets through (ADR-025); a nil or empty filter restricts nothing.
+// A filter no document of the store matches answers with no hits before the
+// query is embedded: there is nothing to rank, so the embedding call and its
+// cost are skipped.
+func (r *Retriever) SearchWithFilter(ctx context.Context, rs *store.RAGStore, query string, k int, prov provider.Provider, model string,
+	filter *store.MetadataFilter) (*Result, error) {
 	mode := rs.SearchMode
 	if mode == "" {
 		mode = store.SearchHybrid
@@ -113,6 +127,16 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	res := &Result{Hits: []store.SearchHit{}, Mode: mode, Backend: backend}
 	if rs.ChunkCount == 0 || strings.TrimSpace(query) == "" {
 		return res, nil
+	}
+	if !filter.Empty() {
+		matches, err := r.store.HasMatchingDocuments(ctx, rs.ID, filter)
+		if err != nil {
+			return nil, fmt.Errorf("metadata filter: %w", err)
+		}
+		if !matches {
+			res.FilterMatchedNothing = true
+			return res, nil
+		}
 	}
 	storeID := strconv.FormatInt(rs.ID, 10)
 	// No attribute here names the query, a passage or a filename: the span
@@ -148,7 +172,7 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 		candidates = k * 3
 	}
 	hits, used, err := r.store.SearchWithBackend(ctx, rs.ID, query, vecs[0], store.SearchOptions{
-		Mode: mode, Backend: backend, FTSConfig: rs.FTSConfig, MaxDistance: rs.MaxDistance, Candidates: candidates})
+		Mode: mode, Backend: backend, FTSConfig: rs.FTSConfig, MaxDistance: rs.MaxDistance, Candidates: candidates, Filter: filter})
 	if err != nil {
 		span.RecordError(errSpanSearch)
 		return nil, err

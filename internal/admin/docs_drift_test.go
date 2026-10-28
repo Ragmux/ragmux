@@ -375,6 +375,17 @@ var ragSettingsPending = map[string]string{
 	"query_model_connection_id": "ADR-024 setting, documented in the v0.6 docs phase",
 }
 
+// documentMetadataPending and searchFilterPending list the ADR-025 fields
+// (migration 0023). Same arrangement as ragSettingsPending: docs/api.md gets
+// them in the v0.6 documentation phase, which is when these exceptions go.
+var documentMetadataPending = map[string]string{
+	"metadata": "ADR-025 field, documented in the v0.6 docs phase",
+}
+
+var searchFilterPending = map[string]string{
+	"filter": "ADR-025 field, documented in the v0.6 docs phase",
+}
+
 // compareDrift returns the code fields the docs lack and the doc keys the code
 // lacks, plus problems with the case itself (anchor not found, stale
 // exceptions).
@@ -540,9 +551,9 @@ func driftCases(t *testing.T) []driftCase {
 		{name: "rag store body", code: jsonFieldNames(typeOf[ragInput]()), sections: []string{"RAG stores and documents"},
 			obj: &jsonSel{"", "search_backend", "document_count"}},
 		{name: "document", code: jsonFieldNames(typeOf[store.Document]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "progress_percent", ""}},
+			obj: &jsonSel{"", "progress_percent", ""}, undocumented: documentMetadataPending},
 		{name: "search request", code: handlerStructFields(t, "admin.go", "searchRAGStore"), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "query", ""}, prose: []string{"backend", "rerank_backend", "rerank_connection_id"}},
+			obj: &jsonSel{"", "query", ""}, prose: []string{"backend", "rerank_backend", "rerank_connection_id"}, undocumented: searchFilterPending},
 		{name: "search hit", code: jsonFieldNames(typeOf[store.SearchHit]()), sections: []string{"RAG stores and documents"},
 			obj: &jsonSel{"hits[]", "chunk_id", ""}},
 

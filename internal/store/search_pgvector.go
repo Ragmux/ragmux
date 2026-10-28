@@ -31,18 +31,25 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 	// is not comparable across queries or configurations, so exposing it as
 	// SearchHit.LexScore would invite exactly the cross-backend comparison it
 	// cannot support.
+	args := []any{p.Vector, p.StoreID, p.Candidates, p.MaxDistance, p.FTSConfig, ftsQuery(p.Query)}
+	first := len(args) + 1 // the filter's arguments follow the six above
+	vec, filterArgs := vectorLeg(p.VecTable, p.Filter, first)
+	args = append(args, filterArgs...)
+	// The lexical leg takes the same filter, on its own LIMIT: the documents
+	// the filter lets through, as a subquery of ids.
+	var lexFilter string
+	if !p.Filter.Empty() {
+		set, _ := p.Filter.documentSet("$2", first)
+		lexFilter = `
+				  AND c.document_id IN (` + set + `)`
+	}
 	sql := fmt.Sprintf(`
 			WITH q AS (SELECT websearch_to_tsquery($5::text::regconfig, $6::text) AS query),
-			v AS (
-				SELECT e.chunk_id, ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
-				FROM %[1]s e
-				WHERE e.rag_store_id = $2
-				ORDER BY e.embedding <=> $1::vector
-				LIMIT $3),
+			%[3]s,
 			f AS (
 				SELECT c.id AS chunk_id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id) AS rank
 				FROM chunks c, q
-				WHERE c.rag_store_id = $2 AND numnode(q.query) > 0 AND c.tsv @@ q.query
+				WHERE c.rag_store_id = $2 AND numnode(q.query) > 0 AND c.tsv @@ q.query%[4]s
 				ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id
 				LIMIT $3),
 			m AS (
@@ -59,8 +66,8 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 			JOIN %[1]s e ON e.chunk_id = m.chunk_id
 			WHERE ($4::float8 = 0 OR (e.embedding <=> $1::vector) <= $4::float8)
 			ORDER BY m.score DESC, distance, m.chunk_id
-			LIMIT $3`, p.VecTable, rrfK)
-	return sql, []any{p.Vector, p.StoreID, p.Candidates, p.MaxDistance, p.FTSConfig, ftsQuery(p.Query)}
+			LIMIT $3`, p.VecTable, rrfK, vec, lexFilter)
+	return sql, args
 }
 
 // ftsQuery prepares free text for websearch_to_tsquery. That function ANDs
