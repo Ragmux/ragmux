@@ -23,6 +23,11 @@ type RequestLog struct {
 	RAGUsed          bool   `json:"rag_used"`
 	// RAGHits is the number of retrieved chunks injected into the prompt.
 	RAGHits int `json:"rag_hits"`
+	// RAGSkipReason is why retrieval did not run although the project has a
+	// store: a member of the closed set in obs (RAGSkip*), empty when it ran
+	// or the project has no store. It is written to request_logs.rag_skip_reason
+	// and not exposed by the admin API yet, hence no JSON name.
+	RAGSkipReason string `json:"-"`
 	// CachedPromptTokens and CacheWriteTokens are the parts of the prompt a
 	// provider cache served and wrote; both are included in PromptTokens.
 	CachedPromptTokens int `json:"cached_prompt_tokens"`
@@ -98,13 +103,14 @@ func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO request_logs
 		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed,
 		 rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens, cost_micros, cost_source,
-		 api_key_id, user_id, request_id, endpoint, requested_model, route, attempt, fallback_from)
+		 api_key_id, user_id, request_id, endpoint, requested_model, route, attempt, fallback_from, rag_skip_reason)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-		 NULLIF($18, ''), NULLIF($19, ''), NULLIF($20, ''), NULLIF($21, ''), NULLIF($22::int, 0)::smallint, $23)`,
+		 NULLIF($18, ''), NULLIF($19, ''), NULLIF($20, ''), NULLIF($21, ''), NULLIF($22::int, 0)::smallint, $23,
+		 NULLIF($24, ''))`,
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
 		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error,
 		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source, l.APIKeyID, l.UserID,
-		l.RequestID, l.Endpoint, clampRequestedModel(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom)
+		l.RequestID, l.Endpoint, clampRequestedModel(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom, l.RAGSkipReason)
 	return err
 }
 

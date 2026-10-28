@@ -12,10 +12,12 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1489,5 +1491,211 @@ func TestProjectRAGSettingsAdminAPI(t *testing.T) {
 	}
 	if del = e.call("DELETE", fmt.Sprintf("/admin/api/models/%d", queryConn), nil, ""); del["_status"] != float64(200) {
 		t.Errorf("delete after release: %v", del)
+	}
+}
+
+// countingEmbeddings fronts an upstream and counts the embedding calls that
+// pass through it, which is how the retrieval policy tests prove that
+// retrieval did or did not happen.
+func countingEmbeddings(t *testing.T, backend *httptest.Server, n *atomic.Int64) *httptest.Server {
+	t.Helper()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/embeddings" {
+			n.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(front.Close)
+	return front
+}
+
+// TestRetrievalPolicyEndToEnd drives ADR-024's retrieval decision through the
+// whole stack: the admin API sets the policy, the gateway acts on it, and the
+// request log, the metric and the response headers all say why.
+func TestRetrievalPolicyEndToEnd(t *testing.T) {
+	backend := mockUpstream(t)
+	defer backend.Close()
+	var embeds atomic.Int64
+	up := countingEmbeddings(t, backend, &embeds)
+
+	e := newEnv(t, testdb.Config(t))
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	connID := int64(conn["id"].(float64))
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 1}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+	doc := e.upload(storeID, "fruits.md", "# Banana\n\nBananas are yellow and soft. They grow in bunches in tropical regions.")
+	if doc["_status"] != float64(202) {
+		t.Fatalf("upload: %v", doc)
+	}
+	e.waitReady(int64(doc["id"].(float64)))
+
+	created := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID,
+		"rag_store_id": storeID, "retrieval_policy": "auto"}, "")
+	if created["_status"] != float64(201) {
+		t.Fatalf("create project: %v", created)
+	}
+	apiKey := created["api_key"].(string)
+	projID := int64(created["project"].(map[string]any)["id"].(float64))
+
+	msg := func(content string) []map[string]any { return []map[string]any{{"role": "user", "content": content}} }
+	// chat posts a body and returns the status, the headers and the answer the
+	// mock upstream gave, which echoes the system prompt it received.
+	chat := func(body map[string]any) (int, http.Header, string) {
+		t.Helper()
+		out, h := e.callRaw("POST", "/v1/chat/completions", body, apiKey)
+		content := ""
+		if ch, ok := out["choices"].([]any); ok && len(ch) > 0 {
+			content, _ = ch[0].(map[string]any)["message"].(map[string]any)["content"].(string)
+		}
+		return int(out["_status"].(float64)), h, content
+	}
+	// skipped runs one chat and checks whether retrieval ran.
+	check := func(name string, body map[string]any, wantSkip string) {
+		t.Helper()
+		before := embeds.Load()
+		status, h, content := chat(body)
+		ran := embeds.Load() - before
+		if status != 200 {
+			t.Errorf("%s: status %d", name, status)
+			return
+		}
+		if got := h.Get("x-ragmux-rag-skip"); got != wantSkip {
+			t.Errorf("%s: x-ragmux-rag-skip = %q, want %q", name, got, wantSkip)
+		}
+		if wantSkip == "" {
+			if ran != 1 || h.Get("x-ragmux-rag-hits") != "1" || !strings.Contains(content, "Bananas are yellow") {
+				t.Errorf("%s: retrieval should have run: embeds %d hits %q content %q", name, ran, h.Get("x-ragmux-rag-hits"), content)
+			}
+			return
+		}
+		if ran != 0 || h.Get("x-ragmux-rag-hits") != "0" || strings.Contains(content, "Bananas are yellow") {
+			t.Errorf("%s: retrieval should have been skipped: embeds %d hits %q content %q", name, ran, h.Get("x-ragmux-rag-hits"), content)
+		}
+	}
+
+	// auto: small talk is skipped, a question is not.
+	check("question", map[string]any{"messages": msg("What color is a banana?")}, "")
+	for text, want := range map[string]string{"merhaba": "greeting", "Teşekkürler!": "greeting", "thanks": "greeting",
+		"ok": "ack", "İYİ GÜNLER": "greeting"} {
+		check("auto "+text, map[string]any{"messages": msg(text)}, want)
+	}
+	// A question asked again is retrieved again (ADR-024).
+	check("repeated question", map[string]any{"messages": []map[string]any{
+		{"role": "user", "content": "What color is a banana?"}, {"role": "assistant", "content": "Yellow."},
+		{"role": "user", "content": "what color is a banana"}}}, "")
+
+	// A tool result as the last message skips retrieval under any policy.
+	toolTurn := []map[string]any{{"role": "user", "content": "What color is a banana?"},
+		{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{"id": "c1", "type": "function",
+			"function": map[string]any{"name": "lookup", "arguments": "{}"}}}},
+		{"role": "tool", "tool_call_id": "c1", "content": "yellow"}}
+	check("tool turn, auto", map[string]any{"messages": toolTurn}, "tool_turn")
+
+	// The request can close retrieval for one turn.
+	check("client off", map[string]any{"messages": msg("What color is a banana?"), "ragmux": map[string]any{"retrieval": "off"}}, "client_off")
+
+	// always: nothing is skipped but tool turns and the client's "off".
+	put := func(policy string) {
+		t.Helper()
+		r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d", projID), map[string]any{"name": "app",
+			"model_connection_id": connID, "rag_store_id": storeID, "retrieval_policy": policy}, "")
+		if r["_status"] != float64(200) || r["retrieval_policy"] != policy {
+			t.Fatalf("set policy %s: %v", policy, r)
+		}
+	}
+	put("always")
+	check("always, greeting", map[string]any{"messages": msg("merhaba")}, "")
+	check("tool turn, always", map[string]any{"messages": toolTurn}, "tool_turn")
+	check("client off, always", map[string]any{"messages": msg("What color is a banana?"), "ragmux": map[string]any{"retrieval": "off"}}, "client_off")
+
+	// off: the client's "always" does not reopen it.
+	put("off")
+	check("policy off", map[string]any{"messages": msg("What color is a banana?")}, "policy_off")
+	status, h, _ := chat(map[string]any{"messages": msg("What color is a banana?"), "ragmux": map[string]any{"retrieval": "always"}})
+	if status != 200 || h.Get("x-ragmux-rag-skip") != "policy_off" || h.Get("x-ragmux-rag-hits") != "0" {
+		t.Errorf("client always on an off project: status %d headers %v", status, h)
+	}
+	if w := h.Values("Warning"); len(w) != 1 || !strings.HasPrefix(w[0], `299 ragmux "`) {
+		t.Errorf("client always on an off project: Warning = %q", w)
+	}
+
+	// The ragmux object: unusable ones are refused, unknown fields warned about.
+	put("always")
+	for _, raw := range []string{`"x"`, `7`, `[]`, `null`} {
+		before := embeds.Load()
+		out, _ := e.callRaw("POST", "/v1/chat/completions", json.RawMessage(
+			`{"messages":[{"role":"user","content":"What color is a banana?"}],"ragmux":`+raw+`}`), apiKey)
+		errObj, _ := out["error"].(map[string]any)
+		if out["_status"] != float64(400) || errObj["code"] != "invalid_ragmux" || errObj["type"] != "invalid_request_error" || embeds.Load() != before {
+			t.Errorf("ragmux=%s: %v (embeds +%d)", raw, out, embeds.Load()-before)
+		}
+	}
+	for name, ext := range map[string]map[string]any{"retrieval always": {"retrieval": "always"}, "unknown": {"foo": 1}} {
+		before := embeds.Load()
+		status, h, _ := chat(map[string]any{"messages": msg("What color is a banana?"), "ragmux": ext})
+		if status != 200 || len(h.Values("Warning")) != 1 || !strings.HasPrefix(h.Get("Warning"), `299 ragmux "`) ||
+			h.Get("x-ragmux-rag-skip") != "" || embeds.Load()-before != 1 {
+			t.Errorf("%s: status %d Warning %q skip %q embeds +%d", name, status, h.Values("Warning"), h.Get("x-ragmux-rag-skip"), embeds.Load()-before)
+		}
+	}
+
+	// Every skip is on the request log as a member of the closed set.
+	wantReasons := map[string]int{"greeting": 4, "ack": 1, "tool_turn": 2, "client_off": 2, "policy_off": 2}
+	deadline := time.Now().Add(5 * time.Second)
+	var got map[string]int
+	for time.Now().Before(deadline) {
+		got = map[string]int{}
+		rows, err := e.store.DB().Query(context.Background(),
+			`SELECT rag_skip_reason, count(*) FROM request_logs WHERE project_id = $1 AND rag_skip_reason IS NOT NULL GROUP BY 1`, projID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var reason string
+			var n int
+			if err := rows.Scan(&reason, &n); err != nil {
+				t.Fatal(err)
+			}
+			got[reason] = n
+		}
+		rows.Close()
+		if fmt.Sprint(got) == fmt.Sprint(wantReasons) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(wantReasons) {
+		t.Errorf("request_logs.rag_skip_reason counts = %v, want %v", got, wantReasons)
+	}
+	var withReasonButRan int
+	if err := e.store.DB().QueryRow(context.Background(),
+		`SELECT count(*) FROM request_logs WHERE project_id = $1 AND rag_skip_reason IS NOT NULL AND (rag_used OR rag_hits > 0)`, projID).
+		Scan(&withReasonButRan); err != nil || withReasonButRan != 0 {
+		t.Errorf("rows with a skip reason that also used RAG: %d, %v", withReasonButRan, err)
+	}
+
+	// The metric carries the same closed set and nothing else.
+	text := e.registry.Text()
+	for reason, n := range wantReasons {
+		want := fmt.Sprintf(`ragmux_rag_skipped_total{project="%d",reason="%s"} %d`, projID, reason, n)
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics lack %s", want)
+		}
+	}
+	if n := seriesWithPrefix(text, "ragmux_rag_skipped_total{"); n != len(wantReasons) {
+		t.Errorf("ragmux_rag_skipped_total has %d series, want %d:\n%s", n, len(wantReasons), grepLines(text, "ragmux_rag_skipped_total"))
 	}
 }

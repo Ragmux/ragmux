@@ -34,6 +34,9 @@ type upstream struct {
 	srv       *httptest.Server
 	chat      atomic.Pointer[http.HandlerFunc]
 	embedFail atomic.Bool
+	// embeds counts the embedding calls, which is how a test proves that
+	// retrieval did or did not run.
+	embeds atomic.Int64
 	// seenCancel is closed by blocking handlers once their request context
 	// ended, which proves the gateway tore the upstream call down.
 	seenCancel chan struct{}
@@ -45,6 +48,7 @@ func newUpstream(t *testing.T) *upstream {
 	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/embeddings":
+			u.embeds.Add(1)
 			if u.embedFail.Load() {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"error":{"message":"embedding backend down"}}`))
@@ -1359,5 +1363,325 @@ func TestRetrievedContextCountsTowardTPM(t *testing.T) {
 	_ = r2.Body.Close()
 	if r2.StatusCode != 200 || upstreamCalls.Load() != 1 {
 		t.Errorf("without context: %d, upstream calls %d", r2.StatusCode, upstreamCalls.Load())
+	}
+}
+
+// ---- retrieval policy and the ragmux request object (ADR-024) ----
+
+// skipReasonOf waits for the n-th request log row of the project and returns
+// its rag_skip_reason ("" for NULL). The column is write-only for the admin
+// API, so the test reads it from the table.
+func (e *env) skipReasonOf(n int) string {
+	e.t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var reason *string
+		err := e.st.DB().QueryRow(ctx,
+			`SELECT rag_skip_reason FROM request_logs WHERE project_id = $1 ORDER BY id OFFSET $2 LIMIT 1`,
+			e.proj.ID, n-1).Scan(&reason)
+		if err == nil {
+			if reason == nil {
+				return ""
+			}
+			return *reason
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	e.t.Fatalf("request log row %d never appeared", n)
+	return ""
+}
+
+func msgsOf(roles ...string) []map[string]any {
+	var out []map[string]any
+	for i := 0; i+1 < len(roles); i += 2 {
+		out = append(out, map[string]any{"role": roles[i], "content": roles[i+1]})
+	}
+	return out
+}
+
+func TestRetrievalPolicyDecisions(t *testing.T) {
+	question := msgsOf("user", "what colour are apples?")
+	hello := msgsOf("user", "Merhaba!")
+	toolTurn := append(msgsOf("user", "what colour are apples?"),
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
+			"id": "c1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": "{}"}}}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "red"})
+
+	cases := []struct {
+		name     string
+		policy   string
+		msgs     []map[string]any
+		ragmux   any // the ragmux request object, nil for none
+		wantSkip string
+	}{
+		{"always retrieves", store.RetrievalPolicyAlways, question, nil, ""},
+		{"always retrieves a greeting", store.RetrievalPolicyAlways, hello, nil, ""},
+		{"auto retrieves a question", store.RetrievalPolicyAuto, question, nil, ""},
+		{"auto skips a greeting", store.RetrievalPolicyAuto, hello, nil, "greeting"},
+		{"auto skips an ack", store.RetrievalPolicyAuto, msgsOf("user", "ok"), nil, "ack"},
+		{"auto retrieves a repeated question", store.RetrievalPolicyAuto,
+			msgsOf("user", "what colour are apples?", "assistant", "red", "user", "What colour are apples"), nil, ""},
+		{"off skips", store.RetrievalPolicyOff, question, nil, "policy_off"},
+		{"a client cannot reopen off", store.RetrievalPolicyOff, question, map[string]any{"retrieval": "always"}, "policy_off"},
+		{"a client cannot override auto", store.RetrievalPolicyAuto, hello, map[string]any{"retrieval": "always"}, "greeting"},
+		{"client off", store.RetrievalPolicyAlways, question, map[string]any{"retrieval": "off"}, "client_off"},
+		{"policy off wins over client off", store.RetrievalPolicyOff, question, map[string]any{"retrieval": "off"}, "policy_off"},
+		{"tool turn under always", store.RetrievalPolicyAlways, toolTurn, nil, "tool_turn"},
+		{"tool turn under auto", store.RetrievalPolicyAuto, toolTurn, nil, "tool_turn"},
+		{"client off wins over tool turn", store.RetrievalPolicyAlways, toolTurn, map[string]any{"retrieval": "off"}, "client_off"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = tc.policy })
+			e.attachRAG()
+			seen := captureChat(e)
+			embedsBefore := e.up.embeds.Load()
+
+			body := map[string]any{"messages": tc.msgs}
+			if tc.ragmux != nil {
+				body["ragmux"] = tc.ragmux
+			}
+			resp, out := e.chat(body)
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			embeds := e.up.embeds.Load() - embedsBefore
+			skip := resp.Header.Get("x-ragmux-rag-skip")
+			rec := e.lastLog()
+			reason := e.skipReasonOf(1)
+			if skip != tc.wantSkip || reason != tc.wantSkip {
+				t.Errorf("x-ragmux-rag-skip = %q, rag_skip_reason = %q, want %q", skip, reason, tc.wantSkip)
+			}
+			if tc.wantSkip != "" {
+				if embeds != 0 {
+					t.Errorf("retrieval was skipped but the embedding upstream was called %d times", embeds)
+				}
+				if resp.Header.Get("x-ragmux-rag-hits") != "0" || resp.Header.Get("x-ragmux-rag-sources") != "" {
+					t.Errorf("skipped request headers: hits %q sources %q",
+						resp.Header.Get("x-ragmux-rag-hits"), resp.Header.Get("x-ragmux-rag-sources"))
+				}
+				if rec.RAGUsed || rec.RAGHits != 0 {
+					t.Errorf("log = %+v", rec)
+				}
+				calls := seen()
+				if len(calls) != 1 {
+					t.Fatalf("upstream chat calls = %d", len(calls))
+				}
+				for _, m := range calls[0] {
+					if strings.Contains(string(m.Content), "<context>") {
+						t.Errorf("context injected into a skipped request: %s", m.Content)
+					}
+				}
+			} else {
+				if embeds != 1 || resp.Header.Get("x-ragmux-rag-hits") != "1" || !rec.RAGUsed {
+					t.Errorf("retrieval should have run: embeds %d hits %q log %+v",
+						embeds, resp.Header.Get("x-ragmux-rag-hits"), rec)
+				}
+			}
+		})
+	}
+}
+
+// A project without a RAG store has nothing to skip: no header, no reason,
+// whatever the policy says.
+func TestRetrievalPolicyWithoutAStoreSkipsNothingToReport(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyOff })
+	resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "merhaba"), "ragmux": map[string]any{"retrieval": "off"}})
+	if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "" || resp.Header.Get("x-ragmux-rag-hits") != "" {
+		t.Errorf("status %d headers %v", resp.StatusCode, resp.Header)
+	}
+	if got := e.skipReasonOf(1); got != "" {
+		t.Errorf("rag_skip_reason = %q, want NULL", got)
+	}
+}
+
+// include_context on a skipped request answers with no sources and no context
+// rather than failing.
+func TestSkippedRetrievalWithIncludeContext(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyOff })
+	e.attachRAG()
+	resp, out := e.chat(map[string]any{"messages": msgsOf("user", "apples?"), "ragmux": map[string]any{"include_context": true}})
+	rm, _ := out["ragmux"].(map[string]any)
+	if resp.StatusCode != 200 || rm == nil {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	if list, ok := rm["sources"].([]any); !ok || len(list) != 0 || rm["context"] != "" {
+		t.Errorf("ragmux = %v", rm)
+	}
+	if resp.Header.Get("x-ragmux-rag-skip") != "policy_off" {
+		t.Errorf("skip header = %q", resp.Header.Get("x-ragmux-rag-skip"))
+	}
+}
+
+func TestMalformedRagmuxObjectIs400(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	embedsBefore := e.up.embeds.Load()
+	var chatCalls atomic.Int64
+	counted(e.up, &chatCalls)
+
+	for _, raw := range []string{`"x"`, `1`, `true`, `[]`, `null`, `[{"retrieval":"off"}]`, `""`} {
+		body := `{"messages":[{"role":"user","content":"what colour are apples?"}],"ragmux":` + raw + `}`
+		resp, out := e.chat(body)
+		if resp.StatusCode != http.StatusBadRequest || errorField(t, out, "code") != "invalid_ragmux" ||
+			errorField(t, out, "type") != "invalid_request_error" {
+			t.Errorf("ragmux=%s: status %d body %v", raw, resp.StatusCode, out)
+		}
+		if msg, _ := errorField(t, out, "message").(string); strings.Contains(msg, "apples") {
+			t.Errorf("error message echoes the request: %q", msg)
+		}
+	}
+	if chatCalls.Load() != 0 || e.up.embeds.Load() != embedsBefore {
+		t.Errorf("a refused request reached the upstream: chat %d, embeds %d", chatCalls.Load(), e.up.embeds.Load()-embedsBefore)
+	}
+	// The same body with an object is served.
+	if resp, _ := e.chat(`{"messages":[{"role":"user","content":"hi"}],"ragmux":{}}`); resp.StatusCode != 200 {
+		t.Errorf("empty ragmux object: status %d", resp.StatusCode)
+	}
+}
+
+func TestRagmuxWarnings(t *testing.T) {
+	cases := []struct {
+		name   string
+		ragmux map[string]any
+		want   []string // substrings, one per expected Warning header, in order
+	}{
+		{"always is ignored", map[string]any{"retrieval": "always"},
+			[]string{`ragmux.retrieval accepts only the value off`}},
+		{"auto is ignored", map[string]any{"retrieval": "auto"},
+			[]string{`ragmux.retrieval accepts only the value off`}},
+		{"a non-string is ignored", map[string]any{"retrieval": true},
+			[]string{`ragmux.retrieval accepts only the value off`}},
+		{"unknown key", map[string]any{"foo": 1}, []string{`unknown ragmux field foo; ignored`}},
+		{"project setting", map[string]any{"context_placement": "before_last_user", "top_k": 50},
+			[]string{`ragmux.context_placement is a project setting`, `ragmux.top_k is a project setting`}},
+		{"key outside the name shape is not echoed", map[string]any{"Foo-Bar9": 1, "x\"y": 1},
+			[]string{`unknown ragmux field; ignored`, `unknown ragmux field; ignored`}},
+		{"wrong include_context type", map[string]any{"include_context": "yes"},
+			[]string{`ragmux.include_context must be a boolean`}},
+		{"valid fields earn nothing", map[string]any{"retrieval": "off", "include_context": true}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.attachRAG()
+			resp, out := e.chat(map[string]any{"messages": msgsOf("user", "what colour are apples?"), "ragmux": tc.ragmux})
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			got := resp.Header.Values("Warning")
+			if len(got) != len(tc.want) {
+				t.Fatalf("Warning headers = %q, want %d", got, len(tc.want))
+			}
+			for i, w := range tc.want {
+				if !strings.HasPrefix(got[i], `299 ragmux "`) || !strings.Contains(got[i], w) {
+					t.Errorf("Warning[%d] = %q, want it to contain %q", i, got[i], w)
+				}
+			}
+			for _, h := range got {
+				if strings.Contains(h, "Foo-Bar9") || strings.Contains(h, `x\"y`) {
+					t.Errorf("a client key name reached a header: %q", h)
+				}
+			}
+			// None of it changed what the project does: retrieval ran unless
+			// the (valid) retrieval=off said otherwise.
+			wantHits := "1"
+			if v, _ := tc.ragmux["retrieval"].(string); v == "off" {
+				wantHits = "0"
+			}
+			if resp.Header.Get("x-ragmux-rag-hits") != wantHits {
+				t.Errorf("x-ragmux-rag-hits = %q, want %q", resp.Header.Get("x-ragmux-rag-hits"), wantHits)
+			}
+		})
+	}
+}
+
+// A project setting named in the request neither applies nor leaks upstream:
+// the placement stays the project's.
+func TestRagmuxCannotChangeProjectSettings(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	seen := captureChat(e)
+	resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "what colour are apples?"),
+		"ragmux": map[string]any{"context_placement": "before_last_user", "retrieval_policy": "off", "top_k": 1}})
+	if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-hits") != "1" || resp.Header.Get("x-ragmux-rag-skip") != "" {
+		t.Fatalf("status %d headers %v", resp.StatusCode, resp.Header)
+	}
+	calls := seen()
+	if len(calls) != 1 || len(calls[0]) != 2 || calls[0][0].Role != "system" {
+		t.Fatalf("the project's system placement was not kept: %+v", calls)
+	}
+	if len(resp.Header.Values("Warning")) != 3 {
+		t.Errorf("Warning = %q", resp.Header.Values("Warning"))
+	}
+}
+
+func TestRagmuxWarningCountIsBounded(t *testing.T) {
+	obj := map[string]any{}
+	for i := 0; i < 200; i++ {
+		obj[fmt.Sprintf("k_%c%c", 'a'+i/26, 'a'+i%26)] = i
+	}
+	h := http.Header{}
+	o, err := parseRagmux(map[string]json.RawMessage{"ragmux": mustRaw(t, obj)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRagmuxWarnings(h, o.Warnings)
+	got := h.Values("Warning")
+	if len(got) != maxRagmuxWarnings || !strings.Contains(got[len(got)-1], "more ragmux warnings omitted") {
+		t.Errorf("%d warnings, last %q", len(got), got[len(got)-1])
+	}
+	// The order does not depend on map iteration.
+	for i := 0; i < 5; i++ {
+		o2, _ := parseRagmux(map[string]json.RawMessage{"ragmux": mustRaw(t, obj)})
+		if strings.Join(o2.Warnings, "|") != strings.Join(o.Warnings, "|") {
+			t.Fatal("warnings are not deterministic")
+		}
+	}
+}
+
+func mustRaw(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// The warnings describe the request, so a fallback that replaces the adapter's
+// own warnings must keep them.
+func TestRagmuxWarningsSurviveAFallback(t *testing.T) {
+	e := newEnv(t, nil)
+	e.gw.MaxRetries = 0
+	conn2, up2 := e.secondConn("second", "second-model")
+	var hits1, hits2 atomic.Int64
+	status(e.up, &hits1, http.StatusInternalServerError)
+	counted(up2, &hits2)
+	e.orderedRoute("pair", e.conn, conn2)
+
+	resp, out := e.chat(map[string]any{"model": "pair", "messages": userMsg, "ragmux": map[string]any{"foo": 1}})
+	if resp.StatusCode != 200 || hits1.Load() != 1 || hits2.Load() != 1 {
+		t.Fatalf("status %d, calls %d/%d: %v", resp.StatusCode, hits1.Load(), hits2.Load(), out)
+	}
+	if got := resp.Header.Values("Warning"); len(got) != 1 || !strings.Contains(got[0], "unknown ragmux field foo") {
+		t.Errorf("Warning = %q", got)
+	}
+}
+
+// The stream path writes headers on its first chunk; the skip and warning
+// headers must be there too, and the ragmux object must not reach the upstream.
+func TestSkippedStreamCarriesTheHeaders(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+	e.attachRAG()
+	embedsBefore := e.up.embeds.Load()
+	resp := e.post(context.Background(), "/v1/chat/completions",
+		map[string]any{"messages": msgsOf("user", "thanks"), "stream": true, "ragmux": map[string]any{"foo": 1}}, e.key)
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "greeting" || resp.Header.Get("x-ragmux-rag-hits") != "0" ||
+		len(resp.Header.Values("Warning")) != 1 || e.up.embeds.Load() != embedsBefore {
+		t.Errorf("status %d headers %v embeds %d", resp.StatusCode, resp.Header, e.up.embeds.Load()-embedsBefore)
 	}
 }

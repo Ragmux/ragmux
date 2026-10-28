@@ -3,6 +3,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,6 +13,8 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -592,7 +595,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.span.End()
 
-	req, ok := g.decodeChat(c)
+	req, opts, ok := g.decodeChat(c)
 	if !ok {
 		return
 	}
@@ -618,7 +621,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prep := g.prepareChat(c, prov, &req)
+	prep := g.prepareChat(c, prov, &req, opts)
 	g.openRecord(c, req.Stream, prep.apply)
 	defer g.record(c)
 	if !g.checkContextLimits(c, estimate, prep.contextBlock) {
@@ -687,6 +690,8 @@ func (in *chatInvocation) providerFor(c *call, conn *store.ModelConnection) (pro
 	// nothing has been written yet, so they can still be replaced.
 	c.w.Header().Del("Warning")
 	setRequestWarnings(c.w.Header(), prov, in.req)
+	// The ragmux warnings are about the request, not the adapter: they stay.
+	addRagmuxWarnings(c.w.Header(), in.opts.Warnings)
 	return prov, nil
 }
 
@@ -731,21 +736,32 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 
 // decodeChat reads and validates the chat request body, answering the client
 // itself when it cannot.
-func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, bool) {
+func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, ragmuxRequest, bool) {
 	var req provider.ChatRequest
+	var opts ragmuxRequest
 	body, ok := g.readBody(c)
 	if !ok {
-		return req, false
+		return req, opts, false
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
-		return req, false
+		return req, opts, false
 	}
 	if len(req.Messages) == 0 {
 		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "messages is required")
-		return req, false
+		return req, opts, false
 	}
-	return req, true
+	// The ragmux request object is ours; it must not reach the upstream. It is
+	// parsed here, with the rest of the body, so a malformed one is refused
+	// like any other malformed request, before a route is resolved or a limit
+	// is charged.
+	opts, err := parseRagmux(req.Extra)
+	delete(req.Extra, "ragmux")
+	if err != nil {
+		writeErrorCode(c.w, http.StatusBadRequest, "invalid_request_error", errInvalidRagmux, err.Error())
+		return req, opts, false
+	}
+	return req, opts, true
 }
 
 // chatProvider builds the chat adapter for the routed connection. A route with
@@ -775,24 +791,27 @@ func newTargetConfigError() error {
 
 // chatPrep is what prepareChat hands on to invoke and the request log.
 type chatPrep struct {
-	opts         ragmuxRequest
-	ragUsed      bool
-	ragHits      int
+	opts    ragmuxRequest
+	ragUsed bool
+	ragHits int
+	// skipReason is why retrieval did not run for a project that has a store:
+	// an obs.RAGSkip* value, empty when it ran.
+	skipReason   string
 	sources      []ragSource
 	contextBlock string
 }
 
 // apply sets the RAG columns of the request log row.
 func (p chatPrep) apply(rec *store.RequestLog) {
-	rec.RAGUsed, rec.RAGHits = p.ragUsed, p.ragHits
+	rec.RAGUsed, rec.RAGHits, rec.RAGSkipReason = p.ragUsed, p.ragHits, p.skipReason
 }
 
 // prepareChat is the chat-only hook between checkLimits and invoke: it shapes
 // the messages that go upstream with the project's system prompt and the RAG
 // context. Other endpoints have no such step.
-func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.ChatRequest) chatPrep {
+func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.ChatRequest, opts ragmuxRequest) chatPrep {
 	p, ctx, w := c.project, c.ctx(), c.w
-	var prep chatPrep
+	prep := chatPrep{opts: opts}
 
 	// Project-level system prompt, if configured, goes first.
 	//
@@ -806,10 +825,6 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
 
-	// The ragmux request object is ours; it must not reach the upstream.
-	prep.opts = ragmuxOptions(req.Extra)
-	delete(req.Extra, "ragmux")
-
 	// RAG pipeline. The hit count and sources headers are set here, before
 	// either the JSON or the streaming path writes the status line.
 	//
@@ -817,7 +832,18 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 	// Retrieval embeds through the store's own connection and uses prov only
 	// for the LLM rerank backend, which a nil prov skips; the walk still
 	// answers from another target with the same context (ADR-020).
-	if p.RAGStoreID != nil && g.Retriever != nil {
+	//
+	// Whether to retrieve at all is rag.SkipReason's decision (ADR-024). A
+	// project without a store never gets to it: there is nothing to skip.
+	ragOn := p.RAGStoreID != nil && g.Retriever != nil
+	if ragOn {
+		prep.skipReason = rag.SkipReason(p.RetrievalPolicy, opts.RetrievalOff, req.Messages)
+	}
+	if prep.skipReason != "" {
+		g.Metrics.RecordRAGSkipped(c.projectID, prep.skipReason)
+		w.Header().Set("x-ragmux-rag-skip", prep.skipReason)
+		w.Header().Set("x-ragmux-rag-hits", "0")
+	} else if ragOn {
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
 			q := rag.LastUserQuery(req.Messages)
@@ -858,6 +884,7 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 	// Warnings go out before the first byte of either response shape; a
 	// stream's headers are only written once its first chunk arrives.
 	setRequestWarnings(w.Header(), prov, *req)
+	addRagmuxWarnings(w.Header(), opts.Warnings)
 	return prep
 }
 
@@ -877,21 +904,102 @@ func injectRetrieved(msgs []provider.Message, block, placement string) []provide
 	return rag.InjectRetrievedContext(msgs, block)
 }
 
-// ragmuxRequest is the optional "ragmux" object clients may add to a chat
-// request. It is stripped before the request goes upstream.
+// ragmuxRequest is what the optional "ragmux" object of a chat request asked
+// for. The object is stripped before the request goes upstream.
+//
+// A request can only narrow what the project does or add information to the
+// answer; it can never switch retrieval on or change a project setting
+// (ADR-024). Everything it asked for that cannot be honoured is in Warnings.
 type ragmuxRequest struct {
 	// IncludeContext asks for the injected sources and context block in the
 	// (non-streaming) response body.
-	IncludeContext bool `json:"include_context"`
+	IncludeContext bool
+	// RetrievalOff is ragmux.retrieval = "off": skip retrieval for this request.
+	RetrievalOff bool
+	// Warnings are the texts of the Warning headers the object earns.
+	Warnings []string
 }
 
-func ragmuxOptions(extra map[string]json.RawMessage) ragmuxRequest {
+// errInvalidRagmux is the code of the 400 an unusable ragmux object gets.
+const errInvalidRagmux = "invalid_ragmux"
+
+// ragmuxProjectSettings are the names of project settings. A request that
+// names one gets a warning that says so, instead of the generic one.
+var ragmuxProjectSettings = map[string]bool{
+	"context_placement": true, "retrieval_policy": true, "query_strategy": true,
+	"history_turns_for_query": true, "query_model_connection_id": true,
+	"top_k": true, "system_prompt": true, "rag_store_id": true,
+}
+
+// ragmuxKeyName is the shape of a client key that may be echoed in a Warning
+// header; any other key is reported without its name.
+var ragmuxKeyName = regexp.MustCompile(`^[a-z_]{1,32}$`)
+
+// maxRagmuxWarnings bounds the Warning headers one request can earn: the
+// object can carry as many keys as the body limit allows.
+const maxRagmuxWarnings = 8
+
+// parseRagmux reads the "ragmux" request object. A missing one is fine; one
+// that is not a JSON object is the caller's error (the 400 invalid_ragmux).
+// Fields it understands but cannot honour, and fields it does not know, earn a
+// warning and are otherwise ignored (PRD rule 12).
+func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 	var o ragmuxRequest
-	if raw, ok := extra["ragmux"]; ok {
-		// A malformed object is treated as absent; it is still stripped.
-		_ = json.Unmarshal(raw, &o)
+	raw, ok := extra["ragmux"]
+	if !ok {
+		return o, nil
 	}
-	return o
+	var fields map[string]json.RawMessage
+	if t := bytes.TrimSpace(raw); len(t) == 0 || t[0] != '{' || json.Unmarshal(t, &fields) != nil {
+		return o, errors.New("ragmux must be a JSON object")
+	}
+
+	if v, ok := fields["include_context"]; ok {
+		if err := json.Unmarshal(v, &o.IncludeContext); err != nil {
+			o.IncludeContext = false
+			o.Warnings = append(o.Warnings, "ragmux.include_context must be a boolean; ignored")
+		}
+	}
+	if v, ok := fields["retrieval"]; ok {
+		var mode string
+		if json.Unmarshal(v, &mode) == nil && mode == "off" {
+			o.RetrievalOff = true
+		} else {
+			// "always" and "auto" would widen the project's setting.
+			o.Warnings = append(o.Warnings, "ragmux.retrieval accepts only the value off; ignored")
+		}
+	}
+
+	// Map order is random; the headers must not be.
+	var rest []string
+	for k := range fields {
+		if k != "include_context" && k != "retrieval" {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	for _, k := range rest {
+		switch {
+		case ragmuxProjectSettings[k]:
+			o.Warnings = append(o.Warnings, "ragmux."+k+" is a project setting and cannot be set by a request; ignored")
+		case ragmuxKeyName.MatchString(k):
+			o.Warnings = append(o.Warnings, "unknown ragmux field "+k+"; ignored")
+		default:
+			o.Warnings = append(o.Warnings, "unknown ragmux field; ignored")
+		}
+	}
+	if n := len(o.Warnings); n > maxRagmuxWarnings {
+		o.Warnings = append(o.Warnings[:maxRagmuxWarnings-1],
+			strconv.Itoa(n-maxRagmuxWarnings+1)+" more ragmux warnings omitted")
+	}
+	return o, nil
+}
+
+// addRagmuxWarnings adds one `Warning: 299 ragmux "<text>"` header per text.
+func addRagmuxWarnings(h http.Header, texts []string) {
+	for _, text := range texts {
+		h.Add("Warning", `299 ragmux "`+warnTextEscaper.Replace(text)+`"`)
+	}
 }
 
 // ragSource is one injected hit as exposed to the client: where the passage
