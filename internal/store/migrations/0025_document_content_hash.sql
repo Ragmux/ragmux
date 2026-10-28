@@ -1,0 +1,15 @@
+-- Content hash of a document's raw bytes (SHA-256), used to recognise the same
+-- file uploaded to the same store twice so its embeddings are reused instead
+-- of paid for again.
+--
+-- Add-only (ADR-001): the column is nullable with no default, so PostgreSQL
+-- adds it without rewriting the table. Rows written before this migration, or
+-- by a replica that predates it, read as NULL and never match a duplicate
+-- lookup; there is no backfill. The ingester fills the hash in the first time
+-- it processes such a row (reprocess, retry), which is when the bytes are
+-- loaded anyway.
+--
+-- Rollback (manual, nothing else depends on the column):
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_documents_store_content_sha256;
+--   ALTER TABLE documents DROP COLUMN content_sha256;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_sha256 BYTEA;

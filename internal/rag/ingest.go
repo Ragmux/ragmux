@@ -483,6 +483,12 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 	if err != nil {
 		return 0, fmt.Errorf("load document content: %w", err)
 	}
+	if doc.ContentSHA256 == "" {
+		// A row from before content hashes: the bytes are in hand anyway.
+		if err := ing.store.SetDocumentContentHash(ctx, docID, store.ContentHash(data)); err != nil {
+			ing.log.Warn("record content hash", "doc", docID, "err", err)
+		}
+	}
 	parsed, err := Extract(ctx, doc.Filename, data)
 	if err != nil {
 		return 0, err
@@ -520,7 +526,8 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 	}
 	ing.progress(ctx, docID, progressChunked, nil)
 	tokens := 0
-	for i := 0; i < len(chunks); i += ing.batchSize {
+	reused := ing.reuseEmbeddings(ctx, doc, rs, chunks)
+	for i := 0; i < len(chunks) && !reused; i += ing.batchSize {
 		end := i + ing.batchSize
 		if end > len(chunks) {
 			end = len(chunks)
@@ -544,8 +551,71 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 		return 0, fmt.Errorf("store chunks: %w", err)
 	}
 	ing.log.Info("document ingested", "doc", docID, "file", doc.Filename, "chunks", len(chunks),
-		"dims", len(chunks[0].Embedding), "embed_tokens", tokens, "took", time.Since(start).Round(time.Millisecond))
+		"dims", len(chunks[0].Embedding), "embed_tokens", tokens, "deduplicated", reused, "took", time.Since(start).Round(time.Millisecond))
 	return len(chunks), nil
+}
+
+// reuseEmbeddings fills the chunks' embeddings from an identical document of
+// the same store instead of calling the embedding upstream, and reports
+// whether it did. It is an optimisation and never an error: anything short of
+// a certain match returns false and the caller embeds as usual.
+//
+// "Identical" is the content hash (same bytes, same store, ready) and then a
+// chunk-by-chunk check that the donor holds exactly the text this document
+// was just split into and would have embedded. The second check is what keeps
+// the result correct when the store's chunking settings changed since the
+// donor was ingested, or when the file name differs and the store embeds it
+// into the text (contextual chunks): such a pair falls through to a normal
+// embed. The chunks themselves are this document's own (title metadata
+// included); only the vectors are borrowed. Document metadata lives on the
+// document row (ADR-025) and is not touched.
+//
+// Only a document's first ingestion reuses: an explicit reprocess exists to
+// embed again.
+func (ing *Ingester) reuseEmbeddings(ctx context.Context, doc *store.Document, rs *store.RAGStore, chunks []*store.Chunk) bool {
+	if doc.ChunkCount != 0 || rs.Dimensions < 1 {
+		return false
+	}
+	donors, err := ing.store.FindDuplicateDocuments(ctx, doc, rs.ContextualChunks, maxDedupCandidates)
+	if err != nil {
+		ing.log.Warn("duplicate lookup", "doc", doc.ID, "err", err)
+		return false
+	}
+	for _, donor := range donors {
+		vecs, err := ing.store.DocumentChunkVectors(ctx, donor.ID, rs.Dimensions)
+		if err != nil {
+			ing.log.Warn("load duplicate embeddings", "doc", doc.ID, "donor", donor.ID, "err", err)
+			continue
+		}
+		if !sameChunks(vecs, chunks, rs.Dimensions) {
+			continue
+		}
+		for i, v := range vecs {
+			chunks[i].Embedding = v.Embedding
+		}
+		ing.log.Info("embeddings reused from identical document", "doc", doc.ID, "donor", donor.ID, "chunks", len(chunks))
+		return true
+	}
+	return false
+}
+
+// maxDedupCandidates bounds how many identical documents reuseEmbeddings
+// compares against, newest first.
+const maxDedupCandidates = 3
+
+// sameChunks reports whether a donor's stored chunks are exactly the chunks
+// about to be embedded, with vectors of the store's width.
+func sameChunks(vecs []store.ChunkVector, chunks []*store.Chunk, dims int) bool {
+	if len(vecs) != len(chunks) {
+		return false
+	}
+	for i, v := range vecs {
+		c := chunks[i]
+		if v.Index != c.Index || v.Content != c.Content || v.EmbedText != c.EmbedText || len(v.Embedding) != dims {
+			return false
+		}
+	}
+	return true
 }
 
 // recordEmbedUsage counts the tokens one embedding batch spent and returns

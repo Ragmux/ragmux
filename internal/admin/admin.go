@@ -1445,6 +1445,25 @@ func (a *Admin) listDocuments(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, docs)
 }
 
+// uploadedDocument is the upload response: the new document plus a forecast
+// of whether its embeddings will be reused.
+//
+// Deduplicated is decided at upload time, before ingestion runs, and is
+// nothing more than that: the newest ready document of the same store with the
+// same bytes (and, in a store that embeds file names, the same name) is
+// DuplicateOf, the candidate ingestion will try first. It is not stored, so
+// no later read of the document carries it, and it can be wrong in both
+// directions. False positive: the store's chunking changed since the
+// candidate was ingested, so ingestion finds no matching donor and embeds.
+// False negative: the candidate was still pending at upload time (two equal
+// files in flight) and is ready by the time ingestion looks. Anything that
+// shows it must present it as expected, not as what happened.
+type uploadedDocument struct {
+	*store.Document
+	Deduplicated bool   `json:"deduplicated"`
+	DuplicateOf  *int64 `json:"duplicate_of,omitempty"`
+}
+
 func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
 	rs, err := a.Store.GetRAGStore(r.Context(), id)
@@ -1490,7 +1509,7 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		}
 		metadataKeys = store.MetadataKeys(metadata)
 	}
-	var created []*store.Document
+	var created []uploadedDocument
 	for _, fh := range files {
 		name := filepath.Base(fh.Filename)
 		if !rag.IsSupported(name) {
@@ -1539,8 +1558,17 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 			// Key names only: the values are the customer's data.
 			upload["metadata_keys"] = metadataKeys
 		}
+		out := uploadedDocument{Document: doc}
+		// The same bytes are already ingested in this store: ingestion is
+		// expected to reuse their embeddings (no embedding call). This is a
+		// forecast, not a record; see uploadedDocument. A failed lookup only
+		// means no marker.
+		if dups, err := a.Store.FindDuplicateDocuments(r.Context(), doc, rs.ContextualChunks, 1); err == nil && len(dups) > 0 {
+			out.Deduplicated, out.DuplicateOf = true, &dups[0].ID
+			upload["duplicate_of"] = dups[0].ID
+		}
 		a.audit(r, "document.upload", "document", ptr(doc.ID), upload)
-		created = append(created, doc)
+		created = append(created, out)
 	}
 	if len(created) == 1 {
 		writeJSON(w, http.StatusAccepted, created[0])
