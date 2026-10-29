@@ -294,16 +294,18 @@ changed URL or model without re-entering the key. The response has the same shap
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/rag-stores` | viewer | List stores (with `document_count`, `bytes_used`, `chunk_count`, `dimensions`) |
+| GET | `/rag-stores` | viewer | List stores (with `document_count`, `bytes_used`, `chunk_count`, `dimensions`, `vector_index`) |
 | POST | `/rag-stores` | editor | Create → `201` store |
 | GET | `/rag-stores/{id}` | viewer | Read one |
-| PUT | `/rag-stores/{id}` | editor | Update → store plus `reprocess_recommended` |
+| PUT | `/rag-stores/{id}` | editor | Update → store plus `reprocess_recommended`; changing `language` starts a background full-text rebuild |
 | DELETE | `/rag-stores/{id}` | editor | Delete the store, its documents and vectors; projects linked to it lose the link |
 | GET | `/rag-stores/{id}/documents` | viewer | List documents, newest first |
-| POST | `/rag-stores/{id}/documents` | editor | Upload (`multipart/form-data`, one or more `file` fields) → `202` document or array of documents; `422` with `code: "store_quota"` when the store's `max_documents` / `max_bytes` or the instance ceiling would be exceeded |
+| POST | `/rag-stores/{id}/documents` | editor | Upload (`multipart/form-data`, one or more `file` fields and an optional `metadata` field with a JSON object for all of them) → `202` document or array of documents, each with `deduplicated` (and `duplicate_of`); `400` for invalid `metadata`; `422` with `code: "store_quota"` when the store's `max_documents` / `max_bytes` or the instance ceiling would be exceeded |
 | POST | `/rag-stores/{id}/search` | viewer | Retrieval test |
 | POST | `/rag-stores/{id}/reprocess` | editor | Re-parse, re-chunk and re-embed every document → `202 {"ok": true, "documents": n}` |
+| POST | `/rag-stores/{id}/reindex` | admin | Build the vector index of the store's embedding width in the background → `202`; `409` with `code: "already_indexed"`, `"not_indexable"` or `"not_bound"` (see below) |
 | GET | `/documents/{id}` | viewer | Document status |
+| PATCH | `/documents/{id}` | editor | Replace the document's `metadata` (`{"metadata": {...}}`) → the document; one row update, no reprocessing |
 | DELETE | `/documents/{id}` | editor | Delete document and its chunks → `{"ok": true}` |
 | POST | `/documents/{id}/reprocess` | editor | Re-chunk and re-embed one document → `202 {"ok": true}` |
 
@@ -313,7 +315,7 @@ retrieval semantics are explained in [Retrieval (RAG)](rag.md)):
 ```json
 {"name": "handbook", "embedding_connection_id": 2,
  "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
- "search_mode": "hybrid", "search_backend": "pgvector", "fts_config": "simple",
+ "search_mode": "hybrid", "search_backend": "pgvector", "language": "simple",
  "rerank": false, "rerank_backend": "llm", "rerank_connection_id": null,
  "rerank_candidates": 15, "max_distance": 0, "contextual_chunks": true,
  "max_documents": 0, "max_bytes": 0}
@@ -322,18 +324,24 @@ retrieval semantics are explained in [Retrieval (RAG)](rag.md)):
 Validation: `chunk_size` 200-20000, `chunk_overlap` ≥ 0 and smaller than `chunk_size`,
 `top_k` ≤ 50, `search_mode` `vector` or `hybrid`, `search_backend` `pgvector` or
 `pg_search` (`400` when this server cannot run it, see
-[Search backends](rag.md#search-backends)), `fts_config` must exist in `pg_ts_config`
-(anything but `simple` is accepted and, on the `pgvector` backend, logged as a warning,
-see [Search modes](rag.md#search-modes)), `rerank_backend` `llm`, `cohere` or `voyage`
+[Search backends](rag.md#search-backends)), `language` `simple` or an ISO 639-1 code with a
+text search configuration on this server (`400` otherwise, see
+[Store language](rag.md#store-language)); a body that omits it keeps the store's language
+(`simple` on create). `fts_config` is **deprecated**: send `language` instead. A request
+that still sends only `fts_config` has a known configuration name (`english`) translated
+to its language (`en`); an unknown name, or one that contradicts a `language` in the same
+body, is `400`. `rerank_backend` `llm`, `cohere` or `voyage`
 (`cohere` and `voyage` need a `rerank_connection_id` of the matching `cohere_rerank` /
 `voyage_rerank` type; `llm` may name a chat connection, see
 [Reranking](rag.md#reranking)), `rerank_candidates` 1-100, `max_distance` 0-2,
 `max_documents` and `max_bytes` ≥ 0 (`0` = unlimited, see
 [Unlimited (`0`)](configuration.md#zero-means-unlimited)). The embedding
 connection must be of a type that supports embeddings, must produce vectors of at most
-2000 dimensions (`400` when the probe at save time can tell; otherwise the first ingest
+4000 dimensions (`400` when the probe at save time can tell; otherwise the first ingest
 fails the document, see [Embedding width](rag.md#embedding-width)) and
-cannot be changed while the store has chunks (`400`). Responses carry the usage the
+cannot be changed while the store has chunks (`400`). Binding a store to a width of 2001 to
+4000 dimensions whose table has no vector index yet is `409` with `code: "index_missing"`:
+reindex that width first. Responses carry the usage the
 quotas are checked against: `document_count` and `bytes_used`.
 
 A store as the API returns it:
@@ -341,15 +349,25 @@ A store as the API returns it:
 ```json
 {"id": 1, "name": "handbook", "embedding_connection_id": 2,
  "chunk_size": 1000, "chunk_overlap": 200, "top_k": 5,
- "search_mode": "hybrid", "search_backend": "pgvector", "fts_config": "simple",
+ "search_mode": "hybrid", "search_backend": "pgvector", "language": "tr", "fts_config": "turkish",
+ "fts_language_applied": "tr", "fts_status": "ready", "language_applies_to_search": true,
  "rerank": false, "rerank_candidates": 15, "rerank_backend": "llm", "rerank_connection_id": null,
  "max_distance": 0, "contextual_chunks": true, "max_documents": 0, "max_bytes": 0,
  "dimensions": 1536, "document_count": 3, "bytes_used": 3145728, "chunk_count": 126,
- "created_at": "2026-09-18T10:00:00.000Z"}
+ "created_at": "2026-09-18T10:00:00.000Z", "vector_index": "hnsw"}
 ```
 
 `dimensions` is the width of the store's vectors (`0` until the first ingest), and
-`chunk_count` the number of chunks across its documents. `PUT` adds
+`chunk_count` the number of chunks across its documents. `vector_index` is the state of the
+vector index of that width: `hnsw`, `hnsw_halfvec`, `building`, `missing` or
+`not_indexable` (absent while `dimensions` is `0`), and `vector_index_progress` is the
+percentage while it is `building` (see [Embedding width](rag.md#embedding-width)).
+`language` is the store language, `fts_config` its deprecated configuration name (derived,
+never stored independently), `fts_status` `not_needed`, `rebuilding` or `ready`,
+`fts_language_applied` the language the full-text column was last built for (`null` while
+pending, and for `simple`), and `language_applies_to_search` is `false` when the store's
+lexical search runs on `pg_search`, which ignores the language (see
+[Store language](rag.md#store-language)). `PUT` adds
 `reprocess_recommended` to the object: `true` when a changed setting only takes effect
 for documents after they are re-chunked or re-embedded.
 
@@ -358,7 +376,9 @@ Documents look like
 ```json
 {"id": 7, "rag_store_id": 1, "filename": "handbook.pdf", "mime": "application/pdf",
  "size_bytes": 1048576, "status": "ready", "error": "", "chunk_count": 42,
- "page_count": 12, "progress_percent": 100, "attempts": 1, "created_at": "…", "updated_at": "…"}
+ "page_count": 12, "progress_percent": 100, "attempts": 1,
+ "metadata": {"lang": "tr", "product": "gateway", "tags": ["faq", "billing"]},
+ "created_at": "…", "updated_at": "…"}
 ```
 
 with `status` moving `pending` → `processing` → `ready` (or `failed` with `error` set).
@@ -368,6 +388,24 @@ reached. `page_count` is the number of pages of a PDF and `null` for other forma
 until the document has been parsed). `attempts` counts how often a replica claimed the
 document for ingestion since it was last queued; a document past the cap is skipped
 rather than retried forever.
+`metadata` is the document's filterable attributes, `{}` when it has none. It is a flat
+object of strings, numbers, booleans and arrays of those, written with the upload's optional
+`metadata` form field (a JSON string, applied to every file of the request) or replaced
+later with `PATCH /documents/{id}` and `{"metadata": {...}}` (`{}` clears it). Limits and
+the filter that reads it are in [Metadata and filters](rag.md#metadata-and-filters); an
+invalid object is `400`, and the audit log records the key names only.
+An upload answers each document with two extra fields, `deduplicated` and, when it is
+`true`, `duplicate_of` (the id of the twin whose embeddings are expected to be reused):
+
+```json
+{"id": 9, "rag_store_id": 1, "filename": "handbook.pdf", "mime": "application/pdf",
+ "size_bytes": 1048576, "status": "pending", "error": "", "chunk_count": 0,
+ "page_count": null, "progress_percent": 0, "attempts": 0, "metadata": {"lang": "tr"},
+ "created_at": "…", "updated_at": "…", "deduplicated": true, "duplicate_of": 7}
+```
+
+It is a forecast made at upload time and is not stored, so a later `GET` of the document
+does not carry it; see [Duplicate uploads](rag.md#duplicate-uploads).
 Accepted extensions: `.pdf`, `.docx`, `.html`, `.htm`, `.md`, `.markdown`, `.txt`; the
 request body is limited to `MAX_UPLOAD_MB`. Upload and reprocess answer
 `503 the ingestion backlog is full (MAX_PENDING_DOCUMENTS), retry later` when the queue
@@ -379,9 +417,11 @@ Search request and response:
 
 ```json
 POST /admin/api/rag-stores/1/search
-{"query": "vacation policy", "top_k": 3, "mode": "hybrid", "rerank": true, "max_distance": 0.6}
+{"query": "vacation policy", "top_k": 3, "mode": "hybrid", "rerank": true, "max_distance": 0.6,
+ "filter": {"lang": "tr"}}
 
-{"mode": "hybrid", "backend": "pgvector", "fts_config": "simple",
+{"mode": "hybrid", "backend": "pgvector", "language": "tr", "fts_config": "turkish",
+ "fts_status": "ready", "language_applied_to_search": true,
  "reranked": true, "rerank_backend": "llm", "rerank_fallback": false, "latency_ms": 412,
  "retrieval_latency_ms": 180, "rerank_latency_ms": 230,
  "hits": [{"chunk_id": 8, "document_id": 2, "filename": "handbook.pdf", "index": 3,
@@ -396,7 +436,9 @@ POST /admin/api/rag-stores/1/search
 Everything but `query` is optional and overrides the store setting for this call only
 (`mode`, `backend`, `rerank`, `rerank_backend`, `rerank_connection_id`, `max_distance`
 and `top_k`; the full list and the meaning of the response fields are in
-[Search endpoint](rag.md#search-endpoint)); `top_k` is clamped to 1-50 (`0` or absent
+[Search endpoint](rag.md#search-endpoint)); `filter` limits the search to the documents
+whose metadata matches ([Metadata and filters](rag.md#metadata-and-filters); a filter outside
+the grammar is `400`); `top_k` is clamped to 1-50 (`0` or absent
 uses the store's `top_k`). `latency_ms` is the whole call, `retrieval_latency_ms` covers
 embedding the query and the database search, and `rerank_latency_ms` the reranker
 (`null` when `rerank` is off or was skipped; a number, often `0`, when the reranker was
@@ -405,6 +447,21 @@ When `rerank` is on but the store has no `rerank_connection_id` (and so nothing 
 with), the search runs unreranked and the response says so with `"rerank_skipped": true`
 and a `rerank_skipped_reason`; both are `false` / `""` otherwise.
 A `502` is returned when the embedding call fails.
+
+`POST /rag-stores/{id}/reindex` (admin only) builds the vector index of the store's
+embedding width. The index belongs to the width, so every store of that width gains it. It
+answers `202` straight away and builds in the background with
+`CREATE INDEX CONCURRENTLY`; watch `vector_index` (and `vector_index_progress`) on the store:
+
+```json
+{"dimensions": 2560, "vector_index": "building", "vector_index_progress": 0,
+ "affected_stores": [{"id": 1, "name": "handbook"}, {"id": 4, "name": "faq"}]}
+```
+
+Errors are `409`: `already_indexed` (the width is 2000 or fewer, or its index is valid),
+`not_indexable` (wider than 4000 dimensions, or wider than 2000 on a pgvector older than
+0.7.0) and `not_bound` (the store has no embeddings yet). The action is written to the audit
+log as `rag_store.reindex`. See [Embedding width](rag.md#embedding-width).
 
 ### Projects
 
@@ -428,11 +485,31 @@ Project body:
 {"name": "support-bot", "model_connection_id": 1, "rag_store_id": 1,
  "system_prompt": "You are the company support assistant.",
  "member_user_ids": [4],
- "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
+ "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
+ "history_turns_for_query": 3, "query_model_connection_id": null}
 ```
 
 `rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
 [Zero means unlimited](configuration.md#zero-means-unlimited)).
+
+The last five fields are the project's RAG behaviour:
+
+| Field | Values | Default |
+|---|---|---|
+| `context_placement` | `system`, `before_last_user` ([Context placement](rag.md#context-placement)) | `system` |
+| `retrieval_policy` | `always`, `auto`, `off` ([Retrieval policy](rag.md#retrieval-policy)) | `always` |
+| `query_strategy` | `last_user`, `condense` ([Query strategy](rag.md#query-strategy)) | `last_user` |
+| `history_turns_for_query` | 1 to 10 turns sent to `condense` | `3` |
+| `query_model_connection_id` | a chat connection that condenses the query, or `null` for the first route target's | `null` |
+
+Unlike the rest of the body, **a RAG field left out keeps its current value** on update (and
+takes the default on create), so a script that does not know them never resets them by
+saving the project; `query_model_connection_id: null` clears that one explicitly. An unknown
+value is `400`, and so is a `query_model_connection_id` that is not an existing chat
+connection. A connection a project names there cannot be deleted (`409`). A change is
+written to the audit log on the `project.update` entry, under `details.rag_settings_changed`
+(`from` and `to` for each field that changed).
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
 full key is never returned again. The project object:
 
@@ -440,6 +517,8 @@ full key is never returned again. The project object:
 {"id": 3, "name": "support-bot", "model_connection_id": 1, "rag_store_id": 1,
  "api_key_prefix": "sk-proj-ab12", "system_prompt": "You are the company support assistant.",
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
+ "history_turns_for_query": 3, "query_model_connection_id": null,
  "member_ids": [4], "created_at": "…", "updated_at": "…"}
 ```
 
@@ -858,23 +937,42 @@ object is consumed by the gateway and never sent upstream. `messages` is require
 body may not exceed 4 MiB.
 
 ```json
-{"model": "…", "messages": […], "ragmux": {"include_context": true}}
+{"model": "…", "messages": […], "ragmux": {"sources": "inline", "filter": {"lang": "tr"}}}
 ```
 
-`include_context` asks for the retrieved sources and the exact context block that was
-injected, added as a top-level `ragmux` object to a non-streaming response (see
-[RAG](rag.md#sources-on-the-response)); streaming responses only carry the headers.
+The `ragmux` object can only **narrow** what the project's RAG settings would do for this
+request, or ask for more information back; it cannot turn retrieval on or change a project
+setting. Its fields:
+
+| Field | Value | Effect |
+|---|---|---|
+| `retrieval` | `"off"` | skip retrieval for this request |
+| `filter` | an object | retrieve only from documents whose metadata matches ([Metadata and filters](rag.md#metadata-and-filters)) |
+| `sources` | `"inline"` | return the retrieved sources in the response body, streamed or not |
+| `include_context` | `true` | the sources plus the exact context block that was injected |
+
+`sources` and `include_context` add a top-level `ragmux` object to a non-streaming response
+and to the first chunk of a stream that carries `choices` (no extra chunk is sent); see
+[RAG](rag.md#sources-on-the-response). An object that is not a JSON object, or a `filter`
+outside the grammar, is `400` with `code: "invalid_ragmux"`; every other thing the gateway
+cannot honour (another value for `retrieval` or `sources`, a project setting, an unknown
+field, a narrowing with nothing to narrow) is ignored and reported in a `Warning` header.
+The full rules are in [The `ragmux` request object](rag.md#the-ragmux-request-object).
 
 What happens to a request, in order:
 
 1. The project's rate limits and budgets are checked (before any embedding call).
 2. The project `system_prompt`, if set, is prepended to the first `system`/`developer`
    message (or inserted as one).
-3. If the project has a RAG store, the last `user` message is used as the query and the
-   retrieved passages are injected the same way; the response carries
-   `x-ragmux-rag-hits: <n>` and, when passages were injected, `x-ragmux-rag-sources`
-   listing them. Retrieval failures are logged and the request continues without
-   context.
+3. If the project has a RAG store, the [retrieval policy](rag.md#retrieval-policy) decides
+   whether to retrieve (a skipped request carries `x-ragmux-rag-skip`). Otherwise the last
+   `user` message, or a standalone rewrite of it when the project's `query_strategy` is
+   `condense`, is the query, and the retrieved passages are injected into the first system
+   message or in front of the last user message, as the project's `context_placement`
+   says. The per-minute token limit is checked once more against the whole prompt. The
+   response carries `x-ragmux-rag-hits: <n>` and, when passages were injected,
+   `x-ragmux-rag-sources` listing them. Retrieval failures are logged and the request
+   continues without context.
 4. The request is translated for the provider and sent. A project without chat
    [routes](#routes) ignores `model` for selection: the project's connection decides.
    Once a project has a chat route, `model` selects what runs and an unknown value is
@@ -947,10 +1045,11 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-budget-daily-remaining` | tokens left in today's budget |
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
-| `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB |
+| `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB. `ragmux.sources: "inline"` returns the whole list in the body |
+| `x-ragmux-rag-skip` | present when the project has a store and this request did not retrieve, with the reason: `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack` (then `x-ragmux-rag-hits` is `0`). Absent when retrieval ran. See [Retrieval policy](rag.md#retrieval-policy) |
 | `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
-| `Warning` | `299 ragmux "<text>"` when the connection accepted the request but ignored part of it — today only `response_format` (`json_schema`/`json_object`) on an Anthropic connection. Set before the first byte, so a stream carries it too. See [Anthropic](providers.md#anthropic) |
+| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` (`json_schema`/`json_object`) on an Anthropic connection (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
 `Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and
@@ -962,7 +1061,7 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
+| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
@@ -1018,23 +1117,29 @@ Needs the key's `retrieve` scope. The scope decides, not the owner's role: a key
 minted for the project works.
 
 ```json
-{"query": "how many vacation days do I get?", "top_k": 5}
+{"query": "how many vacation days do I get?", "top_k": 5, "filter": {"lang": "tr"}}
 ```
 
 `query` is required. `top_k` is optional, 1 to 50; omitted or `0` uses the store's
-`top_k`. The store's search mode, backend, rerank and distance settings apply; a request
+`top_k`. `filter` is optional and limits the search to documents whose metadata matches
+([Metadata and filters](rag.md#metadata-and-filters)); a filter outside the grammar, `null`
+included, answers `400` `invalid_request_error`, and when no document matches the search
+returns no hits without embedding the query (nothing is charged for it). The store's search
+mode, backend, rerank and distance settings apply; a request
 cannot override them (the dashboard's [search endpoint](rag.md#search-endpoint) can).
 
 ```json
 {"object": "retrieval", "mode": "hybrid", "backend": "pg_search", "reranked": false,
  "rerank_backend": "", "rerank_fallback": false, "retrieval_latency_ms": 41, "rerank_latency_ms": null,
  "hits": [{"chunk_id": 8, "document_id": 2, "content": "…", "score": 0.0325, "distance": 0.18,
-           "metadata": {"filename": "handbook.pdf", "section": "Leave > Vacation", "page": 12, "chunk_index": 3}}],
+           "metadata": {"filename": "handbook.pdf", "section": "Leave > Vacation", "page": 12, "chunk_index": 3},
+           "document_metadata": {"lang": "tr", "product": "gateway"}}],
  "usage": {"prompt_tokens": 7, "total_tokens": 7}}
 ```
 
-`hits` is always an array, empty when nothing matched. `backend` is the one that actually
-ran. `usage` counts the query's embedding tokens, plus the tokens of the rerank call when
+`hits` is always an array, empty when nothing matched. `metadata` describes where the chunk
+sits in its file; `document_metadata` is the document's own filterable metadata (`{}` when it
+has none). `backend` is the one that actually ran. `usage` counts the query's embedding tokens, plus the tokens of the rerank call when
 the store reranks with the LLM backend (that call goes to the project's chat connection, so a
 key with only `retrieve` can cause it; it is counted on the request row and against the
 project's limits, and priced at the rerank connection's rate, not the embedding

@@ -364,62 +364,6 @@ type driftCase struct {
 	docOnly map[string]string
 }
 
-// ragSettingsPending lists the ADR-024 project settings (migration 0021). They
-// are in the admin API from the phase that added them; docs/api.md gets them
-// in the v0.6 documentation phase, which is when these exceptions go.
-var ragSettingsPending = map[string]string{
-	"context_placement":         "ADR-024 setting, documented in the v0.6 docs phase",
-	"retrieval_policy":          "ADR-024 setting, documented in the v0.6 docs phase",
-	"query_strategy":            "ADR-024 setting, documented in the v0.6 docs phase",
-	"history_turns_for_query":   "ADR-024 setting, documented in the v0.6 docs phase",
-	"query_model_connection_id": "ADR-024 setting, documented in the v0.6 docs phase",
-}
-
-// documentMetadataPending and searchFilterPending list the ADR-025 fields
-// (migration 0023). Same arrangement as ragSettingsPending: docs/api.md gets
-// them in the v0.6 documentation phase, which is when these exceptions go.
-var documentMetadataPending = map[string]string{
-	"metadata": "ADR-025 field, documented in the v0.6 docs phase",
-}
-
-var searchFilterPending = map[string]string{
-	"filter": "ADR-025 field, documented in the v0.6 docs phase",
-}
-
-// vectorIndexPending lists the ADR-026 store fields (the halfvec index state).
-// Same arrangement: docs/api.md gets them in the v0.6 documentation phase,
-// which is when these exceptions go.
-var vectorIndexPending = map[string]string{
-	"vector_index":          "ADR-026 field, documented in the v0.6 docs phase",
-	"vector_index_progress": "ADR-026 field, documented in the v0.6 docs phase",
-}
-
-// storeLanguagePending lists the ADR-027 store fields (migration 0027). Same
-// arrangement: docs/api.md gets them in the v0.6 documentation phase, which is
-// when these exceptions go. The store response carries all four; the request
-// body only language (fts_config is documented already, as deprecated there).
-var storeLanguagePending = map[string]string{
-	"language":                   "ADR-027 field, documented in the v0.6 docs phase",
-	"fts_language_applied":       "ADR-027 field, documented in the v0.6 docs phase",
-	"fts_status":                 "ADR-027 field, documented in the v0.6 docs phase",
-	"language_applies_to_search": "ADR-027 field, documented in the v0.6 docs phase",
-}
-
-var storeLanguageBodyPending = map[string]string{
-	"language": "ADR-027 field, documented in the v0.6 docs phase",
-}
-
-// pendingUnion merges exception lists for one case.
-func pendingUnion(lists ...map[string]string) map[string]string {
-	out := map[string]string{}
-	for _, l := range lists {
-		for k, v := range l {
-			out[k] = v
-		}
-	}
-	return out
-}
-
 // compareDrift returns the code fields the docs lack and the doc keys the code
 // lacks, plus problems with the case itself (anchor not found, stale
 // exceptions).
@@ -581,22 +525,23 @@ func driftCases(t *testing.T) []driftCase {
 
 		// RAG stores and documents
 		{name: "rag store", code: jsonFieldNames(typeOf[ragStoreResponse]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "document_count", ""}, prose: []string{"reprocess_recommended"},
-			undocumented: pendingUnion(vectorIndexPending, storeLanguagePending)},
+			obj: &jsonSel{"", "document_count", ""}, prose: []string{"reprocess_recommended", "vector_index_progress"}},
 		{name: "rag store body", code: jsonFieldNames(typeOf[ragInput]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "search_backend", "document_count"}, undocumented: storeLanguageBodyPending},
+			obj: &jsonSel{"", "search_backend", "document_count"}, prose: []string{"fts_config"}},
 		{name: "document", code: jsonFieldNames(typeOf[store.Document]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "progress_percent", ""}, undocumented: documentMetadataPending},
+			obj: &jsonSel{"", "progress_percent", "deduplicated"}},
+		{name: "uploaded document", code: jsonFieldNames(typeOf[uploadedDocument]()), sections: []string{"RAG stores and documents"},
+			obj: &jsonSel{"", "deduplicated", ""}},
 		{name: "search request", code: handlerStructFields(t, "admin.go", "searchRAGStore"), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "query", ""}, prose: []string{"backend", "rerank_backend", "rerank_connection_id"}, undocumented: searchFilterPending},
+			obj: &jsonSel{"", "query", ""}, prose: []string{"backend", "rerank_backend", "rerank_connection_id"}},
 		{name: "search hit", code: jsonFieldNames(typeOf[store.SearchHit]()), sections: []string{"RAG stores and documents"},
 			obj: &jsonSel{"hits[]", "chunk_id", ""}},
 
 		// Projects
 		{name: "project", code: jsonFieldNames(typeOf[store.Project]()), sections: []string{"Projects"},
-			obj: &jsonSel{"", "api_key_prefix", ""}, undocumented: ragSettingsPending},
+			obj: &jsonSel{"", "api_key_prefix", ""}},
 		{name: "project body", code: jsonFieldNames(typeOf[projectInput]()), sections: []string{"Projects"},
-			obj: &jsonSel{"", "member_user_ids", ""}, undocumented: ragSettingsPending},
+			obj: &jsonSel{"", "member_user_ids", ""}},
 		{name: "project members body", code: handlerStructFields(t, "admin.go", "setMembers"), sections: []string{"Projects"},
 			brace: []string{"user_ids"}},
 		{name: "project member", code: jsonFieldNames(typeOf[store.ProjectMember]()), sections: []string{"Projects"},

@@ -163,7 +163,11 @@ counts is a trap for anyone doing cost maths. Divide the estimated request count
 | `ragmux_budget_used_ratio` | gauge | `project` | Tokens used over the token budget, for projects that have one: the larger of the daily and the monthly ratio, so `1` means the project is about to be refused. Read from the database at most every 30 s; the same on every replica. Projects without a budget have no series. New projects count against `METRICS_MAX_SERIES` like any other series. |
 
 The denied request itself is still counted by `ragmux_http_requests_total` with
-`status="429"`.
+`status="429"`. A per-minute token denial can come from two checks: the one before
+retrieval, and, for a project with a RAG store, a second one once the retrieved context is
+known (see [Context and limits](rag.md#context-and-limits)). Both count here as
+`rate_limit_tpm`, but only the second also reaches `ragmux_gateway_requests_total` (as a
+`429`), because by then the request is routed and has a row to write.
 
 **Retrieval.**
 
@@ -176,7 +180,9 @@ The denied request itself is still counted by `ragmux_http_requests_total` with
 | `ragmux_rag_searches_total` | counter | `store`, `used` | `used` is the backend that **actually answered**. |
 | `ragmux_rag_hits_total` | counter | `store` | Passages returned. |
 | `ragmux_search_backend_available` | gauge | `backend` | `1` when this server can answer with that backend. |
-| `ragmux_rag_index_missing` | gauge | — | RAG stores whose embedding width is above 2000 dimensions, which pgvector cannot HNSW-index; they are searched with an exact scan (see [Embedding width](rag.md#embedding-width)). Counted at startup and recounted when such a store is deleted or re-bound. |
+| `ragmux_rag_skipped_total` | counter | `project`, `reason` | Chat requests of a project with a RAG store that did not retrieve. `reason` is `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack` and nothing else; the same value is in the `x-ragmux-rag-skip` header and the request log (see [Retrieval policy](rag.md#retrieval-policy)). |
+| `ragmux_rag_query_condense_total` | counter | `outcome` | Condense calls of projects with `query_strategy: condense`, by outcome: `ok`, `error`, `timeout` or `invalid`. Everything but `ok` means that request retrieved with the last user message instead; a rising share of the others says the condense model is slow or unreliable (see [Query strategy](rag.md#query-strategy)). No call is made, and nothing is counted, for a first question. |
+| `ragmux_rag_index_missing` | gauge | — | RAG stores whose vectors have no usable HNSW index: a width above 4000 dimensions, or 2001 to 4000 whose table has no valid halfvec index yet. They are searched with an exact scan, which is correct but slows down with size; reindex the second kind from the dashboard or with `POST /admin/api/rag-stores/{id}/reindex` (see [Embedding width](rag.md#embedding-width)). Counted at startup, recounted when such a store is deleted or re-bound and when an index build finishes. A positive value is a reason to act, not an outage. |
 
 `used` differs from the store's configured `search_backend` when the configured one is
 not available on this server and the search fell back to pgvector. Comparing the two is
@@ -343,10 +349,13 @@ cost columns, a row identifies the request:
 | `route` | The name of the route that picked the connection. `NULL` for the implicit route and for projects without routes. Like `requested_model`, it lives in the table only, never in a metric label |
 | `attempt` | How many upstream calls the request took in total, retries and fallbacks included; `1` for a call that went upstream once, `NULL` for a denial that never reached the upstream |
 | `fallback_from` | The `connection_id` of the first target, whenever the request moved past it to another target (also when no target answered; the row then records the last failure). `NULL` otherwise |
+| `rag_skip_reason` | Why a request of a project with a RAG store did not retrieve: `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack`; `NULL` when it retrieved, when the project has no store and on rows from before migration `0022`. Like the metric label, a closed set — never text a client wrote. It is in the table only: the admin API's request log and the CSV export do not carry it |
+
+`rag_used` and `rag_hits` say whether retrieved context reached the model and how many passages it held; a request whose context was refused by the second per-minute token check (see [Context and limits](rag.md#context-and-limits)) is a `429` with `rag_used = false`. The condense and rerank calls of a request add their tokens to its row.
 
 `request_id` is a column, never a metric label (see the
-[cardinality checklist](#cardinality-checklist)). The columns are added by migrations
-`0016` and `0017`; the index is built `CONCURRENTLY`, so upgrading does not lock a large
+[cardinality checklist](#cardinality-checklist)). The identifying columns are added by
+migrations `0016` and `0017` (`rag_skip_reason` by `0022`); the index is built `CONCURRENTLY`, so upgrading does not lock a large
 `request_logs` table against writes. Replicas that start together
 take turns on that build (a session advisory lock, polled rather than waited on), and an
 interrupted build repairs itself: PostgreSQL leaves an `INVALID` index behind, the next
@@ -458,7 +467,7 @@ nothing.
 
 ### The spans
 
-There are eight span sites and no more. They are hand-written, so each one is a
+There are nine span sites and no more. They are hand-written, so each one is a
 decision rather than a by-product.
 
 | Span | Kind | Where | Attributes |
@@ -467,6 +476,7 @@ decision rather than a by-product.
 | `chat {model}` / `embeddings {model}` / `rerank {model}` / `retrieval {store id}` | Internal | the `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank` and `/v1/retrieve` handlers; see [Request span names](#request-span-names) | `ragmux.project.id`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `ragmux.stream`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens` (the ones the endpoint has), `ragmux.route`, `ragmux.attempts`, `ragmux.fallback.from_connection`, `gen_ai.data_source.id` (retrieval) |
 | `gateway.attempt` | Internal | one upstream call of the retry and fallback walk; a child of the request span | `ragmux.attempt`, `ragmux.retry`, `ragmux.fallback`, `ragmux.fallback.from_connection`, `ragmux.connection.id`, `ragmux.route`, `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `error.type` |
 | `rag.retrieve` | Internal | `Retriever.SearchWith` | `ragmux.rag.store_id`, `.mode`, `.backend`, `.top_k`, `.hits` |
+| `rag.condense` | Client | around the query condense call; only a request that attempts a condense opens one | `gen_ai.provider.name`, `ragmux.condense.outcome` |
 | `rag.embed_query` | Client | around the query embedding call | `gen_ai.provider.name`, `gen_ai.system` (deprecated) |
 | `rag.rerank` | Client | around the rerank call | `ragmux.rerank.backend`, `ragmux.rerank.fallback` |
 | `provider.chat` / `provider.embed` / `provider.rerank` | Client | `internal/provider/http.go`, `doRequest` / `doStream` | `server.address` (host only), `gen_ai.provider.name`, `gen_ai.system` (deprecated), `gen_ai.operation.name` (`chat` or `embeddings`; absent on rerank), `http.response.status_code`, `ragmux.stream.bytes` |
@@ -585,7 +595,7 @@ Two consequences that are easy to get wrong and are handled in the code:
 `internal/e2e` enforces this with a test that pushes five distinct markers through the
 stack — message content, passage text, a filename, the system prompt and a provider
 credential — flushes the exporter into a stand-in collector, and greps the captured OTLP
-payload for each of them. The same test asserts that all eight span names did arrive, so
+payload for each of them. The same test asserts that the eight span names it lists did arrive (`rag.condense` is not among them), so
 it cannot pass by exporting nothing.
 
 ### What a hand-rolled exporter does not get
