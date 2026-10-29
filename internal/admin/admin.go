@@ -35,6 +35,11 @@ import (
 
 // Admin holds dependencies for management routes.
 type Admin struct {
+	// FTSRebuild is woken when a store's language changes, so the rebuild of
+	// its full-text column starts at once instead of at the job's next poll.
+	// Nil is fine: the job still finds the work by itself.
+	FTSRebuild interface{ Kick() }
+
 	Store          *store.Store
 	Auth           *auth.Service
 	Ingester       *rag.Ingester
@@ -883,19 +888,27 @@ func (a *Admin) providerConfig(c *store.ModelConnection) provider.Config {
 // ---- RAG stores ----
 
 type ragInput struct {
-	Name                  string   `json:"name"`
-	EmbeddingConnectionID int64    `json:"embedding_connection_id"`
-	ChunkSize             int      `json:"chunk_size"`
-	ChunkOverlap          int      `json:"chunk_overlap"`
-	TopK                  int      `json:"top_k"`
-	SearchMode            string   `json:"search_mode"`
-	SearchBackend         string   `json:"search_backend"`
-	FTSConfig             string   `json:"fts_config"`
-	Rerank                bool     `json:"rerank"`
-	RerankCandidates      int      `json:"rerank_candidates"`
-	RerankBackend         string   `json:"rerank_backend"`
-	RerankConnectionID    *int64   `json:"rerank_connection_id"`
-	MaxDistance           *float64 `json:"max_distance"`
+	Name                  string `json:"name"`
+	EmbeddingConnectionID int64  `json:"embedding_connection_id"`
+	ChunkSize             int    `json:"chunk_size"`
+	ChunkOverlap          int    `json:"chunk_overlap"`
+	TopK                  int    `json:"top_k"`
+	SearchMode            string `json:"search_mode"`
+	SearchBackend         string `json:"search_backend"`
+	// Language is "simple" or an ISO 639-1 code (ADR-027). FTSConfig is the
+	// deprecated predecessor: a known configuration name is translated to its
+	// language, and a value that contradicts Language is rejected. Both
+	// omitted keeps the store's language (and means 'simple' on create).
+	Language  string `json:"language"`
+	FTSConfig string `json:"fts_config"`
+	// languageExplicit: the body carried language itself, not only the
+	// deprecated fts_config (set by validateRAG).
+	languageExplicit   bool
+	Rerank             bool     `json:"rerank"`
+	RerankCandidates   int      `json:"rerank_candidates"`
+	RerankBackend      string   `json:"rerank_backend"`
+	RerankConnectionID *int64   `json:"rerank_connection_id"`
+	MaxDistance        *float64 `json:"max_distance"`
 	// ContextualChunks defaults to true when omitted.
 	ContextualChunks *bool `json:"contextual_chunks"`
 	// MaxDocuments and MaxBytes are per-store upload quotas; 0 = unlimited.
@@ -941,19 +954,17 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 		return fmt.Errorf("search_backend %q cannot be used here: %s (see docs/rag.md#search-backends)",
 			in.SearchBackend, a.Store.SearchBackendReason(in.SearchBackend))
 	}
-	in.FTSConfig = strings.ToLower(strings.TrimSpace(in.FTSConfig))
-	if in.FTSConfig == "" {
-		in.FTSConfig = "simple"
+	// Rejected on write like the other settings, so a store saved here can
+	// always be indexed and searched in its language.
+	in.languageExplicit = strings.TrimSpace(in.Language) != ""
+	lang, _, err := a.Store.ResolveLanguage(r.Context(), in.Language, in.FTSConfig)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidLanguage) {
+			return err
+		}
+		return fmt.Errorf("checking language: %w", err)
 	}
-	if ok, err := a.Store.TextSearchConfigExists(r.Context(), in.FTSConfig); err != nil {
-		return err
-	} else if !ok {
-		return fmt.Errorf("fts_config %q is not a text search configuration on this server", in.FTSConfig)
-	}
-	// Accepted as before; the operator is only told what it does not do.
-	if msg := store.FTSConfigWarning(in.FTSConfig, in.SearchBackend); msg != "" {
-		a.Log.Warn("rag store: "+msg, "store", in.Name, "fts_config", in.FTSConfig)
-	}
+	in.Language, in.FTSConfig = lang, ""
 	if in.RerankCandidates <= 0 {
 		in.RerankCandidates = 15
 	}
@@ -1037,7 +1048,7 @@ func (a *Admin) validateRerank(r *http.Request, in *ragInput) error {
 func (in *ragInput) toStore(id int64) *store.RAGStore {
 	return &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
 		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK,
-		SearchMode: in.SearchMode, SearchBackend: in.SearchBackend, FTSConfig: in.FTSConfig,
+		SearchMode: in.SearchMode, SearchBackend: in.SearchBackend, Language: in.Language, LanguageExplicit: in.languageExplicit,
 		Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
 		RerankBackend: in.RerankBackend, RerankConnectionID: in.RerankConnectionID,
 		MaxDistance: *in.MaxDistance, ContextualChunks: *in.ContextualChunks,
@@ -1203,7 +1214,14 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	if connChanged && rs.DocumentCount > 0 {
 		reprocess = true
 	}
-	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess})
+	// A language change leaves chunks.fts to be rebuilt; the rebuild job is
+	// told now rather than at its next poll. Searches keep working on
+	// 'simple' until it is done (fts_status says "rebuilding" meanwhile).
+	if rs.FTSStatus == store.FTSRebuilding && a.FTSRebuild != nil {
+		a.FTSRebuild.Kick()
+	}
+	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess,
+		"language": rs.Language, "language_changed": before.Language != rs.Language})
 	writeJSON(w, http.StatusOK, ragStoreResponse{RAGStore: rs, ReprocessRecommended: reprocess})
 }
 
@@ -1487,10 +1505,15 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "backend": res.Backend,
-		// fts_config is echoed because the pg_search backend ignores it: the
-		// index is global and tokenised once, so the setting is inert there.
-		// Returning it makes that visible instead of surprising.
-		"fts_config": rs.FTSConfig, "reranked": res.Reranked, "rerank_backend": res.RerankBackend,
+		// language is echoed with whether it took part in this search: a vector
+		// search never runs the lexical leg, the pg_search backend ignores it (its index is global and tokenised once,
+		// by PG_SEARCH_TOKENIZER), and a store whose full-text column is being
+		// rebuilt is searched with 'simple' until the rebuild is done.
+		// Returning that makes it visible instead of surprising. fts_config is
+		// the deprecated name of the language's configuration.
+		"language": rs.Language, "fts_config": rs.FTSConfig, "fts_status": rs.FTSStatus,
+		"language_applied_to_search": res.Mode != store.SearchVector && res.Backend != store.BackendPgSearch && rs.FTSStatus != store.FTSRebuilding,
+		"reranked":                   res.Reranked, "rerank_backend": res.RerankBackend,
 		"rerank_fallback": res.RerankFallback,
 		// rerank_skipped is true when rerank was requested but the store has no
 		// usable rerank connection, so the hits are the fused order and

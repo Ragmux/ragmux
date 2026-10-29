@@ -1,6 +1,9 @@
 package rag
 
 import (
+	"encoding/json"
+	"math"
+	"os"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -125,4 +128,71 @@ func TestSplitBlocksOverlapDoesNotCrossSections(t *testing.T) {
 	if last := chunks[len(chunks)-1]; last.Section != "Two" {
 		t.Errorf("last chunk should be section two: %+v", last)
 	}
+}
+
+func TestEstimateTokens(t *testing.T) {
+	// The default divisor is the old characters/4 rule, rounded up.
+	for _, lang := range []string{"", "simple", "en", "de", "zz"} {
+		for _, c := range []struct {
+			s    string
+			want int
+		}{{"", 0}, {"a", 1}, {"abcd", 1}, {"abcde", 2}, {strings.Repeat("x", 400), 100}, {"çğıöşü", 2}} {
+			if got := EstimateTokens(c.s, lang); got != c.want {
+				t.Errorf("EstimateTokens(%q, %q) = %d, want %d", c.s, lang, got, c.want)
+			}
+		}
+	}
+	// Runes, not bytes: a Turkish letter is two bytes and one character.
+	text := strings.Repeat("ş", 300)
+	if got, want := EstimateTokens(text, "tr"), int(math.Ceil(300/charsPerToken["tr"])); got != want {
+		t.Errorf("EstimateTokens of 300 runes under tr = %d, want %d", got, want)
+	}
+	// A language with its own divisor estimates more tokens than the default
+	// for the same text, never fewer.
+	for lang, div := range charsPerToken {
+		if div <= 0 || div >= DefaultCharsPerToken {
+			t.Errorf("charsPerToken[%q] = %v: a table entry exists to be below the default %v", lang, div, DefaultCharsPerToken)
+		}
+		if EstimateTokens(text, lang) <= EstimateTokens(text, "en") {
+			t.Errorf("%s: estimate %d is not above the default's %d", lang, EstimateTokens(text, lang), EstimateTokens(text, "en"))
+		}
+	}
+}
+
+// tokenReference is testdata/token_reference_tr.json: the token count of
+// testdata/token_corpus_tr.txt under a reference tokenizer, written by the
+// measurement described on charsPerToken (made in CI or a sandbox, never on a
+// developer machine).
+type tokenReference struct {
+	Tokenizer string `json:"tokenizer"`
+	Tokens    int    `json:"tokens"`
+}
+
+// TestEstimateTokensTurkishCorpus holds the Turkish divisor to the reference
+// tokenizer's count on the fixed corpus: within 15%.
+func TestEstimateTokensTurkishCorpus(t *testing.T) {
+	corpus, err := os.ReadFile("testdata/token_corpus_tr.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile("testdata/token_reference_tr.json")
+	if os.IsNotExist(err) {
+		t.Skip("testdata/token_reference_tr.json is not there yet: the reference count has to be measured with a tokenizer " +
+			"library, in CI or a sandbox (see charsPerToken); the Turkish divisor is provisional until then")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ref tokenReference
+	if err := json.Unmarshal(raw, &ref); err != nil || ref.Tokens <= 0 || ref.Tokenizer == "" {
+		t.Fatalf("token_reference_tr.json = %q (%v): want {\"tokenizer\": ..., \"tokens\": N}", raw, err)
+	}
+	got := EstimateTokens(string(corpus), "tr")
+	lo, hi := float64(ref.Tokens)*0.85, float64(ref.Tokens)*1.15
+	if float64(got) < lo || float64(got) > hi {
+		t.Errorf("EstimateTokens(corpus, tr) = %d, reference (%s) = %d: outside +-15%% [%.0f, %.0f]; re-measure the divisor",
+			got, ref.Tokenizer, ref.Tokens, lo, hi)
+	}
+	// The default divisor is what was wrong for Turkish; keep the evidence.
+	t.Logf("corpus %d runes: tr estimate %d, default estimate %d, reference %d", len([]rune(string(corpus))), got, EstimateTokens(string(corpus), "en"), ref.Tokens)
 }

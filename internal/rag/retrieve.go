@@ -172,7 +172,7 @@ func (r *Retriever) SearchWithFilter(ctx context.Context, rs *store.RAGStore, qu
 		candidates = k * 3
 	}
 	hits, used, err := r.store.SearchWithBackend(ctx, rs.ID, query, vecs[0], store.SearchOptions{
-		Mode: mode, Backend: backend, FTSConfig: rs.FTSConfig, MaxDistance: rs.MaxDistance, Candidates: candidates, Filter: filter})
+		Mode: mode, Backend: backend, MaxDistance: rs.MaxDistance, Candidates: candidates, Filter: filter})
 	if err != nil {
 		span.RecordError(errSpanSearch)
 		return nil, err

@@ -394,6 +394,32 @@ var vectorIndexPending = map[string]string{
 	"vector_index_progress": "ADR-026 field, documented in the v0.6 docs phase",
 }
 
+// storeLanguagePending lists the ADR-027 store fields (migration 0027). Same
+// arrangement: docs/api.md gets them in the v0.6 documentation phase, which is
+// when these exceptions go. The store response carries all four; the request
+// body only language (fts_config is documented already, as deprecated there).
+var storeLanguagePending = map[string]string{
+	"language":                   "ADR-027 field, documented in the v0.6 docs phase",
+	"fts_language_applied":       "ADR-027 field, documented in the v0.6 docs phase",
+	"fts_status":                 "ADR-027 field, documented in the v0.6 docs phase",
+	"language_applies_to_search": "ADR-027 field, documented in the v0.6 docs phase",
+}
+
+var storeLanguageBodyPending = map[string]string{
+	"language": "ADR-027 field, documented in the v0.6 docs phase",
+}
+
+// pendingUnion merges exception lists for one case.
+func pendingUnion(lists ...map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, l := range lists {
+		for k, v := range l {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // compareDrift returns the code fields the docs lack and the doc keys the code
 // lacks, plus problems with the case itself (anchor not found, stale
 // exceptions).
@@ -556,9 +582,9 @@ func driftCases(t *testing.T) []driftCase {
 		// RAG stores and documents
 		{name: "rag store", code: jsonFieldNames(typeOf[ragStoreResponse]()), sections: []string{"RAG stores and documents"},
 			obj: &jsonSel{"", "document_count", ""}, prose: []string{"reprocess_recommended"},
-			undocumented: vectorIndexPending},
+			undocumented: pendingUnion(vectorIndexPending, storeLanguagePending)},
 		{name: "rag store body", code: jsonFieldNames(typeOf[ragInput]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "search_backend", "document_count"}},
+			obj: &jsonSel{"", "search_backend", "document_count"}, undocumented: storeLanguageBodyPending},
 		{name: "document", code: jsonFieldNames(typeOf[store.Document]()), sections: []string{"RAG stores and documents"},
 			obj: &jsonSel{"", "progress_percent", ""}, undocumented: documentMetadataPending},
 		{name: "search request", code: handlerStructFields(t, "admin.go", "searchRAGStore"), sections: []string{"RAG stores and documents"},

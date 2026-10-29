@@ -515,7 +515,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 	chunks := make([]*store.Chunk, len(pieces))
 	inputs := make([]string, len(pieces))
 	for i, p := range pieces {
-		c := &store.Chunk{Index: p.Index, Content: p.Content, TokenEstimate: EstimateTokens(p.Content),
+		c := &store.Chunk{Index: p.Index, Content: p.Content, TokenEstimate: EstimateTokens(p.Content, rs.Language),
 			Metadata: chunkMetadata(title, p)}
 		inputs[i] = p.Content
 		if rs.ContextualChunks {
@@ -537,7 +537,7 @@ func (ing *Ingester) pipeline(ctx context.Context, doc *store.Document) (int, er
 		if err != nil {
 			return 0, fmt.Errorf("embed batch %d: %w", i/ing.batchSize, err)
 		}
-		tokens += ing.recordEmbedUsage(usage, inputs)
+		tokens += ing.recordEmbedUsage(usage, inputs, rs.Language)
 		for j := range vecs {
 			chunks[i+j].Embedding = vecs[j]
 		}
@@ -620,15 +620,16 @@ func sameChunks(vecs []store.ChunkVector, chunks []*store.Chunk, dims int) bool 
 
 // recordEmbedUsage counts the tokens one embedding batch spent and returns
 // them. The upstream's own count is used when it sent one; otherwise the
-// tokens are estimated from the input text with EstimateTokens.
-func (ing *Ingester) recordEmbedUsage(usage *provider.Usage, inputs []string) int {
+// tokens are estimated from the input text with EstimateTokens, by the
+// language of the store being ingested.
+func (ing *Ingester) recordEmbedUsage(usage *provider.Usage, inputs []string, language string) int {
 	if usage != nil && usage.PromptTokens > 0 {
 		ing.metrics.RecordIngestEmbedTokens(obs.EmbedTokensReported, usage.PromptTokens)
 		return usage.PromptTokens
 	}
 	est := 0
 	for _, in := range inputs {
-		est += EstimateTokens(in)
+		est += EstimateTokens(in, language)
 	}
 	ing.metrics.RecordIngestEmbedTokens(obs.EmbedTokensEstimated, est)
 	return est

@@ -145,16 +145,24 @@ func TestCheckStoreBinding(t *testing.T) {
 }
 
 func TestFTSConfigWarning(t *testing.T) {
-	if msg := FTSConfigWarning("turkish", BackendPgvector); !strings.Contains(msg, "turkish") || !strings.Contains(msg, "v0.6-9") {
+	// A leftover fts_config on a store that has no language yet: the warning
+	// names the language to set.
+	msg := FTSConfigWarning("turkish", LanguageSimple, BackendPgvector)
+	if !strings.Contains(msg, "turkish") || !strings.Contains(msg, "language to 'tr'") {
 		t.Errorf("turkish warning = %q", msg)
 	}
-	for _, c := range []struct{ cfg, backend string }{
-		{"simple", BackendPgvector}, {"", BackendPgvector}, {" Simple ", BackendPgvector},
-		// pg_search ignores fts_config, so there is nothing to warn about.
-		{"turkish", BackendPgSearch},
+	if msg := FTSConfigWarning("danish", "", BackendPgvector); !strings.Contains(msg, "'da'") {
+		t.Errorf("danish warning = %q", msg)
+	}
+	for _, c := range []struct{ cfg, language, backend string }{
+		{"simple", "simple", BackendPgvector}, {"", "simple", BackendPgvector}, {" Simple ", "simple", BackendPgvector},
+		// pg_search never read fts_config, so there is nothing to warn about.
+		{"turkish", "simple", BackendPgSearch},
+		// The store already has its language: the old setting is moot.
+		{"turkish", "tr", BackendPgvector},
 	} {
-		if msg := FTSConfigWarning(c.cfg, c.backend); msg != "" {
-			t.Errorf("FTSConfigWarning(%q, %q) = %q, want none", c.cfg, c.backend, msg)
+		if msg := FTSConfigWarning(c.cfg, c.language, c.backend); msg != "" {
+			t.Errorf("FTSConfigWarning(%q, %q, %q) = %q, want none", c.cfg, c.language, c.backend, msg)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package rag
 
 import (
+	"math"
 	"strings"
 	"unicode/utf8"
 )
@@ -174,8 +175,45 @@ func indexRune(rs []rune, r rune) int {
 	return -1
 }
 
-// EstimateTokens approximates token count as characters / 4.
-func EstimateTokens(s string) int {
+// DefaultCharsPerToken is the characters-per-token divisor of a language with
+// no entry in charsPerToken: the long-standing rule of thumb for English.
+const DefaultCharsPerToken = 4.0
+
+// charsPerToken is the characters-per-token divisor of the languages whose
+// text tokenises noticeably worse than English (ADR-027, R27). The key is a
+// store language; anything not listed uses DefaultCharsPerToken. The table is
+// an estimate for token limits and usage figures, never a count: it is
+// replaced by the upstream's own usage whenever the upstream reports one.
+//
+// How a value is measured: take a fixed corpus of the language, count its
+// characters (runes) and its tokens under a reference tokenizer
+// (o200k_base), and enter characters / tokens, rounded to one decimal. The
+// measurement needs a tokenizer library and its vocabulary, so it is made in
+// CI or a sandbox, never on a developer machine, and the corpus, the
+// tokenizer and the date go into the comment of the entry.
+//
+//	tr: 3.5, measured 2026-10-28 on testdata/token_corpus_tr.txt (1135
+//	    characters, counted as runes like EstimateTokens does) with tiktoken
+//	    0.9.0 in a throwaway container with the corpus mounted read-only:
+//	    o200k_base 307 tokens (3.70 characters/token), cl100k_base 427 tokens
+//	    (2.66 characters/token). 3.5 estimates 325 tokens for the corpus,
+//	    +6% over o200k_base (inside the +-15% TestEstimateTokensTurkishCorpus
+//	    holds it to, against testdata/token_reference_tr.json) and well under
+//	    cl100k_base's count, so older tokenizers are over-estimated rather
+//	    than under-estimated, the safe direction for a limit check.
+var charsPerToken = map[string]float64{
+	"tr": 3.5,
+}
+
+// EstimateTokens approximates the token count of s as characters divided by
+// the language's characters-per-token divisor (4 unless the language is in
+// charsPerToken). language is a store language: "simple", an ISO 639-1 code
+// or "" all mean the default. Chat messages are not estimated through it.
+func EstimateTokens(s, language string) int {
 	n := utf8.RuneCountInString(s)
-	return (n + 3) / 4
+	div := DefaultCharsPerToken
+	if d, ok := charsPerToken[language]; ok && d > 0 {
+		div = d
+	}
+	return int(math.Ceil(float64(n) / div))
 }

@@ -57,10 +57,6 @@ type SearchOptions struct {
 	// (BackendPgvector or BackendPgSearch; default pgvector). It is ignored
 	// in vector mode, which never touches a lexical index.
 	Backend string
-	// FTSConfig is the text search configuration for parsing the query
-	// (default "simple"); indexing always uses "simple". Only the pgvector
-	// backend reads it.
-	FTSConfig string
 	// MaxDistance drops candidates with a cosine distance above it; 0 = off.
 	MaxDistance float64
 	// Candidates caps the vector and full-text candidate lists and the
@@ -304,9 +300,23 @@ func (s *Store) ReplaceDocumentChunksFrom(ctx context.Context, doc *Document, em
 
 	var curConn int64
 	var curDims int
-	if err := tx.QueryRow(ctx, "SELECT embedding_connection_id, dimensions FROM rag_stores WHERE id = $1 FOR NO KEY UPDATE",
-		doc.RAGStoreID).Scan(&curConn, &curDims); err != nil {
+	var language string
+	if err := tx.QueryRow(ctx, "SELECT embedding_connection_id, dimensions, language FROM rag_stores WHERE id = $1 FOR NO KEY UPDATE",
+		doc.RAGStoreID).Scan(&curConn, &curDims, &language); err != nil {
 		return scanErr(err)
+	}
+	// The language is read under the row lock a language change also takes,
+	// so every chunk is written with the language the store has when the
+	// write commits (ADR-027). A 'simple' store keeps chunks.fts NULL and
+	// searches the generated chunks.tsv; any other language gets chunks.fts
+	// here, also while a rebuild of the older chunks is still running.
+	ftsCfg, ok := LanguageConfig(language)
+	if !ok {
+		return fmt.Errorf("rag store %d has language %q, which maps to no text search configuration", doc.RAGStoreID, language)
+	}
+	ftsExpr := "NULL"
+	if language != LanguageSimple {
+		ftsExpr = "to_tsvector($8::regconfig, $4)"
 	}
 	if err := checkStoreBinding(curConn, curDims, embeddingConnID, dims); err != nil {
 		return err
@@ -335,8 +345,14 @@ func (s *Store) ReplaceDocumentChunksFrom(ctx context.Context, doc *Document, em
 		if c.EmbedText != "" {
 			embedText = &c.EmbedText
 		}
-		batch.Queue(`INSERT INTO chunks (document_id, rag_store_id, idx, content, token_estimate, metadata, embed_text)
-			VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, doc.ID, doc.RAGStoreID, c.Index, c.Content, c.TokenEstimate, meta, embedText)
+		// $8 is only referenced when the store has a language; a statement
+		// that does not mention it is sent without it.
+		args := []any{doc.ID, doc.RAGStoreID, c.Index, c.Content, c.TokenEstimate, meta, embedText}
+		if language != LanguageSimple {
+			args = append(args, ftsCfg)
+		}
+		batch.Queue(`INSERT INTO chunks (document_id, rag_store_id, idx, content, token_estimate, metadata, embed_text, fts)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, `+ftsExpr+`) RETURNING id`, args...)
 	}
 	br := tx.SendBatch(ctx, batch)
 	for _, c := range chunks {
@@ -431,9 +447,6 @@ func (s *Store) SearchWithBackend(ctx context.Context, storeID int64, query stri
 	if opts.Mode == "" {
 		opts.Mode = SearchHybrid
 	}
-	if opts.FTSConfig == "" {
-		opts.FTSConfig = "simple"
-	}
 	if opts.Mode != SearchVector && opts.Mode != SearchHybrid {
 		return nil, "", fmt.Errorf("unknown search mode %q", opts.Mode)
 	}
@@ -523,8 +536,9 @@ func searchStatement(backend SearchBackend, r *RAGStore, query string, queryVec 
 		halfDims = r.Dimensions
 	}
 	if opts.Mode != SearchVector {
+		column, config := r.lexicalPlan()
 		return backend.HybridQuery(SearchParams{VecTable: table, HalfvecDims: halfDims, Vector: vec, StoreID: r.ID,
-			Candidates: opts.Candidates, MaxDistance: opts.MaxDistance, FTSConfig: opts.FTSConfig, Query: query,
+			Candidates: opts.Candidates, MaxDistance: opts.MaxDistance, FTSColumn: column, FTSConfig: config, Query: query,
 			Filter: opts.Filter})
 	}
 	// Vector-only retrieval is identical under every backend: it never
@@ -560,11 +574,23 @@ var errLexicalQuery = errors.New("search statement rejected")
 // own rather than another statement on this one.
 func (s *Store) runSearch(ctx context.Context, backend SearchBackend, r *RAGStore,
 	query string, queryVec []float32, opts SearchOptions) ([]SearchHit, error) {
-	tx, err := s.pool.Begin(ctx)
+	// One snapshot for the whole search, taken by the store row read below.
+	// The language of a store, the state of its chunks.fts and the chunks the
+	// lexical leg reads then agree even when the language is changed -- and
+	// its rebuild batches commit -- while the search runs: the lexical leg
+	// never queries a column with a configuration it was not built with
+	// (ADR-027).
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	cur := *r
+	if err := tx.QueryRow(ctx, "SELECT language, fts_language_applied FROM rag_stores WHERE id = $1", r.ID).
+		Scan(&cur.Language, &cur.FTSLanguageApplied); err != nil {
+		return nil, scanErr(err)
+	}
+	r = &cur
 	// HNSW returns at most ef_search candidates; keep it comfortably above N.
 	efSearch := opts.Candidates * 4
 	if efSearch < 40 {

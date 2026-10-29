@@ -8,7 +8,8 @@ import (
 
 // pgvectorBackend answers the lexical half with PostgreSQL's own full-text
 // search: the chunks.tsv column generated with the 'simple' configuration
-// and its GIN index. It needs no extension beyond pgvector itself, so it is
+// and its GIN index, or -- for a store with a language, once its chunks.fts is
+// built -- chunks.fts and its partial GIN index. It needs no extension beyond pgvector itself, so it is
 // always available and is what every store falls back to.
 type pgvectorBackend struct{}
 
@@ -32,6 +33,12 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 	// SearchHit.LexScore would invite exactly the cross-backend comparison it
 	// cannot support.
 	args := []any{p.Vector, p.StoreID, p.Candidates, p.MaxDistance, p.FTSConfig, ftsQuery(p.Query)}
+	// The column name is interpolated, so it is one of two constants, never a
+	// value that came from outside.
+	col := tsvColumn
+	if p.FTSColumn == ftsColumn {
+		col = ftsColumn
+	}
 	first := len(args) + 1 // the filter's arguments follow the six above
 	vec, filterArgs := vectorLeg(p.VecTable, p.HalfvecDims, p.Filter, first)
 	args = append(args, filterArgs...)
@@ -47,10 +54,10 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 			WITH q AS (SELECT websearch_to_tsquery($5::text::regconfig, $6::text) AS query),
 			%[3]s,
 			f AS (
-				SELECT c.id AS chunk_id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id) AS rank
+				SELECT c.id AS chunk_id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.%[5]s, q.query) DESC, c.id) AS rank
 				FROM chunks c, q
-				WHERE c.rag_store_id = $2 AND numnode(q.query) > 0 AND c.tsv @@ q.query%[4]s
-				ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id
+				WHERE c.rag_store_id = $2 AND numnode(q.query) > 0 AND c.%[5]s @@ q.query%[4]s
+				ORDER BY ts_rank_cd(c.%[5]s, q.query) DESC, c.id
 				LIMIT $3),
 			m AS (
 				SELECT COALESCE(v.chunk_id, f.chunk_id) AS chunk_id,
@@ -66,7 +73,7 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 			JOIN %[1]s e ON e.chunk_id = m.chunk_id
 			WHERE ($4::float8 = 0 OR (e.embedding <=> $1::vector) <= $4::float8)
 			ORDER BY m.score DESC, distance, m.chunk_id
-			LIMIT $3`, p.VecTable, rrfK, vec, lexFilter)
+			LIMIT $3`, p.VecTable, rrfK, vec, lexFilter, col)
 	return sql, args
 }
 

@@ -474,6 +474,13 @@ func (g *Gateway) checkLimits(c *call, estimate int, streamed bool) bool {
 	return false
 }
 
+// contextTokenEstimate is the token estimate of a retrieved context block: the
+// language-aware rag.EstimateTokens, but never below the bytes / 4 the limit
+// check used before ADR-027 (see checkContextLimits).
+func contextTokenEstimate(contextBlock, language string) int {
+	return max(rag.EstimateTokens(contextBlock, language), (len(contextBlock)+3)/4)
+}
+
 // checkContextLimits is the second half of the chat token-limit check. The
 // first (checkLimits) runs before retrieval and sees only the client's
 // messages and the project prompt; the retrieved context can add thousands of
@@ -487,11 +494,20 @@ func (g *Gateway) checkLimits(c *call, estimate int, streamed bool) bool {
 // openRecord, so a denial leaves the row the retrieval's own spend (rerank
 // tokens) is recorded on and the request is counted once, as a 429, like any
 // denied request. Nothing has gone upstream, so the attempt count is zero.
-func (g *Gateway) checkContextLimits(c *call, estimate int, contextBlock string) bool {
+//
+// The context block is estimated with rag.EstimateTokens by the language of
+// the store it was retrieved from (ADR-027): text in a language that
+// tokenises worse than English counts for more tokens. It never counts for
+// fewer than the bytes / 4 this check always used: a language without an
+// entry in the divisor table (Cyrillic, Greek, Arabic ... at two bytes a
+// letter) would otherwise be counted at half of what it was, which loosens
+// the limit. The client's messages and the project prompt (estimate) are
+// still characters / 4.
+func (g *Gateway) checkContextLimits(c *call, estimate int, contextBlock, language string) bool {
 	if g.Limiter == nil || contextBlock == "" {
 		return true
 	}
-	total := estimate + (len(contextBlock)+3)/4
+	total := estimate + contextTokenEstimate(contextBlock, language)
 	decision, err := g.Limiter.CheckTokens(c.ctx(), c.subject, c.decision, total)
 	if err != nil {
 		c.log.Error("limit check", "err", err)

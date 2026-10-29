@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/ragmux/ragmux/internal/store"
@@ -98,9 +99,13 @@ func TestHybridSearchFusesVectorAndFullText(t *testing.T) {
 			t.Errorf("blank query %q should fall back to vector order: %+v", blank, bh)
 		}
 	}
-	// A query with an unknown text search configuration is an error, not a crash.
-	if _, err := s.Search(ctx, r.ID, "apples", q, store.SearchOptions{Mode: store.SearchHybrid, FTSConfig: "nope", Candidates: 3}); err == nil {
-		t.Error("expected an error for an unknown fts config")
+	// A language the server cannot honour is refused when it is written, so a
+	// search never meets one.
+	for _, bad := range []store.RAGStore{{Language: "xx"}, {Language: "klingon"}, {FTSConfig: "nope"}, {Language: "tr", FTSConfig: "english"}} {
+		bad.Name, bad.EmbeddingConnectionID = "bad", conn.ID
+		if _, err := s.CreateRAGStore(ctx, &bad); !errors.Is(err, store.ErrInvalidLanguage) {
+			t.Errorf("create with language %q / fts_config %q: err = %v, want ErrInvalidLanguage", bad.Language, bad.FTSConfig, err)
+		}
 	}
 	if ok, err := s.TextSearchConfigExists(ctx, "english"); err != nil || !ok {
 		t.Errorf("english config: %v %v", ok, err)
@@ -110,12 +115,12 @@ func TestHybridSearchFusesVectorAndFullText(t *testing.T) {
 	}
 
 	// Store settings round-trip through update.
-	r.Rerank, r.RerankCandidates, r.MaxDistance, r.SearchMode, r.FTSConfig, r.ContextualChunks = true, 20, 0.35, store.SearchVector, "english", false
+	r.Rerank, r.RerankCandidates, r.MaxDistance, r.SearchMode, r.Language, r.FTSConfig, r.ContextualChunks = true, 20, 0.35, store.SearchVector, "en", "", false
 	r2, err := s.UpdateRAGStore(ctx, r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r2.Rerank || r2.RerankCandidates != 20 || r2.MaxDistance < 0.349 || r2.MaxDistance > 0.351 || r2.SearchMode != store.SearchVector || r2.FTSConfig != "english" || r2.ContextualChunks {
+	if !r2.Rerank || r2.RerankCandidates != 20 || r2.MaxDistance < 0.349 || r2.MaxDistance > 0.351 || r2.SearchMode != store.SearchVector || r2.Language != "en" || r2.FTSConfig != "english" || r2.ContextualChunks {
 		t.Errorf("updated store: %+v", r2)
 	}
 

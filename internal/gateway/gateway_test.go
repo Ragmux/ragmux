@@ -225,10 +225,14 @@ func (e *env) newProject(name string, mutate func(*store.Project)) *store.Projec
 
 // attachRAG creates a RAG store with one ingested document and attaches it
 // to the project so retrieval runs on every chat call.
-func (e *env) attachRAG() {
+func (e *env) attachRAG() { e.attachRAGLanguage("") }
+
+// attachRAGLanguage is attachRAG for a store of the given language ("" = the
+// default, 'simple').
+func (e *env) attachRAGLanguage(language string) {
 	e.t.Helper()
 	ctx := context.Background()
-	rs, err := e.st.CreateRAGStore(ctx, &store.RAGStore{Name: "docs", EmbeddingConnectionID: e.conn.ID, ChunkSize: 200, TopK: 2})
+	rs, err := e.st.CreateRAGStore(ctx, &store.RAGStore{Name: "docs", EmbeddingConnectionID: e.conn.ID, ChunkSize: 200, TopK: 2, Language: language})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -1643,6 +1647,60 @@ func TestRetrievedContextCountsTowardTPM(t *testing.T) {
 	_ = r2.Body.Close()
 	if r2.StatusCode != 200 || upstreamCalls.Load() != 1 {
 		t.Errorf("without context: %d, upstream calls %d", r2.StatusCode, upstreamCalls.Load())
+	}
+}
+
+// TestContextLimitUsesStoreLanguage: the token estimate of the retrieved
+// context divides by the characters-per-token figure of the store's language
+// (ADR-027). The same context, the same per-minute limit: a 'simple' store's
+// block fits, a Turkish store's block counts for more tokens and is refused.
+// The limit sits between the two estimates, so the test holds whatever
+// measured divisor the Turkish entry ends up with, as long as it is below the
+// default.
+func TestContextLimitUsesStoreLanguage(t *testing.T) {
+	const question = "what colour are apples?"
+	block := rag.FormatContext([]store.SearchHit{{Filename: "a.txt", Content: "apples are red"}})
+	simple, turkish := rag.EstimateTokens(block, "simple"), rag.EstimateTokens(block, "tr")
+	if turkish-simple < 2 {
+		t.Fatalf("estimates for the fixture block: simple %d, tr %d: no room for a limit between them", simple, turkish)
+	}
+	messages := (len(question) + 3) / 4
+	limit := messages + simple + (turkish-simple)/2
+	msgs := []map[string]any{{"role": "user", "content": question}}
+
+	for _, c := range []struct {
+		language string
+		want     int
+	}{{"simple", 200}, {"tr", 429}} {
+		t.Run(c.language, func(t *testing.T) {
+			e := newEnv(t, func(p *store.Project) { p.RateLimitTPM = limit; p.RateLimitRPM = 10 })
+			e.attachRAGLanguage(c.language)
+			resp, out := e.chat(map[string]any{"messages": msgs})
+			if resp.StatusCode != c.want {
+				t.Fatalf("status %d, want %d (limit %d, context estimate %d): %v", resp.StatusCode, c.want, limit,
+					map[string]int{"simple": simple, "tr": turkish}[c.language], out)
+			}
+			if c.want == 429 && errorField(t, out, "code") != limits.ReasonTPM {
+				t.Errorf("denial reason = %v, want %s", errorField(t, out, "code"), limits.ReasonTPM)
+			}
+		})
+	}
+}
+
+// TestContextTokenEstimateNeverBelowBytesOverFour: a language without a divisor
+// entry must not make the limit check looser than the bytes / 4 it replaced.
+func TestContextTokenEstimateNeverBelowBytesOverFour(t *testing.T) {
+	cyrillic := strings.Repeat("привет мир ", 40) // two bytes a letter
+	if got, byBytes := contextTokenEstimate(cyrillic, "ru"), (len(cyrillic)+3)/4; got < byBytes {
+		t.Errorf("ru estimate %d is below the byte-based %d", got, byBytes)
+	}
+	ascii := strings.Repeat("apples are red ", 40)
+	if got, want := contextTokenEstimate(ascii, "simple"), (len(ascii)+3)/4; got != want {
+		t.Errorf("ascii estimate %d, want %d", got, want)
+	}
+	// A language with a divisor below 4 counts more than either basis.
+	if got := contextTokenEstimate(ascii, "tr"); got <= (len(ascii)+3)/4 {
+		t.Errorf("tr estimate %d is not above the default's %d", got, (len(ascii)+3)/4)
 	}
 }
 

@@ -302,7 +302,8 @@ func run(cfg config.Config) error {
 	met.RegisterBreakers(gw.Breakers.Snapshot)
 	limiter := &auth.LoginLimiter{Store: st, PerIP: cfg.LoginRateLimitPerMin, PerUser: cfg.LoginUserLimitPerMin,
 		LockoutFailures: cfg.LoginLockoutFailures, LockoutWindow: time.Duration(cfg.LoginLockoutMinutes) * time.Minute}
-	adm := &admin.Admin{Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
+	ftsRebuilder := maintenance.NewFTSRebuilder(st, log)
+	adm := &admin.Admin{FTSRebuild: ftsRebuilder, Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
 		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage, Prices: prices,
 		ProviderConfig: provCfg, AllowPrivateUpstreams: cfg.AllowPrivateUpstreams, PrivateAllowlist: cfg.PrivateUpstreamAllowlist,
 		MaxDocumentsPerStore: cfg.MaxDocumentsPerStore, MaxBytesPerStore: cfg.MaxBytesPerStore}
@@ -370,6 +371,15 @@ func run(cfg config.Config) error {
 	}()
 	log.Info("retention job scheduled", "log_retention_days", cfg.LogRetentionDays,
 		"audit_retention_days", cfg.AuditRetentionDays, "interval", maintenance.DefaultInterval)
+
+	// The rebuild of the per-store-language full-text column (ADR-027). It
+	// resumes whatever a previous process left half done and is kicked by the
+	// admin API when a store's language changes.
+	ftsRebuildDone := make(chan struct{})
+	go func() {
+		defer close(ftsRebuildDone)
+		ftsRebuilder.Run(bgCtx)
+	}()
 
 	// One slot per listener goroutine: only the first error is acted on, but
 	// a second one must not park its goroutine on a full channel for the rest
@@ -457,6 +467,7 @@ func run(cfg config.Config) error {
 	}
 	stopBackground()
 	<-janitorDone
+	<-ftsRebuildDone
 	log.Info("shutdown complete")
 	return shutErr
 }

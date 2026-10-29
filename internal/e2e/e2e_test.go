@@ -975,7 +975,10 @@ func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
 	}
 	for _, h := range hy["hits"].([]any) {
 		hm := h.(map[string]any)
-		if strings.Contains(hm["content"].(string), "zyxquux") && (hm["fts_rank"] != float64(1) || hm["score"].(float64) <= 0) {
+		// The store is English, so its chunks are indexed with stems and "apple"
+		// reaches the Apples chunk too: the zyxquux chunk is on the full-text
+		// leg (a rank above 0) but no longer necessarily first on it.
+		if strings.Contains(hm["content"].(string), "zyxquux") && (hm["fts_rank"].(float64) < 1 || hm["score"].(float64) <= 0) {
 			t.Errorf("zyxquux hit ranks: %v", hm)
 		}
 	}

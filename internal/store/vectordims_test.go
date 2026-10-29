@@ -315,7 +315,9 @@ func TestStaleIngestRacingConnectionChangeIsStoppedUnderLock(t *testing.T) {
 	}
 }
 
-// fts_config other than 'simple' is accepted as before, with a warning.
+// A store saved before the language existed (fts_config 'turkish', language
+// 'simple' after migration 0027) is left as it is, parses its queries with
+// 'simple' and is warned about at startup with the language to set.
 func TestFTSConfigTurkishIsWarnedAtStartup(t *testing.T) {
 	ctx := context.Background()
 	cfg := testdb.Config(t)
@@ -324,7 +326,23 @@ func TestFTSConfigTurkishIsWarnedAtStartup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateRAGStore(ctx, &store.RAGStore{Name: "tr", EmbeddingConnectionID: conn.ID, ChunkSize: 200, TopK: 3, FTSConfig: "turkish"}); err != nil {
+	r, err := s.CreateRAGStore(ctx, &store.RAGStore{Name: "tr", EmbeddingConnectionID: conn.ID, ChunkSize: 200, TopK: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What an installation upgraded from 0.5 holds: the old column set, the
+	// new one at its migration default.
+	if _, err := s.DB().Exec(ctx, "UPDATE rag_stores SET fts_config = 'turkish' WHERE id = $1", r.ID); err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated save (the dashboard sends the derived fts_config back) must
+	// not erase the leftover the warning is read from.
+	r, err = s.GetRAGStore(ctx, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Name = "renamed"
+	if _, err := s.UpdateRAGStore(ctx, r); err != nil {
 		t.Fatal(err)
 	}
 	var logs syncBuffer
@@ -334,12 +352,12 @@ func TestFTSConfigTurkishIsWarnedAtStartup(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s2.Close() })
 	out := logs.String()
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "fts_config=turkish") || !strings.Contains(out, "v0.6-9") {
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "fts_config=turkish") || !strings.Contains(out, "language to 'tr'") {
 		t.Errorf("startup log has no fts_config warning:\n%s", out)
 	}
 	got, err := s2.ListRAGStores(ctx)
-	if err != nil || len(got) != 1 || got[0].FTSConfig != "turkish" {
-		t.Errorf("the store must be left as configured: %v %+v", err, got)
+	if err != nil || len(got) != 1 || got[0].Language != "simple" || got[0].FTSConfig != "simple" || got[0].FTSStatus != store.FTSNotNeeded {
+		t.Errorf("the store must start on 'simple', untouched: %v %+v", err, got)
 	}
 }
 

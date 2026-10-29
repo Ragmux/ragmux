@@ -259,11 +259,13 @@ func tokenizerFromReloptions(opts []string) string {
 }
 
 func (pgSearchBackend) HybridQuery(p SearchParams) (string, []any) {
-	// FTSConfig is deliberately absent: the BM25 index is global and was
-	// tokenised once at index time, so a per-store text search configuration
-	// has nothing left to select. The admin search response reports the
-	// store's fts_config next to the effective backend so the setting is
-	// visibly inert rather than silently so.
+	// FTSColumn and FTSConfig are deliberately absent: the BM25 index is
+	// global and was tokenised once at index time (PG_SEARCH_TOKENIZER), so
+	// the store's language (ADR-027) has nothing left to select. The admin
+	// search response and the store response report the language next to the
+	// effective backend (language_applied_to_search, language_applies_to_search)
+	// so the setting is visibly inert rather than silently so. A store that
+	// falls back to pgvector gets the language rule there.
 	//
 	// ftsQuery is not applied either: paradedb.match tokenises the string
 	// itself and OR-joins the terms, so the " or " rewriting the tsquery

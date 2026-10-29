@@ -53,10 +53,14 @@ type SearchParams struct {
 	Candidates int
 	// MaxDistance drops candidates further than this cosine distance; 0 = off.
 	MaxDistance float64
-	// FTSConfig is the text search configuration used to parse the query.
-	// Only the pgvector backend reads it: the pg_search index is global and
-	// tokenises at index time, so a per-store configuration has nothing to
-	// select there.
+	// FTSColumn is the chunks column the lexical leg searches (tsvColumn or
+	// ftsColumn) and FTSConfig the text search configuration it parses the
+	// query with: the store's lexicalPlan, so the query is always parsed with
+	// the configuration the column was built with (ADR-027). Only the
+	// pgvector backend reads them: the pg_search index is global and
+	// tokenises at index time, so a store language has nothing to select
+	// there.
+	FTSColumn string
 	FTSConfig string
 	// Query is the raw user query. Each backend prepares it its own way.
 	Query string

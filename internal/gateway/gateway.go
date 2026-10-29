@@ -628,7 +628,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	prep := g.prepareChat(c, prov, &req, opts)
 	g.openRecord(c, req.Stream, prep.apply)
 	defer g.record(c)
-	if !g.checkContextLimits(c, estimate, prep.contextBlock) {
+	if !g.checkContextLimits(c, estimate, prep.contextBlock, prep.contextLanguage) {
 		return
 	}
 
@@ -811,6 +811,9 @@ type chatPrep struct {
 	skipReason   string
 	sources      []ragSource
 	contextBlock string
+	// contextLanguage is the language of the store contextBlock came from; the
+	// limit check estimates the block's tokens with it (ADR-027).
+	contextLanguage string
 }
 
 // apply sets the RAG columns of the request log row.
@@ -907,6 +910,7 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 				c.log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
 				prep.contextBlock = rag.FormatContext(hits)
+				prep.contextLanguage = rs.Language
 				req.Messages = injectRetrieved(req.Messages, prep.contextBlock, p.ContextPlacement)
 				prep.ragUsed, prep.ragHits = true, len(hits)
 				prep.sources = ragSources(hits)
