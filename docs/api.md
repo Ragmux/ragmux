@@ -301,7 +301,7 @@ changed URL or model without re-entering the key. The response has the same shap
 | DELETE | `/rag-stores/{id}` | editor | Delete the store, its documents and vectors; projects linked to it lose the link |
 | GET | `/rag-stores/{id}/documents` | viewer | List documents, newest first |
 | POST | `/rag-stores/{id}/documents` | editor | Upload (`multipart/form-data`, one or more `file` fields and an optional `metadata` field with a JSON object for all of them) → `202` document or array of documents, each with `deduplicated` (and `duplicate_of`); `400` for invalid `metadata`; `422` with `code: "store_quota"` when the store's `max_documents` / `max_bytes` or the instance ceiling would be exceeded |
-| POST | `/rag-stores/{id}/search` | viewer | Retrieval test |
+| POST | `/rag-stores/{id}/search` | viewer | Retrieval test; the `rerank_backend` and `rerank_connection_id` overrides need editor ([Search endpoint](rag.md#search-endpoint)) |
 | POST | `/rag-stores/{id}/reprocess` | editor | Re-parse, re-chunk and re-embed every document → `202 {"ok": true, "documents": n}` |
 | POST | `/rag-stores/{id}/reindex` | admin | Build the vector index of the store's embedding width in the background → `202`; `409` with `code: "already_indexed"`, `"not_indexable"` or `"not_bound"` (see below) |
 | GET | `/documents/{id}` | viewer | Document status |

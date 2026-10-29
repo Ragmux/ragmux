@@ -1437,18 +1437,40 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 	if in.Rerank != nil {
 		rs.Rerank = *in.Rerank
 	}
-	if in.RerankBackend != "" {
-		if !store.IsValidRerankBackend(in.RerankBackend) {
-			writeErr(w, http.StatusBadRequest, "rerank_backend must be one of "+strings.Join(store.RerankBackends, ", "))
-			return
+	// rerank_backend and rerank_connection_id decide which upstream receives
+	// the store's chunk text, so they are a store-editing power: a caller
+	// below editor (or a key without the write scope) searches with the
+	// store's saved rerank settings. The override is ignored and reported in
+	// a Warning header rather than rejected (PRD rule 12), so a client that
+	// sends a full settings payload keeps working. The gate runs before any
+	// validation of the values, so it is no oracle for connection ids.
+	var ignoredOverrides []string
+	if canOverrideRerank(r) {
+		if in.RerankBackend != "" {
+			if !store.IsValidRerankBackend(in.RerankBackend) {
+				writeErr(w, http.StatusBadRequest, "rerank_backend must be one of "+strings.Join(store.RerankBackends, ", "))
+				return
+			}
+			rs.RerankBackend = in.RerankBackend
 		}
-		rs.RerankBackend = in.RerankBackend
-	}
-	if in.RerankConnectionID != nil {
-		if *in.RerankConnectionID == 0 {
-			rs.RerankConnectionID = nil
-		} else {
-			rs.RerankConnectionID = in.RerankConnectionID
+		if in.RerankConnectionID != nil {
+			if *in.RerankConnectionID == 0 {
+				rs.RerankConnectionID = nil
+			} else {
+				rs.RerankConnectionID = in.RerankConnectionID
+			}
+		}
+	} else {
+		if in.RerankBackend != "" {
+			ignoredOverrides = append(ignoredOverrides, "rerank_backend")
+		}
+		if in.RerankConnectionID != nil {
+			ignoredOverrides = append(ignoredOverrides, "rerank_connection_id")
+		}
+		if len(ignoredOverrides) > 0 {
+			w.Header().Add("Warning", `299 ragmux "`+strings.Join(ignoredOverrides, " and ")+
+				` ignored: overriding the rerank settings needs the editor role; the store's saved rerank settings were used"`)
+			a.Log.Warn("rerank override ignored", "store_id", rs.ID, "fields", ignoredOverrides)
 		}
 	}
 	// top_k is clamped to the store's own bounds; 0 means "use the store's
@@ -1520,7 +1542,17 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		// rerank_fallback stays false: nothing was attempted, so nothing failed.
 		"rerank_skipped": skipped != "", "rerank_skipped_reason": skipped,
 		"latency_ms": time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
-		"rerank_latency_ms": res.RerankLatencyMS})
+		"rerank_latency_ms": res.RerankLatencyMS,
+		// rerank_overrides_ignored names the rerank fields the request sent
+		// but the caller's role or key scope does not allow.
+		"rerank_overrides_ignored": ignoredOverrides})
+}
+
+// canOverrideRerank reports whether the caller may point a search at another
+// rerank backend or connection: the same authority as editing the store
+// (editor role, and the write scope for a management key).
+func canOverrideRerank(r *http.Request) bool {
+	return auth.Allows(r.Context(), auth.RoleEditor, store.ScopeWrite)
 }
 
 // rerankConnection returns the store's rerank connection, the one named by

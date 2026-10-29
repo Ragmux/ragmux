@@ -131,6 +131,14 @@ All notable changes to Ragmux are documented here. The format follows
   `govulncheck`).
 - **Go 1.27.3.** The minimum Go version moves from 1.27.2 to 1.27.3, picking up the fix for a
   reachable vulnerability in `crypto/x509` (GO-2026-6809, reported by `govulncheck`).
+- **Dashboard search no longer lets a viewer pick the rerank connection.** `POST
+  /admin/api/rag-stores/{id}/search` is open to the `viewer` role, and its `rerank_connection_id`
+  and `rerank_backend` overrides replaced the store's settings, so a viewer could send the
+  store's chunk text to any model connection on a `rerank: true` search (present since v0.4.0).
+  The two overrides now need the authority to edit the store: the editor role, and the `write`
+  scope for a management key. Below that they are ignored, the search runs with the store's saved
+  rerank settings, and the response carries `Warning: 299 ragmux "..."` and
+  `rerank_overrides_ignored`. See [Search endpoint](docs/rag.md#search-endpoint).
 
 ## [0.5.0] - 2026-10-11
 

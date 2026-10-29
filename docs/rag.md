@@ -838,6 +838,15 @@ makes these settings usable: run `{"backend":"pgvector"}` and `{"backend":"pg_se
 or `{"rerank_backend":"llm"}` and `{"rerank_backend":"cohere","rerank_connection_id":3}`,
 and read the orders off against each other.
 
+`rerank_backend` and `rerank_connection_id` decide which upstream receives the store's chunk
+text, so they are honoured only for a caller who may edit the store: the `editor` or `admin`
+role, and for a management key also the `write` scope. For anyone else (a `viewer`, or a
+key with only `read`) the override is ignored and the search uses the store's saved rerank
+connection; the response carries `Warning: 299 ragmux "..."` and lists the ignored fields in
+`rerank_overrides_ignored` (empty otherwise). The request is not rejected, in line with the rule
+that an ignored part of a request is reported, not silent. `rerank` itself (on or off) stays open to
+every role: it only switches the saved connection on.
+
 ## Client retrieve endpoint
 
 `POST /v1/retrieve` is the search endpoint for applications: a gateway key with the
