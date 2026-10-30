@@ -18,9 +18,6 @@ const (
 	// it for: a rebuild a dead process left half done, or one another replica
 	// started and then lost.
 	DefaultFTSRebuildPoll = time.Minute
-	// ftsBusyRetry is the wait before a store another replica is rebuilding
-	// is looked at again.
-	ftsBusyRetry = 5 * time.Second
 )
 
 // FTSRebuilder keeps the per-store-language full-text column (chunks.fts,

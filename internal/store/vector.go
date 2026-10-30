@@ -200,7 +200,7 @@ func (s *Store) ensureVecTable(ctx context.Context, dims int) error {
 			stmts = append(stmts, halfvecIndexDDL(dims, false))
 		}
 	} else if halfvecIndexable(dims, s.caps) {
-		state, _, err := s.halfvecIndexState(ctx, tx, dims)
+		state, err := s.halfvecIndexState(ctx, tx, dims)
 		if err != nil {
 			return err
 		}

@@ -138,7 +138,7 @@ func (s *Store) SearchUnderSettings(ctx context.Context, storeID int64, query st
 }
 
 // LockVecReindex is the advisory lock key of the halfvec index builds.
-const LockVecReindex = int32(lockVecReindex)
+const LockVecReindex = lockVecReindex
 
 // SetCaps replaces the detected server features and returns the function that
 // puts them back, so a test can act as a server with an older pgvector.

@@ -46,7 +46,7 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 	// the filter lets through, as a subquery of ids.
 	var lexFilter string
 	if !p.Filter.Empty() {
-		set, _ := p.Filter.documentSet("$2", first)
+		set := p.Filter.documentSet("$2", first)
 		lexFilter = `
 				  AND c.document_id IN (` + set + `)`
 	}

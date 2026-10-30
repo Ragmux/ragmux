@@ -80,7 +80,7 @@ func BuildCondensePrompt(msgs []provider.Message, turns int) (prompt string, ok 
 	if last < 0 {
 		return "", false
 	}
-	lastText := oneLine(msgs[last].Text())
+	lastText := oneLine(msgs[last].Text()) //nolint:gosec // G602: last is an index the loop above found in msgs
 	if lastText == "" {
 		return "", false
 	}

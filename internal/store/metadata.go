@@ -484,9 +484,9 @@ func (f *MetadataFilter) predicate(alias string, first int) (string, []any) {
 
 // documentSet is the SQL for "the documents of rag store $storeParam that the
 // filter lets through", as a subquery of ids.
-func (f *MetadataFilter) documentSet(storeParam string, first int) (string, []any) {
-	pred, args := f.predicate("fd", first)
-	return "SELECT fd.id FROM documents fd WHERE fd.rag_store_id = " + storeParam + " AND " + pred, args
+func (f *MetadataFilter) documentSet(storeParam string, first int) string {
+	pred, _ := f.predicate("fd", first)
+	return "SELECT fd.id FROM documents fd WHERE fd.rag_store_id = " + storeParam + " AND " + pred
 }
 
 // HasMatchingDocuments reports whether the filter lets at least one document

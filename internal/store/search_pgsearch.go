@@ -286,7 +286,7 @@ func (pgSearchBackend) HybridQuery(p SearchParams) (string, []any) {
 	// scan that produces paradedb.score stays the only relation of this leg.
 	var lexFilter string
 	if !p.Filter.Empty() {
-		set, _ := p.Filter.documentSet("$2", first)
+		set := p.Filter.documentSet("$2", first)
 		lexFilter = `
 				  AND c.document_id = ANY (ARRAY(` + set + `))`
 	}

@@ -480,9 +480,9 @@ func TestMetadataFilterEndToEnd(t *testing.T) {
 		}
 		return files
 	}
-	out, h := sourcesOf(map[string]any{"sources": "inline"})
+	out, _ = sourcesOf(map[string]any{"sources": "inline"})
 	same("chat, no filter", chatFiles(out), "apple.md", "banana.md", "cherry.md")
-	out, h = sourcesOf(map[string]any{"sources": "inline", "filter": map[string]any{"lang": "en"}})
+	out, h := sourcesOf(map[string]any{"sources": "inline", "filter": map[string]any{"lang": "en"}})
 	same("chat, lang=en", chatFiles(out), "apple.md")
 	if out["_status"] != float64(200) || len(h.Values("Warning")) != 0 {
 		t.Errorf("chat, lang=en: %v Warning %q", out["_status"], h.Values("Warning"))

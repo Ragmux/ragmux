@@ -130,12 +130,12 @@ func readHalfvecCatalog(ctx context.Context, q queryRower, dims int) (halfvecCat
 	return c, err
 }
 
-func (s *Store) halfvecIndexState(ctx context.Context, q queryRower, dims int) (halfvecState, int, error) {
+func (s *Store) halfvecIndexState(ctx context.Context, q queryRower, dims int) (halfvecState, error) {
 	c, err := readHalfvecCatalog(ctx, q, dims)
 	if err != nil {
-		return halfvecNoTable, 0, err
+		return halfvecNoTable, err
 	}
-	return c.state(), c.percent, nil
+	return c.state(), nil
 }
 
 // orphanVecTable reports whether a table can be indexed without a reindex
@@ -165,7 +165,7 @@ func (s *Store) checkBindable(ctx context.Context, q queryRower, dims int) error
 	if !halfvecIndexable(dims, s.caps) {
 		return nil
 	}
-	state, _, err := s.halfvecIndexState(ctx, q, dims)
+	state, err := s.halfvecIndexState(ctx, q, dims)
 	if err != nil {
 		return err
 	}
@@ -318,7 +318,7 @@ func (s *Store) StartVectorReindex(ctx context.Context, dims int) (VectorIndexIn
 	}
 	conn := pc.Hijack() // a build holds its connection for minutes; it never goes back to the pool
 	var got bool
-	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1, $2)", lockVecReindex, int32(dims)).Scan(&got); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1, $2)", lockVecReindex, int32(dims)).Scan(&got); err != nil { //nolint:gosec // G115: dims is a bound embedding width, at most 4000
 		_ = conn.Close(context.Background())
 		return VectorIndexInfo{}, err
 	}
