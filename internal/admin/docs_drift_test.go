@@ -525,11 +525,13 @@ func driftCases(t *testing.T) []driftCase {
 
 		// RAG stores and documents
 		{name: "rag store", code: jsonFieldNames(typeOf[ragStoreResponse]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "document_count", ""}, prose: []string{"reprocess_recommended"}},
+			obj: &jsonSel{"", "document_count", ""}, prose: []string{"reprocess_recommended", "vector_index_progress"}},
 		{name: "rag store body", code: jsonFieldNames(typeOf[ragInput]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "search_backend", "document_count"}},
+			obj: &jsonSel{"", "search_backend", "document_count"}, prose: []string{"fts_config"}},
 		{name: "document", code: jsonFieldNames(typeOf[store.Document]()), sections: []string{"RAG stores and documents"},
-			obj: &jsonSel{"", "progress_percent", ""}},
+			obj: &jsonSel{"", "progress_percent", "deduplicated"}},
+		{name: "uploaded document", code: jsonFieldNames(typeOf[uploadedDocument]()), sections: []string{"RAG stores and documents"},
+			obj: &jsonSel{"", "deduplicated", ""}},
 		{name: "search request", code: handlerStructFields(t, "admin.go", "searchRAGStore"), sections: []string{"RAG stores and documents"},
 			obj: &jsonSel{"", "query", ""}, prose: []string{"backend", "rerank_backend", "rerank_connection_id"}},
 		{name: "search hit", code: jsonFieldNames(typeOf[store.SearchHit]()), sections: []string{"RAG stores and documents"},

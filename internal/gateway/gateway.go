@@ -3,6 +3,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,6 +13,8 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -64,6 +67,10 @@ type Gateway struct {
 	// target before the route moves on. Zero disables retries; fallback to the
 	// next target is not affected.
 	MaxRetries int
+	// CondenseTimeout is the time budget of the query condense call (ADR-024),
+	// cut to the request's remaining upstream budget. Zero means 5 s; it is
+	// not a setting of the product, tests shorten it.
+	CondenseTimeout time.Duration
 	// Sleep waits between a failed attempt and its retry. Nil uses a timer;
 	// tests inject one that records the wait instead of taking it.
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -592,7 +599,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.span.End()
 
-	req, ok := g.decodeChat(c)
+	req, opts, ok := g.decodeChat(c)
 	if !ok {
 		return
 	}
@@ -609,16 +616,21 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.Model = c.conn.ModelName
 	}
 
-	// The token estimate covers the client's messages and the project prompt;
-	// retrieved context is not included.
+	// This estimate covers the client's messages and the project prompt. The
+	// retrieved context does not exist yet and is not retrieved before the
+	// check, so throttled clients do not cost an embedding call; it is added
+	// by checkContextLimits once retrieval has run.
 	estimate := (len(c.project.SystemPrompt) + messageChars(req.Messages) + 3) / 4
 	if !g.checkLimits(c, estimate, req.Stream) {
 		return
 	}
 
-	prep := g.prepareChat(c, prov, &req)
+	prep := g.prepareChat(c, prov, &req, opts)
 	g.openRecord(c, req.Stream, prep.apply)
 	defer g.record(c)
+	if !g.checkContextLimits(c, estimate, prep.contextBlock, prep.contextLanguage) {
+		return
+	}
 
 	// A nil prov (the first target's adapter could not be built) leaves provConn
 	// unset and records the connection and its error as failedConn and
@@ -653,8 +665,9 @@ type chatInvocation struct {
 	// promptChars is the size of the prompt after context injection, the basis
 	// of the usage estimate when the upstream reports none.
 	promptChars int
-	// opts, sources and contextBlock come from prepareChat and only shape the
-	// non-streaming response body.
+	// opts, sources and contextBlock come from prepareChat. They shape the
+	// "ragmux" object of the response: in the JSON body, or in the first chunk
+	// of a stream.
 	opts         ragmuxRequest
 	sources      []ragSource
 	contextBlock string
@@ -682,6 +695,8 @@ func (in *chatInvocation) providerFor(c *call, conn *store.ModelConnection) (pro
 	// nothing has been written yet, so they can still be replaced.
 	c.w.Header().Del("Warning")
 	setRequestWarnings(c.w.Header(), prov, in.req)
+	// The ragmux warnings are about the request, not the adapter: they stay.
+	addRagmuxWarnings(c.w.Header(), in.opts.Warnings)
 	return prov, nil
 }
 
@@ -694,8 +709,15 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	if err != nil {
 		return err
 	}
+	inline, err := in.opts.inlineField(in.sources, in.contextBlock)
+	if err != nil {
+		// A marshal failure of plain strings and numbers is not expected;
+		// the answer is still worth more than the opt-in.
+		c.log.Error("ragmux response field", "err", err)
+		inline = nil
+	}
 	if req.Stream {
-		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars)
+		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars, withInlineRagmux(inline))
 	}
 
 	ctx, cancel := c.attemptContext()
@@ -714,8 +736,8 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	fillUsage(c.rec, resp.Usage, in.promptChars, completionChars(resp))
 	c.rec.StatusCode = http.StatusOK
 	c.w.Header().Set("Content-Type", "application/json")
-	if in.opts.IncludeContext {
-		if b, err := withRagmuxField(resp, in.sources, in.contextBlock); err == nil {
+	if inline != nil {
+		if b, err := withRagmuxField(resp, inline); err == nil {
 			_, _ = c.w.Write(b)
 			return nil
 		}
@@ -726,21 +748,32 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 
 // decodeChat reads and validates the chat request body, answering the client
 // itself when it cannot.
-func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, bool) {
+func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, ragmuxRequest, bool) {
 	var req provider.ChatRequest
+	var opts ragmuxRequest
 	body, ok := g.readBody(c)
 	if !ok {
-		return req, false
+		return req, opts, false
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
-		return req, false
+		return req, opts, false
 	}
 	if len(req.Messages) == 0 {
 		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "messages is required")
-		return req, false
+		return req, opts, false
 	}
-	return req, true
+	// The ragmux request object is ours; it must not reach the upstream. It is
+	// parsed here, with the rest of the body, so a malformed one is refused
+	// like any other malformed request, before a route is resolved or a limit
+	// is charged.
+	opts, err := parseRagmux(req.Extra)
+	delete(req.Extra, "ragmux")
+	if err != nil {
+		writeErrorCode(c.w, http.StatusBadRequest, "invalid_request_error", errInvalidRagmux, err.Error())
+		return req, opts, false
+	}
+	return req, opts, true
 }
 
 // chatProvider builds the chat adapter for the routed connection. A route with
@@ -770,40 +803,55 @@ func newTargetConfigError() error {
 
 // chatPrep is what prepareChat hands on to invoke and the request log.
 type chatPrep struct {
-	opts         ragmuxRequest
-	ragUsed      bool
-	ragHits      int
+	opts    ragmuxRequest
+	ragUsed bool
+	ragHits int
+	// skipReason is why retrieval did not run for a project that has a store:
+	// an obs.RAGSkip* value, empty when it ran.
+	skipReason   string
 	sources      []ragSource
 	contextBlock string
+	// contextLanguage is the language of the store contextBlock came from; the
+	// limit check estimates the block's tokens with it (ADR-027).
+	contextLanguage string
 }
 
 // apply sets the RAG columns of the request log row.
 func (p chatPrep) apply(rec *store.RequestLog) {
-	rec.RAGUsed, rec.RAGHits = p.ragUsed, p.ragHits
+	rec.RAGUsed, rec.RAGHits, rec.RAGSkipReason = p.ragUsed, p.ragHits, p.skipReason
 }
 
 // prepareChat is the chat-only hook between checkLimits and invoke: it shapes
 // the messages that go upstream with the project's system prompt and the RAG
 // context. Other endpoints have no such step.
-func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.ChatRequest) chatPrep {
+func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.ChatRequest, opts ragmuxRequest) chatPrep {
 	p, ctx, w := c.project, c.ctx(), c.w
-	var prep chatPrep
+	// A narrowing that cannot narrow anything is not refused, because no
+	// document reaches the context anyway; it earns a warning (PRD rule 12).
+	if p.RAGStoreID == nil {
+		switch {
+		case opts.InlineSources:
+			opts.Warnings = append(opts.Warnings, "ragmux.sources has no effect: this project has no RAG store; the list is empty")
+		case opts.IncludeContext:
+			opts.Warnings = append(opts.Warnings, "ragmux.include_context has no effect: this project has no RAG store; the sources and the context are empty")
+		}
+		if !opts.Filter.Empty() {
+			opts.Warnings = append(opts.Warnings, "ragmux.filter has no effect: this project has no RAG store")
+		}
+	}
+	prep := chatPrep{opts: opts}
 
 	// Project-level system prompt, if configured, goes first.
 	//
-	// The prompt injected here and the RAG context block injected below are
-	// the stable prefix most worth an Anthropic cache breakpoint, but the
-	// gateway does not mark one: a project-level cache_prompt flag needs a
-	// column, a migration and dashboard work of its own. Clients that mark
-	// their own content parts are relayed unchanged in the meantime, except
-	// in the system message the RAG context lands in (see below).
+	// The prompt injected here is the stable prefix most worth an Anthropic
+	// cache breakpoint, but the gateway does not mark one: a project-level
+	// cache_prompt flag needs a column, a migration and dashboard work of its
+	// own. Clients that mark their own content parts are relayed unchanged in
+	// the meantime, except in the system message the RAG context lands in
+	// under the "system" placement (see below).
 	if p.SystemPrompt != "" {
 		req.Messages = rag.InjectContext(req.Messages, p.SystemPrompt)
 	}
-
-	// The ragmux request object is ours; it must not reach the upstream.
-	prep.opts = ragmuxOptions(req.Extra)
-	delete(req.Extra, "ragmux")
 
 	// RAG pipeline. The hit count and sources headers are set here, before
 	// either the JSON or the streaming path writes the status line.
@@ -812,10 +860,32 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 	// Retrieval embeds through the store's own connection and uses prov only
 	// for the LLM rerank backend, which a nil prov skips; the walk still
 	// answers from another target with the same context (ADR-020).
-	if p.RAGStoreID != nil && g.Retriever != nil {
+	//
+	// Whether to retrieve at all is rag.SkipReason's decision (ADR-024). A
+	// project without a store never gets to it: there is nothing to skip.
+	ragOn := p.RAGStoreID != nil && g.Retriever != nil
+	if ragOn {
+		prep.skipReason = rag.SkipReason(p.RetrievalPolicy, opts.RetrievalOff,
+			p.QueryStrategy == store.QueryStrategyCondense, req.Messages)
+	}
+	if prep.skipReason != "" {
+		// A filter on a request whose retrieval does not run narrows nothing.
+		if !opts.Filter.Empty() {
+			opts.Warnings = append(opts.Warnings, "ragmux.filter has no effect: retrieval was skipped for this request ("+prep.skipReason+")")
+			prep.opts = opts
+		}
+		g.Metrics.RecordRAGSkipped(c.projectID, prep.skipReason)
+		w.Header().Set("x-ragmux-rag-skip", prep.skipReason)
+		w.Header().Set("x-ragmux-rag-hits", "0")
+	} else if ragOn {
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
 			q := rag.LastUserQuery(req.Messages)
+			if p.QueryStrategy == store.QueryStrategyCondense {
+				// A side call of the request like the rerank below: it falls
+				// back to q, and its tokens go on the row through c.sideCharges.
+				q = g.condenseQuery(c, prov, req.Messages, q)
+			}
 			// The rerank of this retrieval is a side call of the chat request:
 			// its tokens (an LLM rerank is a chat call, an API rerank a scoring
 			// call) go on this request's log row through c.sideCharges.
@@ -829,7 +899,7 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 				rerankSpend = &rerankUsageProvider{Provider: prov}
 				searchProv = rerankSpend
 			}
-			res, err := g.Retriever.SearchWith(ctx, rs, q, rs.TopK, searchProv, c.conn.ModelName)
+			res, err := g.Retriever.SearchWithFilter(ctx, rs, q, rs.TopK, searchProv, c.conn.ModelName, opts.Filter)
 			var hits []store.SearchHit
 			if res != nil {
 				hits = res.Hits
@@ -840,9 +910,8 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 				c.log.Warn("rag retrieval failed; continuing without context", "err", err)
 			} else if len(hits) > 0 {
 				prep.contextBlock = rag.FormatContext(hits)
-				// Drops the client's cache_control in that system message:
-				// a per-query prefix can never be read back from the cache.
-				req.Messages = rag.InjectRetrievedContext(req.Messages, prep.contextBlock)
+				prep.contextLanguage = rs.Language
+				req.Messages = injectRetrieved(req.Messages, prep.contextBlock, p.ContextPlacement)
 				prep.ragUsed, prep.ragHits = true, len(hits)
 				prep.sources = ragSources(hits)
 				w.Header().Set("x-ragmux-rag-sources", sourcesHeader(prep.sources))
@@ -855,24 +924,154 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 	// Warnings go out before the first byte of either response shape; a
 	// stream's headers are only written once its first chunk arrives.
 	setRequestWarnings(w.Header(), prov, *req)
+	addRagmuxWarnings(w.Header(), opts.Warnings)
 	return prep
 }
 
-// ragmuxRequest is the optional "ragmux" object clients may add to a chat
-// request. It is stripped before the request goes upstream.
-type ragmuxRequest struct {
-	// IncludeContext asks for the injected sources and context block in the
-	// (non-streaming) response body.
-	IncludeContext bool `json:"include_context"`
+// injectRetrieved puts the retrieved-context block where the project's
+// context_placement says.
+//
+// "system" is the original behaviour: the block leads the system message and
+// the client's cache_control is dropped there, because a per-query prefix can
+// never be read back from the cache. "before_last_user" leaves the system
+// message and every breakpoint alone and puts the block at the head of the
+// last user message, behind the cached prefix. Any other value -- the store
+// already maps unknown ones to the default -- is treated as "system".
+func injectRetrieved(msgs []provider.Message, block, placement string) []provider.Message {
+	if placement == store.ContextPlacementBeforeLastUser {
+		return rag.InjectBeforeLastUser(msgs, block)
+	}
+	return rag.InjectRetrievedContext(msgs, block)
 }
 
-func ragmuxOptions(extra map[string]json.RawMessage) ragmuxRequest {
+// ragmuxRequest is what the optional "ragmux" object of a chat request asked
+// for. The object is stripped before the request goes upstream.
+//
+// A request can only narrow what the project does or add information to the
+// answer; it can never switch retrieval on or change a project setting
+// (ADR-024). Everything it asked for that cannot be honoured is in Warnings.
+type ragmuxRequest struct {
+	// IncludeContext asks for the injected sources and context block in the
+	// response: the body, or the first chunk of a stream. It implies
+	// InlineSources.
+	IncludeContext bool
+	// InlineSources is ragmux.sources = "inline": the sources in the response
+	// body, or in the first chunk of a stream, instead of only in the
+	// x-ragmux-rag-sources header (which stops at 2 KB).
+	InlineSources bool
+	// RetrievalOff is ragmux.retrieval = "off": skip retrieval for this request.
+	RetrievalOff bool
+	// Filter is ragmux.filter (ADR-025): retrieval is limited to the documents
+	// whose metadata matches. Nil when absent. It only narrows.
+	Filter *store.MetadataFilter
+	// Warnings are the texts of the Warning headers the object earns.
+	Warnings []string
+}
+
+// errInvalidRagmux is the code of the 400 an unusable ragmux object gets.
+const errInvalidRagmux = "invalid_ragmux"
+
+// ragmuxProjectSettings are the names of project settings. A request that
+// names one gets a warning that says so, instead of the generic one.
+var ragmuxProjectSettings = map[string]bool{
+	"context_placement": true, "retrieval_policy": true, "query_strategy": true,
+	"history_turns_for_query": true, "query_model_connection_id": true,
+	"top_k": true, "system_prompt": true, "rag_store_id": true,
+}
+
+// ragmuxKeyName is the shape of a client key that may be echoed in a Warning
+// header; any other key is reported without its name.
+var ragmuxKeyName = regexp.MustCompile(`^[a-z_]{1,32}$`)
+
+// maxRagmuxWarnings bounds the Warning headers one request can earn: the
+// object can carry as many keys as the body limit allows. addRagmuxWarnings
+// applies it.
+const maxRagmuxWarnings = 8
+
+// parseRagmux reads the "ragmux" request object. A missing one is fine; one
+// that is not a JSON object is the caller's error (the 400 invalid_ragmux).
+// Fields it understands but cannot honour, and fields it does not know, earn a
+// warning and are otherwise ignored (PRD rule 12).
+func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 	var o ragmuxRequest
-	if raw, ok := extra["ragmux"]; ok {
-		// A malformed object is treated as absent; it is still stripped.
-		_ = json.Unmarshal(raw, &o)
+	raw, ok := extra["ragmux"]
+	if !ok {
+		return o, nil
 	}
-	return o
+	var fields map[string]json.RawMessage
+	if t := bytes.TrimSpace(raw); len(t) == 0 || t[0] != '{' || json.Unmarshal(t, &fields) != nil {
+		return o, errors.New("ragmux must be a JSON object")
+	}
+
+	if v, ok := fields["include_context"]; ok {
+		if err := json.Unmarshal(v, &o.IncludeContext); err != nil {
+			o.IncludeContext = false
+			o.Warnings = append(o.Warnings, "ragmux.include_context must be a boolean; ignored")
+		}
+	}
+	if v, ok := fields["retrieval"]; ok {
+		var mode string
+		if json.Unmarshal(v, &mode) == nil && mode == "off" {
+			o.RetrievalOff = true
+		} else {
+			// "always" and "auto" would widen the project's setting.
+			o.Warnings = append(o.Warnings, "ragmux.retrieval accepts only the value off; ignored")
+		}
+	}
+
+	if v, ok := fields["sources"]; ok {
+		var mode string
+		if json.Unmarshal(v, &mode) == nil && mode == "inline" {
+			o.InlineSources = true
+		} else {
+			o.Warnings = append(o.Warnings, "ragmux.sources accepts only the value inline; ignored")
+		}
+	}
+
+	// A filter outside the grammar is refused like a malformed object, not
+	// ignored: dropping it would answer from documents the caller meant to
+	// exclude (ADR-024, ADR-025).
+	if v, ok := fields["filter"]; ok {
+		f, err := store.ParseMetadataFilter(v)
+		if err != nil {
+			return o, errors.New("ragmux.filter: " + strings.TrimPrefix(err.Error(), store.ErrInvalidMetadata.Error()+": "))
+		}
+		o.Filter = f
+	}
+
+	// Map order is random; the headers must not be.
+	var rest []string
+	for k := range fields {
+		if k != "include_context" && k != "retrieval" && k != "sources" && k != "filter" {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	for _, k := range rest {
+		switch {
+		case ragmuxProjectSettings[k]:
+			o.Warnings = append(o.Warnings, "ragmux."+k+" is a project setting and cannot be set by a request; ignored")
+		case ragmuxKeyName.MatchString(k):
+			o.Warnings = append(o.Warnings, "unknown ragmux field "+k+"; ignored")
+		default:
+			o.Warnings = append(o.Warnings, "unknown ragmux field; ignored")
+		}
+	}
+	return o, nil
+}
+
+// addRagmuxWarnings adds one `Warning: 299 ragmux "<text>"` header per text, at
+// most maxRagmuxWarnings of them: the last stands for the ones left out. The
+// bound is applied here, where every warning has been collected, so a warning
+// added after parsing cannot exceed it.
+func addRagmuxWarnings(h http.Header, texts []string) {
+	if n := len(texts); n > maxRagmuxWarnings {
+		kept := texts[: maxRagmuxWarnings-1 : maxRagmuxWarnings-1]
+		texts = append(kept, strconv.Itoa(n-maxRagmuxWarnings+1)+" more ragmux warnings omitted")
+	}
+	for _, text := range texts {
+		h.Add("Warning", `299 ragmux "`+warnTextEscaper.Replace(text)+`"`)
+	}
 }
 
 // ragSource is one injected hit as exposed to the client: where the passage
@@ -931,9 +1130,28 @@ func asciiJSON(b []byte) string {
 	return sb.String()
 }
 
+// inlineField is the JSON value of the "ragmux" field the request asked to get
+// back, or nil when it asked for none. Both response shapes carry the same
+// object: the sources, and the context block when include_context asked for it.
+// A request without hits or without retrieval gets an empty list, not a missing
+// one.
+func (o ragmuxRequest) inlineField(sources []ragSource, contextBlock string) ([]byte, error) {
+	if !o.IncludeContext && !o.InlineSources {
+		return nil, nil
+	}
+	if sources == nil {
+		sources = []ragSource{}
+	}
+	m := map[string]any{"sources": sources}
+	if o.IncludeContext {
+		m["context"] = contextBlock
+	}
+	return json.Marshal(m)
+}
+
 // withRagmuxField adds a top-level "ragmux" object to the serialised
 // response without disturbing the OpenAI fields.
-func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBlock string) ([]byte, error) {
+func withRagmuxField(resp *provider.ChatResponse, extra []byte) ([]byte, error) {
 	base, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err
@@ -942,19 +1160,44 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 	if err := json.Unmarshal(base, &m); err != nil {
 		return nil, err
 	}
-	if sources == nil {
-		sources = []ragSource{}
-	}
-	extra, err := json.Marshal(map[string]any{"sources": sources, "context": contextBlock})
-	if err != nil {
-		return nil, err
-	}
 	m["ragmux"] = extra
 	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
 	return append(b, '\n'), nil
+}
+
+// withRagmuxChunk adds the "ragmux" object to one serialised stream chunk. The
+// object is appended after the chunk's own fields, which keep their order and
+// bytes.
+func withRagmuxChunk(chunk, extra []byte) []byte {
+	n := len(chunk)
+	if n == 0 || chunk[n-1] != '}' {
+		return chunk
+	}
+	out := make([]byte, 0, n+len(extra)+10)
+	out = append(out, chunk[:n-1]...)
+	out = append(out, `,"ragmux":`...)
+	out = append(out, extra...)
+	return append(out, '}')
+}
+
+// streamOption tunes one stream call.
+type streamOption func(*streamConfig)
+
+type streamConfig struct {
+	// inline is the "ragmux" object for the first chunk that has choices; nil
+	// leaves every chunk as the upstream's.
+	inline []byte
+}
+
+// withInlineRagmux makes the stream carry the given "ragmux" object, once, on
+// the first chunk that has choices. The object goes there rather than in a
+// chunk of its own because a chunk with an empty choices array breaks clients
+// that index choices[0].
+func withInlineRagmux(extra []byte) streamOption {
+	return func(c *streamConfig) { c.inline = extra }
 }
 
 // stream relays one streamed chat call to the client.
@@ -966,7 +1209,12 @@ func withRagmuxField(resp *provider.ChatResponse, sources []ragSource, contextBl
 // upstream has to produce that first chunk; it does not limit the stream
 // afterwards.
 func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.Duration, prov provider.Provider,
-	conn *store.ModelConnection, req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int) error {
+	conn *store.ModelConnection, req provider.ChatRequest, rec *store.RequestLog, obsv *requestObs, promptChars int,
+	options ...streamOption) error {
+	var cfg streamConfig
+	for _, o := range options {
+		o(&cfg)
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by server")
@@ -1067,6 +1315,10 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 			}
 		}
 		b, _ := json.Marshal(chunk)
+		if cfg.inline != nil && len(chunk.Choices) > 0 {
+			b = withRagmuxChunk(b, cfg.inline)
+			cfg.inline = nil
+		}
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
 			// Writing to a closed client: stop the upstream call. The
 			// goroutine exits once ChatStream observes ctx and closes out.
@@ -1097,6 +1349,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 		return err
 	}
 	sendHeaders()
+	if cfg.inline != nil {
+		// No chunk with choices came, so the field had nowhere to go. A chunk of
+		// the gateway's own would break clients that index choices[0]; the
+		// headers are out, so no Warning either: the log says it.
+		g.Log.Warn("ragmux inline sources not delivered: the stream had no chunk with choices", "project", rec.ProjectID)
+	}
 	if err != nil {
 		// Mid-stream failure: surface it as an SSE error event then end.
 		_, pe := providerError(err)

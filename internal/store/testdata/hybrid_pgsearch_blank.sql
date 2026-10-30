@@ -1,10 +1,13 @@
 
-			WITH v AS (
-				SELECT e.chunk_id, ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
+			WITH vc AS MATERIALIZED (
+				SELECT e.chunk_id, e.embedding <=> $1::vector AS distance
 				FROM chunk_embeddings_4 e
 				WHERE e.rag_store_id = $2
-				ORDER BY e.embedding <=> $1::vector
+				ORDER BY distance
 				LIMIT $3),
+			v AS (
+				SELECT chunk_id, distance, ROW_NUMBER() OVER (ORDER BY distance + 0, chunk_id) AS rank
+				FROM vc),
 			f AS (
 				SELECT NULL::bigint AS chunk_id, 0::float8 AS lex_score, 0::bigint AS rank
 				WHERE false),

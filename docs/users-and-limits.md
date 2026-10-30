@@ -354,8 +354,12 @@ the upstream call, so concurrent requests cannot exceed the limit; a rejected re
 is released again so `remaining` stays accurate. Tokens are only known after the provider
 answers, so the token limit and the budgets are checked against what has been recorded so
 far. For the per-minute token limit the request's own prompt is estimated at four
-characters per token (client messages plus the project system prompt, before RAG context
-is added); budgets use recorded usage only. A single request can therefore overshoot a
+characters per token (client messages plus the project system prompt) before any
+retrieval. When a project's RAG store then supplies context, the per-minute limit is
+checked a second time against the prompt plus the retrieved block (estimated with the
+store language's ratio, see [Context and limits](rag.md#context-and-limits)); a request
+over the limit by then is a `429` `rate_limit_tpm` and the context is not sent. That second
+check takes no further request slot. Budgets use recorded usage only. A single request can therefore overshoot a
 budget by its own size — the *next* request is refused. Providers that do not report
 usage fall back to the same character estimate.
 

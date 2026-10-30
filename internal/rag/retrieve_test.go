@@ -70,6 +70,95 @@ func TestInjectRetrievedContextDropsCacheControl(t *testing.T) {
 	}
 }
 
+// TestInjectBeforeLastUser pins the "before_last_user" placement: the block
+// becomes the leading text part of the last user message, the system message
+// and the earlier turns are relayed byte for byte, and no system message is
+// added.
+func TestInjectBeforeLastUser(t *testing.T) {
+	sys := json.RawMessage(`[{"type":"text","text":"long stable prompt","cache_control":{"type":"ephemeral"}}]`)
+	first := json.RawMessage(`[{"type":"text","text":"q1","cache_control":{"type":"ephemeral"}}]`)
+	msgs := []provider.Message{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: first},
+		{Role: "assistant", Content: provider.TextContent("a1")},
+		{Role: "user", Content: provider.TextContent("q2")},
+	}
+	out := InjectBeforeLastUser(msgs, "CTX")
+	if len(out) != len(msgs) {
+		t.Fatalf("a message was added or dropped: %+v", out)
+	}
+	for i := 0; i < 3; i++ {
+		if out[i].Role != msgs[i].Role || string(out[i].Content) != string(msgs[i].Content) {
+			t.Errorf("message %d changed: %s", i, out[i].Content)
+		}
+	}
+	if string(msgs[3].Content) != `"q2"` {
+		t.Errorf("input mutated: %s", msgs[3].Content)
+	}
+	if got, want := string(out[3].Content), `[{"type":"text","text":"CTX"},{"type":"text","text":"q2"}]`; got != want {
+		t.Errorf("last user content = %s, want %s", got, want)
+	}
+	if LastUserQuery(out) != "CTX\nq2" {
+		t.Errorf("flattened last user text = %q", LastUserQuery(out))
+	}
+}
+
+// TestInjectBeforeLastUserKeepsClientParts: a parts array keeps every part
+// and every field behind the new leading part, cache_control included -- the
+// marker of a rolling breakpoint is the client's to place.
+func TestInjectBeforeLastUserKeepsClientParts(t *testing.T) {
+	last := json.RawMessage(`[{"type":"image_url","image_url":{"url":"u"}},{"type":"text","text":"q","cache_control":{"type":"ephemeral"},"x_extra":1}]`)
+	out := InjectBeforeLastUser([]provider.Message{{Role: "user", Content: last}}, "CTX")
+	want := `[{"type":"text","text":"CTX"},` + string(last)[1:]
+	if string(out[0].Content) != want {
+		t.Errorf("content = %s\nwant     %s", out[0].Content, want)
+	}
+}
+
+// TestInjectBeforeLastUserRelaysPartsVerbatim: the client's parts are not
+// re-encoded -- whitespace stays and <, > and & are not escaped.
+func TestInjectBeforeLastUserRelaysPartsVerbatim(t *testing.T) {
+	last := json.RawMessage(`[ {"type":"text", "text":"a <b> & c" ,"cache_control":{"type":"ephemeral"}} ]`)
+	out := InjectBeforeLastUser([]provider.Message{{Role: "user", Content: last}}, "CTX")
+	want := `[{"type":"text","text":"CTX"},{"type":"text", "text":"a <b> & c" ,"cache_control":{"type":"ephemeral"}}]`
+	if string(out[0].Content) != want {
+		t.Errorf("content = %s\nwant     %s", out[0].Content, want)
+	}
+	if !json.Valid(out[0].Content) {
+		t.Errorf("not valid JSON: %s", out[0].Content)
+	}
+}
+
+// TestInjectBeforeLastUserEdges covers the shapes that have no text to keep
+// and the request that has no user message at all.
+func TestInjectBeforeLastUserEdges(t *testing.T) {
+	for name, content := range map[string]json.RawMessage{"empty string": provider.TextContent(""), "null": json.RawMessage(`null`), "absent": nil} {
+		out := InjectBeforeLastUser([]provider.Message{{Role: "user", Content: content}}, "CTX")
+		if got := string(out[0].Content); got != `[{"type":"text","text":"CTX"}]` {
+			t.Errorf("%s: content = %s", name, got)
+		}
+	}
+	// The last *user* message is the target even when something else follows.
+	out := InjectBeforeLastUser([]provider.Message{
+		{Role: "user", Content: provider.TextContent("q")},
+		{Role: "assistant", Content: provider.TextContent("calling")},
+		{Role: "tool", Content: provider.TextContent("result")},
+	}, "CTX")
+	if string(out[0].Content) != `[{"type":"text","text":"CTX"},{"type":"text","text":"q"}]` || string(out[2].Content) != `"result"` {
+		t.Errorf("tool turn: %+v", out)
+	}
+	// No user message: the block falls back to the system placement.
+	out = InjectBeforeLastUser([]provider.Message{{Role: "system", Content: provider.TextContent("be terse")}}, "CTX")
+	if len(out) != 1 || out[0].Text() != "CTX\n\nbe terse" {
+		t.Errorf("no user message: %+v", out)
+	}
+	// An empty block changes nothing.
+	in := []provider.Message{{Role: "user", Content: provider.TextContent("q")}}
+	if got := InjectBeforeLastUser(in, ""); string(got[0].Content) != `"q"` {
+		t.Errorf("empty block: %s", got[0].Content)
+	}
+}
+
 // systemParts checks what both injection variants share -- the input is not
 // mutated, the context leads and the second client part is relayed intact --
 // and returns the decoded parts of the system message.

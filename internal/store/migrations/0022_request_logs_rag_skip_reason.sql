@@ -1,0 +1,14 @@
+-- Why retrieval did not run for a request (ADR-024). Add-only (ADR-001): the
+-- column is nullable with no default, so every row written before this
+-- migration, or by a replica that predates it, reads as NULL -- "retrieval was
+-- not skipped by the retrieval policy", which is what it always meant.
+--
+-- The value is a member of a closed set the application writes and never a
+-- client string (PRD rule 10): 'policy_off', 'client_off', 'tool_turn',
+-- 'greeting' or 'ack'. No CHECK on purpose: the application owns the
+-- set and it widens in later releases, and a CHECK would need a migration for
+-- every new reason.
+--
+-- Rollback (manual, nothing else depends on the column):
+--   ALTER TABLE request_logs DROP COLUMN rag_skip_reason;
+ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS rag_skip_reason TEXT NULL;

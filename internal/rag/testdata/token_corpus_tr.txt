@@ -1,0 +1,9 @@
+Kütüphanelerimizdeki kitapların çoğu, öğrencilerimizin ödevlerini hazırlarken yararlandığı kaynaklardır. Her sabah erkenden açılan okuma salonunda, yapılandırılmış çalışma masalarının başında oturanlar sessizce notlarını düzenler.
+
+Bilgisayar ağlarının güvenliği, kurumların en çok önem verdiği konulardan biri hâline geldi. Yöneticiler, kullanıcıların parolalarını düzenli olarak değiştirmelerini ve iki aşamalı doğrulamayı etkinleştirmelerini istiyor.
+
+İstanbul'dan Ankara'ya giden yolcular, hızlı trenin kalkış saatlerini öğrenmek için gişelerin önünde bekliyordu. Yağmurlu havada ertelenen seferler yüzünden yolculuk planlarını değiştirmek zorunda kalanlar da vardı.
+
+Veritabanına eklenen belgeler parçalara ayrılır, her parça için bir gömme vektörü üretilir ve arama sırasında sorguya en yakın parçalar getirilir. Sonuçların kalitesi, belgelerin dilinin doğru tanıtılmasına da bağlıdır.
+
+Türkçe gibi eklemeli dillerde bir sözcük, kök ile birçok ekin birleşiminden oluşabilir: arkadaşlarımızdan, öğretmenlerinizin, çalıştırabileceklermiş. Bu yüzden sözcüklerin kökünü bulan bir arama, ekli biçimleri de aynı belgeye ulaştırabilir.

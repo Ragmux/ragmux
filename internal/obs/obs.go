@@ -82,6 +82,41 @@ const (
 	RerankUnavailable = "unavailable"
 )
 
+// Retrieval skip reasons (ADR-024): why a project with a RAG store did not
+// retrieve for a request. They are the values of
+// ragmux_rag_skipped_total{reason}, of request_logs.rag_skip_reason and of the
+// x-ragmux-rag-skip response header. The set is closed on purpose: a label
+// must never carry text a client wrote (PRD rule 10).
+const (
+	RAGSkipPolicyOff = "policy_off"
+	RAGSkipClientOff = "client_off"
+	RAGSkipToolTurn  = "tool_turn"
+	RAGSkipGreeting  = "greeting"
+	RAGSkipAck       = "ack"
+)
+
+// ragSkipReasons is the closed set above, for the guard in RecordRAGSkipped.
+var ragSkipReasons = map[string]bool{
+	RAGSkipPolicyOff: true, RAGSkipClientOff: true, RAGSkipToolTurn: true,
+	RAGSkipGreeting: true, RAGSkipAck: true,
+}
+
+// Query condense outcomes (ADR-024), the values of
+// ragmux_rag_query_condense_total{outcome}. The set is closed on purpose: the
+// label may never carry a model reply or an error message.
+const (
+	CondenseOK      = "ok"
+	CondenseError   = "error"
+	CondenseTimeout = "timeout"
+	CondenseInvalid = "invalid"
+)
+
+// condenseOutcomes is the closed set above, for the guard in
+// RecordQueryCondense.
+var condenseOutcomes = map[string]bool{
+	CondenseOK: true, CondenseError: true, CondenseTimeout: true, CondenseInvalid: true,
+}
+
 // Metrics holds every family this process exports.
 type Metrics struct {
 	reg *metrics.Registry
@@ -115,6 +150,8 @@ type Metrics struct {
 	ragRerankFailed *metrics.CounterVec
 	ragSearches     *metrics.CounterVec
 	ragHits         *metrics.CounterVec
+	ragSkipped      *metrics.CounterVec
+	ragCondense     *metrics.CounterVec
 	searchBackends  *metrics.GaugeVec
 
 	ingestJobs      *metrics.CounterVec
@@ -202,6 +239,12 @@ func New(reg *metrics.Registry) *Metrics {
 			"store's configured backend when the search fell back to pgvector.", "store", "used")
 	m.ragHits = reg.Counter("ragmux_rag_hits_total",
 		"Passages returned by retrieval, by store.", "store")
+	m.ragSkipped = reg.Counter("ragmux_rag_skipped_total",
+		"Requests of a project with a RAG store that skipped retrieval, by a fixed reason: policy_off, "+
+			"client_off, tool_turn, greeting or ack.", "project", "reason")
+	m.ragCondense = reg.Counter("ragmux_rag_query_condense_total",
+		"Query condense calls (query_strategy condense) by outcome: ok, error, timeout or invalid. "+
+			"A failed call falls back to the last user message.", "outcome")
 	m.searchBackends = reg.Gauge("ragmux_search_backend_available",
 		"1 when this server can answer with that search backend, 0 when a store configured for it falls back.",
 		"backend")
@@ -461,6 +504,30 @@ func (m *Metrics) RecordRetrieval(storeID, backend, mode string, hits int, d tim
 	}
 }
 
+// RecordRAGSkipped records a request that skipped retrieval. A reason outside
+// the closed RAGSkip* set is counted as "other" rather than becoming a label.
+func (m *Metrics) RecordRAGSkipped(project, reason string) {
+	if m == nil {
+		return
+	}
+	if !ragSkipReasons[reason] {
+		reason = otherLabel
+	}
+	m.ragSkipped.With(project, reason).Inc()
+}
+
+// RecordQueryCondense records one query condense call. An outcome outside the
+// closed Condense* set is counted as "other" rather than becoming a label.
+func (m *Metrics) RecordQueryCondense(outcome string) {
+	if m == nil {
+		return
+	}
+	if !condenseOutcomes[outcome] {
+		outcome = otherLabel
+	}
+	m.ragCondense.With(outcome).Inc()
+}
+
 // RecordEmbedQuery records the query embedding call of a retrieval.
 func (m *Metrics) RecordEmbedQuery(providerType string, d time.Duration) {
 	if m == nil {
@@ -551,8 +618,9 @@ func (m *Metrics) RegisterStore(st *store.Store) {
 	m.searchBackends.With(store.BackendPgSearch).Set(boolGauge(st.Caps().PgSearch))
 	// Unlabelled on purpose (ADR-002): the store ids are in the startup log.
 	m.reg.GaugeFunc("ragmux_rag_index_missing",
-		"RAG stores whose embedding width is above what pgvector can HNSW-index (2000); they are "+
-			"searched with an exact scan. Counted at startup, recounted when such a store is deleted or re-bound.",
+		"RAG stores whose vectors have no usable HNSW index: a width above 4000, or 2001-4000 without a valid "+
+			"halfvec index (reindex it from the dashboard); they are searched with an exact scan. Counted at "+
+			"startup, recounted when such a store is deleted or re-bound and when an index build finishes.",
 		func() float64 { return float64(st.RAGIndexMissing()) })
 
 	m.reg.CachedGaugeFunc("ragmux_documents",

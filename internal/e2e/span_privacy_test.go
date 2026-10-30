@@ -147,3 +147,83 @@ func TestIngestFailureSpanCarriesNoFilename(t *testing.T) {
 		}
 	}
 }
+
+// TestCondenseSpanCarriesNoQueryText is the tracing rule for query condense
+// (ADR-024, PRD rule 10): the rag.condense span names the provider and the
+// outcome and nothing else. A marker is pushed through every slot the call
+// touches -- the conversation, the model's reply and the failure body of a
+// model that errors -- and none may reach the exported spans, on either path.
+func TestCondenseSpanCarriesNoQueryText(t *testing.T) {
+	const (
+		secretHistory = "SECRETHISTORY-hunter2-do-not-export"
+		secretAnswer  = "SECRETANSWER-marzipan-do-not-export"
+		secretLast    = "SECRETLAST-quarterly-payroll"
+		secretQuery   = "SECRETQUERY-banana-condensed-9471"
+	)
+	backend := mockUpstream(t)
+	defer backend.Close()
+	up := newCondenseUpstream(t, backend, secretQuery)
+	col := newCollector(t)
+	tracer := tracing.New(tracing.Config{Endpoint: col.URL, ServiceName: "ragmux-test",
+		SampleRatio: 1, Timeout: 5 * time.Second})
+	e := newEnvOpts(t, testdb.Config(t), envOpts{bootstrap: true, tracer: tracer})
+
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	connID := int64(conn["id"].(float64))
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 1}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+	doc := e.upload(storeID, "fruits.md", "# Banana\n\nBananas are yellow and soft.")
+	if doc["_status"] != float64(202) {
+		t.Fatalf("upload: %v", doc)
+	}
+	e.waitReady(int64(doc["id"].(float64)))
+	proj := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID,
+		"rag_store_id": storeID, "query_strategy": "condense"}, "")
+	if proj["_status"] != float64(201) {
+		t.Fatalf("create project: %v", proj)
+	}
+	apiKey := proj["api_key"].(string)
+
+	conversation := []map[string]string{{"role": "user", "content": "banana " + secretHistory},
+		{"role": "assistant", "content": secretAnswer}, {"role": "user", "content": secretLast}}
+	for _, failing := range []bool{false, true} {
+		up.failing.Store(failing)
+		chat := e.call("POST", "/v1/chat/completions", map[string]any{"messages": conversation}, apiKey)
+		if chat["_status"] != float64(200) {
+			t.Fatalf("chat (failing=%v): %v", failing, chat)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tracer.Shutdown(ctx); err != nil {
+		t.Fatalf("flush spans: %v", err)
+	}
+	payload := col.payload()
+	if payload == "" {
+		t.Fatal("the collector received no spans at all; the test proves nothing")
+	}
+	// Not vacuous: both calls were condensed and their spans exported.
+	if n := col.spanNames()["rag.condense"]; n != 2 {
+		t.Fatalf("%d rag.condense spans exported, want 2; got %v", n, col.spanNames())
+	}
+	for _, want := range []string{"ragmux.condense.outcome", `"ok"`, `"error"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("the spans lack %s", want)
+		}
+	}
+	for _, secret := range []string{secretHistory, secretAnswer, secretLast, secretQuery, condenseFailureBody,
+		"SECRET-CONDENSE-FAILURE-BODY", "standalone search query"} {
+		if strings.Contains(payload, secret) {
+			t.Errorf("a span carried %q; the condense span names the provider and the outcome only", secret)
+		}
+	}
+}

@@ -1,6 +1,7 @@
 package rag
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -80,6 +81,10 @@ type Result struct {
 	// EmbedUsage is what the embedding upstream reported for the query; nil
 	// when it reported none or no embedding call was made.
 	EmbedUsage *provider.Usage
+	// FilterMatchedNothing is true when the metadata filter matched no
+	// document of the store, so the search ended before the query was
+	// embedded: nothing was spent and nothing should be billed or estimated.
+	FilterMatchedNothing bool
 	// RerankSpend is what an API reranker's call used; nil when no such call
 	// was made. The LLM backend is not counted here: it spends through the
 	// chat provider the caller passed in.
@@ -101,6 +106,16 @@ func (r *Retriever) Search(ctx context.Context, rs *store.RAGStore, query string
 // SearchWith is Search plus the mode, the effective backend and the rerank
 // outcome.
 func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query string, k int, prov provider.Provider, model string) (*Result, error) {
+	return r.SearchWithFilter(ctx, rs, query, k, prov, model, nil)
+}
+
+// SearchWithFilter is SearchWith restricted to the documents whose metadata
+// the filter lets through (ADR-025); a nil or empty filter restricts nothing.
+// A filter no document of the store matches answers with no hits before the
+// query is embedded: there is nothing to rank, so the embedding call and its
+// cost are skipped.
+func (r *Retriever) SearchWithFilter(ctx context.Context, rs *store.RAGStore, query string, k int, prov provider.Provider, model string,
+	filter *store.MetadataFilter) (*Result, error) {
 	mode := rs.SearchMode
 	if mode == "" {
 		mode = store.SearchHybrid
@@ -112,6 +127,16 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 	res := &Result{Hits: []store.SearchHit{}, Mode: mode, Backend: backend}
 	if rs.ChunkCount == 0 || strings.TrimSpace(query) == "" {
 		return res, nil
+	}
+	if !filter.Empty() {
+		matches, err := r.store.HasMatchingDocuments(ctx, rs.ID, filter)
+		if err != nil {
+			return nil, fmt.Errorf("metadata filter: %w", err)
+		}
+		if !matches {
+			res.FilterMatchedNothing = true
+			return res, nil
+		}
 	}
 	storeID := strconv.FormatInt(rs.ID, 10)
 	// No attribute here names the query, a passage or a filename: the span
@@ -147,7 +172,7 @@ func (r *Retriever) SearchWith(ctx context.Context, rs *store.RAGStore, query st
 		candidates = k * 3
 	}
 	hits, used, err := r.store.SearchWithBackend(ctx, rs.ID, query, vecs[0], store.SearchOptions{
-		Mode: mode, Backend: backend, FTSConfig: rs.FTSConfig, MaxDistance: rs.MaxDistance, Candidates: candidates})
+		Mode: mode, Backend: backend, MaxDistance: rs.MaxDistance, Candidates: candidates, Filter: filter})
 	if err != nil {
 		span.RecordError(errSpanSearch)
 		return nil, err
@@ -396,15 +421,88 @@ func InjectContext(msgs []provider.Message, contextBlock string) []provider.Mess
 
 // InjectRetrievedContext prepends a retrieved-passages block the way
 // InjectContext does, but strips cache_control from the client parts of the
-// message it lands in.
+// message it lands in. It is the "system" placement of a project's
+// context_placement setting.
 //
 // The block changes with every query and sits in front of the client's
 // parts, so a breakpoint there would make Anthropic write a fresh cache
 // entry (billed above the plain input rate) on each request and never read
-// one back. Dropping the marker keeps the pre-0.4.2 cost; placing the block
-// after the client's cached prefix is the real fix and is left to v0.6-1.
+// one back. Dropping the marker keeps the pre-0.4.2 cost; the
+// "before_last_user" placement (InjectBeforeLastUser) is the one that keeps
+// the client's breakpoints.
 func InjectRetrievedContext(msgs []provider.Message, contextBlock string) []provider.Message {
 	return inject(msgs, contextBlock, true)
+}
+
+// InjectBeforeLastUser puts a retrieved-passages block in front of the content
+// of the last user message, as its leading text part, and touches nothing
+// else: the system message, every earlier message and every cache_control
+// marker -- including the other parts of the last user message, which stay
+// behind the new leading part exactly as the client wrote them -- are relayed
+// byte for byte, so the prefix a client's prompt cache was built on is the
+// same on every turn. No system message is added; Anthropic
+// and Gemini pull system messages to the top of the request, which would put
+// the per-query block back in front of the cached prefix.
+//
+// A string content becomes a parts array of the block followed by the original
+// text. With no user message there is nothing to put the block in front of,
+// and it falls back to InjectRetrievedContext. It returns a copy; the input is
+// not mutated.
+func InjectBeforeLastUser(msgs []provider.Message, contextBlock string) []provider.Message {
+	if contextBlock == "" {
+		return msgs
+	}
+	last := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			last = i
+			break
+		}
+	}
+	if last < 0 {
+		return InjectRetrievedContext(msgs, contextBlock)
+	}
+	out := make([]provider.Message, len(msgs))
+	copy(out, msgs)
+	out[last].Content = leadWithTextPart(out[last], contextBlock)
+	return out
+}
+
+// leadWithTextPart returns m's content as a parts array that starts with a
+// text part holding block. A parts array keeps its parts untouched behind it;
+// a non-empty string becomes a second text part; absent or null content
+// leaves the block alone.
+func leadWithTextPart(m provider.Message, block string) json.RawMessage {
+	parts := []json.RawMessage{textPart(block)}
+	var existing []json.RawMessage
+	var text string
+	if err := json.Unmarshal(m.Content, &existing); err == nil && existing != nil {
+		parts = append(parts, existing...)
+	} else if err := json.Unmarshal(m.Content, &text); err == nil && text != "" {
+		parts = append(parts, textPart(text))
+	}
+	// The array is joined by hand: json.Marshal would compact the client's
+	// parts and escape <, > and & in them, and a part is the client's to relay
+	// as it came.
+	var b bytes.Buffer
+	b.WriteByte('[')
+	for i, part := range parts {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(part)
+	}
+	b.WriteByte(']')
+	return b.Bytes()
+}
+
+// textPart renders one OpenAI text content part.
+func textPart(text string) json.RawMessage {
+	b, _ := json.Marshal(struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{Type: "text", Text: text})
+	return b
 }
 
 func inject(msgs []provider.Message, contextBlock string, dropCacheControl bool) []provider.Message {

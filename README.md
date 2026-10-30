@@ -23,8 +23,14 @@ database. More at <https://ragmux.com>.
   before the first byte and a circuit breaker per connection; see
   [Routing](docs/providers.md#routing).
 - **RAG stores:** PDF, DOCX, HTML, TXT and Markdown, section-aware chunking, hybrid search
-  (pgvector with Postgres full-text ranking or ParadeDB BM25) and reranking; see
+  (pgvector with Postgres full-text ranking or ParadeDB BM25), reranking, a search language
+  per store, document metadata with filtering at query time, no re-embedding of duplicate
+  uploads, and HNSW-indexed embeddings of up to 4000 dimensions; see
   [Retrieval](docs/rag.md).
+- **RAG behaviour per project:** where the retrieved context goes in the prompt (so a cached
+  system prompt stays cacheable), a retrieval policy that skips greetings and tool turns,
+  and a query strategy that condenses a conversation into one standalone question. A request
+  can narrow retrieval through a `ragmux` object and receive its sources, streamed or not.
 - **Projects and API keys:** one `sk-proj-` key per project, mapped to a model connection, a
   system prompt and an optional RAG store; scoped `sk-user-` and `sk-mgmt-` keys with expiry
   and revocation.
@@ -161,8 +167,8 @@ curl -s localhost:8765/admin/api/projects -H "$AUTH" -H 'Content-Type: applicati
 
 **5. Call it like OpenAI.** The `model` field is echoed back but the project decides the
 real model (a project with [routes](docs/providers.md#routing) uses it to pick one).
-Retrieved passages are injected into the system prompt and counted in the
-`x-ragmux-rag-hits` header.
+Retrieved passages are injected into the system prompt (or in front of the last user
+message, by project setting) and counted in the `x-ragmux-rag-hits` header.
 
 ```bash
 curl -N localhost:8765/v1/chat/completions \
@@ -264,7 +270,7 @@ Reference pages are on <https://ragmux.com> and in this repository.
 |---|---|
 | [Configuration](docs/configuration.md) | every environment variable and default, flags, subcommands, Compose variables, reverse-proxy notes |
 | [API reference](docs/api.md) | authentication, roles per endpoint, the `/v1` surface, error envelope, `/healthz` |
-| [Retrieval (RAG)](docs/rag.md) | formats, chunking, hybrid search, reranking, context format |
+| [Retrieval (RAG)](docs/rag.md) | formats, chunking, hybrid search, store language, metadata filters, reranking, context placement, retrieval policy, context format |
 | [Users, roles and limits](docs/users-and-limits.md) | roles matrix, login protection, audit log, rate limits, budgets, retention |
 | [Providers](docs/providers.md) | provider types and presets, translation details, routing, retry, fallback |
 | [Backup and restore](docs/backup-restore.md) | what to back up, scripts, scheduled backups, restore runbook |

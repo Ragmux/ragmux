@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,5 +143,30 @@ func TestNoTxMigrationWaitsForTheBuildLock(t *testing.T) {
 	}
 	if !migrationRecorded(t, s, 17) {
 		t.Error("migration 17 not recorded after the lock was released")
+	}
+}
+
+// TestDocumentMetadataMigrationsApply: 0023 adds the column with its default,
+// 0024 builds the GIN index outside a transaction, and both are recorded.
+func TestDocumentMetadataMigrationsApply(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	for _, v := range []int{23, 24} {
+		if !migrationRecorded(t, s, v) {
+			t.Errorf("migration %d is not recorded", v)
+		}
+	}
+	var valid *bool
+	var def string
+	if err := s.DB().QueryRow(ctx, `SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('idx_documents_metadata')),
+		(SELECT column_default FROM information_schema.columns
+		  WHERE table_schema = current_schema() AND table_name = 'documents' AND column_name = 'metadata')`).Scan(&valid, &def); err != nil {
+		t.Fatal(err)
+	}
+	if valid == nil || !*valid {
+		t.Errorf("idx_documents_metadata: valid = %v", valid)
+	}
+	if !strings.Contains(def, "'{}'") {
+		t.Errorf("documents.metadata default = %q", def)
 	}
 }

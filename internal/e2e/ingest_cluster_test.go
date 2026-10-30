@@ -264,3 +264,106 @@ func TestWritesAreRefusedAfterTheLeaseIsTakenOver(t *testing.T) {
 		t.Errorf("progress write by the current owner: %v", err)
 	}
 }
+
+// TestDuplicateUploadReusesEmbeddingsEndToEnd drives the content dedup through
+// the upload endpoint. Stores embed the file name by default (contextual
+// chunks), so a duplicate is the same bytes under the same name: it is
+// embedded once, says so in the response, keeps the metadata of its own upload
+// and searches like its twin. A renamed copy and the same file in another
+// store are embedded.
+func TestDuplicateUploadReusesEmbeddingsEndToEnd(t *testing.T) {
+	backend := mockUpstream(t)
+	defer backend.Close()
+	var embeds atomic.Int64
+	up := countingEmbeddings(t, backend, &embeds)
+	e := newEnv(t, testdb.Config(t))
+
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "k", "model_name": "mock-model"}, "")
+	connID := int64(conn["id"].(float64))
+	newStore := func(name string) int64 {
+		rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": name, "embedding_connection_id": connID,
+			"chunk_size": 200, "chunk_overlap": 0, "top_k": 5}, "")
+		return int64(rs["id"].(float64))
+	}
+	storeA, storeB := newStore("a"), newStore("b")
+	const text = "Apples are red and crunchy."
+	// upload sends one file and waits for it; wantDup is the expected
+	// deduplicated marker and embedCalls the expected number of embedding
+	// calls the upload itself cost.
+	upload := func(storeID int64, name, meta string, wantDup bool, embedCalls int64) map[string]any {
+		t.Helper()
+		before := embeds.Load()
+		out := e.uploadWithMetadata(storeID, name, text, meta)
+		if out["_status"] != float64(202) || out["deduplicated"] != wantDup {
+			t.Fatalf("upload %s: want deduplicated=%v, got %v", name, wantDup, out)
+		}
+		e.waitReady(int64(out["id"].(float64)))
+		if got := embeds.Load() - before; got != embedCalls {
+			t.Errorf("upload %s cost %d embedding call(s), want %d", name, got, embedCalls)
+		}
+		return out
+	}
+
+	first := upload(storeA, "apple.md", `{"lang":"en"}`, false, 1)
+	firstID := int64(first["id"].(float64))
+	// Same bytes, other name: the store embeds the name, so this is new text.
+	upload(storeA, "apple-copy.md", "", false, 1)
+	// Same bytes, same name: reused, with the metadata of this upload.
+	dup := upload(storeA, "apple.md", `{"lang":"tr"}`, true, 0)
+	dupID := int64(dup["id"].(float64))
+	if dup["duplicate_of"] != float64(firstID) {
+		t.Errorf("duplicate_of = %v, want %d", dup["duplicate_of"], firstID)
+	}
+	if m, _ := e.call("GET", fmt.Sprintf("/admin/api/documents/%d", dupID), nil, "")["metadata"].(map[string]any); m["lang"] != "tr" {
+		t.Errorf("the duplicate lost the metadata of its own upload: %v", m)
+	}
+
+	search := func(body map[string]any) []map[string]any {
+		t.Helper()
+		body["query"], body["top_k"] = "apple", 10
+		out := e.call("POST", fmt.Sprintf("/admin/api/rag-stores/%d/search", storeA), body, "")
+		if out["_status"] != float64(200) {
+			t.Fatalf("search: %v", out)
+		}
+		var hits []map[string]any
+		for _, h := range out["hits"].([]any) {
+			hits = append(hits, h.(map[string]any))
+		}
+		return hits
+	}
+	byDoc := map[float64]map[string]any{}
+	hits := search(map[string]any{})
+	for _, h := range hits {
+		byDoc[h["document_id"].(float64)] = h
+	}
+	if len(hits) != 3 || byDoc[float64(firstID)] == nil || byDoc[float64(dupID)] == nil {
+		t.Fatalf("search returned %d hits, want one per document: %v", len(hits), hits)
+	}
+	if a, b := byDoc[float64(firstID)], byDoc[float64(dupID)]; a["distance"] != b["distance"] || a["content"] != b["content"] {
+		t.Errorf("twins score differently: %v vs %v", a, b)
+	}
+	// The new document answers the metadata filter of its own upload.
+	if only := search(map[string]any{"filter": map[string]any{"lang": "tr"}}); len(only) != 1 || only[0]["document_id"] != float64(dupID) {
+		t.Errorf("filtering on the duplicate's own metadata: %v", only)
+	}
+
+	// Another store never shares embeddings.
+	upload(storeB, "apple.md", "", false, 1)
+
+	// The duplicate owns its chunks: deleting the document it borrowed vectors
+	// from leaves it searchable with the same score.
+	wantDistance := byDoc[float64(dupID)]["distance"]
+	if del := e.call("DELETE", fmt.Sprintf("/admin/api/documents/%d", firstID), nil, ""); del["_status"] != float64(200) && del["_status"] != float64(204) {
+		t.Fatalf("delete the source document: %v", del)
+	}
+	var found bool
+	for _, h := range search(map[string]any{}) {
+		if h["document_id"] == float64(dupID) {
+			found = h["distance"] == wantDistance
+		}
+	}
+	if !found {
+		t.Errorf("the duplicate is gone or scores differently after its source was deleted")
+	}
+}

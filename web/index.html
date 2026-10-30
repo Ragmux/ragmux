@@ -97,6 +97,7 @@ button{cursor:pointer}
 .input{min-height:42px;padding:0 12px;border-radius:10px;border:1px solid var(--line2);background:#0f131b;color:var(--tx);width:100%}
 .input:focus{outline:2px solid rgba(242,182,50,.45);outline-offset:0;border-color:var(--amber)}
 .input::placeholder{color:#6b7689}
+.input:disabled{opacity:.5;cursor:not-allowed}
 select.input{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--tx3) 50%),linear-gradient(135deg,var(--tx3) 50%,transparent 50%);background-position:calc(100% - 18px) 18px,calc(100% - 13px) 18px;background-size:5px 5px;background-repeat:no-repeat;padding-right:34px}
 select.input option{background:#12161f}
 textarea.input{min-height:96px;padding:10px 12px;resize:vertical}
@@ -238,6 +239,40 @@ td.json{font-family:var(--mono);font-size:11.5px;color:var(--tx2);max-width:360p
 .auth-form form{width:420px;max-width:100%;padding:32px;display:flex;flex-direction:column;gap:18px}
 .auth-form h2{font-size:26px}
 .status-lines{display:flex;flex-direction:column;gap:8px;font-size:13px}
+
+/* v0.6 settings: metadata editor, index and language status */
+.meta-rows{display:flex;flex-direction:column;gap:8px;container-type:inline-size}
+.meta-row{display:grid;grid-template-columns:minmax(0,1fr) 36px;gap:8px;align-items:center}
+.meta-row>[data-k]{grid-column:1;grid-row:1}
+.meta-row>.icon-btn{grid-column:2;grid-row:1}
+.meta-row>[data-t],.meta-row>.meta-val{grid-column:1/3}
+@container (min-width:340px){
+  .meta-row{grid-template-columns:minmax(0,1fr) 130px 36px}
+  .meta-row>[data-t]{grid-column:2;grid-row:1}
+  .meta-row>.icon-btn{grid-column:3}
+  .meta-row>.meta-val{grid-column:1/3}
+}
+@container (min-width:520px){
+  .meta-row{grid-template-columns:minmax(0,1fr) 130px minmax(0,1.3fr) 36px}
+  .meta-row>.meta-val{grid-column:3;grid-row:1}
+  .meta-row>.icon-btn{grid-column:4}
+}
+.meta-err{color:#ffa3b0;font-size:12.5px}.meta-err:empty{display:none}
+.meta-pills{display:flex;flex-wrap:wrap;gap:4px;max-width:320px}
+.meta-pills .pill{max-width:200px;overflow:hidden;text-overflow:ellipsis;display:inline-block}
+.meta-more summary{cursor:pointer;color:var(--tx3);font-size:12px;margin-top:4px;width:max-content;border-radius:6px}
+.meta-more[open] summary{margin-bottom:4px}
+.meta-upload{border:1px solid var(--line2);border-radius:12px;background:#0f131b;padding:10px 14px}
+.meta-upload>summary{cursor:pointer;color:var(--tx2);font-weight:500;display:flex;align-items:center;gap:10px;min-height:28px}
+.meta-upload[open]>summary{margin-bottom:12px}
+.status-kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px 14px;font-size:12.5px;align-items:start}
+.status-kv .k{color:var(--tx3);padding-top:3px}
+.status-kv .meter{width:140px;display:inline-block;vertical-align:middle}
+.docs-note{font-size:12px;color:var(--tx3)}
+@media (max-width:760px){
+  .status-kv{grid-template-columns:minmax(0,1fr)}
+  .status-kv .k{margin-top:4px}
+}
 
 /* responsive */
 @media (max-width:1100px){
@@ -390,7 +425,7 @@ const providerBadge = (type, cls = '') => `<div class="provider p-${esc(type)} $
 // Compact "2 rpm · 10k tpm · 1M/day" summary of a project's non-zero limits.
 const limitSummary = p => [p.rate_limit_rpm ? `${fmtK(p.rate_limit_rpm)} rpm` : '', p.rate_limit_tpm ? `${fmtK(p.rate_limit_tpm)} tpm` : '', p.budget_daily_tokens ? `${fmtK(p.budget_daily_tokens)}/day` : '', p.budget_monthly_tokens ? `${fmtK(p.budget_monthly_tokens)}/month` : ''].filter(Boolean).join(' · ') || 'unlimited';
 // "hybrid (english) · rerank 15 · dist ≤ 0.6" summary of a store's retrieval settings.
-const retrievalSummary = r => [r.search_mode === 'vector' ? 'vector' : `hybrid (${r.search_backend === 'pg_search' ? 'bm25' : r.fts_config || 'simple'})`, r.rerank ? `rerank ${r.rerank_backend || 'llm'} ${r.rerank_candidates}` : '', r.max_distance ? `dist ≤ ${r.max_distance}` : ''].filter(Boolean).join(' · ');
+const retrievalSummary = r => [r.search_mode === 'vector' ? 'vector' : `hybrid (${ftsLabel(r)})`, r.rerank ? `rerank ${r.rerank_backend || 'llm'} ${r.rerank_candidates}` : '', r.max_distance ? `dist ≤ ${r.max_distance}` : ''].filter(Boolean).join(' · ');
 // Options for the search-backend picker; what this server cannot run is
 // listed but disabled, because saving it would be rejected with a 400.
 const backendOpts = () => (state.searchBackends.length ? state.searchBackends : [{ id: 'pgvector', available: true }])
@@ -406,7 +441,7 @@ const errMsg = (data, fallback) => (data && data.error && data.error.message) ||
 // and headers; api() is the throwing wrapper every other screen uses.
 async function request(path, opts = {}) {
   const o = { headers: {}, ...opts };
-  if (o.body && !(o.body instanceof FormData)) { o.headers['Content-Type'] = 'application/json'; o.body = JSON.stringify(o.body); }
+  if (o.body && !(o.body instanceof FormData)) { o.headers['Content-Type'] = 'application/json'; if (typeof o.body !== 'string') o.body = JSON.stringify(o.body); }
   const r = await fetch('/admin/api' + path, o);
   const ct = r.headers.get('content-type') || '';
   const data = ct.includes('json') ? await r.json() : await r.text();
@@ -950,6 +985,14 @@ let pollTimer;
 const quotaPct = r => Math.max(r.max_documents ? pct(r.document_count, r.max_documents) : 0, r.max_bytes ? pct(r.bytes_used || 0, r.max_bytes) : 0);
 const quotaLine = r => `${fmtN(r.document_count)} / ${r.max_documents ? fmtN(r.max_documents) : '∞'} docs · ${mb(r.bytes_used || 0)} / ${r.max_bytes ? mb(r.max_bytes) : '∞'} MB`;
 const embModels = () => state.models.filter(m => ptype(m.provider_type).supports_embeddings);
+function storeCardInner(r) {
+  const m = modelById(r.embedding_connection_id) || {}; const qp = quotaPct(r);
+  return `<div class="row between"><div style="font-weight:600" class="ellip">${esc(r.name)}</div><span class="pill ${r.search_mode === 'vector' ? '' : 'ok'}">${r.search_mode === 'vector' ? 'vector' : 'hybrid'}</span></div>
+        <div class="hint" style="margin-top:4px">${esc(m.name || '#' + r.embedding_connection_id)}${r.dimensions ? ` · ${r.dimensions}d` : ''}${r.search_mode !== 'vector' ? ` · ${esc(ftsLabel(r))}` : ''}</div>
+        ${storeFlags(r) ? `<div class="row wrap" style="margin-top:8px;gap:6px">${storeFlags(r)}</div>` : ''}
+        <div class="row mono" style="margin-top:12px;gap:14px;font-size:12px"><span><span style="color:var(--tx)">${fmtN(r.document_count)}</span> <span class="muted">docs</span></span><span><span style="color:var(--tx)">${fmtN(r.chunk_count)}</span> <span class="muted">chunks</span></span>${r.rerank ? `<span class="muted">rerank ${r.rerank_candidates}</span>` : ''}${r.max_distance ? `<span class="muted">dist ≤ ${r.max_distance}</span>` : ''}</div>
+        <div style="margin-top:10px">${meter(qp, r.max_documents || r.max_bytes ? '' : 'mint')}</div><div class="hint" style="margin-top:4px">${quotaLine(r)}</div>`;
+}
 function renderRAG() {
   const app = $('#app'); const w = can('editor'); const emb = embModels();
   if (state.openStore && !state.rag.some(r => r.id === state.openStore)) state.openStore = null;
@@ -957,11 +1000,7 @@ function renderRAG() {
   app.innerHTML = `<div class="topbar"><div><div class="eyebrow">RAG · ${state.rag.length} store${state.rag.length === 1 ? '' : 's'} · ${emb.length} embedding model${emb.length === 1 ? '' : 's'}</div><h1>RAG stores</h1><p class="lede">Hybrid retrieval: full-text and vectors fused with reciprocal rank fusion, optional rerank with the project's chat model.</p></div>
     <div class="actions">${w ? `<button class="btn primary" id="addStore" ${emb.length ? '' : 'disabled title="Add an embedding-capable model connection first"'}>${ICON.plus} Add store</button>` : ''}</div></div>
     <div class="split"><section class="stack" style="gap:10px" id="storeList">
-      ${state.rag.map(r => { const m = modelById(r.embedding_connection_id) || {}; const qp = quotaPct(r); return `<button class="card tight store-card ${r.id === state.openStore ? 'sel' : ''}" data-open="${r.id}" aria-pressed="${r.id === state.openStore}">
-        <div class="row between"><div style="font-weight:600" class="ellip">${esc(r.name)}</div><span class="pill ${r.search_mode === 'vector' ? '' : 'ok'}">${r.search_mode === 'vector' ? 'vector' : 'hybrid'}</span></div>
-        <div class="hint" style="margin-top:4px">${esc(m.name || '#' + r.embedding_connection_id)}${r.dimensions ? ` · ${r.dimensions}d` : ''}${r.search_mode !== 'vector' ? ` · ${esc(r.search_backend === 'pg_search' ? 'bm25' : r.fts_config || 'simple')}` : ''}</div>
-        <div class="row mono" style="margin-top:12px;gap:14px;font-size:12px"><span><span style="color:var(--tx)">${fmtN(r.document_count)}</span> <span class="muted">docs</span></span><span><span style="color:var(--tx)">${fmtN(r.chunk_count)}</span> <span class="muted">chunks</span></span>${r.rerank ? `<span class="muted">rerank ${r.rerank_candidates}</span>` : ''}${r.max_distance ? `<span class="muted">dist ≤ ${r.max_distance}</span>` : ''}</div>
-        <div style="margin-top:10px">${meter(qp, r.max_documents || r.max_bytes ? '' : 'mint')}</div><div class="hint" style="margin-top:4px">${quotaLine(r)}</div></button>`; }).join('') || `<div class="empty">No RAG stores yet.${emb.length ? '' : ' Add an embedding-capable model connection first.'}</div>`}</section>
+      ${state.rag.map(r => `<button class="card tight store-card ${r.id === state.openStore ? 'sel' : ''}" data-open="${r.id}" aria-pressed="${r.id === state.openStore}">${storeCardInner(r)}</button>`).join('') || `<div class="empty">No RAG stores yet.${emb.length ? '' : ' Add an embedding-capable model connection first.'}</div>`}</section>
     <section class="stack" style="gap:16px" id="storePanel"></section></div>`;
   if (w) $('#addStore').onclick = () => storeForm(null);
   on(app, '[data-open]', 'click', b => { state.openStore = Number(b.dataset.open); $$('[data-open]', app).forEach(x => { const sel = Number(x.dataset.open) === state.openStore; x.classList.toggle('sel', sel); x.setAttribute('aria-pressed', sel); }); renderStorePanel(); });
@@ -994,28 +1033,267 @@ function storeForm(r) {
     ${field('embedding_connection_id', 'Embedding model connection', select('embedding_connection_id', emb.map(m => ({ value: m.id, label: `${m.name} (${m.provider_type} · ${m.model_name})` })), r ? r.embedding_connection_id : undefined, r && r.chunk_count ? 'disabled' : ''), r && r.chunk_count ? 'Locked while the store has chunks.' : '')}
     ${twoCol(field('chunk_size', 'Chunk size (chars)', input('chunk_size', r ? r.chunk_size : 1000, 'type=number min=200 max=20000')), field('chunk_overlap', 'Chunk overlap', input('chunk_overlap', r ? r.chunk_overlap : 200, 'type=number min=0')))}
     ${twoCol(field('top_k', 'Top-k', input('top_k', r ? r.top_k : 5, 'type=number min=1 max=50')), field('search_mode', 'Search mode', select('search_mode', [{ value: 'hybrid', label: 'hybrid — vector + full-text (RRF)' }, { value: 'vector', label: 'vector only' }], r ? r.search_mode : 'hybrid')))}
-    ${field('search_backend', 'Search backend', select('search_backend', backendOpts(), r ? r.search_backend || 'pgvector' : 'pgvector'), 'Who answers the lexical half of a hybrid search. <code>pg_search</code> needs the ParadeDB extension; switching needs no reprocessing and ignores the full-text config below.')}
+    ${field('search_backend', 'Search backend', select('search_backend', backendOpts(), r ? r.search_backend || 'pgvector' : 'pgvector'), 'Who answers the lexical half of a hybrid search. <code>pg_search</code> needs the ParadeDB extension; switching needs no reprocessing and ignores the language below.')}
     ${toggle('contextual_chunks', r ? r.contextual_chunks : true, 'Contextual chunks', 'Embed filename and section with each chunk (changing this needs a reprocess).')}
-    ${field('fts_config', 'Full-text query config', input('fts_config', r ? r.fts_config || 'simple' : 'simple', 'placeholder=simple'), 'Postgres text search configuration for hybrid queries: <code>simple</code> (no stemming), <code>english</code>, <code>turkish</code>, <code>german</code>… Chunks are always indexed with <code>simple</code>.')}
+    ${field('language', 'Language', select('language', languageOpts(r ? r.language : 'simple'), r ? r.language || 'simple' : 'simple'), 'Sets stemming and stop words for the full-text half of a hybrid search, and the token estimate. <code>simple</code> suits mixed-language content: the language is never detected from the text.')}
+    <div class="stack" style="gap:8px" id="langNotes" aria-live="polite"></div>
     ${toggle('rerank', !!(r && r.rerank), 'Rerank the candidates', 'Reorders the candidates on every request (extra latency, and tokens or rerank-API calls).')}
     ${twoCol(field('rerank_backend', 'Rerank backend', select('rerank_backend', [{ value: 'llm', label: 'llm — the project chat model' }, { value: 'cohere', label: 'cohere — Cohere Rerank API' }, { value: 'voyage', label: 'voyage — Voyage Rerank API' }], savedBackend)), field('rerank_connection_id', 'Rerank connection', select('rerank_connection_id', rerankConnOpts(savedBackend, savedRerankConn, true), savedRerankConn || '', savedBackend === 'llm' ? '' : 'required'), `<span id="rerankConnHint">${rerankConnHint(savedBackend)}</span>`))}
     ${twoCol(field('rerank_candidates', 'Rerank candidates', input('rerank_candidates', r ? r.rerank_candidates : 15, 'type=number min=1 max=100')), field('max_distance', 'Max distance (0 = off)', input('max_distance', r ? r.max_distance : 0, 'type=number min=0 max=2 step=0.01')))}
     ${twoCol(field('max_documents', 'Max documents (0 = ∞)', input('max_documents', r ? r.max_documents : 0, 'type=number min=0 step=1')), field('max_mb', 'Max size MB (0 = ∞)', input('max_mb', r && r.max_bytes ? Math.ceil(r.max_bytes / 1048576) : 0, 'type=number min=0 step=1')))}
     <p class="hint">Upload quotas for this store; an instance-wide ceiling (MAX_DOCUMENTS_PER_STORE / MAX_BYTES_PER_STORE_MB) may apply on top. Max distance drops passages whose cosine distance to the query exceeds it.</p>`,
-    onSubmit: async d => { const body = { name: d.name, embedding_connection_id: Number(d.embedding_connection_id || (r && r.embedding_connection_id)), chunk_size: Number(d.chunk_size), chunk_overlap: Number(d.chunk_overlap), top_k: Number(d.top_k), search_mode: d.search_mode, search_backend: d.search_backend, fts_config: d.fts_config,
+    onSubmit: async d => { const body = { name: d.name, embedding_connection_id: Number(d.embedding_connection_id || (r && r.embedding_connection_id)), chunk_size: Number(d.chunk_size), chunk_overlap: Number(d.chunk_overlap), top_k: Number(d.top_k), search_mode: d.search_mode, search_backend: d.search_backend, language: d.language,
         contextual_chunks: d.contextual_chunks, rerank: d.rerank, rerank_backend: d.rerank_backend, rerank_connection_id: Number(d.rerank_connection_id) || null, rerank_candidates: Number(d.rerank_candidates) || 15, max_distance: Number(d.max_distance) || 0, max_documents: Number(d.max_documents) || 0, max_bytes: (Number(d.max_mb) || 0) * 1048576 };
       const res = r ? await api('/rag-stores/' + r.id, { method: 'PUT', body }) : await api('/rag-stores', { method: 'POST', body });
-      toast(res && res.reprocess_recommended ? 'Saved. Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : 'Saved', res && res.reprocess_recommended ? 7000 : 3000, 'ok');
+      const rebuilding = r && res && res.fts_status === 'rebuilding' && res.language !== r.language;
+      const notes = [res && res.reprocess_recommended ? 'Chunking settings changed — use "Reprocess all" to apply them to existing documents.' : '', rebuilding ? `Rebuilding the full-text index for "${res.language}" in the background; searches use simple until it finishes.` : ''].filter(Boolean);
+      toast(notes.length ? 'Saved. ' + notes.join(' ') : 'Saved', notes.length ? 8000 : 3000, 'ok');
       if (!r && res && res.id) state.openStore = res.id; await loadAll(); render(); } });
   // The connection list follows the backend. Changing the backend clears the
   // choice (the server rejects a connection of the wrong type); going back to
   // the saved backend restores the saved connection.
+  const langSel = $('[name=language]', form); const searchSel = $('[name=search_backend]', form); const langNotes = $('#langNotes', form);
+  const paintLangNotes = () => { const lang = langSel.value; const notes = [];
+    if (searchSel.value === 'pg_search' && lang !== 'simple') notes.push(['', 'pg_search ignores the language: its BM25 index is global and uses the instance tokenizer (<code>PG_SEARCH_TOKENIZER</code>). The language still applies if the store falls back to pgvector.']);
+    if (r && lang !== (r.language || 'simple')) notes.push(lang === 'simple' ? ['', 'Switching back to <code>simple</code> needs no rebuild.'] : ['warn', r.chunk_count ? `Saving rebuilds the full-text index of ${fmtN(r.chunk_count)} chunk${r.chunk_count === 1 ? '' : 's'} in the background. Searches use <code>simple</code> until it finishes, then switch to <code>${esc(lang)}</code>.` : 'No chunks yet, so there is nothing to rebuild.']);
+    langNotes.innerHTML = notes.map(([cls, html]) => `<div class="note ${cls}" style="padding:10px 14px"><span class="dim" style="font-size:12.5px">${html}</span></div>`).join(''); };
+  langSel.onchange = searchSel.onchange = paintLangNotes; paintLangNotes();
   const backendSel = $('[name=rerank_backend]', form); const connSel = $('[name=rerank_connection_id]', form);
   backendSel.onchange = () => { const b = backendSel.value; const same = b === savedBackend;
     connSel.innerHTML = optionTags(rerankConnOpts(b, savedRerankConn, same), same && savedRerankConn ? savedRerankConn : '');
     connSel.required = b !== 'llm'; $('#rerankConnHint', form).innerHTML = rerankConnHint(b); };
 }
+// ---- v0.6: language, vector index and metadata helpers -------------------
+// The language codes the server accepts (store.languageConfigs, ADR-027). The
+// server validates on write; this list only fills the picker.
+const LANGUAGE_CODES = ['ar', 'ca', 'da', 'de', 'el', 'en', 'es', 'eu', 'fi', 'fr', 'ga', 'hi', 'hu', 'hy', 'id', 'it', 'lt', 'ne', 'nl', 'no', 'pt', 'ro', 'ru', 'sr', 'sv', 'ta', 'tr', 'yi'];
+const languageName = code => { try { return new Intl.DisplayNames(['en'], { type: 'language' }).of(code) || code; } catch (e) { return code; } };
+function languageOpts(current) {
+  const opts = [{ value: 'simple', label: 'simple — no stemming, no stop words' }, ...LANGUAGE_CODES.map(c => ({ value: c, label: `${c} — ${languageName(c)}` }))];
+  if (current && !opts.some(o => o.value === current)) opts.push({ value: current, label: current });
+  return opts;
+}
+// What answers the lexical half of a hybrid search, for the one-line summaries.
+const ftsLabel = r => r.search_backend === 'pg_search' ? 'bm25' : r.language || 'simple';
+
+function vectorIndexPill(r) {
+  const p = r.vector_index_progress;
+  switch (r.vector_index) {
+    case 'hnsw': return '<span class="pill ok">hnsw</span>';
+    case 'hnsw_halfvec': return '<span class="pill ok" title="HNSW over a halfvec expression index">hnsw · halfvec</span>';
+    case 'building': return `<span class="pill warn">indexing${p != null ? ` · ${p}%` : ''}</span>`;
+    case 'missing': return '<span class="pill warn" title="No valid vector index for this width: searches scan every vector (correct, but slow on large stores)">no vector index</span>';
+    case 'not_indexable': return '<span class="pill err" title="This embedding width cannot be indexed">not indexable</span>';
+    default: return '';
+  }
+}
+const ftsPill = r => r.fts_status === 'rebuilding' ? '<span class="pill warn" title="The language changed: the full-text index is being rebuilt in the background. Searches use the simple configuration until it finishes.">rebuilding full-text</span>' : '';
+// The pills a store card carries: only states that need attention.
+const storeFlags = r => [['building', 'missing', 'not_indexable'].includes(r.vector_index) ? vectorIndexPill(r) : '', ftsPill(r)].filter(Boolean).join(' ');
+
+const metaText = v => Array.isArray(v) ? v.join(', ') : String(v);
+function metaPills(m) {
+  const e = Object.entries(m || {});
+  if (!e.length) return '<span class="muted">—</span>';
+  const pill = ([k, v]) => `<span class="pill" title="${esc(k + ': ' + metaText(v))}"><span class="muted">${esc(k)}</span>&nbsp;${esc(metaText(v))}</span>`;
+  return `<div class="meta-pills">${e.slice(0, 3).map(pill).join('')}</div>${e.length > 3 ? `<details class="meta-more"><summary>+${e.length - 3} more</summary><div class="meta-pills">${e.slice(3).map(pill).join('')}</div></details>` : ''}`;
+}
+
+// ---- metadata editor (ADR-025 shape: flat object of text, number, boolean or a list of those)
+const META_TYPES = [{ value: 'text', label: 'text' }, { value: 'number', label: 'number' }, { value: 'boolean', label: 'true / false' }, { value: 'list', label: 'list of text' }, { value: 'numlist', label: 'list of numbers' }, { value: 'json', label: 'JSON (advanced)' }];
+const META_PLACEHOLDER = { text: 'value', number: '2026', list: 'a, b, c', numlist: '1, 2, 3', json: '[true, false]' };
+const JSON_NUMBER_RE = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/;
+// Lists are typed as comma-separated text; "\," is a literal comma.
+const splitList = s => { const out = []; let cur = ''; for (let i = 0; i < s.length; i++) { const c = s[i]; if (c === '\\' && i + 1 < s.length) cur += s[++i]; else if (c === ',') { out.push(cur); cur = ''; } else cur += c; } out.push(cur); return out.map(x => x.trim()).filter(Boolean); };
+const joinList = a => a.map(x => String(x).replace(/[\\,]/g, '\\$&')).join(', ');
+// rawMembers splits the text of a JSON object into {key: text of its value},
+// so a value the editor cannot represent exactly (a 20-digit number, say) can
+// be sent back byte for byte. Returns {} when the text is not what it expects.
+function rawMembers(text) {
+  const out = {}; const n = text.length; let i = text.indexOf('{') + 1;
+  const ws = () => { while (i < n && ' \n\r\t'.includes(text[i])) i++; };
+  const str = () => { const st = i; i++; while (i < n && text[i] !== '"') { if (text[i] === '\\') i++; i++; } i++; return text.slice(st, i); };
+  const value = () => { const st = i;
+    if (text[i] === '"') str();
+    else if (text[i] === '{' || text[i] === '[') { let d = 0; do { const c = text[i]; if (c === '"') { str(); continue; } if (c === '{' || c === '[') d++; else if (c === '}' || c === ']') d--; i++; } while (d > 0 && i < n); }
+    else while (i < n && !',}] \n\r\t'.includes(text[i])) i++;
+    return text.slice(st, i); };
+  try { if (i < 1) return {}; ws(); while (i < n && text[i] !== '}') { const k = JSON.parse(str()); ws(); i++; ws(); out[k] = value(); ws(); if (text[i] === ',') i++; ws(); } } catch (e) { return {}; }
+  return out;
+}
+const metaSig = m => JSON.stringify([m.key, m.type, m.value]);
+// metaRowsFrom builds editor rows from a metadata object (raw: rawMembers of
+// its text, when known). A value the typed editor would change on a round
+// trip is shown as JSON, and a row nobody touches is written back as it came.
+function metaRowsFrom(obj, raw = {}) {
+  return Object.entries(obj || {}).map(([key, v]) => {
+    const rawText = raw[key]; const json = { key, type: 'json', value: rawText !== undefined ? rawText : JSON.stringify(v) };
+    let row = json;
+    const numOK = x => typeof x === 'number' && Number.isFinite(x);
+    if (typeof v === 'string') row = { key, type: 'text', value: v };
+    else if (typeof v === 'boolean') row = { key, type: 'boolean', value: String(v) };
+    else if (numOK(v)) { if (rawText === undefined ? Number.isSafeInteger(v) : String(v) === rawText) row = { key, type: 'number', value: String(v) }; }
+    else if (Array.isArray(v) && v.length) {
+      if (v.every(x => typeof x === 'string')) { const j = joinList(v); if (JSON.stringify(splitList(j)) === JSON.stringify(v)) row = { key, type: 'list', value: j }; }
+      else if (v.every(numOK) && (rawText === undefined ? v.every(Number.isSafeInteger) : rawText.replace(/\s/g, '') === JSON.stringify(v))) row = { key, type: 'numlist', value: v.join(', ') };
+    }
+    const m = { ...row }; if (rawText !== undefined) { m.raw = rawText; m.sig = metaSig(m); }
+    return m;
+  });
+}
+const metaFilled = rows => rows.filter(m => m.key.trim() || String(m.value).trim() || m.raw).length;
+// metaCollect turns the editor rows into the JSON text of the metadata object,
+// or says what is wrong. It checks only what it must to build valid JSON (and
+// duplicate keys, which an object would swallow); key shape, sizes and counts
+// are the server's to judge, and its message is shown as it comes.
+function metaCollect(rows) {
+  const seen = new Set(); const parts = [];
+  for (const [i, m] of rows.entries()) {
+    const key = m.key.trim(); const val = String(m.value);
+    if (!key && !val.trim() && !m.raw) continue;
+    if (!key) return { error: `Row ${i + 1} has a value but no key.` };
+    if (seen.has(key)) return { error: `Key "${key}" appears twice.` };
+    seen.add(key);
+    let text;
+    if (m.raw !== undefined && m.sig === metaSig(m)) text = m.raw;
+    else if (m.type === 'boolean') text = val === 'false' ? 'false' : 'true';
+    else if (m.type === 'text') text = JSON.stringify(val);
+    else if (m.type === 'list') text = JSON.stringify(splitList(val));
+    else if (m.type === 'number') { const t = val.trim(); if (!JSON_NUMBER_RE.test(t)) return { error: `Key "${key}": "${t}" is not a number.` }; text = t; }
+    else if (m.type === 'numlist') { const items = splitList(val); const bad = items.find(x => !JSON_NUMBER_RE.test(x)); if (bad !== undefined) return { error: `Key "${key}": "${bad}" is not a number.` }; text = `[${items.join(',')}]`; }
+    else { const t = val.trim(); if (!t) return { error: `Key "${key}" needs a JSON value.` }; try { JSON.parse(t); } catch (e) { return { error: `Key "${key}": that is not valid JSON.` }; } text = t; }
+    parts.push(`${JSON.stringify(key)}:${text}`);
+  }
+  return { json: `{${parts.join(',')}}`, count: parts.length };
+}
+// metaEditor renders the key/value rows of `rows` into host and edits that
+// array in place, so a caller can keep the draft across re-renders.
+function metaEditor(host, rows, onChange = () => {}) {
+  const clearErr = () => { const e = $('[data-err]', host); if (e) e.textContent = ''; };
+  const draw = focus => {
+    host.innerHTML = `${rows.length ? `<div class="meta-rows" role="group" aria-label="Metadata keys and values">${rows.map((m, i) => `<div class="meta-row">
+        <input class="input" data-k="${i}" value="${esc(m.key)}" placeholder="key" autocomplete="off" spellcheck="false" aria-label="Metadata key ${i + 1}">
+        <select class="input" data-t="${i}" aria-label="Value type of key ${i + 1}">${optionTags(META_TYPES, m.type)}</select>
+        ${m.type === 'boolean' ? `<select class="input meta-val" data-v="${i}" aria-label="Value of key ${i + 1}">${optionTags([{ value: 'true', label: 'true' }, { value: 'false', label: 'false' }], m.value === 'false' ? 'false' : 'true')}</select>`
+          : `<input class="input meta-val" data-v="${i}" value="${esc(m.value)}" placeholder="${META_PLACEHOLDER[m.type]}" autocomplete="off" spellcheck="false" aria-label="Value of key ${i + 1}">`}
+        <button type="button" class="icon-btn" data-rm="${i}" aria-label="Remove metadata key ${i + 1}">${ICON.close}</button></div>`).join('')}</div>` : ''}
+      <div class="row wrap" style="${rows.length ? 'margin-top:8px' : ''}"><button type="button" class="btn sm" data-add>${ICON.plus} Add key</button><span class="hint">${rows.length ? 'Lists: separate values with commas; write <code>\\,</code> for a literal comma.' : 'No metadata. Keys use letters, digits, <code>_ . -</code>.'}</span></div>
+      <div class="meta-err" role="alert" data-err></div>`;
+    if (focus) { const el = $(focus, host); if (el) el.focus(); }
+  };
+  host.oninput = e => { const t = e.target; clearErr();
+    if (t.dataset.k != null) rows[t.dataset.k].key = t.value; else if (t.dataset.v != null) rows[t.dataset.v].value = t.value; onChange(); };
+  host.onchange = e => { const t = e.target; if (t.dataset.v != null) { rows[t.dataset.v].value = t.value; onChange(); return; } if (t.dataset.t == null) return; const m = rows[t.dataset.t]; m.type = t.value;
+    if (m.type === 'boolean' && m.value !== 'false') m.value = 'true';
+    clearErr(); draw(`[data-t="${t.dataset.t}"]`); onChange(); };
+  host.onclick = e => { const b = e.target.closest('button'); if (!b) return; clearErr();
+    if (b.hasAttribute('data-add')) { rows.push({ key: '', type: 'text', value: '' }); draw(`[data-k="${rows.length - 1}"]`); onChange(); }
+    else if (b.dataset.rm != null) { rows.splice(Number(b.dataset.rm), 1); draw('[data-add]'); onChange(); } };
+  draw();
+  return { showError: msg => { const e = $('[data-err]', host); if (e) e.textContent = msg || ''; } };
+}
+// Upload drafts are kept per store so a re-render (or a poll) never loses what
+// was typed; they are visible in the upload section's summary, never silent.
+const uploadDrafts = new Map();
+const draftFor = id => { if (!uploadDrafts.has(id)) uploadDrafts.set(id, []); return uploadDrafts.get(id); };
+// Dedup is a forecast the upload response makes (see uploadedDocument in the
+// admin API); no later read carries it, so it lives here for the session.
+const dedupForecast = new Map();
+
 const docStatus = d => d.status === 'processing' || d.status === 'pending' ? `<span class="pill warn">${d.status}${d.progress_percent != null ? ` · ${d.progress_percent}%` : ''}</span>` : d.status === 'failed' ? `<span class="pill err" title="${esc(d.error)}">failed</span>` : '<span class="pill ok">ready</span>';
+function docsTableHtml(docs, w) {
+  const nameOf = id => { const x = docs.find(d => d.id === id); return x ? x.filename : '#' + id; };
+  return `<div class="tbl"><table><thead><tr><th>Document</th><th>Size</th><th>Chunks</th><th>Metadata</th><th>Status</th><th>Added</th>${w ? '<th><span class="sr">Actions</span></th>' : ''}</tr></thead><tbody>
+      ${docs.map(d => `<tr><td><div class="ellip" style="font-weight:500;max-width:340px" title="${esc(d.filename)}">${esc(d.filename)}</div><div class="hint mono">${esc(d.mime || '')}${d.page_count ? ` · ${fmtN(d.page_count)} page${d.page_count === 1 ? '' : 's'}` : ''}</div>${d.error ? `<div class="hint ellip" style="max-width:340px" title="${esc(d.error)}">${esc(d.error)}</div>` : ''}${dedupForecast.has(d.id) ? `<div style="margin-top:4px"><span class="pill info" title="Same bytes as an existing document: ingestion is expected to reuse its embeddings. A forecast made at upload time, not a record of what happened.">dedup expected · of ${esc(nameOf(dedupForecast.get(d.id)))}</span></div>` : ''}</td><td class="mono nowrap">${fmtBytes(d.size_bytes)}</td><td class="mono">${d.chunk_count ? fmtN(d.chunk_count) : '—'}</td><td>${metaPills(d.metadata)}</td><td>${docStatus(d)}</td><td class="mono muted nowrap" title="${esc(fmtDate(d.created_at))}">${fmtDay(d.created_at)}</td>${w ? `<td class="right nowrap"><button class="btn sm ghost" data-meta="${d.id}" aria-label="Edit metadata of ${esc(d.filename)}">Metadata</button> <button class="btn sm ghost" data-re="${d.id}" aria-label="Reprocess ${esc(d.filename)}">Reprocess</button> <button class="btn sm ghost danger" data-del="${d.id}" aria-label="Delete ${esc(d.filename)}">Delete</button></td>` : ''}</tr>`).join('') || `<tr><td colspan="${w ? 7 : 6}" class="muted">No documents yet.${w ? ' Upload PDF, DOCX, HTML, TXT or Markdown files.' : ''}</td></tr>`}</tbody></table></div>`;
+}
+
+let liveDocs = [];
+async function refreshStores() { await loadAll(); if (state.tab === 'rag') render(); }
+function paintDocs(docs) {
+  liveDocs = docs; const region = $('#docsRegion'); if (!region) return;
+  const w = can('editor');
+  // A poll repaints the table: put keyboard focus back on the same button.
+  const a = document.activeElement; const had = a && region.contains(a) && ['data-meta', 'data-re', 'data-del'].map(k => a.hasAttribute(k) ? `[${k}="${a.getAttribute(k)}"]` : '').find(Boolean);
+  region.innerHTML = docsTableHtml(docs, w);
+  if (had) { const el = $(had, region); if (el) el.focus(); }
+  if (!w) return;
+  on(region, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this document and its vectors?', { label: 'Delete' })) return; try { await api('/documents/' + b.dataset.del, { method: 'DELETE' }); await refreshStores(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(region, '[data-re]', 'click', async b => { try { await api('/documents/' + b.dataset.re + '/reprocess', { method: 'POST' }); toast('Queued', 2500, 'ok'); setTimeout(liveRefresh, 800); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(region, '[data-meta]', 'click', b => { const d = liveDocs.find(x => x.id === Number(b.dataset.meta)); if (d) metadataDrawer(d); });
+}
+// The drawer reads the document again as text, so values the editor shows as
+// JSON (or leaves untouched) go back exactly as the server stored them.
+async function metadataDrawer(d) {
+  // Without the stored text a value like 12345678901234567890 or 1.10 would be
+  // saved rounded, so the drawer does not open on a failed or unreadable read.
+  // The fresh copy supplies both the values and their stored text.
+  let meta, raw;
+  try { const res = await fetch('/admin/api/documents/' + d.id); if (res.status === 401) { signedOut(); return; } if (!res.ok) throw new Error(String(res.status)); const txt = await res.text(); meta = JSON.parse(txt).metadata || {}; raw = rawMembers(rawMembers(txt).metadata || ''); if (Object.keys(raw).length !== Object.keys(meta).length) throw new Error('unreadable'); }
+  catch (e) { toast('Could not read this document\'s metadata from the server. Reload the page and try again.', 6000, 'err'); return; }
+  const rows = metaRowsFrom(meta, raw); let ed;
+  const form = drawer({ eyebrow: 'Metadata', title: d.filename, submitLabel: 'Save metadata', body: '<div id="metaHost"></div><p class="hint">Replaces all metadata of this document; remove every key to clear it. Searches that filter on metadata see the change at once, and the document is not reprocessed.</p>',
+    onSubmit: async () => { const c = metaCollect(rows); if (c.error) { ed.showError(c.error); throw new Error(c.error); }
+      try { await api('/documents/' + d.id, { method: 'PATCH', body: `{"metadata":${c.json}}` }); } catch (e) { ed.showError(e.message); throw e; }
+      toast('Metadata saved', 3000, 'ok'); await liveRefresh(); } });
+  ed = metaEditor($('#metaHost', form), rows);
+  setTimeout(() => { const el = $('[data-k]', form) || $('[data-add]', form); if (el) el.focus(); }, 80);
+}
+
+function storeStatusHtml(r) {
+  const admin = can('admin'); const p = r.vector_index_progress;
+  let v;
+  if (!r.vector_index) v = '<span class="muted">Not bound yet: the first document sets the embedding width.</span>';
+  else {
+    const shared = state.rag.filter(x => x.dimensions === r.dimensions).length;
+    v = `<div class="row wrap" style="gap:8px">${vectorIndexPill(r)}<span class="muted">${fmtN(r.dimensions)} dimensions${shared > 1 ? ` · index shared by ${shared} stores` : ''}</span>${r.vector_index === 'building' && p != null ? `<div class="meter blue" role="progressbar" aria-label="Vector index build progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p}"><i style="width:${Math.min(100, Math.max(0, p))}%"></i></div>` : ''}</div>`;
+    if (r.vector_index === 'building') v += '<div class="hint" style="margin-top:4px">Building in the background. Searches stay correct, only slower, until it finishes.</div>';
+    if (r.vector_index === 'missing') v += `<div class="hint" style="margin-top:4px">Searches scan every vector until the index exists: correct, but slow on large stores.${admin ? '' : ' An admin can build it.'}</div>${admin ? '<button type="button" class="btn sm" id="reindexBtn" style="margin-top:8px">Reindex…</button>' : ''}`;
+    if (r.vector_index === 'not_indexable') v += '<div class="hint" style="margin-top:4px">This width cannot be indexed (the limit is 4000 dimensions, 2000 on a pgvector without halfvec). Searches scan every vector.</div>';
+  }
+  const lang = r.language || 'simple';
+  let l = `<div class="row wrap" style="gap:8px"><span class="pill">${esc(lang)}</span>${ftsPill(r)}</div>`;
+  if (lang !== 'simple' && r.fts_status === 'rebuilding') l += '<div class="hint" style="margin-top:4px">Rebuilding the full-text index in the background. Searches use <code>simple</code> until it finishes.</div>';
+  if (lang !== 'simple' && !r.language_applies_to_search) l += '<div class="hint" style="margin-top:4px">No effect on the <code>pg_search</code> leg: its BM25 index is global and uses the instance tokenizer (<code>PG_SEARCH_TOKENIZER</code>).</div>';
+  return `<span class="k">Vector index</span><div>${v}</div><span class="k">Language</span><div>${l}</div>`;
+}
+function paintStatus(r) {
+  const el = $('#storeStatus'); if (!el) return;
+  el.innerHTML = storeStatusHtml(r);
+  const b = $('#reindexBtn', el); if (b) b.onclick = () => reindexDialog(r);
+}
+// The index belongs to the embedding width, so the confirmation lists every
+// store of that width (ADR-026).
+function reindexDialog(r) {
+  const affected = state.rag.filter(x => x.dimensions === r.dimensions);
+  modal(`Reindex ${fmtN(r.dimensions)}-dimension vectors`, `<p class="dim">The vector index belongs to the embedding width, not to one store. Reindexing affects every store with ${fmtN(r.dimensions)} dimensions:</p>
+    <ul class="mono" style="margin:0;padding-left:20px;max-height:160px;overflow:auto">${affected.map(x => `<li>${esc(x.name)}</li>`).join('')}</ul>
+    <p class="hint">Builds the HNSW index in the background without blocking writes (CREATE INDEX CONCURRENTLY). A large table can take many minutes; searches stay correct, only slower, until it finishes.</p>`,
+    { submitLabel: 'Start reindex', danger: false, onSubmit: async () => { const res = await api(`/rag-stores/${r.id}/reindex`, { method: 'POST' }); toast(`Reindex started for ${res.affected_stores.length} store${res.affected_stores.length === 1 ? '' : 's'}`, 4000, 'ok'); await liveRefresh(); } });
+}
+const needsLive = docs => docs.some(d => d.status === 'pending' || d.status === 'processing') || state.rag.some(x => x.vector_index === 'building' || x.fts_status === 'rebuilding');
+// liveRefresh re-reads the open store's documents and every store's state and
+// repaints only the regions that change, so a poll never steals focus from a
+// field the user is typing in.
+async function liveRefresh() {
+  clearTimeout(pollTimer);
+  const id = state.openStore; if (state.tab !== 'rag' || !id) return;
+  const before = new Map(state.rag.map(x => [x.id, x]));
+  let docs, rag;
+  try { [docs, rag] = await Promise.all([api(`/rag-stores/${id}/documents`), api('/rag-stores')]); }
+  catch (e) { pollTimer = setTimeout(liveRefresh, 5000); return; } // keep what is on screen
+  if (state.tab !== 'rag' || state.openStore !== id) return;
+  state.rag = rag;
+  for (const x of rag) {
+    const o = before.get(x.id); if (!o) continue;
+    if (o.vector_index === 'building' && x.vector_index !== 'building') toast(x.vector_index === 'missing' ? `Vector index build for ${x.dimensions} dimensions did not finish. Reindex again to retry.` : `Vector index ready for ${x.dimensions} dimensions`, 5000, x.vector_index === 'missing' ? 'err' : 'ok');
+    if (o.fts_status === 'rebuilding' && x.fts_status !== 'rebuilding') toast(`Full-text index of "${x.name}" is rebuilt for language ${x.language}`, 4000, 'ok');
+    const card = $(`[data-open="${x.id}"]`); if (card) card.innerHTML = storeCardInner(x);
+  }
+  const r = rag.find(x => x.id === id); if (!r) return;
+  paintStatus(r); paintDocs(docs);
+  if (needsLive(docs)) pollTimer = setTimeout(liveRefresh, 2500);
+}
+
 async function renderStorePanel() {
   const r = state.rag.find(x => x.id === state.openStore); const panel = $('#storePanel'); if (!r || !panel) return;
   const w = can('editor');
@@ -1024,28 +1302,38 @@ async function renderStorePanel() {
   const rt = panel.dataset.mode || r.search_mode || 'hybrid'; const rr = panel.dataset.rerank ? panel.dataset.rerank === '1' : !!r.rerank;
   const rb = panel.dataset.backend || r.search_backend || 'pgvector';
   const hitsHtml = panel.dataset.hits || '';
+  liveDocs = docs;
   panel.innerHTML = `<div class="card stack" style="gap:14px">
       <div class="card-head m0"><div><h2>${esc(r.name)} · documents</h2><div class="hint">chunk ${r.chunk_size} / overlap ${r.chunk_overlap} · contextual chunks ${r.contextual_chunks ? 'on' : 'off'} · top-k ${r.top_k} · ${esc(retrievalSummary(r))}</div></div>
         <div class="row wrap">${w ? `<button class="btn sm" id="reAll" ${docs.length ? '' : 'disabled'}>Reprocess all</button><button class="btn sm" id="editStore">Edit store</button><button class="btn sm ghost danger" id="delStore">Delete</button><button class="btn sm primary" id="uploadBtn">${ICON.upload} Upload</button><input type="file" id="fileInput" class="hidden" multiple accept=".pdf,.docx,.html,.htm,.txt,.md,.markdown">` : ''}</div></div>
-      ${w ? `<button type="button" class="drop" id="dropzone">${ICON.upload}<span class="dim">Drop PDF, DOCX, HTML, Markdown or text here, or click to choose</span></button>` : ''}
-      <div class="tbl"><table><thead><tr><th>Document</th><th>Size</th><th>Chunks</th><th>Status</th><th>Added</th>${w ? '<th></th>' : ''}</tr></thead><tbody>
-      ${docs.map(d => `<tr><td><div class="ellip" style="font-weight:500;max-width:340px">${esc(d.filename)}</div><div class="hint mono">${esc(d.mime || '')}${d.page_count ? ` · ${fmtN(d.page_count)} page${d.page_count === 1 ? '' : 's'}` : ''}</div>${d.error ? `<div class="hint ellip" style="max-width:340px" title="${esc(d.error)}">${esc(d.error)}</div>` : ''}</td><td class="mono nowrap">${fmtBytes(d.size_bytes)}</td><td class="mono">${d.chunk_count ? fmtN(d.chunk_count) : '—'}</td><td>${docStatus(d)}</td><td class="mono muted nowrap" title="${esc(fmtDate(d.created_at))}">${fmtDay(d.created_at)}</td>${w ? `<td class="right nowrap"><button class="btn sm ghost" data-re="${d.id}">Reprocess</button> <button class="btn sm ghost danger" data-del="${d.id}">Delete</button></td>` : ''}</tr>`).join('') || `<tr><td colspan="6" class="muted">No documents yet.${w ? ' Upload PDF, DOCX, HTML, TXT or Markdown files.' : ''}</td></tr>`}</tbody></table></div></div>
-    <div class="card stack" style="gap:12px"><div class="card-head m0"><h2>Test retrieval</h2><div class="row"><div class="tabs" role="tablist" aria-label="Search mode"><button class="tab" role="tab" data-mode="hybrid" aria-selected="${rt === 'hybrid'}">hybrid</button><button class="tab" role="tab" data-mode="vector" aria-selected="${rt === 'vector'}">vector</button></div><label for="backendSel" class="sr">Search backend</label>${select('backend', backendOpts(), rb, 'id=backendSel style="width:auto;padding:6px 10px"')}<button class="tab" id="rerankToggle" aria-pressed="${rr}" style="border:1px solid var(--line)">rerank</button></div></div>
+      <div class="status-kv" id="storeStatus"></div>
+      ${w ? `<details class="meta-upload" id="uploadMeta"${draftFor(r.id).length ? ' open' : ''}><summary>Metadata for new uploads <span class="pill" id="uploadMetaCount"></span></summary><div id="uploadMetaHost"></div><p class="hint" style="margin-top:10px">Attached to every file of the next upload, then cleared. Searches can filter on it (<code>ragmux.filter</code>); you can edit it per document later without reprocessing.</p></details>
+      <button type="button" class="drop" id="dropzone">${ICON.upload}<span class="dim">Drop PDF, DOCX, HTML, Markdown or text here, or click to choose</span></button>` : ''}
+      <div id="docsRegion"></div></div>
+    <div class="card stack" style="gap:12px"><div class="card-head m0"><h2>Test retrieval</h2><div class="row wrap" style="max-width:100%"><div class="tabs" role="tablist" aria-label="Search mode"><button class="tab" role="tab" data-mode="hybrid" aria-selected="${rt === 'hybrid'}">hybrid</button><button class="tab" role="tab" data-mode="vector" aria-selected="${rt === 'vector'}">vector</button></div><label for="backendSel" class="sr">Search backend</label>${select('backend', backendOpts(), rb, 'id=backendSel style="width:auto;max-width:100%;min-width:0;padding:6px 10px"')}<button class="tab" id="rerankToggle" aria-pressed="${rr}" style="border:1px solid var(--line)">rerank</button></div></div>
       <form class="row" id="srch"><div class="search grow">${ICON.search}<label for="q" class="sr">Query</label><input id="q" class="input" name="q" placeholder="Ask something that should be in the documents…" autocomplete="off"></div><button type="submit" class="btn primary">Search</button></form>
       <div id="hits">${hitsHtml}</div></div>`;
-  const refresh = async () => { await loadAll(); if (state.tab === 'rag') { render(); } };
+  const refresh = refreshStores;
+  paintStatus(r); paintDocs(docs);
   if (w) {
-    const upload = async files => { if (!files.length) return; const fd = new FormData(); for (const f of files) fd.append('file', f); toast(`Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`, 60000);
-      try { await api(`/rag-stores/${r.id}/documents`, { method: 'POST', body: fd }); toast('Uploaded; processing in background', 3500, 'ok'); await refresh(); } catch (e) { toast(e.message, 6000, 'err'); } };
+    const countEl = $('#uploadMetaCount'); const updateCount = () => { const n = metaFilled(draftFor(r.id)); countEl.textContent = n ? `${n} key${n === 1 ? '' : 's'}` : 'none'; countEl.className = 'pill' + (n ? ' info' : ''); };
+    const ed = metaEditor($('#uploadMetaHost'), draftFor(r.id), updateCount); updateCount();
+    const upload = async files => { if (!files.length) return;
+      const c = metaCollect(draftFor(r.id)); if (c.error) { $('#uploadMeta').open = true; ed.showError(c.error); toast(c.error, 6000, 'err'); return; }
+      const fd = new FormData(); for (const f of files) fd.append('file', f); if (c.count) fd.append('metadata', c.json);
+      toast(`Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`, 60000);
+      try { const res = await api(`/rag-stores/${r.id}/documents`, { method: 'POST', body: fd }); const made = Array.isArray(res) ? res : [res];
+        for (const u of made) if (u.deduplicated && u.duplicate_of) dedupForecast.set(u.id, u.duplicate_of);
+        const dups = made.filter(u => u.deduplicated).length;
+        draftFor(r.id).length = 0; // the metadata belongs to this upload only
+        toast(`Uploaded; processing in background${dups ? ` · ${dups} already in the store, embeddings should be reused` : ''}`, 4500, 'ok'); await refresh(); } catch (e) { if (c.count) { $('#uploadMeta').open = true; ed.showError(e.message); } toast(e.message, 6000, 'err'); } };
     const fi = $('#fileInput'); fi.onchange = () => { upload([...fi.files]); fi.value = ''; };
     $('#uploadBtn').onclick = () => fi.click(); const dz = $('#dropzone'); dz.onclick = () => fi.click();
     dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); }); dz.addEventListener('dragleave', () => dz.classList.remove('over'));
     dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('over'); upload([...e.dataTransfer.files]); });
     $('#editStore').onclick = () => storeForm(r);
     $('#delStore').onclick = async () => { if (!await confirmDialog('Delete this store with all its documents and vectors? Projects linked to it lose the link.', { label: 'Delete store' })) return; try { await api('/rag-stores/' + r.id, { method: 'DELETE' }); state.openStore = null; await refresh(); } catch (e) { toast(e.message, 5000, 'err'); } };
-    $('#reAll').onclick = async () => { if (!await confirmDialog('Re-parse, re-chunk and re-embed every document in this store? This calls the embedding model for all chunks again.', { label: 'Reprocess all', danger: false })) return; try { const res = await api(`/rag-stores/${r.id}/reprocess`, { method: 'POST' }); toast(`Queued ${res.documents} document(s)`, 3000, 'ok'); setTimeout(renderStorePanel, 800); } catch (e) { toast(e.message, 5000, 'err'); } };
-    on(panel, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this document and its vectors?', { label: 'Delete' })) return; try { await api('/documents/' + b.dataset.del, { method: 'DELETE' }); await refresh(); } catch (e) { toast(e.message, 5000, 'err'); } });
-    on(panel, '[data-re]', 'click', async b => { try { await api('/documents/' + b.dataset.re + '/reprocess', { method: 'POST' }); toast('Queued', 2500, 'ok'); setTimeout(renderStorePanel, 800); } catch (e) { toast(e.message, 5000, 'err'); } });
+    $('#reAll').onclick = async () => { if (!await confirmDialog('Re-parse, re-chunk and re-embed every document in this store? This calls the embedding model for all chunks again.', { label: 'Reprocess all', danger: false })) return; try { const res = await api(`/rag-stores/${r.id}/reprocess`, { method: 'POST' }); toast(`Queued ${res.documents} document(s)`, 3000, 'ok'); setTimeout(liveRefresh, 800); } catch (e) { toast(e.message, 5000, 'err'); } };
   }
   on(panel, '[data-mode]', 'click', b => { panel.dataset.mode = b.dataset.mode; $$('[data-mode]', panel).forEach(x => x.setAttribute('aria-selected', x === b)); });
   $('#rerankToggle').onclick = b => { const el = b.currentTarget; const v = el.getAttribute('aria-pressed') !== 'true'; el.setAttribute('aria-pressed', v); panel.dataset.rerank = v ? '1' : '0'; };
@@ -1053,15 +1341,14 @@ async function renderStorePanel() {
   $('#srch').onsubmit = async e => { e.preventDefault(); const q = $('#q').value.trim(); if (!q) return; const hits = $('#hits'); hits.innerHTML = '<p class="hint">Searching…</p>';
     try { const res = await api(`/rag-stores/${r.id}/search`, { method: 'POST', body: { query: q, mode: panel.dataset.mode || rt, backend: panel.dataset.backend || rb, rerank: panel.dataset.rerank ? panel.dataset.rerank === '1' : rr } });
       const maxS = Math.max(1e-9, ...res.hits.map(h => h.score)); const where = h => [h.section, h.page ? `p.${h.page}` : ''].filter(Boolean).join(' · ');
-      hits.innerHTML = `<div class="hint">${res.hits.length} hit${res.hits.length === 1 ? '' : 's'} in ${fmtN(res.latency_ms)} ms · ${esc(res.mode)}${res.mode === 'vector' ? '' : ` · ${esc(res.backend || 'pgvector')}${res.backend === 'pg_search' ? ' (fts_config ignored)' : ''}`}${res.retrieval_latency_ms != null ? ` · retrieval ${fmtN(res.retrieval_latency_ms)} ms` : ''}${res.reranked ? ` · rerank ${esc(res.rerank_backend || 'llm')} ${res.rerank_latency_ms != null ? fmtN(res.rerank_latency_ms) + ' ms' : 'on'}` : res.rerank_fallback ? ` · rerank ${esc(res.rerank_backend || 'llm')} skipped` : ''}</div>` +
+      hits.innerHTML = `<div class="hint">${res.hits.length} hit${res.hits.length === 1 ? '' : 's'} in ${fmtN(res.latency_ms)} ms · ${esc(res.mode)}${res.mode === 'vector' ? '' : ` · ${esc(res.backend || 'pgvector')}${res.backend === 'pg_search' ? ' (store language ignored)' : ''}`}${res.retrieval_latency_ms != null ? ` · retrieval ${fmtN(res.retrieval_latency_ms)} ms` : ''}${res.reranked ? ` · rerank ${esc(res.rerank_backend || 'llm')} ${res.rerank_latency_ms != null ? fmtN(res.rerank_latency_ms) + ' ms' : 'on'}` : res.rerank_fallback ? ` · rerank ${esc(res.rerank_backend || 'llm')} skipped` : ''}</div>` +
         res.hits.map((h, i) => `<div class="hit"><div class="n">[${i + 1}]</div><div><div class="row wrap" style="gap:8px;margin-bottom:4px"><span style="font-weight:500">${esc(h.filename)}</span>${where(h) ? `<span class="pill">${esc(where(h))}</span>` : ''}<span class="hint">chunk ${h.index}</span></div><pre>${esc(h.content)}</pre></div>
           <div class="score"><div class="row between"><span>${res.mode === 'vector' ? 'score' : 'rrf'}</span><span style="color:var(--tx)">${Number(h.score).toFixed(4)}</span></div><div class="meter mint"><i style="width:${pct(h.score, maxS)}%"></i></div><div class="row between"><span>vec #${h.vector_rank || '—'} · fts #${h.fts_rank || '—'}${h.lex_score ? ` · bm25 ${Number(h.lex_score).toFixed(2)}` : ''}</span><span>d ${Number(h.distance).toFixed(2)}</span></div></div></div>`).join('');
       panel.dataset.hits = hits.innerHTML; }
     catch (err) { hits.innerHTML = `<p class="hint">Error: ${esc(err.message)}</p>`; } };
   clearTimeout(pollTimer);
-  if (docs.some(d => d.status === 'pending' || d.status === 'processing')) pollTimer = setTimeout(async () => { if (state.tab === 'rag' && state.openStore === r.id) { try { state.rag = await api('/rag-stores'); } catch (e) { /* keep the previous counts */ } renderStorePanel(); } }, 2500);
+  if (needsLive(docs)) pollTimer = setTimeout(liveRefresh, 2500);
 }
-
 // ---------------------------------------------------------------------------
 // projects
 // ---------------------------------------------------------------------------
@@ -1075,7 +1362,7 @@ function renderProjects() {
     <div class="split wide"><section class="stack" style="gap:10px">
       ${state.projects.map(p => `<div class="card tight stack ${p.id === state.openProject ? 'sel' : ''}" style="gap:10px" data-card="${p.id}">
         <div class="row between"><div style="font-weight:600;font-size:15px" class="ellip">${esc(p.name)}</div><code class="pill">${esc(p.api_key_prefix)}…</code></div>
-        <div class="kv" style="font-size:12.5px;gap:4px 12px"><span class="k">model</span><span class="mono ellip">${esc(modelName(p.model_connection_id))}</span><span class="k">rag</span><span class="ellip">${esc(ragName(p.rag_store_id))}</span><span class="k">limits</span><span class="mono dim ellip">${esc(limitSummary(p))}</span></div>
+        <div class="kv" style="font-size:12.5px;gap:4px 12px"><span class="k">model</span><span class="mono ellip">${esc(modelName(p.model_connection_id))}</span><span class="k">rag</span><span class="ellip">${esc(ragName(p.rag_store_id))}</span><span class="k">limits</span><span class="mono dim ellip">${esc(limitSummary(p))}</span>${p.rag_store_id ? `<span class="k">retrieval</span><span class="mono dim ellip" title="${esc(ragBehaviourSummary(p) || 'default behaviour')}">${esc(ragBehaviourSummary(p) || 'default')}</span>` : ''}</div>
         <div class="row between" style="margin-top:2px"><span class="hint ellip">${(p.member_ids || []).length} member${(p.member_ids || []).length === 1 ? '' : 's'}${state.users.length ? ' · ' + esc((p.member_ids || []).map(userName).join(', ')) : ''}</span><span class="row" style="gap:6px"><button class="btn sm ghost" data-metrics="${p.id}" aria-pressed="${p.id === state.openProject}">Metrics</button>${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button>` : ''}</span></div></div>`).join('') || `<div class="empty">No projects yet.${state.models.length ? '' : ' Add a model connection first.'}</div>`}</section>
     <section class="stack" style="gap:16px" id="projPanel"></section></div>`;
   if (w) $('#addProject').onclick = () => projectForm();
@@ -1083,21 +1370,58 @@ function renderProjects() {
   on(app, '[data-metrics]', 'click', b => { state.openProject = Number(b.dataset.metrics); $$('[data-card]', app).forEach(c => c.classList.toggle('sel', Number(c.dataset.card) === state.openProject)); $$('[data-metrics]', app).forEach(x => x.setAttribute('aria-pressed', Number(x.dataset.metrics) === state.openProject)); projectPanel(); });
   if (state.openProject) projectPanel();
 }
+// RAG behaviour settings (ADR-024). The defaults are what the server applies
+// to a project that never set them; the form sends only what the user changed
+// (an older replica's UpdateProject must not be handed values it would write
+// back over a newer setting).
+const PROJECT_RAG_DEFAULTS = { context_placement: 'system', retrieval_policy: 'always', query_strategy: 'last_user', history_turns_for_query: 3, query_model_connection_id: 0 };
+const CONTEXT_PLACEMENTS = [{ value: 'system', label: 'system — in the system message' }, { value: 'before_last_user', label: 'before_last_user — ahead of the last user message' }];
+const RETRIEVAL_POLICIES = [{ value: 'always', label: 'always — retrieve on every request' }, { value: 'auto', label: 'auto — skip greetings and acknowledgements' }, { value: 'off', label: 'off — never retrieve' }];
+const QUERY_STRATEGIES = [{ value: 'last_user', label: 'last_user — search with the last user message' }, { value: 'condense', label: 'condense — rewrite the conversation into one query' }];
+// A current value the lists below do not know (a newer release wrote it) stays
+// selectable, so saving the project untouched does not overwrite it.
+const withCurrent = (opts, cur, label = c => `${c} — set by a newer version`) => opts.some(o => String(o.value) === String(cur)) ? opts : [...opts, { value: cur, label: label(cur) }];
+const ragCur = (p, k) => p && p[k] != null ? p[k] : PROJECT_RAG_DEFAULTS[k];
+// "placement before_last_user · policy auto · condense (3 turns)", or '' when everything is default.
+function ragBehaviourSummary(p) {
+  const parts = [];
+  if (ragCur(p, 'context_placement') !== 'system') parts.push('placement ' + p.context_placement);
+  if (ragCur(p, 'retrieval_policy') !== 'always') parts.push('policy ' + p.retrieval_policy);
+  if (ragCur(p, 'query_strategy') === 'condense') parts.push(`condense (${ragCur(p, 'history_turns_for_query')} turns${p.query_model_connection_id ? ' · ' + modelName(p.query_model_connection_id) : ''})`);
+  return parts.join(' · ');
+}
 function projectForm(p) {
-  drawer({ eyebrow: p ? 'Edit' : 'New', title: 'Project', submitLabel: p ? 'Save project' : 'Create project', body: `
+  const form = drawer({ eyebrow: p ? 'Edit' : 'New', title: 'Project', submitLabel: p ? 'Save project' : 'Create project', body: `
     ${field('name', 'Name', input('name', p ? p.name : '', 'required'))}
     ${field('model_connection_id', 'Model connection', select('model_connection_id', connOpts(chatModels()), p ? p.model_connection_id : undefined))}
     ${field('rag_store_id', 'RAG store (optional)', select('rag_store_id', [{ value: 0, label: '— none —' }, ...state.rag.map(r => ({ value: r.id, label: r.name }))], p ? p.rag_store_id || 0 : 0))}
     ${field('system_prompt', 'Project system prompt', textarea('system_prompt', p ? p.system_prompt : ''), 'Optional; prepended to every request.')}
+    <h3 style="margin-top:4px">Retrieval behaviour</h3>
+    <p class="hint" style="margin-top:-8px">Applies when a RAG store is linked. Clients can narrow what is retrieved per request, never widen it.</p>
+    ${field('context_placement', 'Context placement', select('context_placement', withCurrent(CONTEXT_PLACEMENTS, ragCur(p, 'context_placement')), ragCur(p, 'context_placement')), '<code>before_last_user</code> keeps the client\'s system prompt and cache breakpoints identical between turns.')}
+    ${field('retrieval_policy', 'Retrieval policy', select('retrieval_policy', withCurrent(RETRIEVAL_POLICIES, ragCur(p, 'retrieval_policy')), ragCur(p, 'retrieval_policy')), 'Tool turns are always skipped. <code>auto</code> does not skip acknowledgements while the query strategy is <code>condense</code>.')}
+    ${field('query_strategy', 'Query strategy', select('query_strategy', withCurrent(QUERY_STRATEGIES, ragCur(p, 'query_strategy')), ragCur(p, 'query_strategy')), '<code>condense</code> makes one extra chat call per multi-turn request: its tokens count against limits and cost the price of the connection below. If it fails, the last user message is used.')}
+    ${twoCol(field('history_turns_for_query', 'History turns to condense', input('history_turns_for_query', ragCur(p, 'history_turns_for_query'), 'type=number min=1 max=10 step=1 required'), '1–10; a turn is one user message and its reply.'), field('query_model_connection_id', 'Condense connection', select('query_model_connection_id', withCurrent([{ value: 0, label: '— first route target —' }, ...connOpts(chatModels())], ragCur(p, 'query_model_connection_id'), c => `${modelName(c)} — currently saved`), ragCur(p, 'query_model_connection_id')), 'A chat connection. Blank uses the first route target.'))}
     ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', p ? p.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', p ? p.rate_limit_tpm : 0, 'type=number min=0 step=1')))}
     ${twoCol(field('budget_daily_tokens', 'Daily token budget', input('budget_daily_tokens', p ? p.budget_daily_tokens : 0, 'type=number min=0 step=1')), field('budget_monthly_tokens', 'Monthly token budget', input('budget_monthly_tokens', p ? p.budget_monthly_tokens : 0, 'type=number min=0 step=1')))}
     <p class="hint">0 = unlimited. Windows are UTC minute / day / month; budgets count prompt + completion tokens and are checked before each call, so one request can overshoot by its own size. Over the limit the API answers <code>429</code> with <code>Retry-After</code>.</p>
     <div class="field"><span class="field"><label>Members</label></span>${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p ? p.member_ids || [] : [state.user.id])}<div class="hint">You stay a member of projects you create; an editor cannot remove themselves.</div></div>`,
     onSubmit: async (d, form) => { const members = checkedValues(form, 'members');
       const body = { name: d.name, model_connection_id: Number(d.model_connection_id), rag_store_id: Number(d.rag_store_id) || null, system_prompt: d.system_prompt, rate_limit_rpm: Number(d.rate_limit_rpm) || 0, rate_limit_tpm: Number(d.rate_limit_tpm) || 0, budget_daily_tokens: Number(d.budget_daily_tokens) || 0, budget_monthly_tokens: Number(d.budget_monthly_tokens) || 0 };
+      // Only settings that differ from the project's current (or default) value
+      // are sent. The fields that only matter for condense are disabled, and so
+      // absent from d, while the strategy is last_user.
+      for (const k of ['context_placement', 'retrieval_policy', 'query_strategy']) if (d[k] !== ragCur(p, k)) body[k] = d[k];
+      if (d.history_turns_for_query != null && Number(d.history_turns_for_query) !== ragCur(p, 'history_turns_for_query')) body.history_turns_for_query = Number(d.history_turns_for_query);
+      if (d.query_model_connection_id != null && (Number(d.query_model_connection_id) || 0) !== ragCur(p, 'query_model_connection_id')) body.query_model_connection_id = Number(d.query_model_connection_id) || null;
       if (p) { await api('/projects/' + p.id, { method: 'PUT', body }); await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: members } }); toast('Saved', 3000, 'ok'); }
       else { const r = await api('/projects', { method: 'POST', body: { ...body, member_user_ids: members } }); state.openProject = r.project.id; showKey(r.project, r.api_key); }
       await loadAll(); render(); } });
+  // The two condense-only fields follow the strategy: disabled fields are not
+  // submitted, which is what keeps them out of the request body.
+  const strategySel = $('[name=query_strategy]', form);
+  const syncCondense = () => { for (const n of ['history_turns_for_query', 'query_model_connection_id']) $(`[name=${n}]`, form).disabled = strategySel.value !== 'condense'; };
+  strategySel.onchange = syncCondense; syncCondense();
 }
 function membersForm(p) {
   drawer({ eyebrow: 'Members', title: p.name, submitLabel: 'Save members', body: `${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p.member_ids || [])}<p class="hint">Members see the project, its metrics and usage; editors among them can change it. An editor cannot remove themselves.</p>`,

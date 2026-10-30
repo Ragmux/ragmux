@@ -259,26 +259,47 @@ func tokenizerFromReloptions(opts []string) string {
 }
 
 func (pgSearchBackend) HybridQuery(p SearchParams) (string, []any) {
-	// FTSConfig is deliberately absent: the BM25 index is global and was
-	// tokenised once at index time, so a per-store text search configuration
-	// has nothing left to select. The admin search response reports the
-	// store's fts_config next to the effective backend so the setting is
-	// visibly inert rather than silently so.
+	// FTSColumn and FTSConfig are deliberately absent: the BM25 index is
+	// global and was tokenised once at index time (PG_SEARCH_TOKENIZER), so
+	// the store's language (ADR-027) has nothing left to select. The admin
+	// search response and the store response report the language next to the
+	// effective backend (language_applied_to_search, language_applies_to_search)
+	// so the setting is visibly inert rather than silently so. A store that
+	// falls back to pgvector gets the language rule there.
 	//
 	// ftsQuery is not applied either: paradedb.match tokenises the string
 	// itself and OR-joins the terms, so the " or " rewriting the tsquery
 	// path needs would land in the index as the literal term "or".
 	args := []any{p.Vector, p.StoreID, p.Candidates, p.MaxDistance}
+	blank := strings.TrimSpace(p.Query) == ""
+	if !blank {
+		args = append(args, p.Query)
+	}
+	first := len(args) + 1 // the filter's arguments follow
+	vec, filterArgs := vectorLeg(p.VecTable, p.HalfvecDims, p.Filter, first)
+	args = append(args, filterArgs...)
+	// The metadata filter sits next to the @@@ predicate, in the same WHERE and
+	// therefore before the LIMIT: a filter applied after it would shrink the
+	// list whenever filtered-out chunks outscore the rest. It is a plain
+	// predicate on the document_id column (a fast field of the BM25 index), on
+	// an array computed once as an InitPlan rather than a join, so the BM25
+	// scan that produces paradedb.score stays the only relation of this leg.
+	var lexFilter string
+	if !p.Filter.Empty() {
+		set := p.Filter.documentSet("$2", first)
+		lexFilter = `
+				  AND c.document_id = ANY (ARRAY(` + set + `))`
+	}
 	lex := `
 				SELECT c.id AS chunk_id, paradedb.score(c.id) AS lex_score,
 				       ROW_NUMBER() OVER (ORDER BY paradedb.score(c.id) DESC, c.id) AS rank
 				FROM chunks c
 				WHERE c.id @@@ paradedb.boolean(must => ARRAY[
 				          paradedb.term('rag_store_id', $2::bigint),
-				          paradedb.match('content', $5::text)])
+				          paradedb.match('content', $5::text)])` + lexFilter + `
 				ORDER BY paradedb.score(c.id) DESC, c.id
 				LIMIT $3`
-	if strings.TrimSpace(p.Query) == "" {
+	if blank {
 		// A blank query has no terms to match. paradedb.match on an empty
 		// string is not a documented no-op, so the lexical leg is replaced
 		// by an empty relation and the search degrades to the vector order,
@@ -286,16 +307,9 @@ func (pgSearchBackend) HybridQuery(p SearchParams) (string, []any) {
 		lex = `
 				SELECT NULL::bigint AS chunk_id, 0::float8 AS lex_score, 0::bigint AS rank
 				WHERE false`
-	} else {
-		args = append(args, p.Query)
 	}
 	sql := fmt.Sprintf(`
-			WITH v AS (
-				SELECT e.chunk_id, ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
-				FROM %[1]s e
-				WHERE e.rag_store_id = $2
-				ORDER BY e.embedding <=> $1::vector
-				LIMIT $3),
+			WITH %[4]s,
 			f AS (%[3]s),
 			m AS (
 				SELECT COALESCE(v.chunk_id, f.chunk_id) AS chunk_id,
@@ -312,6 +326,6 @@ func (pgSearchBackend) HybridQuery(p SearchParams) (string, []any) {
 			JOIN %[1]s e ON e.chunk_id = m.chunk_id
 			WHERE ($4::float8 = 0 OR (e.embedding <=> $1::vector) <= $4::float8)
 			ORDER BY m.score DESC, distance, m.chunk_id
-			LIMIT $3`, p.VecTable, rrfK, lex)
+			LIMIT $3`, p.VecTable, rrfK, lex, vec)
 	return sql, args
 }

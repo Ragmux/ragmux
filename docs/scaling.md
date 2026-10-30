@@ -154,6 +154,32 @@ behind*, counted as `SELECT count(*) FROM documents WHERE status='pending'` and
 cached for about a second. That is genuine cross-replica backpressure and the
 number an operator can act on.
 
+## Background jobs started from the dashboard
+
+Two RAG operations outlive the request that starts them, and both are safe with several
+replicas.
+
+- **Full-text rebuild.** Changing a store's `language` marks its `chunks.fts` column to be
+  rebuilt. Every replica runs the rebuild job; for each store it takes a transaction-scoped
+  advisory lock per batch (5000 chunks), so only one replica works on a store at a time and
+  a replica that finds a store busy moves on and looks at it again on its next pass. The
+  progress cursor is stored with each batch, so a replica that dies mid-rebuild loses
+  nothing: another continues from the cursor, within a minute (the job polls once a minute
+  for unfinished work, and the replica that took the request wakes up at once). While it
+  runs, every replica searches that store with `simple`, because the `fts_status` the
+  search reads comes from the database, not from process memory.
+- **Vector index build.** **Reindex** (`POST /admin/api/rag-stores/{id}/reindex`) runs one
+  `CREATE INDEX CONCURRENTLY` on the replica that received the request. Which build is
+  running is read from the PostgreSQL catalog (`pg_index`, `pg_stat_progress_create_index`)
+  and a session advisory lock per width, so any replica reports it as `building` and none
+  starts a second build of the same width. If that replica is stopped, the build is
+  cancelled and leaves an invalid index behind; the next **Reindex** drops it and starts
+  over. Searches in the meantime use an exact scan and return the same results.
+
+A replica that has not yet been upgraded can run during a rolling update: the new
+migrations only add columns, constraints and indexes, the vector tables keep their format, and an older
+replica reads them as it always did. See [Rolling restarts and shutdown](#rolling-restarts-and-shutdown).
+
 ## The retention leader lock
 
 The retention job (request logs, audit entries, login attempts, expired

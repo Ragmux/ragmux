@@ -147,6 +147,127 @@ func apiCharge(spend *rag.RerankSpend, inRow bool) sideCharge {
 		providerType: spend.ProviderType, model: spend.Model, inRow: inRow}
 }
 
+// errSpanCondense is what the rag.condense span records for a failed call: a
+// fixed value, never the error, which can quote the upstream.
+var errSpanCondense = errors.New("condense_failed")
+
+// condenseQuery is the "condense" query strategy (ADR-024): it asks a chat
+// model to turn the last turns of msgs into one standalone search query and
+// returns it. It returns fallback -- the last user message -- when there is
+// nothing to condense (one user message) and whenever the call fails, times
+// out or answers with something unusable; the request goes on either way and
+// the client is told nothing (PRD rule 8).
+//
+// The model is the project's query_model_connection_id, else the first route
+// target, the one whose adapter (prov) the LLM rerank uses. The call is a
+// single attempt: no retry, no fallback, no circuit breaker. Its tokens are a
+// side charge priced with the connection that did the work (ADR-021), counted
+// even when the reply turned out to be unusable.
+//
+// Neither the prompt nor the reply reaches a log line, a span or a metric
+// label (PRD rule 10): they carry the outcome and the connection only.
+func (g *Gateway) condenseQuery(c *call, prov provider.Provider, msgs []provider.Message, fallback string) string {
+	prompt, ok := rag.BuildCondensePrompt(msgs, c.project.HistoryTurnsForQuery)
+	if !ok {
+		return fallback
+	}
+	// prepareChat runs before invoke, so c.conn is still the first target.
+	work, conn := prov, c.conn
+	if id := c.project.QueryModelConnectionID; id != nil {
+		work, conn = g.queryModelAdapter(c, *id)
+	}
+
+	ctx, span := g.Tracer.Start(c.ctx(), "rag.condense", tracing.KindClient)
+	defer span.End()
+	if work == nil {
+		// The adapter could not be built: nothing was sent.
+		// conn is nil only when the project's query model could not be loaded;
+		// the configured id then names it.
+		id := int64(0)
+		switch {
+		case conn != nil:
+			id = conn.ID
+		case c.project.QueryModelConnectionID != nil:
+			id = *c.project.QueryModelConnectionID
+		}
+		c.log.Warn("query condense unavailable; searching with the last user message",
+			"outcome", obs.CondenseError, "connection", id)
+		g.finishCondense(span, conn, obs.CondenseError)
+		return fallback
+	}
+	spend := &rerankUsageProvider{Provider: work}
+	query, err := rag.Condense(ctx, spend, conn.ModelName, prompt, g.condenseTimeout(c))
+	c.addSideCharge(llmCharge(spend, conn.ProviderType, conn.ModelName, false))
+	outcome := rag.CondenseOutcome(err)
+	g.finishCondense(span, conn, outcome)
+	if err != nil {
+		attrs := []any{"outcome", outcome, "connection", conn.ID}
+		var pe *provider.Error
+		if errors.As(err, &pe) {
+			// The status only: the message can quote the prompt back.
+			attrs = append(attrs, "status", pe.Status)
+		}
+		c.log.Warn("query condense failed; searching with the last user message", attrs...)
+		return fallback
+	}
+	return query
+}
+
+// finishCondense counts the call and closes its span's attributes; conn is nil
+// when the project's query model could not be loaded.
+func (g *Gateway) finishCondense(span *tracing.Span, conn *store.ModelConnection, outcome string) {
+	g.Metrics.RecordQueryCondense(outcome)
+	if !span.IsRecording() {
+		return
+	}
+	if conn != nil {
+		span.SetAttributes(tracing.String("gen_ai.provider.name", tracing.GenAIProviderName(conn.ProviderType)))
+	}
+	span.SetAttributes(tracing.String("ragmux.condense.outcome", outcome))
+	if outcome == obs.CondenseOK {
+		span.SetStatusOK()
+	} else {
+		span.RecordError(errSpanCondense)
+	}
+}
+
+// queryModelAdapter loads the project's query_model_connection_id and builds
+// its adapter. A nil adapter means it cannot be used; the connection may be
+// nil too, when it could not be loaded at all.
+func (g *Gateway) queryModelAdapter(c *call, id int64) (provider.Provider, *store.ModelConnection) {
+	conn, err := g.Store.GetConnection(c.ctx(), id)
+	if err != nil {
+		c.log.Error("query model connection", "connection", id, "err", err)
+		return nil, nil
+	}
+	prov, err := g.Providers(conn)
+	if err != nil {
+		// The factory error names the provider type or URL: log only.
+		c.log.Error("query model provider setup", "connection", id, "err", err)
+		return nil, conn
+	}
+	return prov, conn
+}
+
+// condenseTimeout is the time budget of one condense call: the fixed one
+// (CondenseTimeout, 5 s by default), cut to what is left of the request's
+// upstream budget. The budget starts when invoke does, so before that it is
+// the whole UpstreamTimeout.
+func (g *Gateway) condenseTimeout(c *call) time.Duration {
+	limit := g.CondenseTimeout
+	if limit <= 0 {
+		limit = rag.DefaultCondenseTimeout
+	}
+	left := c.budgetLeft()
+	if left == 0 {
+		left = g.UpstreamTimeout
+	}
+	if left > 0 && left < limit {
+		limit = left
+	}
+	return limit
+}
+
 // call is the state one request carries from step to step. Nothing in it is
 // specific to an endpoint's request or response body.
 type call struct {
@@ -349,6 +470,64 @@ func (g *Gateway) checkLimits(c *call, estimate int, streamed bool) bool {
 	if err := g.Store.InsertRequestLog(c.ctx(), rec); err != nil {
 		c.log.Error("write request log", "err", err)
 	}
+	writeLimitError(c.w, decision)
+	return false
+}
+
+// contextTokenEstimate is the token estimate of a retrieved context block: the
+// language-aware rag.EstimateTokens, but never below the bytes / 4 the limit
+// check used before ADR-027 (see checkContextLimits).
+func contextTokenEstimate(contextBlock, language string) int {
+	return max(rag.EstimateTokens(contextBlock, language), (len(contextBlock)+3)/4)
+}
+
+// checkContextLimits is the second half of the chat token-limit check. The
+// first (checkLimits) runs before retrieval and sees only the client's
+// messages and the project prompt; the retrieved context can add thousands of
+// tokens, so once it is known the per-minute token limit is checked again
+// against the whole prompt. estimate is the figure checkLimits used.
+//
+// This is a second, request-slot-free check rather than a move of retrieval
+// ahead of checkLimits: the first check keeps shielding the embedding and
+// rerank calls from a client that is already over RPM or a budget, and a
+// repeated CheckSubject would take a second RPM slot. It runs after
+// openRecord, so a denial leaves the row the retrieval's own spend (rerank
+// tokens) is recorded on and the request is counted once, as a 429, like any
+// denied request. Nothing has gone upstream, so the attempt count is zero.
+//
+// The context block is estimated with rag.EstimateTokens by the language of
+// the store it was retrieved from (ADR-027): text in a language that
+// tokenises worse than English counts for more tokens. It never counts for
+// fewer than the bytes / 4 this check always used: a language without an
+// entry in the divisor table (Cyrillic, Greek, Arabic ... at two bytes a
+// letter) would otherwise be counted at half of what it was, which loosens
+// the limit. The client's messages and the project prompt (estimate) are
+// still characters / 4.
+func (g *Gateway) checkContextLimits(c *call, estimate int, contextBlock, language string) bool {
+	if g.Limiter == nil || contextBlock == "" {
+		return true
+	}
+	total := estimate + contextTokenEstimate(contextBlock, language)
+	decision, err := g.Limiter.CheckTokens(c.ctx(), c.subject, c.decision, total)
+	if err != nil {
+		c.log.Error("limit check", "err", err)
+		c.rec.StatusCode, c.rec.Error = http.StatusInternalServerError, "limit check failed"
+		c.rec.Attempt = 0
+		writeError(c.w, http.StatusInternalServerError, "server_error", "limit check failed")
+		return false
+	}
+	if decision.Allowed {
+		return true
+	}
+	g.Metrics.RecordLimitDenied(c.projectID, decision.Reason)
+	// The retrieval was thrown away: no context went to the model, so neither
+	// the headers nor the row (which feeds the RAG-use figures) may say it did.
+	// Its rerank spend stays on the row as a side charge.
+	c.w.Header().Del("x-ragmux-rag-hits")
+	c.w.Header().Del("x-ragmux-rag-sources")
+	c.rec.RAGUsed, c.rec.RAGHits = false, 0
+	c.rec.StatusCode, c.rec.Error = http.StatusTooManyRequests, decision.Reason
+	c.rec.Attempt = 0
 	writeLimitError(c.w, decision)
 	return false
 }

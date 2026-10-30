@@ -84,6 +84,21 @@ func RequireRole(min Role) func(http.Handler) http.Handler {
 	}
 }
 
+// Allows reports whether the request's authenticated user holds at least min
+// and, for a management key, the given scope. It is the in-handler form of
+// RequireRole and RequireScope used together, for a route that serves several
+// roles but gates part of its behaviour on a higher one.
+func Allows(ctx context.Context, min Role, scope string) bool {
+	u := UserFrom(ctx)
+	if u == nil || !Role(u.Role).AtLeast(min) {
+		return false
+	}
+	if se := SessionFrom(ctx); se.IsKey() && !hasScope(se.Scopes, scope) {
+		return false
+	}
+	return true
+}
+
 // RequireScope narrows an api-key principal to the scopes its key carries.
 // It is a no-op for a dashboard session, which is already bounded by the
 // user's role, and it never widens anything: RequireRole still runs on the

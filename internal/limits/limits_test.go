@@ -98,6 +98,57 @@ func TestTokensPerMinute(t *testing.T) {
 	}
 }
 
+// CheckTokens re-checks TPM for a request already admitted: it takes no
+// request slot, keeps the slot the first check took, and denies once the
+// larger estimate no longer fits.
+func TestCheckTokensGrowsTheEstimateWithoutReserving(t *testing.T) {
+	l, p, c := setup(t, store.Project{RateLimitTPM: 100, RateLimitRPM: 5})
+	ctx := context.Background()
+	subject := Subject{Project: p}
+	first, err := l.CheckSubject(ctx, subject, 10)
+	if err != nil || !first.Allowed || !first.Reserved {
+		t.Fatalf("first: %+v %v", first, err)
+	}
+	if d, err := l.CheckTokens(ctx, subject, first, 100); err != nil || !d.Allowed || !d.Reserved || d.RemainingRequests != first.RemainingRequests {
+		t.Fatalf("exact fit: %+v %v", d, err)
+	}
+	d, err := l.CheckTokens(ctx, subject, first, 101)
+	if err != nil || d.Allowed || d.Reason != ReasonTPM || d.Scope != ScopeProject || d.RetryAfter != 40*time.Second || !d.Reserved {
+		t.Fatalf("over tpm: %+v %v", d, err)
+	}
+	// Neither call took a request slot of its own.
+	if u, err := l.Usage(ctx, p); err != nil || u.Minute.Requests != 1 {
+		t.Fatalf("usage after rechecks: %+v %v", u.Minute, err)
+	}
+	// Usage already recorded in the minute counts against the new estimate.
+	if err := l.Record(ctx, p.ID, 60, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := l.CheckTokens(ctx, subject, first, 41); d.Allowed {
+		t.Fatalf("60 used + 41 should not fit: %+v", d)
+	}
+	if d, _ := l.CheckTokens(ctx, subject, first, 40); !d.Allowed {
+		t.Fatalf("60 used + 40 should fit: %+v", d)
+	}
+	c.t = c.t.Add(time.Minute)
+	if d, _ := l.CheckTokens(ctx, subject, first, 100); !d.Allowed {
+		t.Fatalf("next minute: %+v", d)
+	}
+}
+
+// Without a TPM limit on either tier CheckTokens has nothing to enforce.
+func TestCheckTokensWithoutTPMLimit(t *testing.T) {
+	l, p, _ := setup(t, store.Project{RateLimitRPM: 5})
+	subject := Subject{Project: p}
+	first, err := l.CheckSubject(context.Background(), subject, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, err := l.CheckTokens(context.Background(), subject, first, 1<<30); err != nil || !d.Allowed {
+		t.Fatalf("no limit: %+v %v", d, err)
+	}
+}
+
 func TestDailyAndMonthlyBudget(t *testing.T) {
 	l, p, c := setup(t, store.Project{BudgetDailyTokens: 50, BudgetMonthlyTokens: 120})
 	ctx := context.Background()

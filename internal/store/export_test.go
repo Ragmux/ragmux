@@ -78,3 +78,80 @@ func (s *Store) EnsureBM25Index(ctx context.Context) error { return s.ensureBM25
 // LockNoTxMigrations is the advisory lock key applyOutsideTx serialises on,
 // for tests that hold it.
 const LockNoTxMigrations = lockNoTxMigrations
+
+// SearchUnderSettings runs the statement of one pgvector search inside a
+// transaction that first runs the given setup statements (SET LOCAL ..., or
+// DDL: the transaction is rolled back), and returns
+// the hits together with the plan the server chose for it. It exists to
+// force the planner onto the HNSW index (enable_seqscan = off and friends) on
+// tables far too small for it to choose that by itself, so a test can show
+// what the index scan -- the thing iterative scans are for -- returns.
+func (s *Store) SearchUnderSettings(ctx context.Context, storeID int64, query string, queryVec []float32,
+	opts SearchOptions, settings ...string) ([]SearchHit, string, error) {
+	r, err := s.GetRAGStore(ctx, storeID)
+	if err != nil {
+		return nil, "", err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, set := range settings {
+		if _, err := tx.Exec(ctx, set); err != nil {
+			return nil, "", err
+		}
+	}
+	sql, args := searchStatement(searchBackends[BackendPgvector], r, query, queryVec, opts, s.useHalfvecOrder(r.Dimensions))
+	// pgvector.Vector binds as text for EXPLAIN just as it does for the query.
+	prows, err := tx.Query(ctx, "EXPLAIN "+sql, args...)
+	if err != nil {
+		return nil, "", err
+	}
+	plan := ""
+	for prows.Next() {
+		var line string
+		if err := prows.Scan(&line); err != nil {
+			return nil, "", err
+		}
+		plan += line + "\n"
+	}
+	prows.Close()
+	if err := prows.Err(); err != nil {
+		return nil, "", err
+	}
+	rows, err := tx.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, plan, err
+	}
+	defer rows.Close()
+	var hits []SearchHit
+	for rows.Next() {
+		var h SearchHit
+		if err := rows.Scan(&h.ChunkID, &h.DocumentID, &h.Index, &h.Content, &h.Filename, &h.Section, &h.Page,
+			&h.Distance, &h.Score, &h.VectorRank, &h.FTSRank, &h.LexScore); err != nil {
+			return nil, plan, err
+		}
+		hits = append(hits, h)
+	}
+	return hits, plan, rows.Err()
+}
+
+// LockVecReindex is the advisory lock key of the halfvec index builds.
+const LockVecReindex = lockVecReindex
+
+// SetCaps replaces the detected server features and returns the function that
+// puts them back, so a test can act as a server with an older pgvector.
+func (s *Store) SetCaps(c Capabilities) func() {
+	prev := s.caps
+	s.caps = c
+	return func() { s.caps = prev }
+}
+
+// SetIndexMissingTTL changes how old the index-missing count may get before a
+// read recounts it, and returns the function that restores the default.
+func (s *Store) SetIndexMissingTTL(d time.Duration) func() {
+	prev := s.indexMissingTTL
+	s.indexMissingTTL = d
+	return func() { s.indexMissingTTL = prev }
+}

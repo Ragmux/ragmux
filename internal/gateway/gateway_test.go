@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ragmux/ragmux/internal/limits"
+	"github.com/ragmux/ragmux/internal/pricing"
 	"github.com/ragmux/ragmux/internal/provider"
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
@@ -33,6 +35,13 @@ type upstream struct {
 	srv       *httptest.Server
 	chat      atomic.Pointer[http.HandlerFunc]
 	embedFail atomic.Bool
+	// embeds counts the embedding calls, which is how a test proves that
+	// retrieval did or did not run.
+	embeds atomic.Int64
+	// events is the ordered log of what the upstream was asked: "embed:<input>"
+	// for an embedding call and whatever a chat handler notes.
+	evMu   sync.Mutex
+	events []string
 	// seenCancel is closed by blocking handlers once their request context
 	// ended, which proves the gateway tore the upstream call down.
 	seenCancel chan struct{}
@@ -44,6 +53,7 @@ func newUpstream(t *testing.T) *upstream {
 	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/embeddings":
+			u.embeds.Add(1)
 			if u.embedFail.Load() {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"error":{"message":"embedding backend down"}}`))
@@ -54,6 +64,7 @@ func newUpstream(t *testing.T) *upstream {
 			}
 			body, _ := io.ReadAll(r.Body)
 			_ = json.Unmarshal(body, &req)
+			u.note("embed:" + strings.Join(req.Input, "|"))
 			data := make([]map[string]any, len(req.Input))
 			for i := range req.Input {
 				data[i] = map[string]any{"index": i, "embedding": []float32{1, 0, 0, 0}}
@@ -74,6 +85,28 @@ func newUpstream(t *testing.T) *upstream {
 }
 
 func (u *upstream) setChat(h http.HandlerFunc) { u.chat.Store(&h) }
+
+// note appends to the ordered event log.
+func (u *upstream) note(ev string) {
+	u.evMu.Lock()
+	defer u.evMu.Unlock()
+	u.events = append(u.events, ev)
+}
+
+// seen returns the event log so far.
+func (u *upstream) seen() []string {
+	u.evMu.Lock()
+	defer u.evMu.Unlock()
+	return append([]string(nil), u.events...)
+}
+
+// resetEvents forgets the events so far, such as the embedding calls of a
+// fixture document's ingestion.
+func (u *upstream) resetEvents() {
+	u.evMu.Lock()
+	defer u.evMu.Unlock()
+	u.events = nil
+}
 
 // okChat is the default chat handler: a plain answer with usage, streamed as
 // two content chunks when requested.
@@ -192,10 +225,14 @@ func (e *env) newProject(name string, mutate func(*store.Project)) *store.Projec
 
 // attachRAG creates a RAG store with one ingested document and attaches it
 // to the project so retrieval runs on every chat call.
-func (e *env) attachRAG() {
+func (e *env) attachRAG() { e.attachRAGLanguage("") }
+
+// attachRAGLanguage is attachRAG for a store of the given language ("" = the
+// default, 'simple').
+func (e *env) attachRAGLanguage(language string) {
 	e.t.Helper()
 	ctx := context.Background()
-	rs, err := e.st.CreateRAGStore(ctx, &store.RAGStore{Name: "docs", EmbeddingConnectionID: e.conn.ID, ChunkSize: 200, TopK: 2})
+	rs, err := e.st.CreateRAGStore(ctx, &store.RAGStore{Name: "docs", EmbeddingConnectionID: e.conn.ID, ChunkSize: 200, TopK: 2, Language: language})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -865,19 +902,271 @@ func TestRAGSourcesHeaderAndIncludeContext(t *testing.T) {
 		t.Errorf("ragmux field reached upstream: %v", b)
 	}
 
-	// Streaming responses carry the header but the body stays plain SSE.
+	// include_context reaches a stream too: the first chunk carries the
+	// sources and the context, the header stays, and the field never goes
+	// upstream.
 	sresp := e.post(context.Background(), "/v1/chat/completions",
 		map[string]any{"messages": msgs, "stream": true, "ragmux": map[string]any{"include_context": true}}, e.key)
 	defer sresp.Body.Close()
-	raw, _ := io.ReadAll(sresp.Body)
 	if sresp.StatusCode != 200 || sresp.Header.Get("Content-Type") != "text/event-stream" || sresp.Header.Get("x-ragmux-rag-sources") == "" {
 		t.Fatalf("stream: %d %v", sresp.StatusCode, sresp.Header)
 	}
-	if strings.Contains(string(raw), "ragmux") || !strings.HasSuffix(strings.TrimSpace(string(raw)), "data: [DONE]") {
-		t.Errorf("stream body: %s", raw)
+	events := readSSE(t, sresp.Body)
+	if len(events) != 3 || events[2] != "[DONE]" {
+		t.Fatalf("stream events: %v", events)
+	}
+	rm = streamRagmux(t, events[0])
+	if list, _ := rm["sources"].([]any); len(list) != 1 || list[0].(map[string]any)["filename"] != "a.txt" {
+		t.Errorf("stream sources: %v", rm["sources"])
+	}
+	if c, _ := rm["context"].(string); !strings.Contains(c, "<context>") || !strings.Contains(c, "apples are red") {
+		t.Errorf("stream context: %q", rm["context"])
+	}
+	if rm := streamRagmux(t, events[1]); rm != nil {
+		t.Errorf("second chunk carries ragmux: %s", events[1])
 	}
 	if b := upstreamBody.Load(); b == nil || strings.Contains(*b, "ragmux") {
 		t.Errorf("ragmux field reached upstream on stream: %v", b)
+	}
+}
+
+// streamRagmux is the "ragmux" object of one SSE event, nil when it has none.
+func streamRagmux(t *testing.T, event string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(event), &m); err != nil {
+		t.Fatalf("event %q: %v", event, err)
+	}
+	rm, _ := m["ragmux"].(map[string]any)
+	return rm
+}
+
+// ragmux.sources = "inline" is the whole opt-in for the sources: no context,
+// in the JSON body and in the first chunk of a stream, and the OpenAI fields
+// stay where they were.
+func TestInlineSources(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	msgs := msgsOf("user", "what colour are apples?")
+	opt := map[string]any{"sources": "inline"}
+
+	resp, out := e.chat(map[string]any{"messages": msgs, "ragmux": opt})
+	rm, _ := out["ragmux"].(map[string]any)
+	if resp.StatusCode != 200 || rm == nil || len(resp.Header.Values("Warning")) != 0 {
+		t.Fatalf("status %d warnings %q body %v", resp.StatusCode, resp.Header.Values("Warning"), out)
+	}
+	if list, _ := rm["sources"].([]any); len(list) != 1 || list[0].(map[string]any)["filename"] != "a.txt" {
+		t.Errorf("sources: %v", rm["sources"])
+	}
+	if _, ok := rm["context"]; ok {
+		t.Errorf("sources=inline leaked the context: %v", rm)
+	}
+	if out["choices"] == nil || out["usage"] == nil || resp.Header.Get("x-ragmux-rag-sources") == "" {
+		t.Errorf("OpenAI fields or header lost: %v %v", out, resp.Header)
+	}
+
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgs, "stream": true, "ragmux": opt}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if sresp.StatusCode != 200 || len(events) != 3 || events[2] != "[DONE]" {
+		t.Fatalf("stream: %d %v", sresp.StatusCode, events)
+	}
+	rm = streamRagmux(t, events[0])
+	if list, _ := rm["sources"].([]any); len(list) != 1 || list[0].(map[string]any)["filename"] != "a.txt" {
+		t.Errorf("stream sources: %v", rm)
+	}
+	if _, ok := rm["context"]; ok {
+		t.Errorf("stream sources=inline leaked the context: %v", rm)
+	}
+	if streamRagmux(t, events[1]) != nil {
+		t.Errorf("second chunk carries ragmux: %s", events[1])
+	}
+	// The chunk keeps its own fields in front of the new one.
+	if !strings.HasPrefix(events[0], `{"id":"c","object":`) || !strings.Contains(events[0], `"delta":{"role":"assistant","content":"Hel"}`) {
+		t.Errorf("first chunk = %s", events[0])
+	}
+}
+
+// Without the opt-in, or with a sources value other than "inline", the stream
+// is exactly the plain one.
+func TestStreamWithoutInlineSources(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	msgs := msgsOf("user", "what colour are apples?")
+	raw := func(ragmux any) string {
+		t.Helper()
+		body := map[string]any{"messages": msgs, "stream": true}
+		if ragmux != nil {
+			body["ragmux"] = ragmux
+		}
+		resp := e.post(context.Background(), "/v1/chat/completions", body, e.key)
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("status %d: %s", resp.StatusCode, b)
+		}
+		return string(b)
+	}
+	plain := raw(nil)
+	if strings.Contains(plain, "ragmux") {
+		t.Fatalf("plain stream: %s", plain)
+	}
+	for _, v := range []any{"yes", "INLINE", true, 1, nil, []string{"inline"}} {
+		if got := raw(map[string]any{"sources": v}); got != plain {
+			t.Errorf("sources=%v changed the stream:\n%s\nwant\n%s", v, got, plain)
+		}
+	}
+	// include_context=false does not opt in either.
+	if got := raw(map[string]any{"include_context": false}); got != plain {
+		t.Errorf("include_context=false changed the stream: %s", got)
+	}
+}
+
+func TestInlineSourcesWarnings(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	for _, v := range []any{"yes", "INLINE", true, 1, nil, []string{"inline"}} {
+		resp, out := e.chat(map[string]any{"messages": msgsOf("user", "apples?"), "ragmux": map[string]any{"sources": v}})
+		got := resp.Header.Values("Warning")
+		if resp.StatusCode != 200 || len(got) != 1 || !strings.Contains(got[0], "ragmux.sources accepts only the value inline") {
+			t.Errorf("sources=%v: status %d Warning %q", v, resp.StatusCode, got)
+		}
+		if _, ok := out["ragmux"]; ok {
+			t.Errorf("sources=%v opted in: %v", v, out["ragmux"])
+		}
+	}
+}
+
+// A project without a RAG store has nothing to list: the request is served,
+// the narrowing earns a Warning, and the list is empty -- in a stream as well.
+func TestInlineSourcesWithoutRAGStore(t *testing.T) {
+	e := newEnv(t, nil)
+	msgs := msgsOf("user", "what colour are apples?")
+	resp, out := e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"sources": "inline"}})
+	rm, _ := out["ragmux"].(map[string]any)
+	if list, ok := rm["sources"].([]any); resp.StatusCode != 200 || !ok || len(list) != 0 {
+		t.Errorf("status %d ragmux %v", resp.StatusCode, out["ragmux"])
+	}
+	if w := resp.Header.Values("Warning"); len(w) != 1 || !strings.Contains(w[0], "ragmux.sources has no effect: this project has no RAG store") {
+		t.Errorf("Warning = %q", w)
+	}
+
+	sresp := e.post(context.Background(), "/v1/chat/completions",
+		map[string]any{"messages": msgs, "stream": true, "ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if rm := streamRagmux(t, events[0]); rm == nil || len(rm["sources"].([]any)) != 0 || len(sresp.Header.Values("Warning")) != 1 {
+		t.Errorf("stream: %v warnings %q", events, sresp.Header.Values("Warning"))
+	}
+
+	// include_context is sources=inline plus the context: the same empty answer
+	// earns its own Warning, and naming both earns one.
+	resp, out = e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": true}})
+	rm, _ = out["ragmux"].(map[string]any)
+	if w := resp.Header.Values("Warning"); len(w) != 1 || !strings.Contains(w[0], "ragmux.include_context has no effect: this project has no RAG store") {
+		t.Errorf("include_context Warning = %q", w)
+	}
+	if list, ok := rm["sources"].([]any); !ok || len(list) != 0 || rm["context"] != "" {
+		t.Errorf("include_context ragmux = %v", rm)
+	}
+	resp, _ = e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": true, "sources": "inline"}})
+	if w := resp.Header.Values("Warning"); len(w) != 1 || !strings.Contains(w[0], "ragmux.sources has no effect") {
+		t.Errorf("both fields Warning = %q", w)
+	}
+	// Neither field, no Warning.
+	resp, _ = e.chat(map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": false}})
+	if len(resp.Header.Values("Warning")) != 0 {
+		t.Errorf("include_context=false earned %q", resp.Header.Values("Warning"))
+	}
+}
+
+// The bound on Warning headers holds for a warning added after parsing too.
+func TestRagmuxWarningBoundHoldsWithoutRAGStore(t *testing.T) {
+	e := newEnv(t, nil)
+	ragmux := map[string]any{"sources": "inline"}
+	for i := 0; i < 20; i++ {
+		ragmux[fmt.Sprintf("k_%c", 'a'+i)] = i
+	}
+	resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "hi"), "ragmux": ragmux})
+	got := resp.Header.Values("Warning")
+	if resp.StatusCode != 200 || len(got) != maxRagmuxWarnings || !strings.Contains(got[len(got)-1], "more ragmux warnings omitted") {
+		t.Errorf("status %d, %d warnings, last %q", resp.StatusCode, len(got), got)
+	}
+}
+
+// An upstream that never sends a chunk with choices cannot carry the field. The
+// stream stays as the upstream made it, and the log says the opt-in was lost.
+func TestInlineSourcesNotDeliveredIsLogged(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	logs := e.captureLog()
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{}, "usage": map[string]int{"prompt_tokens": 7, "completion_tokens": 0}})
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"stream_options": map[string]any{"include_usage": true}, "ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if sresp.StatusCode != 200 || len(events) != 2 || events[1] != "[DONE]" || strings.Contains(events[0], "ragmux") {
+		t.Fatalf("events = %v", events)
+	}
+	if !strings.Contains(logs.String(), "ragmux inline sources not delivered") {
+		t.Errorf("log = %q", logs.String())
+	}
+
+	// A stream that delivered says nothing.
+	e.up.setChat(okChat)
+	logs2 := e.captureLog()
+	sresp2 := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp2.Body.Close()
+	_ = readSSE(t, sresp2.Body)
+	if strings.Contains(logs2.String(), "not delivered") {
+		t.Errorf("log = %q", logs2.String())
+	}
+}
+
+// A skipped retrieval answers a stream with an empty list too.
+func TestInlineSourcesOnSkippedStream(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"ragmux": map[string]any{"sources": "inline", "include_context": true, "retrieval": "off"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	rm := streamRagmux(t, events[0])
+	if list, ok := rm["sources"].([]any); !ok || len(list) != 0 || rm["context"] != "" || sresp.Header.Get("x-ragmux-rag-skip") != "client_off" {
+		t.Errorf("ragmux = %v skip %q", rm, sresp.Header.Get("x-ragmux-rag-skip"))
+	}
+}
+
+// The field rides the first chunk that has choices: a leading chunk with an
+// empty choices array (a prompt filter result, say) is relayed as it is, and
+// no chunk of the gateway's own is added.
+func TestInlineSourcesSkipsChunksWithoutChoices(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{}})
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "a"}}}})
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "b"}, "finish_reason": "stop"}}})
+		writeSSE(w, map[string]any{"id": "c", "choices": []any{}, "usage": map[string]int{"prompt_tokens": 7, "completion_tokens": 2}})
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	sresp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgsOf("user", "what colour are apples?"), "stream": true,
+		"stream_options": map[string]any{"include_usage": true}, "ragmux": map[string]any{"sources": "inline"}}, e.key)
+	defer sresp.Body.Close()
+	events := readSSE(t, sresp.Body)
+	if len(events) != 5 || events[4] != "[DONE]" {
+		t.Fatalf("events = %v", events)
+	}
+	for i, want := range []bool{false, true, false, false} {
+		if got := streamRagmux(t, events[i]) != nil; got != want {
+			t.Errorf("event %d has ragmux = %v, want %v: %s", i, got, want, events[i])
+		}
 	}
 }
 
@@ -1182,4 +1471,1041 @@ func TestKeySubLimitDeniesBeforeTheProjectCeiling(t *testing.T) {
 	if rec := e.lastLog(); rec.StatusCode != 429 || rec.APIKeyID == nil {
 		t.Errorf("denied request is not attributed: %+v", rec)
 	}
+}
+
+// upstreamMessage is one chat message as the upstream received it, content
+// kept as the raw bytes that crossed the wire.
+type upstreamMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// captureChat makes the upstream record the messages of every chat call and
+// answer normally. The returned func gives the calls seen so far.
+func captureChat(e *env) func() [][]upstreamMessage {
+	var mu sync.Mutex
+	var calls [][]upstreamMessage
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Messages []upstreamMessage `json:"messages"`
+		}
+		_ = json.Unmarshal(body, &req)
+		mu.Lock()
+		calls = append(calls, req.Messages)
+		mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		okChat(w, r)
+	})
+	return func() [][]upstreamMessage {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([][]upstreamMessage(nil), calls...)
+	}
+}
+
+// TestBeforeLastUserKeepsClientPrefixAcrossTurns is the point of the
+// "before_last_user" placement: over a three-turn conversation the system
+// message -- with the client's cache_control -- and every earlier turn reach
+// the upstream byte for byte as the client sent them, no system message is
+// added, and the retrieved context is the leading part of the last user
+// message only.
+func TestBeforeLastUserKeepsClientPrefixAcrossTurns(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.ContextPlacement = store.ContextPlacementBeforeLastUser })
+	e.attachRAG()
+	seen := captureChat(e)
+
+	system := `[{"type":"text","text":"You are a fruit expert.","cache_control":{"type":"ephemeral"}}]`
+	turn := func(n int) string {
+		return fmt.Sprintf(`[{"type":"text","text":"question %d about apples?","cache_control":{"type":"ephemeral"}}]`, n)
+	}
+	reply := func(n int) string { return fmt.Sprintf(`"answer %d"`, n) }
+	var messages []string
+	messages = append(messages, `{"role":"system","content":`+system+`}`)
+	for n := 1; n <= 3; n++ {
+		messages = append(messages, `{"role":"user","content":`+turn(n)+`}`)
+		body := `{"messages":[` + strings.Join(messages, ",") + `]}`
+		resp := e.post(context.Background(), "/v1/chat/completions", body, e.key)
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("turn %d: status %d", n, resp.StatusCode)
+		}
+		messages = append(messages, `{"role":"assistant","content":`+reply(n)+`}`)
+	}
+
+	calls := seen()
+	if len(calls) != 3 {
+		t.Fatalf("upstream saw %d calls, want 3", len(calls))
+	}
+	for n, msgs := range calls {
+		turnNo := n + 1
+		if want := 1 + 2*turnNo - 1; len(msgs) != want {
+			t.Fatalf("turn %d: %d messages, want %d (a message was added): %v", turnNo, len(msgs), want, msgs)
+		}
+		if msgs[0].Role != "system" || string(msgs[0].Content) != system {
+			t.Errorf("turn %d: system message changed: %s", turnNo, msgs[0].Content)
+		}
+		// Every earlier turn is the client's own bytes.
+		for i := 1; i < len(msgs)-1; i++ {
+			var want string
+			if msgs[i].Role == "user" {
+				want = turn((i + 1) / 2)
+			} else {
+				want = reply(i / 2)
+			}
+			if string(msgs[i].Content) != want {
+				t.Errorf("turn %d: message %d changed: %s, want %s", turnNo, i, msgs[i].Content, want)
+			}
+		}
+		last := msgs[len(msgs)-1]
+		var parts []struct {
+			Type         string          `json:"type"`
+			Text         string          `json:"text"`
+			CacheControl json.RawMessage `json:"cache_control"`
+		}
+		if last.Role != "user" || json.Unmarshal(last.Content, &parts) != nil || len(parts) != 2 {
+			t.Fatalf("turn %d: last message is not [context, client part]: %v", turnNo, last)
+		}
+		if !strings.Contains(parts[0].Text, "<context>") || !strings.Contains(parts[0].Text, "apples are red") || parts[0].CacheControl != nil {
+			t.Errorf("turn %d: context is not the first part: %s", turnNo, last.Content)
+		}
+		if parts[1].Text != fmt.Sprintf("question %d about apples?", turnNo) || string(parts[1].CacheControl) != `{"type":"ephemeral"}` {
+			t.Errorf("turn %d: client part changed: %s", turnNo, last.Content)
+		}
+	}
+}
+
+// TestSystemPlacementStaysTheDefault: a project that never set the placement
+// keeps the context in the system message and the last user message plain.
+func TestSystemPlacementStaysTheDefault(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	if e.proj.ContextPlacement != store.ContextPlacementSystem {
+		t.Fatalf("default placement = %q", e.proj.ContextPlacement)
+	}
+	seen := captureChat(e)
+	resp, _ := e.chat(map[string]any{"messages": []map[string]any{{"role": "user", "content": "what colour are apples?"}}})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	calls := seen()
+	if len(calls) != 1 || len(calls[0]) != 2 || calls[0][0].Role != "system" ||
+		!strings.Contains(string(calls[0][0].Content), "apples are red") || string(calls[0][1].Content) != `"what colour are apples?"` {
+		t.Errorf("messages = %v", calls)
+	}
+}
+
+// TestRetrievedContextCountsTowardTPM: the first limit check cannot see the
+// retrieved context, so a request whose own messages fit under the per-minute
+// token limit is still refused once retrieval makes the prompt exceed it. The
+// same request without a RAG store passes, nothing reaches the upstream, and
+// the request is counted once.
+func TestRetrievedContextCountsTowardTPM(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RateLimitTPM = 50; p.RateLimitRPM = 10 })
+	e.attachRAG()
+	var upstreamCalls atomic.Int32
+	e.up.setChat(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		okChat(w, r)
+	})
+	msgs := []map[string]any{{"role": "user", "content": "what colour are apples?"}}
+
+	before := limits.Windows(time.Now())
+	resp, out := e.chat(map[string]any{"messages": msgs})
+	if resp.StatusCode != 429 || errorField(t, out, "code") != limits.ReasonTPM || errorField(t, out, "scope") != limits.ScopeProject ||
+		resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("with context: %d %v %v", resp.StatusCode, resp.Header, out)
+	}
+	if resp.Header.Get("x-ragmux-rag-sources") != "" || resp.Header.Get("x-ragmux-rag-hits") != "" {
+		t.Errorf("retrieval headers on a denial: %v", resp.Header)
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Errorf("the denied request reached the upstream %d times", upstreamCalls.Load())
+	}
+	rec := e.lastLog()
+	if rec.StatusCode != 429 || rec.Error != limits.ReasonTPM || rec.Attempt != 0 {
+		t.Errorf("log = %+v", rec)
+	}
+	if rec.RAGUsed || rec.RAGHits != 0 {
+		t.Errorf("the denied row claims the context was used: rag_used=%v rag_hits=%d", rec.RAGUsed, rec.RAGHits)
+	}
+	minute, _, _, err := e.st.GetUsage(context.Background(), e.proj.ID, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := limits.Windows(time.Now()); after.Minute.Equal(before.Minute) && minute.Requests != 1 {
+		t.Errorf("the denied request was counted %d times, want 1", minute.Requests)
+	}
+
+	// Without a store there is no context, and the bare messages are well
+	// under the limit.
+	_, otherKey, err := e.st.CreateProject(context.Background(), &store.Project{Name: "no-rag", ModelConnectionID: e.conn.ID, RateLimitTPM: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2 := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": msgs}, otherKey)
+	_ = r2.Body.Close()
+	if r2.StatusCode != 200 || upstreamCalls.Load() != 1 {
+		t.Errorf("without context: %d, upstream calls %d", r2.StatusCode, upstreamCalls.Load())
+	}
+}
+
+// TestContextLimitUsesStoreLanguage: the token estimate of the retrieved
+// context divides by the characters-per-token figure of the store's language
+// (ADR-027). The same context, the same per-minute limit: a 'simple' store's
+// block fits, a Turkish store's block counts for more tokens and is refused.
+// The limit sits between the two estimates, so the test holds whatever
+// measured divisor the Turkish entry ends up with, as long as it is below the
+// default.
+func TestContextLimitUsesStoreLanguage(t *testing.T) {
+	const question = "what colour are apples?"
+	block := rag.FormatContext([]store.SearchHit{{Filename: "a.txt", Content: "apples are red"}})
+	simple, turkish := rag.EstimateTokens(block, "simple"), rag.EstimateTokens(block, "tr")
+	if turkish-simple < 2 {
+		t.Fatalf("estimates for the fixture block: simple %d, tr %d: no room for a limit between them", simple, turkish)
+	}
+	messages := (len(question) + 3) / 4
+	limit := messages + simple + (turkish-simple)/2
+	msgs := []map[string]any{{"role": "user", "content": question}}
+
+	for _, c := range []struct {
+		language string
+		want     int
+	}{{"simple", 200}, {"tr", 429}} {
+		t.Run(c.language, func(t *testing.T) {
+			e := newEnv(t, func(p *store.Project) { p.RateLimitTPM = limit; p.RateLimitRPM = 10 })
+			e.attachRAGLanguage(c.language)
+			resp, out := e.chat(map[string]any{"messages": msgs})
+			if resp.StatusCode != c.want {
+				t.Fatalf("status %d, want %d (limit %d, context estimate %d): %v", resp.StatusCode, c.want, limit,
+					map[string]int{"simple": simple, "tr": turkish}[c.language], out)
+			}
+			if c.want == 429 && errorField(t, out, "code") != limits.ReasonTPM {
+				t.Errorf("denial reason = %v, want %s", errorField(t, out, "code"), limits.ReasonTPM)
+			}
+		})
+	}
+}
+
+// TestContextTokenEstimateNeverBelowBytesOverFour: a language without a divisor
+// entry must not make the limit check looser than the bytes / 4 it replaced.
+func TestContextTokenEstimateNeverBelowBytesOverFour(t *testing.T) {
+	cyrillic := strings.Repeat("привет мир ", 40) // two bytes a letter
+	if got, byBytes := contextTokenEstimate(cyrillic, "ru"), (len(cyrillic)+3)/4; got < byBytes {
+		t.Errorf("ru estimate %d is below the byte-based %d", got, byBytes)
+	}
+	ascii := strings.Repeat("apples are red ", 40)
+	if got, want := contextTokenEstimate(ascii, "simple"), (len(ascii)+3)/4; got != want {
+		t.Errorf("ascii estimate %d, want %d", got, want)
+	}
+	// A language with a divisor below 4 counts more than either basis.
+	if got := contextTokenEstimate(ascii, "tr"); got <= (len(ascii)+3)/4 {
+		t.Errorf("tr estimate %d is not above the default's %d", got, (len(ascii)+3)/4)
+	}
+}
+
+// ---- retrieval policy and the ragmux request object (ADR-024) ----
+
+// skipReasonOf waits for the n-th request log row of the project and returns
+// its rag_skip_reason ("" for NULL). The column is write-only for the admin
+// API, so the test reads it from the table.
+func (e *env) skipReasonOf(n int) string {
+	e.t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var reason *string
+		err := e.st.DB().QueryRow(ctx,
+			`SELECT rag_skip_reason FROM request_logs WHERE project_id = $1 ORDER BY id OFFSET $2 LIMIT 1`,
+			e.proj.ID, n-1).Scan(&reason)
+		if err == nil {
+			if reason == nil {
+				return ""
+			}
+			return *reason
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	e.t.Fatalf("request log row %d never appeared", n)
+	return ""
+}
+
+func msgsOf(roles ...string) []map[string]any {
+	var out []map[string]any
+	for i := 0; i+1 < len(roles); i += 2 {
+		out = append(out, map[string]any{"role": roles[i], "content": roles[i+1]})
+	}
+	return out
+}
+
+func TestRetrievalPolicyDecisions(t *testing.T) {
+	question := msgsOf("user", "what colour are apples?")
+	hello := msgsOf("user", "Merhaba!")
+	toolTurn := append(msgsOf("user", "what colour are apples?"),
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
+			"id": "c1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": "{}"}}}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "red"})
+
+	cases := []struct {
+		name     string
+		policy   string
+		msgs     []map[string]any
+		ragmux   any // the ragmux request object, nil for none
+		wantSkip string
+	}{
+		{"always retrieves", store.RetrievalPolicyAlways, question, nil, ""},
+		{"always retrieves a greeting", store.RetrievalPolicyAlways, hello, nil, ""},
+		{"auto retrieves a question", store.RetrievalPolicyAuto, question, nil, ""},
+		{"auto skips a greeting", store.RetrievalPolicyAuto, hello, nil, "greeting"},
+		{"auto skips an ack", store.RetrievalPolicyAuto, msgsOf("user", "ok"), nil, "ack"},
+		{"auto retrieves a repeated question", store.RetrievalPolicyAuto,
+			msgsOf("user", "what colour are apples?", "assistant", "red", "user", "What colour are apples"), nil, ""},
+		{"off skips", store.RetrievalPolicyOff, question, nil, "policy_off"},
+		{"a client cannot reopen off", store.RetrievalPolicyOff, question, map[string]any{"retrieval": "always"}, "policy_off"},
+		{"a client cannot override auto", store.RetrievalPolicyAuto, hello, map[string]any{"retrieval": "always"}, "greeting"},
+		{"client off", store.RetrievalPolicyAlways, question, map[string]any{"retrieval": "off"}, "client_off"},
+		{"policy off wins over client off", store.RetrievalPolicyOff, question, map[string]any{"retrieval": "off"}, "policy_off"},
+		{"tool turn under always", store.RetrievalPolicyAlways, toolTurn, nil, "tool_turn"},
+		{"tool turn under auto", store.RetrievalPolicyAuto, toolTurn, nil, "tool_turn"},
+		{"client off wins over tool turn", store.RetrievalPolicyAlways, toolTurn, map[string]any{"retrieval": "off"}, "client_off"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = tc.policy })
+			e.attachRAG()
+			seen := captureChat(e)
+			embedsBefore := e.up.embeds.Load()
+
+			body := map[string]any{"messages": tc.msgs}
+			if tc.ragmux != nil {
+				body["ragmux"] = tc.ragmux
+			}
+			resp, out := e.chat(body)
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			embeds := e.up.embeds.Load() - embedsBefore
+			skip := resp.Header.Get("x-ragmux-rag-skip")
+			rec := e.lastLog()
+			reason := e.skipReasonOf(1)
+			if skip != tc.wantSkip || reason != tc.wantSkip {
+				t.Errorf("x-ragmux-rag-skip = %q, rag_skip_reason = %q, want %q", skip, reason, tc.wantSkip)
+			}
+			if tc.wantSkip != "" {
+				if embeds != 0 {
+					t.Errorf("retrieval was skipped but the embedding upstream was called %d times", embeds)
+				}
+				if resp.Header.Get("x-ragmux-rag-hits") != "0" || resp.Header.Get("x-ragmux-rag-sources") != "" {
+					t.Errorf("skipped request headers: hits %q sources %q",
+						resp.Header.Get("x-ragmux-rag-hits"), resp.Header.Get("x-ragmux-rag-sources"))
+				}
+				if rec.RAGUsed || rec.RAGHits != 0 {
+					t.Errorf("log = %+v", rec)
+				}
+				calls := seen()
+				if len(calls) != 1 {
+					t.Fatalf("upstream chat calls = %d", len(calls))
+				}
+				for _, m := range calls[0] {
+					if strings.Contains(string(m.Content), "<context>") {
+						t.Errorf("context injected into a skipped request: %s", m.Content)
+					}
+				}
+			} else {
+				if embeds != 1 || resp.Header.Get("x-ragmux-rag-hits") != "1" || !rec.RAGUsed {
+					t.Errorf("retrieval should have run: embeds %d hits %q log %+v",
+						embeds, resp.Header.Get("x-ragmux-rag-hits"), rec)
+				}
+			}
+		})
+	}
+}
+
+// A project without a RAG store has nothing to skip: no header, no reason,
+// whatever the policy says.
+func TestRetrievalPolicyWithoutAStoreSkipsNothingToReport(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyOff })
+	resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "merhaba"), "ragmux": map[string]any{"retrieval": "off"}})
+	if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "" || resp.Header.Get("x-ragmux-rag-hits") != "" {
+		t.Errorf("status %d headers %v", resp.StatusCode, resp.Header)
+	}
+	if got := e.skipReasonOf(1); got != "" {
+		t.Errorf("rag_skip_reason = %q, want NULL", got)
+	}
+}
+
+// include_context on a skipped request answers with no sources and no context
+// rather than failing.
+func TestSkippedRetrievalWithIncludeContext(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyOff })
+	e.attachRAG()
+	resp, out := e.chat(map[string]any{"messages": msgsOf("user", "apples?"), "ragmux": map[string]any{"include_context": true}})
+	rm, _ := out["ragmux"].(map[string]any)
+	if resp.StatusCode != 200 || rm == nil {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	if list, ok := rm["sources"].([]any); !ok || len(list) != 0 || rm["context"] != "" {
+		t.Errorf("ragmux = %v", rm)
+	}
+	if resp.Header.Get("x-ragmux-rag-skip") != "policy_off" {
+		t.Errorf("skip header = %q", resp.Header.Get("x-ragmux-rag-skip"))
+	}
+}
+
+func TestMalformedRagmuxObjectIs400(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	embedsBefore := e.up.embeds.Load()
+	var chatCalls atomic.Int64
+	counted(e.up, &chatCalls)
+
+	for _, raw := range []string{`"x"`, `1`, `true`, `[]`, `null`, `[{"retrieval":"off"}]`, `""`} {
+		body := `{"messages":[{"role":"user","content":"what colour are apples?"}],"ragmux":` + raw + `}`
+		resp, out := e.chat(body)
+		if resp.StatusCode != http.StatusBadRequest || errorField(t, out, "code") != "invalid_ragmux" ||
+			errorField(t, out, "type") != "invalid_request_error" {
+			t.Errorf("ragmux=%s: status %d body %v", raw, resp.StatusCode, out)
+		}
+		if msg, _ := errorField(t, out, "message").(string); strings.Contains(msg, "apples") {
+			t.Errorf("error message echoes the request: %q", msg)
+		}
+	}
+	if chatCalls.Load() != 0 || e.up.embeds.Load() != embedsBefore {
+		t.Errorf("a refused request reached the upstream: chat %d, embeds %d", chatCalls.Load(), e.up.embeds.Load()-embedsBefore)
+	}
+	// The same body with an object is served.
+	if resp, _ := e.chat(`{"messages":[{"role":"user","content":"hi"}],"ragmux":{}}`); resp.StatusCode != 200 {
+		t.Errorf("empty ragmux object: status %d", resp.StatusCode)
+	}
+}
+
+func TestRagmuxWarnings(t *testing.T) {
+	cases := []struct {
+		name   string
+		ragmux map[string]any
+		want   []string // substrings, one per expected Warning header, in order
+	}{
+		{"always is ignored", map[string]any{"retrieval": "always"},
+			[]string{`ragmux.retrieval accepts only the value off`}},
+		{"auto is ignored", map[string]any{"retrieval": "auto"},
+			[]string{`ragmux.retrieval accepts only the value off`}},
+		{"a non-string is ignored", map[string]any{"retrieval": true},
+			[]string{`ragmux.retrieval accepts only the value off`}},
+		{"unknown key", map[string]any{"foo": 1}, []string{`unknown ragmux field foo; ignored`}},
+		{"project setting", map[string]any{"context_placement": "before_last_user", "top_k": 50},
+			[]string{`ragmux.context_placement is a project setting`, `ragmux.top_k is a project setting`}},
+		{"key outside the name shape is not echoed", map[string]any{"Foo-Bar9": 1, "x\"y": 1},
+			[]string{`unknown ragmux field; ignored`, `unknown ragmux field; ignored`}},
+		{"wrong include_context type", map[string]any{"include_context": "yes"},
+			[]string{`ragmux.include_context must be a boolean`}},
+		{"valid fields earn nothing", map[string]any{"retrieval": "off", "include_context": true}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.attachRAG()
+			resp, out := e.chat(map[string]any{"messages": msgsOf("user", "what colour are apples?"), "ragmux": tc.ragmux})
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			got := resp.Header.Values("Warning")
+			if len(got) != len(tc.want) {
+				t.Fatalf("Warning headers = %q, want %d", got, len(tc.want))
+			}
+			for i, w := range tc.want {
+				if !strings.HasPrefix(got[i], `299 ragmux "`) || !strings.Contains(got[i], w) {
+					t.Errorf("Warning[%d] = %q, want it to contain %q", i, got[i], w)
+				}
+			}
+			for _, h := range got {
+				if strings.Contains(h, "Foo-Bar9") || strings.Contains(h, `x\"y`) {
+					t.Errorf("a client key name reached a header: %q", h)
+				}
+			}
+			// None of it changed what the project does: retrieval ran unless
+			// the (valid) retrieval=off said otherwise.
+			wantHits := "1"
+			if v, _ := tc.ragmux["retrieval"].(string); v == "off" {
+				wantHits = "0"
+			}
+			if resp.Header.Get("x-ragmux-rag-hits") != wantHits {
+				t.Errorf("x-ragmux-rag-hits = %q, want %q", resp.Header.Get("x-ragmux-rag-hits"), wantHits)
+			}
+		})
+	}
+}
+
+// A project setting named in the request neither applies nor leaks upstream:
+// the placement stays the project's.
+func TestRagmuxCannotChangeProjectSettings(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	seen := captureChat(e)
+	resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "what colour are apples?"),
+		"ragmux": map[string]any{"context_placement": "before_last_user", "retrieval_policy": "off", "top_k": 1}})
+	if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-hits") != "1" || resp.Header.Get("x-ragmux-rag-skip") != "" {
+		t.Fatalf("status %d headers %v", resp.StatusCode, resp.Header)
+	}
+	calls := seen()
+	if len(calls) != 1 || len(calls[0]) != 2 || calls[0][0].Role != "system" {
+		t.Fatalf("the project's system placement was not kept: %+v", calls)
+	}
+	if len(resp.Header.Values("Warning")) != 3 {
+		t.Errorf("Warning = %q", resp.Header.Values("Warning"))
+	}
+}
+
+func TestRagmuxWarningCountIsBounded(t *testing.T) {
+	obj := map[string]any{}
+	for i := 0; i < 200; i++ {
+		obj[fmt.Sprintf("k_%c%c", 'a'+i/26, 'a'+i%26)] = i
+	}
+	h := http.Header{}
+	o, err := parseRagmux(map[string]json.RawMessage{"ragmux": mustRaw(t, obj)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRagmuxWarnings(h, o.Warnings)
+	got := h.Values("Warning")
+	if len(got) != maxRagmuxWarnings || !strings.Contains(got[len(got)-1], "more ragmux warnings omitted") {
+		t.Errorf("%d warnings, last %q", len(got), got[len(got)-1])
+	}
+	// The order does not depend on map iteration.
+	for i := 0; i < 5; i++ {
+		o2, _ := parseRagmux(map[string]json.RawMessage{"ragmux": mustRaw(t, obj)})
+		if strings.Join(o2.Warnings, "|") != strings.Join(o.Warnings, "|") {
+			t.Fatal("warnings are not deterministic")
+		}
+	}
+}
+
+func mustRaw(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// The warnings describe the request, so a fallback that replaces the adapter's
+// own warnings must keep them.
+func TestRagmuxWarningsSurviveAFallback(t *testing.T) {
+	e := newEnv(t, nil)
+	e.gw.MaxRetries = 0
+	conn2, up2 := e.secondConn("second", "second-model")
+	var hits1, hits2 atomic.Int64
+	status(e.up, &hits1, http.StatusInternalServerError)
+	counted(up2, &hits2)
+	e.orderedRoute("pair", e.conn, conn2)
+
+	resp, out := e.chat(map[string]any{"model": "pair", "messages": userMsg, "ragmux": map[string]any{"foo": 1}})
+	if resp.StatusCode != 200 || hits1.Load() != 1 || hits2.Load() != 1 {
+		t.Fatalf("status %d, calls %d/%d: %v", resp.StatusCode, hits1.Load(), hits2.Load(), out)
+	}
+	if got := resp.Header.Values("Warning"); len(got) != 1 || !strings.Contains(got[0], "unknown ragmux field foo") {
+		t.Errorf("Warning = %q", got)
+	}
+}
+
+// The stream path writes headers on its first chunk; the skip and warning
+// headers must be there too, and the ragmux object must not reach the upstream.
+func TestSkippedStreamCarriesTheHeaders(t *testing.T) {
+	e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+	e.attachRAG()
+	embedsBefore := e.up.embeds.Load()
+	resp := e.post(context.Background(), "/v1/chat/completions",
+		map[string]any{"messages": msgsOf("user", "thanks"), "stream": true, "ragmux": map[string]any{"foo": 1}}, e.key)
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "greeting" || resp.Header.Get("x-ragmux-rag-hits") != "0" ||
+		len(resp.Header.Values("Warning")) != 1 || e.up.embeds.Load() != embedsBefore {
+		t.Errorf("status %d headers %v embeds %d", resp.StatusCode, resp.Header, e.up.embeds.Load()-embedsBefore)
+	}
+}
+
+// ---- query_strategy: condense (ADR-024) ----
+
+// condensePhrase is in every condense prompt and in nothing else a test sends.
+const condensePhrase = "standalone search query"
+
+// condenseReply answers a condense call with text and the given usage.
+func condenseReply(text string, prompt, completion int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "c", "model": "m",
+			"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": text}, "finish_reason": "stop"}},
+			"usage":   map[string]int{"prompt_tokens": prompt, "completion_tokens": completion}})
+	}
+}
+
+// scriptCondense makes the upstream hand a condense prompt to cond and answer
+// everything else normally, noting "chat:condense" and "chat:answer" in its
+// event log. last receives the body of the newest condense call.
+func (u *upstream) scriptCondense(cond http.HandlerFunc, last *atomic.Value) {
+	u.setChat(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if bytes.Contains(body, []byte(condensePhrase)) {
+			u.note("chat:condense")
+			if last != nil {
+				last.Store(string(body))
+			}
+			cond(w, r)
+			return
+		}
+		u.note("chat:answer")
+		okChat(w, r)
+	})
+}
+
+// lockedBuffer is a log sink the server goroutines and the test share.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLog sends the gateway's log to a buffer.
+func (e *env) captureLog() *lockedBuffer {
+	buf := &lockedBuffer{}
+	e.gw.Log = slog.New(slog.NewTextHandler(buf, nil))
+	return buf
+}
+
+// condenseEnv is a project on the condense strategy with a RAG store.
+func condenseEnv(t *testing.T, mutate func(p *store.Project)) *env {
+	t.Helper()
+	e := newEnv(t, func(p *store.Project) {
+		p.QueryStrategy = store.QueryStrategyCondense
+		if mutate != nil {
+			mutate(p)
+		}
+	})
+	e.attachRAG()
+	e.up.resetEvents()
+	return e
+}
+
+var followUp = msgsOf("user", "Tell me about the Apple plan", "assistant", "The Apple plan costs 5 USD.", "user", "and the second one?")
+
+func TestCondenseSearchesWithTheCondensedQuery(t *testing.T) {
+	e := condenseEnv(t, nil)
+	var last atomic.Value
+	e.up.scriptCondense(condenseReply("price of the second plan", 40, 6), &last)
+
+	resp, out := e.chat(map[string]any{"messages": followUp})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	// The condense call comes first, the embedding carries its output, then
+	// the answer is generated.
+	want := []string{"chat:condense", "embed:price of the second plan", "chat:answer"}
+	if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("upstream events = %q, want %q", got, want)
+	}
+	if resp.Header.Get("x-ragmux-rag-hits") != "1" || len(resp.Header.Values("Warning")) != 0 {
+		t.Errorf("hits %q, Warning %q", resp.Header.Get("x-ragmux-rag-hits"), resp.Header.Values("Warning"))
+	}
+
+	// What the model was asked: one user message with the conversation and the
+	// last message, run cold and short, on the first target's model.
+	var req struct {
+		Model       string  `json:"model"`
+		Temperature float64 `json:"temperature"`
+		MaxTokens   int     `json:"max_tokens"`
+		Messages    []struct {
+			Role, Content string
+		} `json:"messages"`
+	}
+	raw, _ := last.Load().(string)
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("condense request: %v: %s", err, raw)
+	}
+	if req.Model != "mock-model" || req.Temperature != 0 || req.MaxTokens != rag.CondenseMaxTokens || len(req.Messages) != 1 || req.Messages[0].Role != "user" {
+		t.Errorf("condense request = %+v", req)
+	}
+	for _, w := range []string{"User: Tell me about the Apple plan", "Assistant: The Apple plan costs 5 USD.", "Last user message:\nand the second one?"} {
+		if !strings.Contains(req.Messages[0].Content, w) {
+			t.Errorf("condense prompt lacks %q:\n%s", w, req.Messages[0].Content)
+		}
+	}
+
+	// Its tokens are on the row, on top of the answer's 5 and 1.
+	rec := e.lastLog()
+	if rec.PromptTokens != 5+40 || rec.CompletionTokens != 1+6 || !rec.RAGUsed {
+		t.Errorf("row = prompt %d completion %d rag %v, want 45, 7, true", rec.PromptTokens, rec.CompletionTokens, rec.RAGUsed)
+	}
+}
+
+// The default strategy never makes the call.
+func TestLastUserStrategyDoesNotCondense(t *testing.T) {
+	e := newEnv(t, nil)
+	e.attachRAG()
+	e.up.resetEvents()
+	e.up.scriptCondense(condenseReply("never used", 40, 6), nil)
+	if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	want := []string{"embed:and the second one?", "chat:answer"}
+	if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("upstream events = %q, want %q", got, want)
+	}
+}
+
+// Where there is nothing to condense -- a single user message, no store, or a
+// retrieval that is skipped -- no call is made, so no tokens are spent.
+func TestCondenseIsNotCalledWithoutNeed(t *testing.T) {
+	toolTurn := append(append([]map[string]any{}, followUp...),
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
+			"id": "c1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": "{}"}}}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": "red"})
+	cases := []struct {
+		name   string
+		mutate func(p *store.Project)
+		body   map[string]any
+		want   []string
+	}{
+		{"one user message", nil, map[string]any{"messages": msgsOf("user", "what colour are apples?")},
+			[]string{"embed:what colour are apples?", "chat:answer"}},
+		{"one user message after a system prompt", nil, map[string]any{"messages": msgsOf("system", "be brief", "user", "apples?")},
+			[]string{"embed:apples?", "chat:answer"}},
+		{"policy off", func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyOff },
+			map[string]any{"messages": followUp}, []string{"chat:answer"}},
+		{"client off", nil, map[string]any{"messages": followUp, "ragmux": map[string]any{"retrieval": "off"}},
+			[]string{"chat:answer"}},
+		{"tool turn", nil, map[string]any{"messages": toolTurn}, []string{"chat:answer"}},
+		{"auto skips a greeting", func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto },
+			map[string]any{"messages": msgsOf("user", "q", "assistant", "a", "user", "merhaba")}, []string{"chat:answer"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := condenseEnv(t, tc.mutate)
+			reg := e.withMetrics()
+			e.up.scriptCondense(condenseReply("condensed", 40, 6), nil)
+			if resp, out := e.chat(tc.body); resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("upstream events = %q, want %q", got, tc.want)
+			}
+			if rec := e.lastLog(); rec.PromptTokens != 5 || rec.CompletionTokens != 1 {
+				t.Errorf("row = prompt %d completion %d, want the answer's 5 and 1 only", rec.PromptTokens, rec.CompletionTokens)
+			}
+			if strings.Contains(reg.Text(), "ragmux_rag_query_condense_total{") {
+				t.Errorf("a condense was counted:\n%s", reg.Text())
+			}
+		})
+	}
+
+	t.Run("no store", func(t *testing.T) {
+		e := newEnv(t, func(p *store.Project) { p.QueryStrategy = store.QueryStrategyCondense })
+		e.up.scriptCondense(condenseReply("condensed", 40, 6), nil)
+		if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+			t.Fatalf("status %d: %v", resp.StatusCode, out)
+		}
+		if got := e.up.seen(); fmt.Sprint(got) != "[chat:answer]" {
+			t.Errorf("upstream events = %q", got)
+		}
+	})
+}
+
+// A failed condense is invisible to the client: the request completes, the
+// search runs on the last user message, and the failure is a warn log and a
+// counter. It is one attempt however many retries the gateway is set to, and
+// whatever tokens the call reported are still counted.
+func TestCondenseFailureFallsBackToTheLastUserMessage(t *testing.T) {
+	const secret = "SECRET-UPSTREAM-BODY"
+	cases := []struct {
+		name        string
+		handler     http.HandlerFunc
+		timeout     time.Duration
+		outcome     string
+		wantPrompt  int // the row's prompt tokens: the answer's 5 plus what the call reported
+		wantCompl   int
+		wantLogText string
+	}{
+		{"upstream 500", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"` + secret + `"}}`))
+		}, 0, "error", 5, 1, "status=502"},
+		{"timeout", func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+		}, 150 * time.Millisecond, "timeout", 5, 1, ""},
+		{"empty reply", condenseReply("   ", 40, 1), 0, "invalid", 45, 2, ""},
+		{"two lines", condenseReply("Here it is:\n"+secret, 40, 9), 0, "invalid", 45, 10, ""},
+		{"too long", condenseReply(strings.Repeat(secret, 30), 40, 9), 0, "invalid", 45, 10, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := condenseEnv(t, nil)
+			e.gw.MaxRetries = 3
+			e.gw.CondenseTimeout = tc.timeout
+			reg := e.withMetrics()
+			logs := e.captureLog()
+			e.up.scriptCondense(tc.handler, nil)
+
+			resp, out := e.chat(map[string]any{"messages": followUp})
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d: %v", resp.StatusCode, out)
+			}
+			// One condense attempt, then the search on the last user message.
+			want := []string{"chat:condense", "embed:and the second one?", "chat:answer"}
+			if got := e.up.seen(); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("upstream events = %q, want %q", got, want)
+			}
+			if resp.Header.Get("x-ragmux-rag-hits") != "1" || len(resp.Header.Values("Warning")) != 0 {
+				t.Errorf("hits %q, Warning %q", resp.Header.Get("x-ragmux-rag-hits"), resp.Header.Values("Warning"))
+			}
+			rec := e.lastLog()
+			if rec.PromptTokens != tc.wantPrompt || rec.CompletionTokens != tc.wantCompl {
+				t.Errorf("row = prompt %d completion %d, want %d and %d", rec.PromptTokens, rec.CompletionTokens, tc.wantPrompt, tc.wantCompl)
+			}
+
+			text := reg.Text()
+			mustContain(t, text, fmt.Sprintf(`ragmux_rag_query_condense_total{outcome="%s"} 1`, tc.outcome))
+			if n := strings.Count(text, "ragmux_rag_query_condense_total{"); n != 1 {
+				t.Errorf("%d condense series, want 1:\n%s", n, text)
+			}
+			log := logs.String()
+			if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "query condense failed") ||
+				!strings.Contains(log, "outcome="+tc.outcome) {
+				t.Errorf("no warn log for the %s outcome:\n%s", tc.outcome, log)
+			}
+			if tc.wantLogText != "" && !strings.Contains(log, tc.wantLogText) {
+				t.Errorf("log lacks %q:\n%s", tc.wantLogText, log)
+			}
+			// PRD rule 10: neither the conversation nor the reply is logged.
+			for _, banned := range []string{secret, "second one", "Apple plan", "Last user message"} {
+				if strings.Contains(log, banned) {
+					t.Errorf("the log carries %q:\n%s", banned, log)
+				}
+			}
+		})
+	}
+}
+
+func TestCondenseSuccessIsCounted(t *testing.T) {
+	e := condenseEnv(t, nil)
+	reg := e.withMetrics()
+	logs := e.captureLog()
+	e.up.scriptCondense(condenseReply(`"price of the second plan"`, 40, 6), nil)
+	if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	mustContain(t, reg.Text(), `ragmux_rag_query_condense_total{outcome="ok"} 1`)
+	if got := e.up.seen(); len(got) < 2 || got[1] != "embed:price of the second plan" {
+		t.Errorf("the model's quotes were not stripped: %q", got)
+	}
+	if strings.Contains(logs.String(), "query condense") {
+		t.Errorf("a success logged a condense line:\n%s", logs.String())
+	}
+}
+
+// history_turns_for_query bounds what the model sees.
+func TestCondenseHistoryTurnsBoundThePrompt(t *testing.T) {
+	e := condenseEnv(t, func(p *store.Project) { p.HistoryTurnsForQuery = 1 })
+	var last atomic.Value
+	e.up.scriptCondense(condenseReply("q", 1, 1), &last)
+	msgs := msgsOf("user", "OLDEST-QUESTION", "assistant", "OLDEST-ANSWER", "user", "NEWER-QUESTION", "assistant", "NEWER-ANSWER", "user", "now?")
+	if resp, out := e.chat(map[string]any{"messages": msgs}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	raw, _ := last.Load().(string)
+	for _, w := range []string{"NEWER-QUESTION", "NEWER-ANSWER", "now?"} {
+		if !strings.Contains(raw, w) {
+			t.Errorf("condense request lacks %q", w)
+		}
+	}
+	for _, w := range []string{"OLDEST-QUESTION", "OLDEST-ANSWER"} {
+		if strings.Contains(raw, w) {
+			t.Errorf("condense request has %q, one turn back is the limit", w)
+		}
+	}
+}
+
+// query_model_connection_id sends the call to that connection and prices its
+// tokens with it, not with the connection that answers the chat.
+func TestCondenseUsesTheQueryModelConnection(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	up2 := newUpstream(t)
+	qconn, err := e.st.CreateConnection(ctx, &store.ModelConnection{Name: "query", ProviderType: "openai",
+		BaseURL: up2.srv.URL + "/v1", APIKey: "sk-secretsecretsecret123", ModelName: "gpt-4o-mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pricing.Seed(ctx, e.st.DB(), slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	e.gw.Prices = pricing.NewCache(e.st.DB(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	e.proj.QueryStrategy, e.proj.QueryModelConnectionID = store.QueryStrategyCondense, &qconn.ID
+	e.attachRAG() // saves the project
+	e.up.resetEvents()
+
+	var last atomic.Value
+	// 2M prompt and 1M completion tokens at gpt-4o-mini's 0.15 and 0.60 USD
+	// per million: 300000 + 600000 micros. The chat connection is unpriced.
+	up2.scriptCondense(condenseReply("price of the second plan", 2_000_000, 1_000_000), &last)
+
+	if resp, out := e.chat(map[string]any{"messages": followUp}); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	if got := up2.seen(); fmt.Sprint(got) != "[chat:condense]" {
+		t.Errorf("query model upstream events = %q", got)
+	}
+	if got := e.up.seen(); fmt.Sprint(got) != "[embed:price of the second plan]" {
+		t.Errorf("chat upstream events = %q", got)
+	}
+	if raw, _ := last.Load().(string); !strings.Contains(raw, `"model":"gpt-4o-mini"`) {
+		t.Errorf("condense request went out with another model: %s", raw)
+	}
+	rec := e.lastLog()
+	if rec.PromptTokens != 5+2_000_000 || rec.CompletionTokens != 1+1_000_000 {
+		t.Errorf("tokens = %d/%d", rec.PromptTokens, rec.CompletionTokens)
+	}
+	if rec.CostMicros != 900_000 {
+		t.Errorf("cost = %d micros, want 900000 (the call priced at the query model)", rec.CostMicros)
+	}
+}
+
+// Without a query model the call runs on the first route target, and its
+// tokens are priced with that target.
+func TestCondenseUsesTheFirstRouteTarget(t *testing.T) {
+	e := condenseEnv(t, nil)
+	conn2, up2 := e.secondConn("second", "second-model")
+	e.addRoute("smart", store.RouteTarget{ConnectionID: conn2.ID, Weight: 1})
+	up2.scriptCondense(condenseReply("price of the second plan", 40, 6), nil)
+
+	resp, out := e.chat(map[string]any{"model": "smart", "messages": followUp})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	if got := up2.seen(); fmt.Sprint(got) != "[chat:condense chat:answer]" {
+		t.Errorf("route target events = %q", got)
+	}
+	// Retrieval embeds through the store's own connection (the project's).
+	if got := e.up.seen(); fmt.Sprint(got) != "[embed:price of the second plan]" {
+		t.Errorf("store connection events = %q", got)
+	}
+}
+
+// A query model whose adapter cannot be built is a failed condense, not a
+// failed request.
+func TestCondenseWithAnUnusableQueryModelFallsBack(t *testing.T) {
+	e := newEnv(t, nil)
+	qconn, _ := e.secondConn("query", "query-model")
+	e.proj.QueryStrategy, e.proj.QueryModelConnectionID = store.QueryStrategyCondense, &qconn.ID
+	e.attachRAG()
+	e.up.resetEvents()
+	reg := e.withMetrics()
+	logs := e.captureLog()
+	real := e.gw.Providers
+	e.gw.Providers = func(c *store.ModelConnection) (provider.Provider, error) {
+		if c.ID == qconn.ID {
+			return nil, errors.New("no adapter for https://internal.example/v1")
+		}
+		return real(c)
+	}
+
+	resp, out := e.chat(map[string]any{"messages": followUp})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, out)
+	}
+	// The default chat handler notes nothing: the search alone is seen, and it
+	// ran on the last user message.
+	if got := e.up.seen(); fmt.Sprint(got) != "[embed:and the second one?]" {
+		t.Errorf("upstream events = %q", got)
+	}
+	mustContain(t, reg.Text(), `ragmux_rag_query_condense_total{outcome="error"} 1`)
+	// The warn line names the connection, so the operator can tell which one.
+	var warn string
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "query condense unavailable") {
+			warn = l
+		}
+	}
+	if !strings.Contains(warn, "outcome=error") || !strings.Contains(warn, fmt.Sprintf("connection=%d", qconn.ID)) {
+		t.Errorf("warn line = %q, want outcome=error and connection=%d:\n%s", warn, qconn.ID, logs.String())
+	}
+}
+
+// The condense budget is the fixed one cut to the request's upstream budget.
+func TestCondenseTimeoutIsBoundedByTheUpstreamBudget(t *testing.T) {
+	cases := []struct {
+		name     string
+		gw       Gateway
+		deadline time.Duration // left of the budget when the call runs; 0 = not started
+		lo, hi   time.Duration
+	}{
+		{"default", Gateway{}, 0, 5 * time.Second, 5 * time.Second},
+		{"set", Gateway{CondenseTimeout: 2 * time.Second}, 0, 2 * time.Second, 2 * time.Second},
+		{"budget shorter than the default", Gateway{UpstreamTimeout: 3 * time.Second}, 0, 3 * time.Second, 3 * time.Second},
+		{"budget longer", Gateway{UpstreamTimeout: time.Minute}, 0, 5 * time.Second, 5 * time.Second},
+		{"started budget with 1s left", Gateway{UpstreamTimeout: time.Minute}, time.Second, 500 * time.Millisecond, time.Second},
+		{"spent budget", Gateway{UpstreamTimeout: time.Minute}, -time.Second, time.Nanosecond, time.Nanosecond},
+	}
+	for _, tc := range cases {
+		c := &call{}
+		if tc.deadline != 0 {
+			c.deadline = time.Now().Add(tc.deadline)
+		}
+		if got := tc.gw.condenseTimeout(c); got < tc.lo || got > tc.hi {
+			t.Errorf("%s: timeout %s, want %s..%s", tc.name, got, tc.lo, tc.hi)
+		}
+	}
+}
+
+// Under the auto policy a bare confirmation is skipped as an ack on the
+// default strategy and condensed on "condense" (ADR-024, 2026-10-28); a
+// greeting is skipped on both.
+func TestCondenseKeepsAcksUnderAutoPolicy(t *testing.T) {
+	ack := msgsOf("user", "Tell me about the Apple plan", "assistant", "Shall I list the prices?", "user", "evet")
+
+	t.Run("last_user skips the ack", func(t *testing.T) {
+		e := newEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+		e.attachRAG()
+		e.up.resetEvents()
+		e.up.scriptCondense(condenseReply("never", 1, 1), nil)
+		resp, _ := e.chat(map[string]any{"messages": ack})
+		if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "ack" || fmt.Sprint(e.up.seen()) != "[chat:answer]" {
+			t.Errorf("status %d skip %q events %q", resp.StatusCode, resp.Header.Get("x-ragmux-rag-skip"), e.up.seen())
+		}
+		if got := e.skipReasonOf(1); got != "ack" {
+			t.Errorf("rag_skip_reason = %q", got)
+		}
+	})
+	t.Run("condense condenses the ack", func(t *testing.T) {
+		e := condenseEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+		e.up.scriptCondense(condenseReply("prices of the Apple plan", 40, 6), nil)
+		resp, _ := e.chat(map[string]any{"messages": ack})
+		want := "[chat:condense embed:prices of the Apple plan chat:answer]"
+		if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "" || fmt.Sprint(e.up.seen()) != want {
+			t.Errorf("status %d skip %q events %q, want %s", resp.StatusCode, resp.Header.Get("x-ragmux-rag-skip"), e.up.seen(), want)
+		}
+		if got := e.skipReasonOf(1); got != "" {
+			t.Errorf("rag_skip_reason = %q, want NULL", got)
+		}
+	})
+	t.Run("condense still skips a greeting", func(t *testing.T) {
+		e := condenseEnv(t, func(p *store.Project) { p.RetrievalPolicy = store.RetrievalPolicyAuto })
+		e.up.scriptCondense(condenseReply("never", 1, 1), nil)
+		resp, _ := e.chat(map[string]any{"messages": msgsOf("user", "q", "assistant", "a", "user", "teşekkürler")})
+		if resp.StatusCode != 200 || resp.Header.Get("x-ragmux-rag-skip") != "greeting" || fmt.Sprint(e.up.seen()) != "[chat:answer]" {
+			t.Errorf("status %d skip %q events %q", resp.StatusCode, resp.Header.Get("x-ragmux-rag-skip"), e.up.seen())
+		}
+	})
 }

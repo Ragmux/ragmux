@@ -6,11 +6,111 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-30
+
+### Added
+
+- **Where retrieved context goes: `context_placement`.** A project setting, `system` (the
+  default, as before) or `before_last_user`, which puts the retrieved block in front of the last
+  user message and leaves the system message and every `cache_control` marker untouched, so a
+  cached system prompt stays cacheable across turns. See
+  [Context placement](docs/rag.md#context-placement).
+- **Retrieval policy: `retrieval_policy`.** `always` (the default), `auto`, which skips
+  retrieval for a greeting or a bare acknowledgement (Turkish and English, rule-based), or
+  `off`. Retrieval is also skipped on a tool turn under every policy, and a request can send
+  `ragmux.retrieval: "off"`. A skipped request carries `x-ragmux-rag-skip: <reason>`
+  (`policy_off`, `client_off`, `tool_turn`, `greeting`, `ack`), writes `request_logs.rag_skip_reason`
+  and counts in `ragmux_rag_skipped_total{project,reason}`. See
+  [Retrieval policy](docs/rag.md#retrieval-policy).
+- **Query strategy: `query_strategy: condense`.** A chat model rewrites the conversation into
+  one standalone search query before retrieval; `history_turns_for_query` (1 to 10, default 3)
+  and `query_model_connection_id` (default: the first route target) tune it. One attempt with
+  a 5 s budget; any failure falls back to the last user message and never fails the request.
+  The call's tokens count towards the request's row and limits. New counter
+  `ragmux_rag_query_condense_total{outcome}` and span `rag.condense`. See
+  [Query strategy](docs/rag.md#query-strategy).
+- **The `ragmux` request object grows `sources`, `filter` and `retrieval`.**
+  `ragmux.sources: "inline"` returns the retrieved sources in the body, and `include_context`
+  now also works on streamed responses: the `ragmux` object rides on the first chunk that
+  carries `choices`. Anything a request asks for that the gateway cannot honour is reported in
+  a `Warning: 299 ragmux` header. See [The `ragmux` request object](docs/rag.md#the-ragmux-request-object).
+- **Document metadata and filtering at query time.** Documents carry a flat `metadata` object,
+  written with the upload's `metadata` form field or `PATCH /admin/api/documents/{id}`. A
+  `filter` (equality or `{"in": [...]}`, keys ANDed) on `ragmux.filter`, `POST /v1/retrieve` and
+  the dashboard search limits retrieval to matching documents, applied to every leg of the
+  search before its `LIMIT`. Searches set `hnsw.iterative_scan = relaxed_order` (pgvector 0.8.0
+  or later). `/v1/retrieve` hits gain `document_metadata`. See
+  [Metadata and filters](docs/rag.md#metadata-and-filters).
+- **Duplicate uploads are not embedded twice.** A document's SHA-256 is stored; the first
+  ingestion of a file whose bytes (and, with `contextual_chunks`, name) match a ready
+  document in the same store reuses that document's vectors. The upload response gains
+  `deduplicated` and `duplicate_of`. See [Duplicate uploads](docs/rag.md#duplicate-uploads).
+- **Embeddings of 2001 to 4000 dimensions are HNSW-indexed** through a `halfvec` expression
+  index, with distances still computed at full precision. Stores now report `vector_index`
+  (and `vector_index_progress`), and `POST /admin/api/rag-stores/{id}/reindex` builds the index
+  of a width in the background for stores that were created without one. See
+  [Embedding width](docs/rag.md#embedding-width).
+- **A search language per store.** `language` (`simple` or an ISO 639-1 code) selects the text
+  search configuration that chunks are indexed and queries parsed with, and the
+  characters-per-token ratio used for estimates (Turkish: 3.5). Changing it rebuilds the
+  store's full-text column in the background while searches keep working on `simple`. Store
+  responses gain `language`, `fts_language_applied`, `fts_status` and
+  `language_applies_to_search`. See [Store language](docs/rag.md#store-language).
+- **Dashboard.** Project RAG settings, a store language selector, the vector index state with a
+  **Reindex** action, upload and edit of document metadata, and a "dedup expected" marker. The
+  dashboard remains dark-only. See [Dashboard](docs/dashboard.md).
+- Migrations `0021` to `0028`. They only add columns, constraints and indexes (the large ones with
+  `CREATE INDEX CONCURRENTLY`), so a rolling update with older replicas keeps working.
+
 ### Changed
 
+- **Behaviour change: a `ragmux` request field that is not a JSON object is now
+  `400 invalid_request_error` with `code: "invalid_ragmux"`.** So is a `ragmux.filter` outside
+  the grammar. Before, a malformed `ragmux` was silently ignored; a client that sends `null`, a
+  string or an array there now gets an error instead of an unfiltered answer. Unknown fields
+  inside a valid object are still ignored, and now earn a `Warning` header.
+- **Behaviour change: the query parsing of a store whose `fts_config` was not `simple` goes
+  back to `simple`.** Chunks were always indexed with `simple`, so a `turkish` or `english`
+  query configuration looked for stems that the index did not contain and quietly lost
+  matches. Query and index now always use the same configuration, chosen by the store's
+  `language`, and existing stores start at `language = simple` with no automatic rebuild. If
+  you relied on a non-`simple` `fts_config`, set the store's `language` (for example `tr` for
+  `turkish`) to get stemmed matching; the startup warning names the language for each
+  store it concerns.
+- **Behaviour change: a request whose last message has the `tool` role no longer retrieves,
+  under every policy, the default `always` included.** Before, the tool-result turn of an
+  agent loop searched the store with the last user message and injected the context again.
+  Now it is skipped as `tool_turn` (`x-ragmux-rag-skip: tool_turn`, `rag_hits = 0`), because
+  the question was already answered with context on the turn that made the tool call; the
+  context the gateway added is not in the client's history, so the model no longer sees
+  it on that turn. A project that depends on the old behaviour has no setting to restore it.
+  See [Retrieval policy](docs/rag.md#retrieval-policy).
+- **Behaviour change: retrieved context now counts towards the per-minute token limit.** Once
+  retrieval is done, `rate_limit_tpm` is checked a second time against the client's messages,
+  the project prompt and the retrieved block, and a request over the limit is a `429` before
+  the chat request goes upstream. The block is estimated as its characters divided by the store
+  language's ratio (3.5 for Turkish, 4 otherwise) and never less than its bytes divided by 4,
+  so a Turkish store counts more tokens than before. The first check still runs before
+  retrieval; chat messages are still estimated at four characters per token.
+- **RAG stores accept embedding models up to 4000 dimensions** (it was 2000); above that is
+  still `400`, now with a message that binary quantization is planned. Binding a new store to a
+  2001 to 4000 wide table that has no index yet is `409 index_missing` until that width is
+  reindexed. `ragmux_rag_index_missing` now counts stores wider than 4000 plus those of 2001
+  to 4000 without a valid index.
+- **`fts_config` is derived from `language`.** On write a known configuration name is
+  translated to its language (`english` to `en`); an unknown one, or one that contradicts
+  `language`, is `400`. The store response still returns it.
+- **Project updates keep RAG fields that are left out.** A `PUT /admin/api/projects/{id}` body
+  without `context_placement`, `retrieval_policy`, `query_strategy`, `history_turns_for_query`
+  or `query_model_connection_id` keeps their current values.
 - **The ParadeDB CI job fails instead of skipping when `pg_search` is missing.** With
   `TEST_REQUIRE_PGSEARCH=1`, `testdb.RequirePgSearch` calls `t.Fatalf` rather than `t.Skipf`;
   the `test-paradedb` job sets it. Local runs without the variable still skip.
+
+### Deprecated
+
+- **`fts_config` on RAG stores.** Send `language` instead. The field stays in the responses and
+  is accepted on write for now.
 
 ### Documentation
 
@@ -18,6 +118,12 @@ All notable changes to Ragmux are documented here. The format follows
   documented under [Health](docs/api.md#health) as part of the v1.0 API contract: from 1.0 on,
   their paths, methods and status meanings follow the same deprecation policy as `/v1`, and
   their JSON bodies only gain fields.
+- **RAG, API, observability, dashboard and scaling references cover everything above.** The
+  `ragmux` request object, the new project and store fields, the reindex and metadata
+  endpoints, `x-ragmux-rag-skip`, the new metrics and request log column, the background jobs
+  and the prompt-caching note for `context_placement` are documented; statements that
+  described the 2000-dimension limit and the single-configuration full-text index as current
+  are corrected.
 
 ### Security
 
@@ -27,6 +133,17 @@ All notable changes to Ragmux are documented here. The format follows
   `govulncheck`).
 - **Go 1.27.3.** The minimum Go version moves from 1.27.2 to 1.27.3, picking up the fix for a
   reachable vulnerability in `crypto/x509` (GO-2026-6809, reported by `govulncheck`).
+- **`golang.org/x/net` v0.62.0.** `x/net` moves from v0.61.0 to v0.62.0, picking up the fix for
+  a reachable vulnerability in `x/net/html`, which the HTML extractor calls (GO-2026-6860,
+  reported by `govulncheck`).
+- **Dashboard search no longer lets a viewer pick the rerank connection.** `POST
+  /admin/api/rag-stores/{id}/search` is open to the `viewer` role, and its `rerank_connection_id`
+  and `rerank_backend` overrides replaced the store's settings, so a viewer could send the
+  store's chunk text to any model connection on a `rerank: true` search (present since v0.4.0).
+  The two overrides now need the authority to edit the store: the editor role, and the `write`
+  scope for a management key. Below that they are ignored, the search runs with the store's saved
+  rerank settings, and the response carries `Warning: 299 ragmux "..."` and
+  `rerank_overrides_ignored`. See [Search endpoint](docs/rag.md#search-endpoint).
 
 ## [0.5.0] - 2026-10-11
 
@@ -926,7 +1043,8 @@ projects with `sk-proj-` keys, metrics and an embedded dashboard.
 No git tag was created for this release, so there is no release page for it. The first
 tagged release is [0.2.0](https://github.com/ragmux/ragmux/releases/tag/v0.2.0).
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ragmux/ragmux/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ragmux/ragmux/releases/tag/v0.5.0
 [0.4.2]: https://github.com/ragmux/ragmux/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ragmux/ragmux/releases/tag/v0.4.1

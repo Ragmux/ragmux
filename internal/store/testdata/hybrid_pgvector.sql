@@ -1,11 +1,14 @@
 
 			WITH q AS (SELECT websearch_to_tsquery($5::text::regconfig, $6::text) AS query),
-			v AS (
-				SELECT e.chunk_id, ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
+			vc AS MATERIALIZED (
+				SELECT e.chunk_id, e.embedding <=> $1::vector AS distance
 				FROM chunk_embeddings_4 e
 				WHERE e.rag_store_id = $2
-				ORDER BY e.embedding <=> $1::vector
+				ORDER BY distance
 				LIMIT $3),
+			v AS (
+				SELECT chunk_id, distance, ROW_NUMBER() OVER (ORDER BY distance + 0, chunk_id) AS rank
+				FROM vc),
 			f AS (
 				SELECT c.id AS chunk_id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id) AS rank
 				FROM chunks c, q

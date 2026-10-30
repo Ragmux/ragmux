@@ -217,6 +217,49 @@ func (l *Limiter) CheckSubject(ctx context.Context, s Subject, estimatedPromptTo
 	return d, nil
 }
 
+// CheckTokens re-checks the per-minute token limit of both tiers against a
+// larger prompt estimate, for a request CheckSubject already admitted. It is
+// for the part of a prompt that is only known after that check -- retrieved
+// context -- so a request cannot slip under TPM by being small until
+// retrieval makes it big.
+//
+// It reserves nothing and releases nothing: prior is the decision
+// CheckSubject returned and keeps the request slot it took, and the figures in
+// prior are carried over. Budgets are not looked at again, because they are
+// compared with usage so far, not with the estimate. When neither tier has a
+// TPM limit it answers without reading usage.
+func (l *Limiter) CheckTokens(ctx context.Context, s Subject, prior Decision, estimatedPromptTokens int) (Decision, error) {
+	pc := projectCaps(s.Project)
+	kc := s.Key
+	if s.KeyID == nil {
+		kc = Caps{}
+	}
+	if pc.TPM == 0 && kc.TPM == 0 {
+		return prior, nil
+	}
+	now := l.now()
+	w := Windows(now)
+	pMinute, _, _, err := l.Store.GetUsage(ctx, s.Project.ID, w)
+	if err != nil {
+		return prior, err
+	}
+	est := int64(estimatedPromptTokens)
+	retryAt := w.Minute.Add(time.Minute).Sub(now)
+	if pc.TPM > 0 && pMinute.Tokens()+est > int64(pc.TPM) {
+		return l.deny(prior, ReasonTPM, ScopeProject, retryAt), nil
+	}
+	if kc.TPM > 0 {
+		kMinute, _, _, err := l.Store.GetKeyUsage(ctx, *s.KeyID, w)
+		if err != nil {
+			return prior, err
+		}
+		if kMinute.Tokens()+est > int64(kc.TPM) {
+			return l.deny(prior, ReasonTPM, ScopeKey, retryAt), nil
+		}
+	}
+	return prior, nil
+}
+
 // rollback releases the minute slots a denied request had already taken.
 func (l *Limiter) rollback(ctx context.Context, s Subject, w store.UsageWindows, project, key bool) error {
 	if project {

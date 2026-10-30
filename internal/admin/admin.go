@@ -35,6 +35,11 @@ import (
 
 // Admin holds dependencies for management routes.
 type Admin struct {
+	// FTSRebuild is woken when a store's language changes, so the rebuild of
+	// its full-text column starts at once instead of at the job's next poll.
+	// Nil is fine: the job still finds the work by itself.
+	FTSRebuild interface{ Kick() }
+
 	Store          *store.Store
 	Auth           *auth.Service
 	Ingester       *rag.Ingester
@@ -156,7 +161,9 @@ func (a *Admin) authenticated(r chi.Router) {
 	editor.With(httpx.ReadDeadline(uploadReadDeadline)).Post("/api/rag-stores/{id}/documents", a.uploadDocument)
 	read.Post("/api/rag-stores/{id}/search", a.searchRAGStore)
 	editor.Post("/api/rag-stores/{id}/reprocess", a.reprocessStore)
+	adminOnly.Post("/api/rag-stores/{id}/reindex", a.reindexStore)
 	read.Get("/api/documents/{id}", a.getDocument)
+	editor.Patch("/api/documents/{id}", a.updateDocumentMetadata)
 	editor.Delete("/api/documents/{id}", a.deleteDocument)
 	editor.Post("/api/documents/{id}/reprocess", a.reprocessDocument)
 
@@ -881,19 +888,27 @@ func (a *Admin) providerConfig(c *store.ModelConnection) provider.Config {
 // ---- RAG stores ----
 
 type ragInput struct {
-	Name                  string   `json:"name"`
-	EmbeddingConnectionID int64    `json:"embedding_connection_id"`
-	ChunkSize             int      `json:"chunk_size"`
-	ChunkOverlap          int      `json:"chunk_overlap"`
-	TopK                  int      `json:"top_k"`
-	SearchMode            string   `json:"search_mode"`
-	SearchBackend         string   `json:"search_backend"`
-	FTSConfig             string   `json:"fts_config"`
-	Rerank                bool     `json:"rerank"`
-	RerankCandidates      int      `json:"rerank_candidates"`
-	RerankBackend         string   `json:"rerank_backend"`
-	RerankConnectionID    *int64   `json:"rerank_connection_id"`
-	MaxDistance           *float64 `json:"max_distance"`
+	Name                  string `json:"name"`
+	EmbeddingConnectionID int64  `json:"embedding_connection_id"`
+	ChunkSize             int    `json:"chunk_size"`
+	ChunkOverlap          int    `json:"chunk_overlap"`
+	TopK                  int    `json:"top_k"`
+	SearchMode            string `json:"search_mode"`
+	SearchBackend         string `json:"search_backend"`
+	// Language is "simple" or an ISO 639-1 code (ADR-027). FTSConfig is the
+	// deprecated predecessor: a known configuration name is translated to its
+	// language, and a value that contradicts Language is rejected. Both
+	// omitted keeps the store's language (and means 'simple' on create).
+	Language  string `json:"language"`
+	FTSConfig string `json:"fts_config"`
+	// languageExplicit: the body carried language itself, not only the
+	// deprecated fts_config (set by validateRAG).
+	languageExplicit   bool
+	Rerank             bool     `json:"rerank"`
+	RerankCandidates   int      `json:"rerank_candidates"`
+	RerankBackend      string   `json:"rerank_backend"`
+	RerankConnectionID *int64   `json:"rerank_connection_id"`
+	MaxDistance        *float64 `json:"max_distance"`
 	// ContextualChunks defaults to true when omitted.
 	ContextualChunks *bool `json:"contextual_chunks"`
 	// MaxDocuments and MaxBytes are per-store upload quotas; 0 = unlimited.
@@ -939,19 +954,17 @@ func (a *Admin) validateRAG(r *http.Request, in *ragInput) error {
 		return fmt.Errorf("search_backend %q cannot be used here: %s (see docs/rag.md#search-backends)",
 			in.SearchBackend, a.Store.SearchBackendReason(in.SearchBackend))
 	}
-	in.FTSConfig = strings.ToLower(strings.TrimSpace(in.FTSConfig))
-	if in.FTSConfig == "" {
-		in.FTSConfig = "simple"
+	// Rejected on write like the other settings, so a store saved here can
+	// always be indexed and searched in its language.
+	in.languageExplicit = strings.TrimSpace(in.Language) != ""
+	lang, _, err := a.Store.ResolveLanguage(r.Context(), in.Language, in.FTSConfig)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidLanguage) {
+			return err
+		}
+		return fmt.Errorf("checking language: %w", err)
 	}
-	if ok, err := a.Store.TextSearchConfigExists(r.Context(), in.FTSConfig); err != nil {
-		return err
-	} else if !ok {
-		return fmt.Errorf("fts_config %q is not a text search configuration on this server", in.FTSConfig)
-	}
-	// Accepted as before; the operator is only told what it does not do.
-	if msg := store.FTSConfigWarning(in.FTSConfig, in.SearchBackend); msg != "" {
-		a.Log.Warn("rag store: "+msg, "store", in.Name, "fts_config", in.FTSConfig)
-	}
+	in.Language, in.FTSConfig = lang, ""
 	if in.RerankCandidates <= 0 {
 		in.RerankCandidates = 15
 	}
@@ -1035,7 +1048,7 @@ func (a *Admin) validateRerank(r *http.Request, in *ragInput) error {
 func (in *ragInput) toStore(id int64) *store.RAGStore {
 	return &store.RAGStore{ID: id, Name: strings.TrimSpace(in.Name),
 		EmbeddingConnectionID: in.EmbeddingConnectionID, ChunkSize: in.ChunkSize, ChunkOverlap: in.ChunkOverlap, TopK: in.TopK,
-		SearchMode: in.SearchMode, SearchBackend: in.SearchBackend, FTSConfig: in.FTSConfig,
+		SearchMode: in.SearchMode, SearchBackend: in.SearchBackend, Language: in.Language, LanguageExplicit: in.languageExplicit,
 		Rerank: in.Rerank, RerankCandidates: in.RerankCandidates,
 		RerankBackend: in.RerankBackend, RerankConnectionID: in.RerankConnectionID,
 		MaxDistance: *in.MaxDistance, ContextualChunks: *in.ContextualChunks,
@@ -1097,6 +1110,9 @@ func (q *storeQuota) add(size int64) error {
 
 func (a *Admin) listRAGStores(w http.ResponseWriter, r *http.Request) {
 	list, err := a.Store.ListRAGStores(r.Context())
+	if err == nil {
+		err = a.Store.AnnotateVectorIndex(r.Context(), list...)
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1115,10 +1131,13 @@ func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.checkEmbeddingDims(r.Context(), in.EmbeddingConnectionID); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		a.dimsFail(w, err)
 		return
 	}
 	rs, err := a.Store.CreateRAGStore(r.Context(), in.toStore(0))
+	if err == nil {
+		err = a.Store.AnnotateVectorIndex(r.Context(), rs)
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1130,6 +1149,9 @@ func (a *Admin) createRAGStore(w http.ResponseWriter, r *http.Request) {
 func (a *Admin) getRAGStore(w http.ResponseWriter, r *http.Request) {
 	id, _ := idParam(r)
 	rs, err := a.Store.GetRAGStore(r.Context(), id)
+	if err == nil {
+		err = a.Store.AnnotateVectorIndex(r.Context(), rs)
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1158,7 +1180,7 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	// probe -- a billed upstream call -- only runs when the switch can happen.
 	if connChanged && before.ChunkCount == 0 {
 		if err := a.checkEmbeddingDims(r.Context(), in.EmbeddingConnectionID); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
+			a.dimsFail(w, err)
 			return
 		}
 	}
@@ -1169,6 +1191,10 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := a.Store.AnnotateVectorIndex(r.Context(), rs); err != nil {
+		a.fail(w, err)
 		return
 	}
 	// Chunking and embedding-text settings only take effect when documents
@@ -1188,7 +1214,14 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 	if connChanged && rs.DocumentCount > 0 {
 		reprocess = true
 	}
-	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess})
+	// A language change leaves chunks.fts to be rebuilt; the rebuild job is
+	// told now rather than at its next poll. Searches keep working on
+	// 'simple' until it is done (fts_status says "rebuilding" meanwhile).
+	if rs.FTSStatus == store.FTSRebuilding && a.FTSRebuild != nil {
+		a.FTSRebuild.Kick()
+	}
+	a.audit(r, "rag_store.update", "rag_store", ptr(rs.ID), map[string]any{"name": rs.Name, "reprocess_recommended": reprocess,
+		"language": rs.Language, "language_changed": before.Language != rs.Language})
 	writeJSON(w, http.StatusOK, ragStoreResponse{RAGStore: rs, ReprocessRecommended: reprocess})
 }
 
@@ -1197,10 +1230,13 @@ func (a *Admin) updateRAGStore(w http.ResponseWriter, r *http.Request) {
 const embeddingProbeTimeout = 10 * time.Second
 
 // checkEmbeddingDims asks for the width of the embedding model a store is
-// about to be bound to and refuses one wider than pgvector can index, so the
-// operator hears about it on save rather than from the first failed ingest.
-// The probe is best effort: if the upstream cannot be reached the save goes
-// ahead and the ingest-time check (store.CheckVectorDims) still applies.
+// about to be bound to and refuses one that cannot be indexed -- wider than
+// 4000, or wider than 2000 on a pgvector without halfvec (400) -- or whose
+// 2001..4000 table exists without a halfvec index (409, reindex first), so
+// the operator hears about it on save rather than from the first failed
+// ingest. The probe is best effort: if the upstream cannot be reached the
+// save goes ahead and the ingest-time check (Store.CheckBindable, run by the
+// first write) still applies.
 func (a *Admin) checkEmbeddingDims(ctx context.Context, connID int64) error {
 	conn, err := a.Store.GetConnection(ctx, connID)
 	if err != nil {
@@ -1218,7 +1254,21 @@ func (a *Admin) checkEmbeddingDims(ctx context.Context, connID int64) error {
 			"err", provider.RedactWith(err.Error(), conn.APIKey))
 		return nil
 	}
-	return store.CheckVectorDims(dims)
+	return a.Store.CheckBindable(ctx, dims)
+}
+
+// dimsFail answers the error of checkEmbeddingDims: an unindexable width is
+// the request's fault (400), a width that only lacks its index is a state
+// conflict the operator resolves with the reindex action (409).
+func (a *Admin) dimsFail(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrVectorIndexMissing):
+		writeErrCode(w, http.StatusConflict, "index_missing", err.Error())
+	case errors.Is(err, store.ErrVectorDimsUnsupported):
+		writeErr(w, http.StatusBadRequest, err.Error())
+	default:
+		a.fail(w, err)
+	}
 }
 
 // probeEmbeddingWidth embeds one word, the way the connection test does.
@@ -1243,6 +1293,56 @@ func (a *Admin) probeEmbeddingWidth(ctx context.Context, conn *store.ModelConnec
 type ragStoreResponse struct {
 	*store.RAGStore
 	ReprocessRecommended bool `json:"reprocess_recommended"`
+}
+
+// reindexStore builds the halfvec index of the store's embedding width
+// (ADR-026). The index belongs to the width, not to the store, so every store
+// bound to the same width is affected; the answer lists them. The build runs
+// in the background (202); progress is the vector_index field of the stores.
+func (a *Admin) reindexStore(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	rs, err := a.Store.GetRAGStore(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	info, err := a.Store.StartVectorReindex(r.Context(), rs.Dimensions)
+	switch {
+	case errors.Is(err, store.ErrVectorIndexPresent):
+		writeErrCode(w, http.StatusConflict, "already_indexed", err.Error())
+		return
+	case errors.Is(err, store.ErrVectorNotIndexable):
+		writeErrCode(w, http.StatusConflict, "not_indexable", err.Error())
+		return
+	case errors.Is(err, store.ErrVectorNotBound):
+		writeErrCode(w, http.StatusConflict, "not_bound", err.Error())
+		return
+	case err != nil:
+		a.fail(w, err)
+		return
+	}
+	affected, err := a.Store.StoresWithDimensions(r.Context(), rs.Dimensions)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	type storeRef struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+	}
+	refs := make([]storeRef, 0, len(affected))
+	ids := make([]int64, 0, len(affected))
+	for _, s := range affected {
+		refs = append(refs, storeRef{s.ID, s.Name})
+		ids = append(ids, s.ID)
+	}
+	a.audit(r, "rag_store.reindex", "rag_store", ptr(rs.ID),
+		map[string]any{"name": rs.Name, "dimensions": rs.Dimensions, "affected_store_ids": ids})
+	resp := map[string]any{"dimensions": rs.Dimensions, "vector_index": info.State, "affected_stores": refs}
+	if info.State == store.VectorIndexBuilding {
+		resp["vector_index_progress"] = info.ProgressPercent
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (a *Admin) reprocessStore(w http.ResponseWriter, r *http.Request) {
@@ -1301,10 +1401,21 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		RerankBackend      string   `json:"rerank_backend"`
 		RerankConnectionID *int64   `json:"rerank_connection_id"`
 		MaxDistance        *float64 `json:"max_distance"`
+		// Filter limits the search to documents whose metadata matches
+		// (ADR-025), the same grammar as /v1/retrieve.
+		Filter json.RawMessage `json:"filter"`
 	}
 	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Query) == "" {
 		writeErr(w, http.StatusBadRequest, "query is required")
 		return
+	}
+	var filter *store.MetadataFilter
+	if in.Filter != nil {
+		var err error
+		if filter, err = store.ParseMetadataFilter(in.Filter); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if in.Mode != "" {
 		if in.Mode != store.SearchVector && in.Mode != store.SearchHybrid {
@@ -1326,18 +1437,40 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 	if in.Rerank != nil {
 		rs.Rerank = *in.Rerank
 	}
-	if in.RerankBackend != "" {
-		if !store.IsValidRerankBackend(in.RerankBackend) {
-			writeErr(w, http.StatusBadRequest, "rerank_backend must be one of "+strings.Join(store.RerankBackends, ", "))
-			return
+	// rerank_backend and rerank_connection_id decide which upstream receives
+	// the store's chunk text, so they are a store-editing power: a caller
+	// below editor (or a key without the write scope) searches with the
+	// store's saved rerank settings. The override is ignored and reported in
+	// a Warning header rather than rejected (PRD rule 12), so a client that
+	// sends a full settings payload keeps working. The gate runs before any
+	// validation of the values, so it is no oracle for connection ids.
+	var ignoredOverrides []string
+	if canOverrideRerank(r) {
+		if in.RerankBackend != "" {
+			if !store.IsValidRerankBackend(in.RerankBackend) {
+				writeErr(w, http.StatusBadRequest, "rerank_backend must be one of "+strings.Join(store.RerankBackends, ", "))
+				return
+			}
+			rs.RerankBackend = in.RerankBackend
 		}
-		rs.RerankBackend = in.RerankBackend
-	}
-	if in.RerankConnectionID != nil {
-		if *in.RerankConnectionID == 0 {
-			rs.RerankConnectionID = nil
-		} else {
-			rs.RerankConnectionID = in.RerankConnectionID
+		if in.RerankConnectionID != nil {
+			if *in.RerankConnectionID == 0 {
+				rs.RerankConnectionID = nil
+			} else {
+				rs.RerankConnectionID = in.RerankConnectionID
+			}
+		}
+	} else {
+		if in.RerankBackend != "" {
+			ignoredOverrides = append(ignoredOverrides, "rerank_backend")
+		}
+		if in.RerankConnectionID != nil {
+			ignoredOverrides = append(ignoredOverrides, "rerank_connection_id")
+		}
+		if len(ignoredOverrides) > 0 {
+			w.Header().Add("Warning", `299 ragmux "`+strings.Join(ignoredOverrides, " and ")+
+				` ignored: overriding the rerank settings needs the editor role; the store's saved rerank settings were used"`)
+			a.Log.Warn("rerank override ignored", "store_id", rs.ID, "fields", ignoredOverrides)
 		}
 	}
 	// top_k is clamped to the store's own bounds; 0 means "use the store's
@@ -1388,23 +1521,38 @@ func (a *Admin) searchRAGStore(w http.ResponseWriter, r *http.Request) {
 		searchStore = &cp
 	}
 	start := time.Now()
-	res, err := a.Retriever.SearchWith(r.Context(), searchStore, in.Query, in.TopK, prov, model)
+	res, err := a.Retriever.SearchWithFilter(r.Context(), searchStore, in.Query, in.TopK, prov, model, filter)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"hits": res.Hits, "mode": res.Mode, "backend": res.Backend,
-		// fts_config is echoed because the pg_search backend ignores it: the
-		// index is global and tokenised once, so the setting is inert there.
-		// Returning it makes that visible instead of surprising.
-		"fts_config": rs.FTSConfig, "reranked": res.Reranked, "rerank_backend": res.RerankBackend,
+		// language is echoed with whether it took part in this search: a vector
+		// search never runs the lexical leg, the pg_search backend ignores it (its index is global and tokenised once,
+		// by PG_SEARCH_TOKENIZER), and a store whose full-text column is being
+		// rebuilt is searched with 'simple' until the rebuild is done.
+		// Returning that makes it visible instead of surprising. fts_config is
+		// the deprecated name of the language's configuration.
+		"language": rs.Language, "fts_config": rs.FTSConfig, "fts_status": rs.FTSStatus,
+		"language_applied_to_search": res.Mode != store.SearchVector && res.Backend != store.BackendPgSearch && rs.FTSStatus != store.FTSRebuilding,
+		"reranked":                   res.Reranked, "rerank_backend": res.RerankBackend,
 		"rerank_fallback": res.RerankFallback,
 		// rerank_skipped is true when rerank was requested but the store has no
 		// usable rerank connection, so the hits are the fused order and
 		// rerank_fallback stays false: nothing was attempted, so nothing failed.
 		"rerank_skipped": skipped != "", "rerank_skipped_reason": skipped,
 		"latency_ms": time.Since(start).Milliseconds(), "retrieval_latency_ms": res.RetrievalLatencyMS,
-		"rerank_latency_ms": res.RerankLatencyMS})
+		"rerank_latency_ms": res.RerankLatencyMS,
+		// rerank_overrides_ignored names the rerank fields the request sent
+		// but the caller's role or key scope does not allow.
+		"rerank_overrides_ignored": ignoredOverrides})
+}
+
+// canOverrideRerank reports whether the caller may point a search at another
+// rerank backend or connection: the same authority as editing the store
+// (editor role, and the write scope for a management key).
+func canOverrideRerank(r *http.Request) bool {
+	return auth.Allows(r.Context(), auth.RoleEditor, store.ScopeWrite)
 }
 
 // rerankConnection returns the store's rerank connection, the one named by
@@ -1431,6 +1579,25 @@ func (a *Admin) listDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, docs)
+}
+
+// uploadedDocument is the upload response: the new document plus a forecast
+// of whether its embeddings will be reused.
+//
+// Deduplicated is decided at upload time, before ingestion runs, and is
+// nothing more than that: the newest ready document of the same store with the
+// same bytes (and, in a store that embeds file names, the same name) is
+// DuplicateOf, the candidate ingestion will try first. It is not stored, so
+// no later read of the document carries it, and it can be wrong in both
+// directions. False positive: the store's chunking changed since the
+// candidate was ingested, so ingestion finds no matching donor and embeds.
+// False negative: the candidate was still pending at upload time (two equal
+// files in flight) and is ready by the time ingestion looks. Anything that
+// shows it must present it as expected, not as what happened.
+type uploadedDocument struct {
+	*store.Document
+	Deduplicated bool   `json:"deduplicated"`
+	DuplicateOf  *int64 `json:"duplicate_of,omitempty"`
 }
 
 func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
@@ -1462,7 +1629,23 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "no file field in form (use 'file')")
 		return
 	}
-	var created []*store.Document
+	// The optional metadata field (JSON) applies to every file of the request.
+	// It is validated before the first file is written, so a bad one leaves
+	// nothing behind.
+	var metadata json.RawMessage
+	var metadataKeys []string
+	if vals := r.MultipartForm.Value["metadata"]; len(vals) > 1 {
+		writeErr(w, http.StatusBadRequest, "the metadata field may be given once")
+		return
+	} else if len(vals) == 1 && strings.TrimSpace(vals[0]) != "" {
+		metadata, err = store.ValidateMetadata(json.RawMessage(vals[0]))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		metadataKeys = store.MetadataKeys(metadata)
+	}
+	var created []uploadedDocument
 	for _, fh := range files {
 		name := filepath.Base(fh.Filename)
 		if !rag.IsSupported(name) {
@@ -1495,7 +1678,7 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		doc, err := a.Store.CreateDocument(r.Context(), &store.Document{RAGStoreID: id, Filename: name,
-			Mime: fh.Header.Get("Content-Type"), SizeBytes: int64(len(data))}, data)
+			Mime: fh.Header.Get("Content-Type"), SizeBytes: int64(len(data)), Metadata: metadata}, data)
 		if err != nil {
 			a.fail(w, err)
 			return
@@ -1506,8 +1689,22 @@ func (a *Admin) uploadDocument(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
-		a.audit(r, "document.upload", "document", ptr(doc.ID), map[string]any{"rag_store_id": id, "filename": name, "size_bytes": len(data)})
-		created = append(created, doc)
+		upload := map[string]any{"rag_store_id": id, "filename": name, "size_bytes": len(data)}
+		if len(metadataKeys) > 0 {
+			// Key names only: the values are the customer's data.
+			upload["metadata_keys"] = metadataKeys
+		}
+		out := uploadedDocument{Document: doc}
+		// The same bytes are already ingested in this store: ingestion is
+		// expected to reuse their embeddings (no embedding call). This is a
+		// forecast, not a record; see uploadedDocument. A failed lookup only
+		// means no marker.
+		if dups, err := a.Store.FindDuplicateDocuments(r.Context(), doc, rs.ContextualChunks, 1); err == nil && len(dups) > 0 {
+			out.Deduplicated, out.DuplicateOf = true, &dups[0].ID
+			upload["duplicate_of"] = dups[0].ID
+		}
+		a.audit(r, "document.upload", "document", ptr(doc.ID), upload)
+		created = append(created, out)
 	}
 	if len(created) == 1 {
 		writeJSON(w, http.StatusAccepted, created[0])
@@ -1523,6 +1720,36 @@ func (a *Admin) getDocument(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+// updateDocumentMetadata replaces a document's metadata (ADR-025). It is one
+// row update: no chunk is rewritten and the document is not reprocessed, so
+// the next filtered search sees the change.
+func (a *Admin) updateDocumentMetadata(w http.ResponseWriter, r *http.Request) {
+	id, _ := idParam(r)
+	var in struct {
+		Metadata json.RawMessage `json:"metadata"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "expected a JSON body {\"metadata\": {...}}")
+		return
+	}
+	if in.Metadata == nil {
+		writeErr(w, http.StatusBadRequest, "metadata is required (send {} to clear it)")
+		return
+	}
+	meta, err := store.ValidateMetadata(in.Metadata)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	d, err := a.Store.SetDocumentMetadata(r.Context(), id, meta)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.audit(r, "document.metadata_update", "document", ptr(id), map[string]any{"metadata_keys": store.MetadataKeys(meta)})
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -1568,14 +1795,69 @@ type projectInput struct {
 	RateLimitTPM        int     `json:"rate_limit_tpm"`
 	BudgetDailyTokens   int64   `json:"budget_daily_tokens"`
 	BudgetMonthlyTokens int64   `json:"budget_monthly_tokens"`
+
+	// RAG behaviour (ADR-024). A field left out of the body keeps the
+	// project's current value on update and takes the default on create, so a
+	// client that does not know these settings (an older dashboard, a script)
+	// never resets them by saving the rest of the project.
+	// QueryModelConnectionID is a raw value because "absent" (keep) and null
+	// (clear) are different requests.
+	ContextPlacement       *string         `json:"context_placement"`
+	RetrievalPolicy        *string         `json:"retrieval_policy"`
+	QueryStrategy          *string         `json:"query_strategy"`
+	HistoryTurnsForQuery   *int            `json:"history_turns_for_query"`
+	QueryModelConnectionID json.RawMessage `json:"query_model_connection_id"`
 }
 
 // project builds the store record from validated input (id and key aside).
-func (in *projectInput) project() *store.Project {
-	return &store.Project{Name: strings.TrimSpace(in.Name), ModelConnectionID: in.ModelConnectionID,
+// base is the project's current state on update, nil on create. Settings the
+// input leaves out stay empty and the store keeps them (create: the defaults);
+// the enum ones are deliberately not copied from base, because base holds the
+// value as this build reads it, and a value it does not know reads as the
+// default -- writing that back would erase what a newer release stored.
+// The history turns and the query model are plain values and carry over.
+func (in *projectInput) project(base *store.Project) *store.Project {
+	p := &store.Project{Name: strings.TrimSpace(in.Name), ModelConnectionID: in.ModelConnectionID,
 		RAGStoreID: in.RAGStoreID, SystemPrompt: in.SystemPrompt,
 		RateLimitRPM: in.RateLimitRPM, RateLimitTPM: in.RateLimitTPM,
 		BudgetDailyTokens: in.BudgetDailyTokens, BudgetMonthlyTokens: in.BudgetMonthlyTokens}
+	if base != nil {
+		p.HistoryTurnsForQuery, p.QueryModelConnectionID = base.HistoryTurnsForQuery, base.QueryModelConnectionID
+	}
+	if in.ContextPlacement != nil {
+		p.ContextPlacement = *in.ContextPlacement
+	}
+	if in.RetrievalPolicy != nil {
+		p.RetrievalPolicy = *in.RetrievalPolicy
+	}
+	if in.QueryStrategy != nil {
+		p.QueryStrategy = *in.QueryStrategy
+	}
+	if in.HistoryTurnsForQuery != nil {
+		p.HistoryTurnsForQuery = *in.HistoryTurnsForQuery
+	}
+	if in.QueryModelConnectionID != nil {
+		// validateProject has already parsed it; null and 0 clear the setting.
+		var id *int64
+		_ = json.Unmarshal(in.QueryModelConnectionID, &id)
+		if id != nil && *id == 0 {
+			id = nil
+		}
+		p.QueryModelConnectionID = id
+	}
+	return p
+}
+
+// ragSettingFields lists the RAG settings with their current values, for the
+// audit trail's "changed" view.
+func ragSettingFields(p *store.Project) map[string]any {
+	var query any
+	if p.QueryModelConnectionID != nil {
+		query = *p.QueryModelConnectionID
+	}
+	return map[string]any{"context_placement": p.ContextPlacement, "retrieval_policy": p.RetrievalPolicy,
+		"query_strategy": p.QueryStrategy, "history_turns_for_query": p.HistoryTurnsForQuery,
+		"query_model_connection_id": query}
 }
 
 // limitFields lists the limit columns with their current values.
@@ -1628,6 +1910,43 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	if in.RateLimitRPM < 0 || in.RateLimitTPM < 0 || in.BudgetDailyTokens < 0 || in.BudgetMonthlyTokens < 0 {
 		return errors.New("rate limits and budgets must be 0 (unlimited) or positive")
 	}
+	return a.validateRAGSettings(r, in)
+}
+
+// validateRAGSettings checks the ADR-024 settings the body carries. Every
+// value the CHECK constraints of migration 0021 allow is accepted here: the
+// setting is the project's, whether or not this build acts on it. The gateway
+// acts on all five: rag.SkipReason decides on retrieval_policy, and
+// query_strategy "condense" uses history_turns_for_query and, when set,
+// query_model_connection_id, which must name an existing chat connection.
+func (a *Admin) validateRAGSettings(r *http.Request, in *projectInput) error {
+	if in.ContextPlacement != nil && !store.ValidContextPlacement(*in.ContextPlacement) {
+		return errors.New(`context_placement must be "system" or "before_last_user"`)
+	}
+	if in.RetrievalPolicy != nil && !store.ValidRetrievalPolicy(*in.RetrievalPolicy) {
+		return errors.New(`retrieval_policy must be "always", "auto" or "off"`)
+	}
+	if in.QueryStrategy != nil && !store.ValidQueryStrategy(*in.QueryStrategy) {
+		return errors.New(`query_strategy must be "last_user" or "condense"`)
+	}
+	if in.HistoryTurnsForQuery != nil && (*in.HistoryTurnsForQuery < 1 || *in.HistoryTurnsForQuery > store.MaxHistoryTurnsForQuery) {
+		return fmt.Errorf("history_turns_for_query must be between 1 and %d", store.MaxHistoryTurnsForQuery)
+	}
+	if in.QueryModelConnectionID != nil {
+		var id *int64
+		if err := json.Unmarshal(in.QueryModelConnectionID, &id); err != nil {
+			return errors.New("query_model_connection_id must be a connection id or null")
+		}
+		if id != nil && *id != 0 {
+			conn, err := a.Store.GetConnection(r.Context(), *id)
+			if err != nil {
+				return errors.New("query_model_connection_id does not reference an existing model connection")
+			}
+			if !provider.SupportsChat(conn.ProviderType) {
+				return fmt.Errorf("provider %q cannot be used for chat", conn.ProviderType)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1661,7 +1980,7 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 	// The creator is always a member so editors keep access to what they
 	// made; project and members are written in one transaction.
 	members := append([]int64{u.ID}, in.MemberUserIDs...)
-	p, key, err := a.Store.CreateProjectWithMembers(r.Context(), in.project(), members)
+	p, key, err := a.Store.CreateProjectWithMembers(r.Context(), in.project(nil), members)
 	if err != nil {
 		if store.IsForeignKeyViolation(err) {
 			writeErr(w, http.StatusBadRequest, "member_user_ids contains an unknown user")
@@ -1670,7 +1989,7 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p)})
+	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p), "rag_settings": ragSettingFields(p)})
 	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
 }
 
@@ -1697,7 +2016,7 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	np := in.project()
+	np := in.project(before)
 	np.ID = id
 	p, err := a.Store.UpdateProject(r.Context(), np)
 	if err != nil {
@@ -1714,6 +2033,16 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(changed) > 0 {
 		details["limits_changed"] = changed
+	}
+	oldRAG, curRAG := ragSettingFields(before), ragSettingFields(p)
+	ragChanged := map[string]any{}
+	for k, v := range curRAG {
+		if oldRAG[k] != v {
+			ragChanged[k] = map[string]any{"from": oldRAG[k], "to": v}
+		}
+	}
+	if len(ragChanged) > 0 {
+		details["rag_settings_changed"] = ragChanged
 	}
 	a.audit(r, "project.update", "project", ptr(p.ID), details)
 	writeJSON(w, http.StatusOK, p)

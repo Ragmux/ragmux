@@ -12,10 +12,13 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -972,7 +975,10 @@ func TestRAGFormatsHybridRerankAndReprocess(t *testing.T) {
 	}
 	for _, h := range hy["hits"].([]any) {
 		hm := h.(map[string]any)
-		if strings.Contains(hm["content"].(string), "zyxquux") && (hm["fts_rank"] != float64(1) || hm["score"].(float64) <= 0) {
+		// The store is English, so its chunks are indexed with stems and "apple"
+		// reaches the Apples chunk too: the zyxquux chunk is on the full-text
+		// leg (a rank above 0) but no longer necessarily first on it.
+		if strings.Contains(hm["content"].(string), "zyxquux") && (hm["fts_rank"].(float64) < 1 || hm["score"].(float64) <= 0) {
 			t.Errorf("zyxquux hit ranks: %v", hm)
 		}
 	}
@@ -1404,5 +1410,725 @@ func TestMetricsExportAndSummaryOptions(t *testing.T) {
 	vm := e.call("GET", "/admin/api/metrics/summary?by_project=1", nil, viewerTok)
 	if list := vm["projects"].([]any); len(list) != 1 || list[0].(map[string]any)["project_id"] != float64(idA) {
 		t.Errorf("viewer projects breakdown: %v", list)
+	}
+}
+
+// TestProjectRAGSettingsAdminAPI covers the ADR-024 project settings through
+// the admin API: defaults, validation, "left out keeps the current value" on
+// update, an explicit null clearing the query model, and the 409 that a
+// connection a project uses for query condensing gives on delete.
+func TestProjectRAGSettingsAdminAPI(t *testing.T) {
+	up := httptest.NewServer(http.NotFoundHandler())
+	defer up.Close()
+	e := newEnv(t, testdb.Config(t))
+	mkConn := func(name string) int64 {
+		c := e.call("POST", "/admin/api/models", map[string]any{"name": name, "provider_type": "custom_openai",
+			"base_url": up.URL + "/v1", "api_key": "k", "model_name": "m"}, "")
+		if c["_status"] != float64(201) {
+			t.Fatalf("create connection %s: %v", name, c)
+		}
+		return int64(c["id"].(float64))
+	}
+	chatConn, queryConn := mkConn("chat"), mkConn("query")
+
+	created := e.call("POST", "/admin/api/projects", map[string]any{"name": "p", "model_connection_id": chatConn}, "")
+	if created["_status"] != float64(201) {
+		t.Fatalf("create: %v", created)
+	}
+	proj := created["project"].(map[string]any)
+	if proj["context_placement"] != "system" || proj["retrieval_policy"] != "always" || proj["query_strategy"] != "last_user" ||
+		proj["history_turns_for_query"] != float64(3) || proj["query_model_connection_id"] != nil {
+		t.Errorf("defaults: %v", proj)
+	}
+	path := fmt.Sprintf("/admin/api/projects/%d", int64(proj["id"].(float64)))
+	put := func(extra map[string]any) map[string]any {
+		body := map[string]any{"name": "p", "model_connection_id": chatConn}
+		for k, v := range extra {
+			body[k] = v
+		}
+		return e.call("PUT", path, body, "")
+	}
+
+	for name, extra := range map[string]map[string]any{
+		"placement":        {"context_placement": "after_all"},
+		"policy":           {"retrieval_policy": "sometimes"},
+		"strategy":         {"query_strategy": "rewrite"},
+		"turns too low":    {"history_turns_for_query": 0},
+		"turns too high":   {"history_turns_for_query": 11},
+		"query model":      {"query_model_connection_id": 999999},
+		"query model type": {"query_model_connection_id": "abc"},
+	} {
+		if r := put(extra); r["_status"] != float64(400) {
+			t.Errorf("%s: status %v, want 400: %v", name, r["_status"], r)
+		}
+	}
+
+	r := put(map[string]any{"context_placement": "before_last_user", "retrieval_policy": "auto", "query_strategy": "condense",
+		"history_turns_for_query": 5, "query_model_connection_id": queryConn})
+	if r["_status"] != float64(200) || r["context_placement"] != "before_last_user" || r["retrieval_policy"] != "auto" ||
+		r["query_strategy"] != "condense" || r["history_turns_for_query"] != float64(5) || r["query_model_connection_id"] != float64(queryConn) {
+		t.Fatalf("update: %v", r)
+	}
+	upd := e.call("GET", "/admin/api/audit?action=project.update", nil, "")["entries"].([]any)
+	changed, _ := upd[0].(map[string]any)["details"].(map[string]any)["rag_settings_changed"].(map[string]any)
+	if changed["context_placement"] == nil || changed["query_model_connection_id"] == nil {
+		t.Errorf("rag_settings_changed: %v", upd[0])
+	}
+
+	// Saving the rest of the project without the settings leaves them alone.
+	r = put(nil)
+	if r["_status"] != float64(200) || r["context_placement"] != "before_last_user" || r["history_turns_for_query"] != float64(5) ||
+		r["query_model_connection_id"] != float64(queryConn) {
+		t.Errorf("update without the settings changed them: %v", r)
+	}
+
+	// The connection is held by the project: delete answers 409.
+	del := e.call("DELETE", fmt.Sprintf("/admin/api/models/%d", queryConn), nil, "")
+	if del["_status"] != float64(409) || !strings.Contains(errMessage(del), "still referenced") {
+		t.Errorf("delete of the query model connection: %v", del)
+	}
+
+	// An explicit null releases it.
+	r = put(map[string]any{"query_model_connection_id": nil})
+	if r["_status"] != float64(200) || r["query_model_connection_id"] != nil || r["context_placement"] != "before_last_user" {
+		t.Errorf("null did not clear the query model alone: %v", r)
+	}
+	if del = e.call("DELETE", fmt.Sprintf("/admin/api/models/%d", queryConn), nil, ""); del["_status"] != float64(200) {
+		t.Errorf("delete after release: %v", del)
+	}
+}
+
+// countingEmbeddings fronts an upstream and counts the embedding calls that
+// pass through it, which is how the retrieval policy tests prove that
+// retrieval did or did not happen.
+func countingEmbeddings(t *testing.T, backend *httptest.Server, n *atomic.Int64) *httptest.Server {
+	t.Helper()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/embeddings" {
+			n.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(front.Close)
+	return front
+}
+
+// TestRetrievalPolicyEndToEnd drives ADR-024's retrieval decision through the
+// whole stack: the admin API sets the policy, the gateway acts on it, and the
+// request log, the metric and the response headers all say why.
+func TestRetrievalPolicyEndToEnd(t *testing.T) {
+	backend := mockUpstream(t)
+	defer backend.Close()
+	var embeds atomic.Int64
+	up := countingEmbeddings(t, backend, &embeds)
+
+	e := newEnv(t, testdb.Config(t))
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	connID := int64(conn["id"].(float64))
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 1}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+	doc := e.upload(storeID, "fruits.md", "# Banana\n\nBananas are yellow and soft. They grow in bunches in tropical regions.")
+	if doc["_status"] != float64(202) {
+		t.Fatalf("upload: %v", doc)
+	}
+	e.waitReady(int64(doc["id"].(float64)))
+
+	created := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID,
+		"rag_store_id": storeID, "retrieval_policy": "auto"}, "")
+	if created["_status"] != float64(201) {
+		t.Fatalf("create project: %v", created)
+	}
+	apiKey := created["api_key"].(string)
+	projID := int64(created["project"].(map[string]any)["id"].(float64))
+
+	msg := func(content string) []map[string]any { return []map[string]any{{"role": "user", "content": content}} }
+	// chat posts a body and returns the status, the headers and the answer the
+	// mock upstream gave, which echoes the system prompt it received.
+	chat := func(body map[string]any) (int, http.Header, string) {
+		t.Helper()
+		out, h := e.callRaw("POST", "/v1/chat/completions", body, apiKey)
+		content := ""
+		if ch, ok := out["choices"].([]any); ok && len(ch) > 0 {
+			content, _ = ch[0].(map[string]any)["message"].(map[string]any)["content"].(string)
+		}
+		return int(out["_status"].(float64)), h, content
+	}
+	// skipped runs one chat and checks whether retrieval ran.
+	check := func(name string, body map[string]any, wantSkip string) {
+		t.Helper()
+		before := embeds.Load()
+		status, h, content := chat(body)
+		ran := embeds.Load() - before
+		if status != 200 {
+			t.Errorf("%s: status %d", name, status)
+			return
+		}
+		if got := h.Get("x-ragmux-rag-skip"); got != wantSkip {
+			t.Errorf("%s: x-ragmux-rag-skip = %q, want %q", name, got, wantSkip)
+		}
+		if wantSkip == "" {
+			if ran != 1 || h.Get("x-ragmux-rag-hits") != "1" || !strings.Contains(content, "Bananas are yellow") {
+				t.Errorf("%s: retrieval should have run: embeds %d hits %q content %q", name, ran, h.Get("x-ragmux-rag-hits"), content)
+			}
+			return
+		}
+		if ran != 0 || h.Get("x-ragmux-rag-hits") != "0" || strings.Contains(content, "Bananas are yellow") {
+			t.Errorf("%s: retrieval should have been skipped: embeds %d hits %q content %q", name, ran, h.Get("x-ragmux-rag-hits"), content)
+		}
+	}
+
+	// auto: small talk is skipped, a question is not.
+	check("question", map[string]any{"messages": msg("What color is a banana?")}, "")
+	for text, want := range map[string]string{"merhaba": "greeting", "Teşekkürler!": "greeting", "thanks": "greeting",
+		"ok": "ack", "İYİ GÜNLER": "greeting"} {
+		check("auto "+text, map[string]any{"messages": msg(text)}, want)
+	}
+	// A question asked again is retrieved again (ADR-024).
+	check("repeated question", map[string]any{"messages": []map[string]any{
+		{"role": "user", "content": "What color is a banana?"}, {"role": "assistant", "content": "Yellow."},
+		{"role": "user", "content": "what color is a banana"}}}, "")
+
+	// A tool result as the last message skips retrieval under any policy.
+	toolTurn := []map[string]any{{"role": "user", "content": "What color is a banana?"},
+		{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{"id": "c1", "type": "function",
+			"function": map[string]any{"name": "lookup", "arguments": "{}"}}}},
+		{"role": "tool", "tool_call_id": "c1", "content": "yellow"}}
+	check("tool turn, auto", map[string]any{"messages": toolTurn}, "tool_turn")
+
+	// The request can close retrieval for one turn.
+	check("client off", map[string]any{"messages": msg("What color is a banana?"), "ragmux": map[string]any{"retrieval": "off"}}, "client_off")
+
+	// always: nothing is skipped but tool turns and the client's "off".
+	put := func(policy string) {
+		t.Helper()
+		r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d", projID), map[string]any{"name": "app",
+			"model_connection_id": connID, "rag_store_id": storeID, "retrieval_policy": policy}, "")
+		if r["_status"] != float64(200) || r["retrieval_policy"] != policy {
+			t.Fatalf("set policy %s: %v", policy, r)
+		}
+	}
+	put("always")
+	check("always, greeting", map[string]any{"messages": msg("merhaba")}, "")
+	check("tool turn, always", map[string]any{"messages": toolTurn}, "tool_turn")
+	check("client off, always", map[string]any{"messages": msg("What color is a banana?"), "ragmux": map[string]any{"retrieval": "off"}}, "client_off")
+
+	// off: the client's "always" does not reopen it.
+	put("off")
+	check("policy off", map[string]any{"messages": msg("What color is a banana?")}, "policy_off")
+	status, h, _ := chat(map[string]any{"messages": msg("What color is a banana?"), "ragmux": map[string]any{"retrieval": "always"}})
+	if status != 200 || h.Get("x-ragmux-rag-skip") != "policy_off" || h.Get("x-ragmux-rag-hits") != "0" {
+		t.Errorf("client always on an off project: status %d headers %v", status, h)
+	}
+	if w := h.Values("Warning"); len(w) != 1 || !strings.HasPrefix(w[0], `299 ragmux "`) {
+		t.Errorf("client always on an off project: Warning = %q", w)
+	}
+
+	// The ragmux object: unusable ones are refused, unknown fields warned about.
+	put("always")
+	for _, raw := range []string{`"x"`, `7`, `[]`, `null`} {
+		before := embeds.Load()
+		out, _ := e.callRaw("POST", "/v1/chat/completions", json.RawMessage(
+			`{"messages":[{"role":"user","content":"What color is a banana?"}],"ragmux":`+raw+`}`), apiKey)
+		errObj, _ := out["error"].(map[string]any)
+		if out["_status"] != float64(400) || errObj["code"] != "invalid_ragmux" || errObj["type"] != "invalid_request_error" || embeds.Load() != before {
+			t.Errorf("ragmux=%s: %v (embeds +%d)", raw, out, embeds.Load()-before)
+		}
+	}
+	for name, ext := range map[string]map[string]any{"retrieval always": {"retrieval": "always"}, "unknown": {"foo": 1}} {
+		before := embeds.Load()
+		status, h, _ := chat(map[string]any{"messages": msg("What color is a banana?"), "ragmux": ext})
+		if status != 200 || len(h.Values("Warning")) != 1 || !strings.HasPrefix(h.Get("Warning"), `299 ragmux "`) ||
+			h.Get("x-ragmux-rag-skip") != "" || embeds.Load()-before != 1 {
+			t.Errorf("%s: status %d Warning %q skip %q embeds +%d", name, status, h.Values("Warning"), h.Get("x-ragmux-rag-skip"), embeds.Load()-before)
+		}
+	}
+
+	// Every skip is on the request log as a member of the closed set.
+	wantReasons := map[string]int{"greeting": 4, "ack": 1, "tool_turn": 2, "client_off": 2, "policy_off": 2}
+	deadline := time.Now().Add(5 * time.Second)
+	var got map[string]int
+	for time.Now().Before(deadline) {
+		got = map[string]int{}
+		rows, err := e.store.DB().Query(context.Background(),
+			`SELECT rag_skip_reason, count(*) FROM request_logs WHERE project_id = $1 AND rag_skip_reason IS NOT NULL GROUP BY 1`, projID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var reason string
+			var n int
+			if err := rows.Scan(&reason, &n); err != nil {
+				t.Fatal(err)
+			}
+			got[reason] = n
+		}
+		rows.Close()
+		if fmt.Sprint(got) == fmt.Sprint(wantReasons) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(wantReasons) {
+		t.Errorf("request_logs.rag_skip_reason counts = %v, want %v", got, wantReasons)
+	}
+	var withReasonButRan int
+	if err := e.store.DB().QueryRow(context.Background(),
+		`SELECT count(*) FROM request_logs WHERE project_id = $1 AND rag_skip_reason IS NOT NULL AND (rag_used OR rag_hits > 0)`, projID).
+		Scan(&withReasonButRan); err != nil || withReasonButRan != 0 {
+		t.Errorf("rows with a skip reason that also used RAG: %d, %v", withReasonButRan, err)
+	}
+
+	// The metric carries the same closed set and nothing else.
+	text := e.registry.Text()
+	for reason, n := range wantReasons {
+		want := fmt.Sprintf(`ragmux_rag_skipped_total{project="%d",reason="%s"} %d`, projID, reason, n)
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics lack %s", want)
+		}
+	}
+	if n := seriesWithPrefix(text, "ragmux_rag_skipped_total{"); n != len(wantReasons) {
+		t.Errorf("ragmux_rag_skipped_total has %d series, want %d:\n%s", n, len(wantReasons), grepLines(text, "ragmux_rag_skipped_total"))
+	}
+}
+
+// condenseUpstream fronts the mock upstream and plays the query model: a chat
+// call whose prompt is a query condense (it carries "standalone search query")
+// is answered here -- with reply and a 21/4 usage, or a 500 when failing --
+// and everything else is passed to the backend. It keeps the ordered log of
+// what it saw, which is how a test proves the order of the calls and what the
+// embedding was asked for.
+type condenseUpstream struct {
+	*httptest.Server
+	reply   string
+	failing atomic.Bool
+	mu      sync.Mutex
+	events  []string
+}
+
+// condenseFailureBody is what the failing query model answers with.
+const condenseFailureBody = `{"error":{"message":"SECRET-CONDENSE-FAILURE-BODY"}}`
+
+func newCondenseUpstream(t *testing.T, backend *httptest.Server, reply string) *condenseUpstream {
+	t.Helper()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	c := &condenseUpstream{reply: reply}
+	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		switch {
+		case r.URL.Path == "/v1/embeddings":
+			var req struct {
+				Input []string `json:"input"`
+			}
+			_ = json.Unmarshal(body, &req)
+			c.note("embed:" + strings.Join(req.Input, "|"))
+		case r.URL.Path == "/v1/chat/completions" && bytes.Contains(body, []byte("standalone search query")):
+			c.note("condense")
+			if c.failing.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(condenseFailureBody))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "q", "model": "mock-model",
+				"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": c.reply}, "finish_reason": "stop"}},
+				"usage":   map[string]int{"prompt_tokens": 21, "completion_tokens": 4}})
+			return
+		case r.URL.Path == "/v1/chat/completions":
+			c.note("chat")
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(c.Close)
+	return c
+}
+
+func (c *condenseUpstream) note(ev string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, ev)
+}
+
+// take returns the events since the last call and forgets them.
+func (c *condenseUpstream) take() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.events
+	c.events = nil
+	return out
+}
+
+// syncBuffer is a log sink the server goroutines and the test share.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestQueryCondenseEndToEnd drives query_strategy "condense" (ADR-024) through
+// the whole stack: the admin API sets it, the gateway calls the query model
+// before the embedding, the embedding carries the model's output, and the
+// request log shows the side call's tokens. A query model that fails costs the
+// request nothing: it completes on the last user message and a warn line says
+// why.
+func TestQueryCondenseEndToEnd(t *testing.T) {
+	backend := mockUpstream(t)
+	defer backend.Close()
+	up := newCondenseUpstream(t, backend, "What color is a banana?")
+	logs := &syncBuffer{}
+
+	e := newEnvOpts(t, testdb.Config(t), envOpts{bootstrap: true, gwTune: func(g *gateway.Gateway) {
+		g.Log = slog.New(slog.NewTextHandler(logs, nil))
+	}})
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	connID := int64(conn["id"].(float64))
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 1}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+	doc := e.upload(storeID, "fruits.md", "# Banana\n\nBananas are yellow and soft. They grow in bunches in tropical regions.")
+	if doc["_status"] != float64(202) {
+		t.Fatalf("upload: %v", doc)
+	}
+	e.waitReady(int64(doc["id"].(float64)))
+	up.take() // the ingestion's embedding calls
+
+	created := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID,
+		"rag_store_id": storeID, "query_strategy": "condense", "history_turns_for_query": 2}, "")
+	if created["_status"] != float64(201) || created["project"].(map[string]any)["query_strategy"] != "condense" {
+		t.Fatalf("create project: %v", created)
+	}
+	apiKey := created["api_key"].(string)
+	projID := int64(created["project"].(map[string]any)["id"].(float64))
+
+	followUp := []map[string]any{{"role": "user", "content": "Tell me about bananas"},
+		{"role": "assistant", "content": "Bananas are a fruit."}, {"role": "user", "content": "and the color?"}}
+	chat := func(msgs []map[string]any) (int, http.Header, string) {
+		t.Helper()
+		out, h := e.callRaw("POST", "/v1/chat/completions", map[string]any{"messages": msgs}, apiKey)
+		content := ""
+		if ch, ok := out["choices"].([]any); ok && len(ch) > 0 {
+			content, _ = ch[0].(map[string]any)["message"].(map[string]any)["content"].(string)
+		}
+		return int(out["_status"].(float64)), h, content
+	}
+	tokens := func(n int) (prompt, completion int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			err := e.store.DB().QueryRow(context.Background(),
+				`SELECT prompt_tokens, completion_tokens FROM request_logs WHERE project_id = $1 ORDER BY id OFFSET $2 LIMIT 1`,
+				projID, n-1).Scan(&prompt, &completion)
+			if err == nil {
+				return prompt, completion
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("request log row %d never appeared", n)
+		return 0, 0
+	}
+
+	// 1. The condense call goes first, the embedding carries its output, and
+	// the answer is generated from the retrieved passage.
+	status, h, content := chat(followUp)
+	if want := "condense,embed:What color is a banana?,chat"; status != 200 || strings.Join(up.take(), ",") != want {
+		t.Errorf("status %d; upstream order differs from %s", status, want)
+	}
+	if h.Get("x-ragmux-rag-hits") != "1" || !strings.Contains(content, "Bananas are yellow") || len(h.Values("Warning")) != 0 {
+		t.Errorf("hits %q Warning %q content %q", h.Get("x-ragmux-rag-hits"), h.Values("Warning"), content)
+	}
+	// The mock answers 10 + 2 tokens; the condense call adds 21 + 4 as a side charge.
+	if p, c := tokens(1); p != 10+21 || c != 2+4 {
+		t.Errorf("request_logs tokens = %d/%d, want 31/6 (answer plus the condense call)", p, c)
+	}
+
+	// 2. One user message: nothing to condense.
+	status, _, _ = chat(followUp[:1])
+	if want := "embed:Tell me about bananas,chat"; status != 200 || strings.Join(up.take(), ",") != want {
+		t.Errorf("single message: status %d; upstream order differs from %s", status, want)
+	}
+	if p, c := tokens(2); p != 10 || c != 2 {
+		t.Errorf("single message tokens = %d/%d, want 10/2", p, c)
+	}
+
+	// 3. A query model that fails: the request completes on the last user
+	// message, and the warn line carries no text of the conversation or of the
+	// failure.
+	up.failing.Store(true)
+	status, h, content = chat(followUp)
+	if want := "condense,embed:and the color?,chat"; status != 200 || strings.Join(up.take(), ",") != want {
+		t.Errorf("failing model: status %d; upstream order differs from %s", status, want)
+	}
+	if h.Get("x-ragmux-rag-hits") != "1" || !strings.Contains(content, "Bananas are yellow") || len(h.Values("Warning")) != 0 {
+		t.Errorf("failing model: hits %q Warning %q content %q", h.Get("x-ragmux-rag-hits"), h.Values("Warning"), content)
+	}
+	if p, c := tokens(3); p != 10 || c != 2 {
+		t.Errorf("failing model tokens = %d/%d, want 10/2 (the failed call reported none)", p, c)
+	}
+	log := logs.String()
+	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "query condense failed") || !strings.Contains(log, "outcome=error") {
+		t.Errorf("no warn log for the failed condense:\n%s", log)
+	}
+	for _, banned := range []string{"SECRET-CONDENSE-FAILURE-BODY", "and the color", "Tell me about bananas"} {
+		if strings.Contains(log, banned) {
+			t.Errorf("the log carries %q (PRD rule 10):\n%s", banned, log)
+		}
+	}
+	text := e.registry.Text()
+	for _, want := range []string{`ragmux_rag_query_condense_total{outcome="ok"} 1`, `ragmux_rag_query_condense_total{outcome="error"} 1`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics lack %s:\n%s", want, grepLines(text, "ragmux_rag_query_condense"))
+		}
+	}
+	if n := seriesWithPrefix(text, "ragmux_rag_query_condense_total{"); n != 2 {
+		t.Errorf("%d condense series, want 2:\n%s", n, grepLines(text, "ragmux_rag_query_condense"))
+	}
+	up.failing.Store(false)
+
+	// 4. The auto policy skips an ack on last_user and condenses it on condense.
+	put := func(fields map[string]any) {
+		t.Helper()
+		body := map[string]any{"name": "app", "model_connection_id": connID, "rag_store_id": storeID}
+		for k, v := range fields {
+			body[k] = v
+		}
+		r := e.call("PUT", fmt.Sprintf("/admin/api/projects/%d", projID), body, "")
+		if r["_status"] != float64(200) {
+			t.Fatalf("update project: %v", r)
+		}
+	}
+	ack := []map[string]any{{"role": "user", "content": "Tell me about bananas"},
+		{"role": "assistant", "content": "Want to know the color?"}, {"role": "user", "content": "evet"}}
+	put(map[string]any{"retrieval_policy": "auto"}) // query_strategy stays condense
+	status, h, _ = chat(ack)
+	if want := "condense,embed:What color is a banana?,chat"; status != 200 || h.Get("x-ragmux-rag-skip") != "" || strings.Join(up.take(), ",") != want {
+		t.Errorf("auto + condense: status %d skip %q; upstream order differs from %s", status, h.Get("x-ragmux-rag-skip"), want)
+	}
+	put(map[string]any{"query_strategy": "last_user"})
+	status, h, _ = chat(ack)
+	if status != 200 || h.Get("x-ragmux-rag-skip") != "ack" || strings.Join(up.take(), ",") != "chat" {
+		t.Errorf("auto + last_user: status %d skip %q", status, h.Get("x-ragmux-rag-skip"))
+	}
+}
+
+// streamBody posts a streaming chat and returns the status, the headers and
+// the raw SSE body.
+func (e *env) streamBody(apiKey string, body map[string]any) (int, http.Header, string) {
+	e.t.Helper()
+	body["stream"] = true
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/chat/completions", bytes.NewReader(mustJSON(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, resp.Header, string(raw)
+}
+
+// dataLines are the payloads of the "data:" lines of an SSE body.
+func dataLines(body string) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			out = append(out, data)
+		}
+	}
+	return out
+}
+
+// ragmuxOf is the "ragmux" object of one SSE payload, nil when it has none.
+func ragmuxOf(t *testing.T, payload string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(payload), &m); err != nil {
+		t.Fatalf("payload %q: %v", payload, err)
+	}
+	rm, _ := m["ragmux"].(map[string]any)
+	return rm
+}
+
+// plainStreamGolden is what a project without a RAG store answers a plain
+// stream with, byte for byte: the mock upstream's three chunks, the usage
+// trailer withheld because the request did not ask for it, and [DONE]. It was
+// captured before ragmux.sources existed.
+const plainStreamGolden = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"whatever\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"SYS:\"},\"finish_reason\":null}]}\n\n" +
+	"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"whatever\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+// A streaming client gets the sources in the first chunk, so a list too long
+// for the 2 KB header still arrives whole (ADR-024).
+func TestStreamSourcesEndToEnd(t *testing.T) {
+	up := mockUpstream(t)
+	defer up.Close()
+	e := newEnv(t, testdb.Config(t))
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "mock", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "secret", "model_name": "mock-model"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	connID := int64(conn["id"].(float64))
+	const sourceCount = 30
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": connID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": sourceCount}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+
+	// Thirty sections, each too big to share a chunk with the next, in a file
+	// whose name and section titles are long enough that thirty sources
+	// cannot fit the header.
+	var doc strings.Builder
+	for i := 1; i <= sourceCount; i++ {
+		fmt.Fprintf(&doc, "# Banana varieties of the tropical orchard number %02d\n\nBananas are yellow and soft, and variety %02d ripens in bunches in warm and humid regions, where growers pick it green and let it turn yellow in storage.\n\n", i, i)
+	}
+	filename := strings.Repeat("orchard-", 8) + "bananas.md"
+	up1 := e.upload(storeID, filename, doc.String())
+	if up1["_status"] != float64(202) {
+		t.Fatalf("upload: %v", up1)
+	}
+	e.waitReady(int64(up1["id"].(float64)))
+
+	proj := e.call("POST", "/admin/api/projects", map[string]any{"name": "app", "model_connection_id": connID, "rag_store_id": storeID}, "")
+	if proj["_status"] != float64(201) {
+		t.Fatalf("create project: %v", proj)
+	}
+	apiKey := proj["api_key"].(string)
+	msgs := []map[string]string{{"role": "user", "content": "What color is a banana?"}}
+
+	// Without the opt-in the stream carries no ragmux field anywhere, and the
+	// header is capped to whole entries.
+	status, h, plain := e.streamBody(apiKey, map[string]any{"messages": msgs})
+	if status != 200 || strings.Contains(plain, "ragmux") {
+		t.Fatalf("plain stream: %d %s", status, plain)
+	}
+	var capped []map[string]any
+	header := h.Get("x-ragmux-rag-sources")
+	if len(header) > 2048 || json.Unmarshal([]byte(header), &capped) != nil || len(capped) == 0 || len(capped) >= sourceCount {
+		t.Fatalf("sources header is %d bytes, %d entries (want a capped, valid array): %.200s", len(header), len(capped), header)
+	}
+	if h.Get("x-ragmux-rag-hits") != strconv.Itoa(sourceCount) {
+		t.Fatalf("x-ragmux-rag-hits = %q, want %d", h.Get("x-ragmux-rag-hits"), sourceCount)
+	}
+
+	// sources=inline: the first data line has the whole list, no other line has
+	// the field, and the header is the same capped one.
+	status, h2, inline := e.streamBody(apiKey, map[string]any{"messages": msgs, "ragmux": map[string]any{"sources": "inline"}})
+	if status != 200 || h2.Get("x-ragmux-rag-sources") != header || len(h2.Values("Warning")) != 0 {
+		t.Fatalf("inline stream: %d headers %v", status, h2)
+	}
+	lines := dataLines(inline)
+	if len(lines) != len(dataLines(plain)) {
+		t.Fatalf("inline stream has %d data lines, plain has %d:\n%s", len(lines), len(dataLines(plain)), inline)
+	}
+	first := ragmuxOf(t, lines[0])
+	list, _ := first["sources"].([]any)
+	if len(list) != sourceCount {
+		t.Fatalf("first line has %d sources, want %d: %.300s", len(list), sourceCount, lines[0])
+	}
+	if _, ok := first["context"]; ok {
+		t.Errorf("sources=inline leaked the context")
+	}
+	for i, s := range list {
+		src := s.(map[string]any)
+		if src["filename"] != filename || src["document_id"] == nil || src["score"] == nil {
+			t.Errorf("source %d = %v", i, src)
+		}
+	}
+	for i, l := range lines[1:] {
+		if l != "[DONE]" && ragmuxOf(t, l) != nil {
+			t.Errorf("data line %d carries ragmux: %s", i+1, l)
+		}
+	}
+	// Taking the field out of the first line gives the plain stream back.
+	var firstChunk map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(lines[0]), &firstChunk)
+	delete(firstChunk, "ragmux")
+	var plainFirst map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(dataLines(plain)[0]), &plainFirst)
+	if string(mustJSON(firstChunk)) != string(mustJSON(plainFirst)) || strings.Join(lines[1:], "\n") != strings.Join(dataLines(plain)[1:], "\n") {
+		t.Errorf("inline stream differs from the plain one beyond the field:\n%s\nvs\n%s", inline, plain)
+	}
+
+	// include_context: sources and context in the same first line.
+	status, _, withCtx := e.streamBody(apiKey, map[string]any{"messages": msgs, "ragmux": map[string]any{"include_context": true}})
+	if status != 200 {
+		t.Fatalf("include_context stream: %d", status)
+	}
+	cl := dataLines(withCtx)
+	first = ragmuxOf(t, cl[0])
+	if l, _ := first["sources"].([]any); len(l) != sourceCount {
+		t.Errorf("include_context sources = %d, want %d", len(l), sourceCount)
+	}
+	if c, _ := first["context"].(string); !strings.Contains(c, "<context>") || !strings.Contains(c, "Bananas are yellow") {
+		t.Errorf("include_context context = %.200q", first["context"])
+	}
+	for i, l := range cl[1:] {
+		if l != "[DONE]" && ragmuxOf(t, l) != nil {
+			t.Errorf("include_context data line %d carries ragmux: %s", i+1, l)
+		}
+	}
+
+	// A body that is not a stream answers the same object in its JSON.
+	body := e.call("POST", "/v1/chat/completions", map[string]any{"messages": msgs, "ragmux": map[string]any{"sources": "inline"}}, apiKey)
+	if l, _ := body["ragmux"].(map[string]any)["sources"].([]any); len(l) != sourceCount {
+		t.Errorf("non-stream sources = %d, want %d", len(l), sourceCount)
+	}
+
+	// A project without a store: the plain stream is the golden one, and the
+	// opt-in earns a Warning and an empty list.
+	bare := e.call("POST", "/admin/api/projects", map[string]any{"name": "bare", "model_connection_id": connID}, "")
+	if bare["_status"] != float64(201) {
+		t.Fatalf("create bare project: %v", bare)
+	}
+	bareKey := bare["api_key"].(string)
+	req := map[string]any{"model": "whatever", "messages": msgs}
+	status, _, got := e.streamBody(bareKey, req)
+	if status != 200 || got != plainStreamGolden {
+		t.Errorf("plain stream drifted from the golden (status %d):\n%q\nwant\n%q", status, got, plainStreamGolden)
+	}
+	status, bh, got := e.streamBody(bareKey, map[string]any{"model": "whatever", "messages": msgs, "ragmux": map[string]any{"sources": "inline"}})
+	bl := dataLines(got)
+	if status != 200 || len(bl) != 3 || len(bh.Values("Warning")) != 1 {
+		t.Fatalf("bare inline stream: %d %q warnings %q", status, got, bh.Values("Warning"))
+	}
+	if rm := ragmuxOf(t, bl[0]); rm == nil || len(rm["sources"].([]any)) != 0 {
+		t.Errorf("bare inline first line = %s", bl[0])
 	}
 }

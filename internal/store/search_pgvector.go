@@ -8,7 +8,8 @@ import (
 
 // pgvectorBackend answers the lexical half with PostgreSQL's own full-text
 // search: the chunks.tsv column generated with the 'simple' configuration
-// and its GIN index. It needs no extension beyond pgvector itself, so it is
+// and its GIN index, or -- for a store with a language, once its chunks.fts is
+// built -- chunks.fts and its partial GIN index. It needs no extension beyond pgvector itself, so it is
 // always available and is what every store falls back to.
 type pgvectorBackend struct{}
 
@@ -31,19 +32,32 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 	// is not comparable across queries or configurations, so exposing it as
 	// SearchHit.LexScore would invite exactly the cross-backend comparison it
 	// cannot support.
+	args := []any{p.Vector, p.StoreID, p.Candidates, p.MaxDistance, p.FTSConfig, ftsQuery(p.Query)}
+	// The column name is interpolated, so it is one of two constants, never a
+	// value that came from outside.
+	col := tsvColumn
+	if p.FTSColumn == ftsColumn {
+		col = ftsColumn
+	}
+	first := len(args) + 1 // the filter's arguments follow the six above
+	vec, filterArgs := vectorLeg(p.VecTable, p.HalfvecDims, p.Filter, first)
+	args = append(args, filterArgs...)
+	// The lexical leg takes the same filter, on its own LIMIT: the documents
+	// the filter lets through, as a subquery of ids.
+	var lexFilter string
+	if !p.Filter.Empty() {
+		set := p.Filter.documentSet("$2", first)
+		lexFilter = `
+				  AND c.document_id IN (` + set + `)`
+	}
 	sql := fmt.Sprintf(`
 			WITH q AS (SELECT websearch_to_tsquery($5::text::regconfig, $6::text) AS query),
-			v AS (
-				SELECT e.chunk_id, ROW_NUMBER() OVER (ORDER BY e.embedding <=> $1::vector) AS rank
-				FROM %[1]s e
-				WHERE e.rag_store_id = $2
-				ORDER BY e.embedding <=> $1::vector
-				LIMIT $3),
+			%[3]s,
 			f AS (
-				SELECT c.id AS chunk_id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id) AS rank
+				SELECT c.id AS chunk_id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.%[5]s, q.query) DESC, c.id) AS rank
 				FROM chunks c, q
-				WHERE c.rag_store_id = $2 AND numnode(q.query) > 0 AND c.tsv @@ q.query
-				ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id
+				WHERE c.rag_store_id = $2 AND numnode(q.query) > 0 AND c.%[5]s @@ q.query%[4]s
+				ORDER BY ts_rank_cd(c.%[5]s, q.query) DESC, c.id
 				LIMIT $3),
 			m AS (
 				SELECT COALESCE(v.chunk_id, f.chunk_id) AS chunk_id,
@@ -59,8 +73,8 @@ func (pgvectorBackend) HybridQuery(p SearchParams) (string, []any) {
 			JOIN %[1]s e ON e.chunk_id = m.chunk_id
 			WHERE ($4::float8 = 0 OR (e.embedding <=> $1::vector) <= $4::float8)
 			ORDER BY m.score DESC, distance, m.chunk_id
-			LIMIT $3`, p.VecTable, rrfK)
-	return sql, []any{p.Vector, p.StoreID, p.Candidates, p.MaxDistance, p.FTSConfig, ftsQuery(p.Query)}
+			LIMIT $3`, p.VecTable, rrfK, vec, lexFilter, col)
+	return sql, args
 }
 
 // ftsQuery prepares free text for websearch_to_tsquery. That function ANDs

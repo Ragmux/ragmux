@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -310,5 +311,117 @@ func TestRerankThroughChatModel(t *testing.T) {
 	row, found := e.logRow(hdr.Get("X-Request-Id"))
 	if !found || row.endpoint != "rerank" || row.promptTokens != 30 || row.completionTokens != 4 || row.modelName != "rank-model" {
 		t.Errorf("log row: %+v found=%v", row, found)
+	}
+}
+
+// The rerank_backend and rerank_connection_id overrides on the admin search
+// choose which upstream receives the store's chunk text, so they are open only
+// to callers who may edit the store. A viewer (or a management key without the
+// write scope) searches with the store's saved connection; the override is
+// ignored and reported in a Warning header and in the response, not rejected.
+func TestAdminSearchRerankOverrideNeedsEditor(t *testing.T) {
+	var callsSaved, callsOther atomic.Int64
+	upSaved, upOther := rerankChatUpstream(&callsSaved), rerankChatUpstream(&callsOther)
+	defer upSaved.Close()
+	defer upOther.Close()
+	emb := mockUpstream(t)
+	defer emb.Close()
+	e := newEnv(t, testdb.Config(t))
+
+	mk := func(name, url, model string) int64 {
+		c := e.call("POST", "/admin/api/models", map[string]any{"name": name, "provider_type": "custom_openai",
+			"base_url": url + "/v1", "api_key": "k", "model_name": model}, "")
+		if c["_status"] != float64(201) {
+			t.Fatalf("connection %s: %v", name, c)
+		}
+		return int64(c["id"].(float64))
+	}
+	embID := mk("embed", emb.URL, "embed-model")
+	saved, other := mk("saved", upSaved.URL, "model-saved"), mk("other", upOther.URL, "model-other")
+	rs := e.call("POST", "/admin/api/rag-stores", map[string]any{"name": "fruit", "embedding_connection_id": embID,
+		"chunk_size": 200, "chunk_overlap": 0, "top_k": 2, "rerank": true, "rerank_connection_id": saved}, "")
+	if rs["_status"] != float64(201) {
+		t.Fatalf("create store: %v", rs)
+	}
+	storeID := int64(rs["id"].(float64))
+	doc := e.upload(storeID, "fruits.md", "# Apple\n\nApples are red and crunchy. They grow on trees in temperate climates and store well.\n\n# Banana\n\nBananas are yellow and soft. They grow in bunches in tropical regions and ripen fast.\n\n# Cherry\n\nCherries are small and sweet. They are harvested in early summer and eaten fresh.")
+	e.waitReady(int64(doc["id"].(float64)))
+
+	e.call("POST", "/admin/api/users", map[string]any{"username": "vw", "password": "viewer-pass-1", "role": "viewer"}, "")
+	e.call("POST", "/admin/api/users", map[string]any{"username": "ed", "password": "editor-pass-1", "role": "editor"}, "")
+	viewer, editor := e.login("vw", "viewer-pass-1"), e.login("ed", "editor-pass-1")
+	keyN := 0
+	mgmtKey := func(scopes ...string) string {
+		keyN++
+		k := e.call("POST", "/admin/api/keys", map[string]any{"kind": "management", "name": fmt.Sprintf("k%d", keyN), "scopes": scopes}, "")
+		if k["_status"] != float64(201) {
+			t.Fatalf("management key: %v", k)
+		}
+		return k["api_key"].(string)
+	}
+	path := fmt.Sprintf("/admin/api/rag-stores/%d/search", storeID)
+	reset := func() { callsSaved.Store(0); callsOther.Store(0) }
+
+	ignored := map[string]struct {
+		bearer string
+		body   map[string]any
+		fields []any
+	}{
+		"viewer connection":     {viewer, map[string]any{"rerank_connection_id": other}, []any{"rerank_connection_id"}},
+		"viewer backend":        {viewer, map[string]any{"rerank_backend": "cohere"}, []any{"rerank_backend"}},
+		"viewer clear":          {viewer, map[string]any{"rerank_connection_id": 0}, []any{"rerank_connection_id"}},
+		"viewer both":           {viewer, map[string]any{"rerank_backend": "llm", "rerank_connection_id": other}, []any{"rerank_backend", "rerank_connection_id"}},
+		"viewer bogus value":    {viewer, map[string]any{"rerank_backend": "nope", "rerank_connection_id": 99999}, []any{"rerank_backend", "rerank_connection_id"}},
+		"read-only key":         {mgmtKey("read"), map[string]any{"rerank_connection_id": other}, []any{"rerank_connection_id"}},
+		"admin owner, read key": {mgmtKey("read"), map[string]any{"rerank_backend": "llm", "rerank_connection_id": other}, []any{"rerank_backend", "rerank_connection_id"}},
+	}
+	for name, c := range ignored {
+		reset()
+		c.body["query"] = "tell me about fruit"
+		res, hdr := e.callRaw("POST", path, c.body, c.bearer)
+		if res["_status"] != float64(200) || res["reranked"] != true || res["rerank_skipped"] != false {
+			t.Errorf("%s: search: %v", name, res)
+			continue
+		}
+		if callsSaved.Load() != 1 || callsOther.Load() != 0 {
+			t.Errorf("%s: saved=%d other=%d, want only the saved connection", name, callsSaved.Load(), callsOther.Load())
+		}
+		if w := hdr.Values("Warning"); len(w) != 1 || !strings.HasPrefix(w[0], `299 ragmux "`) || !strings.Contains(w[0], "ignored") {
+			t.Errorf("%s: Warning header = %q", name, w)
+		}
+		if got, _ := res["rerank_overrides_ignored"].([]any); fmt.Sprint(got) != fmt.Sprint(c.fields) {
+			t.Errorf("%s: rerank_overrides_ignored = %v, want %v", name, res["rerank_overrides_ignored"], c.fields)
+		}
+	}
+
+	// No override, no noise: a viewer's plain search uses the saved connection
+	// and carries no Warning.
+	reset()
+	res, hdr := e.callRaw("POST", path, map[string]any{"query": "tell me about fruit"}, viewer)
+	if res["_status"] != float64(200) || callsSaved.Load() != 1 || callsOther.Load() != 0 || len(hdr.Values("Warning")) != 0 {
+		t.Errorf("viewer plain search: %v saved=%d other=%d warning=%q", res, callsSaved.Load(), callsOther.Load(), hdr.Values("Warning"))
+	}
+	if got, _ := res["rerank_overrides_ignored"].([]any); len(got) != 0 {
+		t.Errorf("viewer plain search reported ignored overrides: %v", got)
+	}
+
+	// Callers who can edit the store keep the override.
+	for name, bearer := range map[string]string{"editor": editor, "admin": "", "key with write scope": mgmtKey("read", "write")} {
+		reset()
+		res, hdr := e.callRaw("POST", path, map[string]any{"query": "tell me about fruit", "rerank_connection_id": other}, bearer)
+		if res["_status"] != float64(200) || res["reranked"] != true {
+			t.Errorf("%s: search: %v", name, res)
+			continue
+		}
+		if callsOther.Load() != 1 || callsSaved.Load() != 0 {
+			t.Errorf("%s: saved=%d other=%d, want the override used", name, callsSaved.Load(), callsOther.Load())
+		}
+		if len(hdr.Values("Warning")) != 0 {
+			t.Errorf("%s: unexpected Warning %q", name, hdr.Values("Warning"))
+		}
+	}
+	// An editor's invalid override is still a 400: validation applies to those who may override.
+	if r := e.call("POST", path, map[string]any{"query": "q", "rerank_backend": "nope"}, editor); r["_status"] != float64(400) {
+		t.Errorf("editor with a bad rerank_backend: %v", r)
 	}
 }
