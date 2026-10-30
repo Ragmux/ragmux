@@ -6,6 +6,12 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Light theme for the dashboard.** The dashboard follows the system colour scheme by default,
+  and a theme button in the sidebar switches between system, light and dark; the choice is saved
+  in the browser. The dark theme is unchanged. See [Dashboard](docs/dashboard.md).
+
 ## [0.6.0] - 2026-10-30
 
 ### Added

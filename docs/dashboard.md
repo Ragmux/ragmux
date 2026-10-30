@@ -48,6 +48,12 @@ form; afterwards a sign-in screen that reports remaining attempts and lockouts. 
 What a user sees follows their role: viewers get read-only screens, editors the forms,
 admins the user and audit screens. The page ships its own fonts (Bricolage Grotesque,
 IBM Plex Sans, JetBrains Mono, all SIL OFL, `web/fonts/`) and runs under a strict
-`Content-Security-Policy`, so it makes no third-party requests. The dashboard has a dark theme only;
-there is no light theme.
+`Content-Security-Policy`, so it makes no third-party requests.
+
+**Theme.** The dashboard has a dark and a light theme and follows the operating system's
+`prefers-color-scheme` by default. The theme button at the bottom of the sidebar cycles
+system, light and dark; the choice is kept in this browser's `localStorage` under
+`ragmux.theme` (`system`, `light` or `dark`) and also applies to the sign-in screen. While the
+setting is `system`, the page follows an operating-system change live. If the browser blocks
+`localStorage`, the page still works and the choice lasts until the page is reloaded.
 
