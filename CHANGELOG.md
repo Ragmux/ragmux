@@ -133,6 +133,9 @@ All notable changes to Ragmux are documented here. The format follows
   `govulncheck`).
 - **Go 1.27.3.** The minimum Go version moves from 1.27.2 to 1.27.3, picking up the fix for a
   reachable vulnerability in `crypto/x509` (GO-2026-6809, reported by `govulncheck`).
+- **`golang.org/x/net` v0.62.0.** `x/net` moves from v0.61.0 to v0.62.0, picking up the fix for
+  a reachable vulnerability in `x/net/html`, which the HTML extractor calls (GO-2026-6860,
+  reported by `govulncheck`).
 - **Dashboard search no longer lets a viewer pick the rerank connection.** `POST
   /admin/api/rag-stores/{id}/search` is open to the `viewer` role, and its `rerank_connection_id`
   and `rerank_backend` overrides replaced the store's settings, so a viewer could send the
