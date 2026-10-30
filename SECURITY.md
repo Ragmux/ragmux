@@ -7,7 +7,7 @@ taken seriously. Thank you for helping keep it safe.
 
 | Version | Supported |
 |---|---|
-| 0.5.0 (latest release) | Yes |
+| 0.6.0 (latest release) | Yes |
 | Older versions | No |
 
 Ragmux is at 0.y.z: only the latest release receives security fixes, and older lines are
