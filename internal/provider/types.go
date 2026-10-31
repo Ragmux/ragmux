@@ -27,6 +27,19 @@ type Message struct {
 	// (stripGatewayExtensions), because an upstream that validates its input
 	// would reject the unknown field.
 	IsError bool `json:"ragmux_is_error,omitempty"`
+	// Thinking is the gateway's extension carrying the thinking blocks an
+	// earlier assistant turn produced (ragmux_thinking), so the next request
+	// can hand them back. It stays raw: a malformed value must surface as the
+	// gateway's own invalid_ragmux_thinking error (ValidateRequestThinking),
+	// not as a decode failure of the whole request. Only the Anthropic
+	// adapter acts on it; every other adapter strips it.
+	Thinking json.RawMessage `json:"ragmux_thinking,omitempty"`
+	// ReasoningContent is the OpenAI-compatible ecosystem's field for the
+	// reasoning text of an assistant turn (DeepSeek and others). It is raw
+	// for the same reason as every other pass-through field: the gateway
+	// forwards it to OpenAI-compatible upstreams as the client sent it and
+	// judges nothing. The adapters that translate the request drop it.
+	ReasoningContent json.RawMessage `json:"reasoning_content,omitempty"`
 }
 
 // Text extracts plain text from a string or parts-array content.
@@ -72,8 +85,10 @@ const toolCallSignatureField = "ragmux_signature"
 // stripGatewayExtensions returns msgs with the gateway's own message
 // extensions removed, for upstreams that speak the OpenAI wire format and
 // were never meant to see them: the signature on an assistant tool call
-// (toolCallSignatureField) and the error flag on a tool message
-// (Message.IsError). The caller's slice is left alone: a fallback may still
+// (toolCallSignatureField), the error flag on a tool message
+// (Message.IsError) and the thinking blocks (Message.Thinking).
+// reasoning_content is not one of them: it is the OpenAI-compatible
+// ecosystem's own field and goes through as sent. The caller's slice is left alone: a fallback may still
 // hand the same request to a provider that does want them. A tool_calls
 // value that does not decode is passed through untouched; the upstream
 // judges it as it would without the gateway.
@@ -89,6 +104,9 @@ func stripGatewayExtensions(msgs []Message) []Message {
 	for i, m := range msgs {
 		if m.IsError {
 			own()[i].IsError = false
+		}
+		if len(m.Thinking) > 0 {
+			own()[i].Thinking = nil
 		}
 		if len(m.ToolCalls) == 0 {
 			continue
@@ -142,6 +160,13 @@ type ChatRequest struct {
 	ResponseFormat   json.RawMessage `json:"response_format,omitempty"`
 	StreamOptions    json.RawMessage `json:"stream_options,omitempty"`
 	User             string          `json:"user,omitempty"`
+	// RAGActive is set by the gateway when retrieval may have changed the
+	// prompt of this conversation: the project has a store and its
+	// retrieval policy is not off, whatever the client sent for this request
+	// (an earlier turn may have had context injected). The Anthropic adapter
+	// reads it to drop replayed thinking blocks on models that bind them to
+	// the prompt prefix. It never goes on the wire or into a client payload.
+	RAGActive bool `json:"-"`
 	// Extra holds unknown client fields; it is merged into the wire object by
 	// MarshalJSON and must never be serialised as a field itself.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -224,6 +249,28 @@ func (r ChatRequest) IncludeUsage() bool {
 		return false
 	}
 	return o.IncludeUsage
+}
+
+// ReasoningEffort returns the client's reasoning_effort and whether one was
+// set. It lives in Extra because OpenAI-compatible upstreams take it as sent;
+// only the adapters that translate it into a provider's own thinking setting
+// read it. null and "" count as not set. A value that is not a string comes
+// back as its JSON text, which no effort level matches, so the translating
+// adapters reject it like any other unknown value.
+func (r ChatRequest) ReasoningEffort() (string, bool) {
+	raw, ok := r.Extra["reasoning_effort"]
+	if !ok {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, s != ""
+	}
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return "", false
+	}
+	return t, true
 }
 
 // StopSequences normalises the stop field into a slice.
@@ -344,6 +391,12 @@ type ResponseMessage struct {
 	// annotations are citations (web search) attached to the content.
 	Refusal     *string         `json:"refusal,omitempty"`
 	Annotations json.RawMessage `json:"annotations,omitempty"`
+	// ReasoningContent is the reasoning text an OpenAI-compatible upstream
+	// returned (DeepSeek and others), relayed as sent.
+	ReasoningContent *string `json:"reasoning_content,omitempty"`
+	// Thinking is ragmux_thinking: the thinking the model produced, as
+	// Anthropic-shaped blocks, whichever provider answered.
+	Thinking []ThinkingBlock `json:"ragmux_thinking,omitempty"`
 }
 
 // ChatResponse is the OpenAI non-streaming response.
@@ -368,6 +421,11 @@ type Delta struct {
 	// fields of the same name.
 	Refusal     *string         `json:"refusal,omitempty"`
 	Annotations json.RawMessage `json:"annotations,omitempty"`
+	// ReasoningContent and Thinking are the streaming halves of the
+	// ResponseMessage fields of the same name. Thinking entries are partial:
+	// a client merges them by Index.
+	ReasoningContent *string         `json:"reasoning_content,omitempty"`
+	Thinking         []ThinkingBlock `json:"ragmux_thinking,omitempty"`
 }
 
 // StreamChoice is one streaming choice.

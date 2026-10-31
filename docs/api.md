@@ -1045,6 +1045,96 @@ relayed as it comes, and some send frames of their own with an empty `choices` a
 Azure's content-filter chunk, a proxy's keep-alive. Ragmux does not drop those: they
 carry information it does not own. Guard the array before indexing it.
 
+**Reasoning and thinking.** `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`; `max` is Ragmux's addition to OpenAI's set) is translated into each
+provider's own thinking setting, and the thinking a model produces comes back in one field
+whichever provider answered. Which setting a model takes is decided per model
+([Model-level capabilities](providers.md#model-level-capabilities)); the tables are in
+[Reasoning effort](providers.md#reasoning-effort).
+
+- **Not sent, nothing sent.** Without `reasoning_effort` no thinking setting is sent and the
+  model's own default applies.
+- **An unknown value is `400`** (`code: "invalid_reasoning_effort"`) on `anthropic`, `gemini`
+  and `ollama`, because the gateway translates the field itself and a typo (`"hgih"`) would
+  otherwise run silently at the provider's default. OpenAI-compatible and Azure connections
+  relay the field as sent and the upstream judges it.
+- **A model without thinking** (a Claude 3.5, Gemini 2.0, ...) is not an error: the field is
+  dropped and the response carries a `Warning`. The same goes for the value the model cannot
+  take (`xhigh` on a model without it is the next level down; `none` on a model that cannot
+  switch thinking off is the lowest effort), and for `temperature`, which Anthropic does not
+  accept while thinking is on and is therefore left out.
+- **`max_tokens`.** On Anthropic a thinking budget has to fit under `max_tokens`, so the
+  gateway adjusts it: with no `max_tokens` it sends the budget plus 4096 (budget models) or
+  16000 at `high` and above (adaptive models); a budget at or above the client's own
+  `max_tokens` is lowered to leave 1024 tokens for the answer, and below that thinking is
+  dropped with a `Warning`. On Gemini and Ollama the output limit covers thinking as well
+  and is left as the client set it.
+
+`ragmux_thinking` carries the thinking as Anthropic-shaped blocks, in a non-streaming
+`choices[].message` and in the streaming `choices[].delta`:
+
+```json
+"message": {"role": "assistant", "content": "...",
+  "ragmux_thinking": [
+    {"type": "thinking", "thinking": "…", "signature": "EuYBCkYI…"},
+    {"type": "redacted_thinking", "data": "EmwKAhgB…"}]}
+```
+
+In a stream the entries are partial updates, and a client merges them by `index` the way it
+accumulates `tool_calls`: text arrives in `thinking`, the `signature` arrives last for its
+block, and a `redacted_thinking` block arrives whole.
+
+```json
+{"delta": {"ragmux_thinking": [{"index": 0, "type": "thinking", "thinking": "The user "}]}}
+{"delta": {"ragmux_thinking": [{"index": 0, "type": "thinking", "signature": "EuYBCkYI…"}]}}
+```
+
+- The blocks are always sent when the model produced thinking; there is no opt-in, because a
+  tool round on Anthropic fails unless the client can hand them back. OpenAI SDKs ignore the
+  unknown field. Claude 5 returns the thinking text omitted: `thinking` is then empty or
+  absent and the `signature` carries the block. The gateway does not log thinking.
+- **Gemini** thought summaries and **Ollama** `message.thinking` become unsigned `thinking`
+  blocks. Gemini only returns thoughts when `reasoning_effort` is set. Gemini's own
+  signatures stay in `ragmux_signature` on the tool calls.
+- **OpenAI-compatible** upstreams: `reasoning_content` is relayed as the upstream sent it, and
+  also written as an unsigned `thinking` block, so a client can read one field everywhere.
+  A `reasoning_content` on an assistant message of the request is forwarded to these
+  connections as sent; the adapters that translate the request (Anthropic, Gemini, Ollama)
+  drop it and the response carries a `Warning`.
+
+**Sending thinking back.** Put the `ragmux_thinking` the response gave you on the same
+assistant message of the next request, unchanged, together with its `tool_calls`. On
+Anthropic the signed blocks (`thinking` with a `signature`, `redacted_thinking` with
+`data`) are written at the start of that assistant turn, in order and with their bytes
+unchanged. Unsigned blocks (from Gemini, Ollama or a compat upstream) are not sent to
+Anthropic, which cannot read them. Ollama takes unsigned thinking back as `message.thinking`;
+every other adapter removes the field. Only the shape is checked: the value is an array
+whose elements have `type` `thinking` or `redacted_thinking`, string `thinking` and
+`signature`, and a non-empty string `data` for a redacted block, and it appears only on
+`assistant` messages. Anything else is `400` with `code: "invalid_ragmux_thinking"`. The
+signature itself is the upstream's to verify.
+
+On Anthropic models with a thinking budget (Claude 4.5 and earlier), sending the blocks
+back is what keeps thinking on across a tool round: a request that ends in a tool result
+whose assistant turn carries no signed block is sent without thinking, and the response has
+a `Warning`. The same models take no forced `tool_choice` with thinking, so there thinking is
+left out as well, with a `Warning`.
+
+Known limit: the gateway rebuilds an assistant message as thinking blocks, then text, then
+tool calls. If the model produced several text blocks, or thinking between text blocks, the
+order and the number of blocks do not survive the round trip through this endpoint. On
+Claude 5.1 and later, where the API checks a block against everything before it, that can
+make the replay invalid.
+
+**Retrieval and thinking blocks.** Claude 5.1 and later bind a thinking block to the system
+prompt and messages that preceded it, and retrieval changes that prefix on every turn. For a
+model with that binding (`thinking_prefix_bound`), in a project whose retrieval is active (a
+store, and a `retrieval_policy` other than `off`; a request that sends `ragmux.retrieval:
+"off"` counts, because earlier turns may have had context injected), the thinking blocks of
+earlier turns are not sent to Anthropic and the response carries a `Warning`. The model
+loses its earlier reasoning in exchange for a request that is not rejected. Models without
+that binding keep their blocks.
+
 `usage` carries OpenAI's breakdown objects whenever the provider reports them:
 
 ```json
@@ -1125,7 +1215,7 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-rag-skip` | present when the project has a store and this request did not retrieve, with the reason: `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack` (then `x-ragmux-rag-hits` is `0`). Absent when retrieval ran. See [Retrieval policy](rag.md#retrieval-policy) |
 | `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
-| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` (`json_schema`/`json_object`) on an Anthropic connection (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
+| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` (`json_schema`/`json_object`) on an Anthropic connection (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
 `Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and

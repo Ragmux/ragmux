@@ -47,6 +47,9 @@ type anthropicRequest struct {
 	Stream        bool               `json:"stream,omitempty"`
 	Tools         []anthropicTool    `json:"tools,omitempty"`
 	ToolChoice    json.RawMessage    `json:"tool_choice,omitempty"`
+	// Thinking and OutputConfig carry reasoning_effort (effort.go).
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -70,6 +73,13 @@ type anthropicContent struct {
 	// CacheControl is the client's prompt-caching breakpoint, relayed
 	// verbatim: the gateway does not interpret its contents.
 	CacheControl json.RawMessage `json:"cache_control,omitempty"`
+	// Thinking, Signature and Data are the fields of thinking and
+	// redacted_thinking blocks. Thinking is a pointer so a block whose text
+	// is empty (Claude 5 omits it) is still sent with "thinking":"", which
+	// the API expects next to the signature.
+	Thinking  *string `json:"thinking,omitempty"`
+	Signature string  `json:"signature,omitempty"`
+	Data      string  `json:"data,omitempty"`
 }
 
 type anthropicImage struct {
@@ -137,15 +147,120 @@ type anthropicResponse struct {
 	Usage      anthropicUsageBlock `json:"usage"`
 }
 
+// anthropicThinkingSetup is every decision the adapter takes about thinking
+// for one request. translateAnthropic applies it and RequestWarnings reports
+// it, from this one computation, so the two cannot disagree.
+type anthropicThinkingSetup struct {
+	plan anthropicEffortPlan
+	// stripHistory: earlier turns' thinking blocks are not sent back, because
+	// the model binds them to a prefix that retrieval changes (ADR-031).
+	stripHistory bool
+	// dropTopP: the API takes top_p with thinking only from 0.95 up.
+	dropTopP bool
+	warnings []string
+}
+
+// anthropicMinThinkingTopP is the lowest top_p the API accepts while thinking
+// is on.
+const anthropicMinThinkingTopP = 0.95
+
+// forcedToolChoice reports a tool_choice that makes the model call a tool
+// (required, or one named), which only counts when there are tools to call.
+func forcedToolChoice(req ChatRequest) bool {
+	if len(req.Tools) == 0 || len(req.ToolChoice) == 0 {
+		return false
+	}
+	var s string
+	if json.Unmarshal(req.ToolChoice, &s) == nil {
+		return s == "required"
+	}
+	var obj struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	return json.Unmarshal(req.ToolChoice, &obj) == nil && obj.Function.Name != ""
+}
+
+// toolTurnWithoutThinking reports a request that ends in a tool result whose
+// assistant turn carries no thinking block the adapter could send back. The
+// messages were validated before.
+func toolTurnWithoutThinking(msgs []Message) bool {
+	if len(msgs) == 0 || msgs[len(msgs)-1].Role != "tool" {
+		return false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "assistant" {
+			continue
+		}
+		blocks, err := parseThinkingBlocks(msgs[i].Thinking)
+		return err != nil || len(replayableThinking(blocks)) == 0
+	}
+	return false
+}
+
+func setupAnthropicThinking(model string, req ChatRequest) (anthropicThinkingSetup, error) {
+	var su anthropicThinkingSetup
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return su, err
+	}
+	caps := CapabilitiesFor("anthropic", model)
+	effort, set := req.ReasoningEffort()
+	plan, err := effortPlan(caps, model, effort, set, req.MaxOutputTokens())
+	if err != nil {
+		return su, err
+	}
+	if plan.Thinking != nil && plan.Thinking.Type == "enabled" {
+		// Manual (budget) thinking has two rules the adaptive mode does not:
+		// the API refuses a forced tool_choice next to it, and a tool round
+		// must continue an assistant turn that starts with a thinking block.
+		// Either would turn a request that worked before reasoning_effort was
+		// translated into a 400, so thinking is the part that gives way.
+		switch {
+		case forcedToolChoice(req):
+			plan.dropThinking(req.MaxOutputTokens(), "thinking disabled for this request: a forced tool_choice cannot be combined with thinking on this model")
+		case toolTurnWithoutThinking(req.Messages):
+			plan.dropThinking(req.MaxOutputTokens(), "thinking disabled for this request: it continues a tool round whose assistant turn has no thinking block to send back, which this model requires while thinking is on; send back ragmux_thinking to keep thinking across tool calls")
+		}
+	}
+	su.plan = plan
+	su.warnings = append(su.warnings, plan.Warnings...)
+	if plan.DropTemperature && req.Temperature != nil {
+		su.warnings = append(su.warnings, "temperature is not supported while thinking is enabled; ignored")
+	}
+	if plan.DropTemperature && req.TopP != nil && *req.TopP < anthropicMinThinkingTopP {
+		su.dropTopP = true
+		su.warnings = append(su.warnings, "top_p below 0.95 is not supported while thinking is enabled; ignored")
+	}
+	if req.RAGActive && caps.ThinkingPrefixBound && hasReplayableThinking(req.Messages) {
+		su.stripHistory = true
+		su.warnings = append(su.warnings, "thinking blocks of earlier turns were dropped: this model binds them to the prompt prefix, which retrieval changes")
+	}
+	if hasReasoningContent(req.Messages) {
+		su.warnings = append(su.warnings, reasoningContentDropped("anthropic"))
+	}
+	return su, nil
+}
+
 // translateAnthropic converts an OpenAI request into the Messages format.
 func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthropicRequest, error) {
 	out := anthropicRequest{Model: cfg.Model, MaxTokens: defaultMaxTokens}
-	images := cfg.imageBudget(ctx)
-	if n := req.MaxOutputTokens(); n > 0 {
-		out.MaxTokens = n
+	su, err := setupAnthropicThinking(cfg.Model, req)
+	if err != nil {
+		return out, err
 	}
-	out.Temperature = req.Temperature
-	out.TopP = req.TopP
+	images := cfg.imageBudget(ctx)
+	out.MaxTokens = su.plan.MaxTokens
+	out.Thinking = su.plan.Thinking
+	if su.plan.Effort != "" {
+		out.OutputConfig = &anthropicOutputConfig{Effort: su.plan.Effort}
+	}
+	if !su.plan.DropTemperature {
+		out.Temperature = req.Temperature
+	}
+	if !su.dropTopP {
+		out.TopP = req.TopP
+	}
 	out.StopSequences = req.StopSequences()
 
 	var system []anthropicContent
@@ -161,6 +276,22 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 			out.Messages = appendAnthropic(out.Messages, "user", parts)
 		case "assistant":
 			var parts []anthropicContent
+			if !su.stripHistory {
+				// Signed blocks go first, in their order and unchanged: the
+				// API refuses a tool-use turn whose thinking was altered or
+				// left out. Blocks without a signature are another
+				// provider's and are not sent.
+				blocks, _ := parseThinkingBlocks(m.Thinking) // validated above
+				for _, b := range replayableThinking(blocks) {
+					c := anthropicContent{Type: b.Type, Signature: b.Signature, Data: b.Data}
+					if b.Type == thinkingBlockThinking {
+						text := b.Thinking
+						c.Thinking = &text
+					}
+					parts = append(parts, c)
+				}
+			}
+			replayed := len(parts)
 			if t := m.Text(); t != "" {
 				parts = append(parts, anthropicContent{Type: "text", Text: t})
 			}
@@ -182,7 +313,8 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 					}
 				}
 			}
-			if len(parts) == 0 {
+			if len(parts) == replayed {
+				// Nothing but thinking is not a turn.
 				continue
 			}
 			out.Messages = appendAnthropic(out.Messages, "assistant", parts)
@@ -291,10 +423,15 @@ func ignoredResponseFormat(req ChatRequest) string {
 
 // RequestWarnings implements RequestWarner.
 func (p *anthropic) RequestWarnings(req ChatRequest) []string {
+	var out []string
 	if ignoredResponseFormat(req) != "" {
-		return []string{anthropicResponseFormatWarning}
+		out = append(out, anthropicResponseFormatWarning)
 	}
-	return nil
+	// A request the adapter will reject has nothing to warn about.
+	if su, err := setupAnthropicThinking(p.cfg.Model, req); err == nil {
+		out = append(out, su.warnings...)
+	}
+	return out
 }
 
 // appendAnthropic merges consecutive same-role messages, which the Messages
@@ -454,15 +591,24 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 	}
 	var text strings.Builder
 	var calls []toolCall
+	var thinking []ThinkingBlock
 	for _, c := range ar.Content {
 		switch c.Type {
+		case thinkingBlockThinking:
+			b := ThinkingBlock{Type: thinkingBlockThinking, Signature: c.Signature}
+			if c.Thinking != nil {
+				b.Thinking = *c.Thinking
+			}
+			thinking = append(thinking, b)
+		case thinkingBlockRedacted:
+			thinking = append(thinking, ThinkingBlock{Type: thinkingBlockRedacted, Data: c.Data})
 		case "text":
 			text.WriteString(c.Text)
 		case "tool_use":
 			calls = append(calls, toolCall{ID: c.ID, Name: c.Name, Arguments: string(c.Input)})
 		}
 	}
-	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String()), ToolCalls: toolCallsJSON(calls)}
+	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String()), ToolCalls: toolCallsJSON(calls), Thinking: thinking}
 	id := ar.ID
 	if id == "" {
 		id = chatID()
@@ -497,6 +643,11 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 		case <-ctx.Done():
 			return false
 		}
+	}
+	// emitThinking sends one ragmux_thinking update. The index is Anthropic's
+	// own content-block index, so the client can merge by it.
+	emitThinking := func(b ThinkingBlock) bool {
+		return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{Thinking: []ThinkingBlock{b}}}}})
 	}
 	// Tool_use blocks are tracked by content index so argument deltas map to
 	// the right OpenAI tool_calls index.
@@ -534,11 +685,21 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 					Type string `json:"type"`
 					ID   string `json:"id"`
 					Name string `json:"name"`
+					Data string `json:"data"`
 				} `json:"content_block"`
 			}
-			if json.Unmarshal([]byte(ev.Data), &cb) == nil && cb.ContentBlock.Type == "tool_use" {
+			if json.Unmarshal([]byte(ev.Data), &cb) != nil {
+				return true
+			}
+			switch cb.ContentBlock.Type {
+			case "tool_use":
 				tc := tools.Open(cb.Index, cb.ContentBlock.ID, cb.ContentBlock.Name)
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
+			case thinkingBlockThinking:
+				return emitThinking(ThinkingBlock{Index: &cb.Index, Type: thinkingBlockThinking})
+			case thinkingBlockRedacted:
+				// A redacted block arrives whole; there are no deltas for it.
+				return emitThinking(ThinkingBlock{Index: &cb.Index, Type: thinkingBlockRedacted, Data: cb.ContentBlock.Data})
 			}
 			return true
 		case "content_block_delta":
@@ -548,6 +709,8 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 					Type        string `json:"type"`
 					Text        string `json:"text"`
 					PartialJSON string `json:"partial_json"`
+					Thinking    string `json:"thinking"`
+					Signature   string `json:"signature"`
 				} `json:"delta"`
 			}
 			if json.Unmarshal([]byte(ev.Data), &d) != nil {
@@ -561,6 +724,10 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 					sentRole = true
 				}
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}})
+			case "thinking_delta":
+				return emitThinking(ThinkingBlock{Index: &d.Index, Type: thinkingBlockThinking, Thinking: d.Delta.Thinking})
+			case "signature_delta":
+				return emitThinking(ThinkingBlock{Index: &d.Index, Type: thinkingBlockThinking, Signature: d.Delta.Signature})
 			case "input_json_delta":
 				tc := tools.Args(d.Index, d.Delta.PartialJSON)
 				if tc == nil {

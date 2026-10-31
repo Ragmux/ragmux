@@ -1,0 +1,14 @@
+{
+  "id": "msg_think_1",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-4-7",
+  "content": [
+    {"type": "thinking", "thinking": "The user wants the weather, so call the tool.", "signature": "EuYBCkYIDBgCKkB7Qm1v3fJ0yR8nA4sL2pT6uW9eZ5cH3kD1gV7oN0qYSWgHR7YpuX2q9eL4mC8vB1nK6sT3wJ0aF5dG7hE2iU9oP4rQ1yZ8xC3vN6bM0lK2jH5gF8dS1a+W4eR7tY0uI3oP6/Zq9=="},
+    {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YYDeXYZ2Js6vb3x+Zq/0r="},
+    {"type": "text", "text": "Let me check."},
+    {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "Ankara"}}
+  ],
+  "stop_reason": "tool_use",
+  "usage": {"input_tokens": 20, "output_tokens": 30}
+}

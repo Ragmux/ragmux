@@ -43,6 +43,10 @@ type ollamaMessage struct {
 	Images    []string         `json:"images,omitempty"`
 	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
 	ToolName  string           `json:"tool_name,omitempty"`
+	// Thinking is the model's reasoning text: returned in a reply when think
+	// is on, and taken back on an assistant message so a thinking model can
+	// continue its own reasoning across a tool round.
+	Thinking string `json:"thinking,omitempty"`
 }
 
 type ollamaToolCall struct {
@@ -60,6 +64,9 @@ type ollamaRequest struct {
 	KeepAlive json.RawMessage `json:"keep_alive,omitempty"`
 	Tools     json.RawMessage `json:"tools,omitempty"`
 	Format    json.RawMessage `json:"format,omitempty"`
+	// Think is reasoning_effort translated: a bool, or a level for a model
+	// that takes one (planOllamaThink).
+	Think json.RawMessage `json:"think,omitempty"`
 }
 
 // ollamaResponse is one /api/chat object; the streaming form emits many.
@@ -73,9 +80,47 @@ type ollamaResponse struct {
 	Error           string        `json:"error"`
 }
 
+// ollamaThinkingSetup is the adapter's decisions about thinking for one
+// request; see anthropicThinkingSetup.
+type ollamaThinkingSetup struct {
+	plan     ollamaThinkPlan
+	warnings []string
+}
+
+func setupOllamaThinking(model string, req ChatRequest) (ollamaThinkingSetup, error) {
+	var su ollamaThinkingSetup
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return su, err
+	}
+	effort, set := req.ReasoningEffort()
+	plan, err := planOllamaThink(CapabilitiesFor("ollama", model), model, effort, set)
+	if err != nil {
+		return su, err
+	}
+	su.plan = plan
+	su.warnings = append(su.warnings, plan.Warnings...)
+	if hasReasoningContent(req.Messages) {
+		su.warnings = append(su.warnings, reasoningContentDropped("ollama"))
+	}
+	return su, nil
+}
+
+// RequestWarnings implements RequestWarner.
+func (p *ollama) RequestWarnings(req ChatRequest) []string {
+	if su, err := setupOllamaThinking(p.cfg.Model, req); err == nil {
+		return su.warnings
+	}
+	return nil
+}
+
 // translateOllama converts an OpenAI request into the native payload.
 func translateOllama(ctx context.Context, cfg Config, req ChatRequest) (ollamaRequest, error) {
 	out := ollamaRequest{Model: cfg.Model, Options: map[string]any{}}
+	su, err := setupOllamaThinking(cfg.Model, req)
+	if err != nil {
+		return out, err
+	}
+	out.Think = su.plan.Think
 	images := cfg.imageBudget(ctx)
 	for _, m := range req.Messages {
 		om := ollamaMessage{Role: m.Role}
@@ -91,6 +136,9 @@ func translateOllama(ctx context.Context, cfg Config, req ChatRequest) (ollamaRe
 			om.Content, om.Images = text, inline
 		case "assistant":
 			om.Content = m.Text()
+			// Only thinking Ollama produced (unsigned) goes back: signed
+			// blocks are Anthropic's, and mean nothing here.
+			om.Thinking = unsignedThinkingText(m.Thinking)
 			if len(m.ToolCalls) > 0 {
 				var calls []struct {
 					Function struct {
@@ -253,7 +301,8 @@ func (p *ollama) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	if or.Error != "" {
 		return nil, &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: RedactWith(or.Error, p.cfg.APIKey)}
 	}
-	msg := ResponseMessage{Role: "assistant", Content: strPtr(or.Message.Content)}
+	msg := ResponseMessage{Role: "assistant", Content: strPtr(or.Message.Content),
+		Thinking: thinkingBlocksOf(or.Message.Thinking)}
 	msg.ToolCalls = ollamaToolCallsJSON(or.Message.ToolCalls)
 	return &ChatResponse{
 		ID: chatID(), Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
@@ -304,7 +353,7 @@ func (p *ollama) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 		if or.Error != "" {
 			return &Error{Status: http.StatusBadGateway, Type: "upstream_error", Message: RedactWith(or.Error, p.cfg.APIKey)}
 		}
-		delta := Delta{}
+		delta := Delta{Thinking: thinkingDeltaOf(or.Message.Thinking)}
 		if !sentRole {
 			delta.Role = "assistant"
 			sentRole = true

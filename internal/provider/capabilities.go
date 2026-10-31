@@ -2,6 +2,7 @@ package provider
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/ragmux/ragmux/internal/glob"
 )
@@ -112,6 +113,12 @@ type Capabilities struct {
 // matches, gets the provider's current-generation defaults.
 func CapabilitiesFor(providerType, model string) Capabilities {
 	c := providerDefaults(providerType)
+	if providerType == "gemini" {
+		// The adapter addresses the model without its "models/" prefix
+		// (geminiModelPath), so a connection that spells it with the prefix
+		// is the same model.
+		model = strings.TrimPrefix(model, "models/")
+	}
 	if model == "" {
 		return c
 	}
@@ -158,6 +165,10 @@ var (
 	effortLMH  = []string{"low", "medium", "high"}
 	effortLMHM = []string{"low", "medium", "high", "max"}
 	effortAll  = []string{"low", "medium", "high", "xhigh", "max"}
+	// Gemini 3 thinkingLevel sets. effortGemini3 is what every Gemini 3 model
+	// takes, and so what a model no row matches is offered.
+	effortGemini3      = []string{"low", "high"}
+	effortGeminiMinLMH = []string{"minimal", "low", "medium", "high"}
 )
 
 // providerDefaults is what a provider type reports before any model row is
@@ -205,7 +216,8 @@ func providerDefaults(providerType string) Capabilities {
 		// argument deltas, and takes only Files API / gs:// image URIs.
 		c := Capabilities{Chat: true, Streaming: true, Embeddings: true, Tools: true, Vision: true,
 			CachedTokenUsage: true}
-		return withModelFlags(c, modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel})
+		return withModelFlags(c, modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel,
+			effortLevels: effortGemini3})
 	case "ollama":
 		// Ollama's API has no tool_choice, so a forced choice cannot be passed.
 		c := Capabilities{Chat: true, Streaming: true, Embeddings: true, Tools: true, Vision: true}
@@ -289,6 +301,14 @@ var modelRules = sortedRules([]modelRule{
 	{"gemini", "gemini-1*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingNone}},
 	{"gemini", "gemini-2.0*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingNone}},
 	{"gemini", "gemini-2.5*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingBudget}},
+	// Gemini 3 and later: a named level, and the set differs per model. The
+	// default for an unlisted model is the set every one of them takes.
+	{"gemini", "gemini-3-pro*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel, effortLevels: effortGemini3}},
+	{"gemini", "gemini-3-flash*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel, effortLevels: effortGeminiMinLMH}},
+	{"gemini", "gemini-3.1-pro*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel, effortLevels: effortLMH}},
+	{"gemini", "gemini-3.5-flash-lite*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel, effortLevels: effortGeminiMinLMH}},
+	{"gemini", "gemini-3.6-flash*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel, effortLevels: effortGeminiMinLMH}},
+	{"gemini", "gemini-3.8-flash*", modelFlags{nativeJSONSchema: true, forcedToolChoice: true, thinking: ThinkingLevel, effortLevels: effortLMH}},
 
 	// gpt-oss takes a level (low, medium, high) where other Ollama models
 	// take a bool.

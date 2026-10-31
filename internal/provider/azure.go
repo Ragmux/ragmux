@@ -106,6 +106,9 @@ func newAzure(cfg Config) *azureChat {
 }
 
 func (p *azureChat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return nil, err
+	}
 	endpoint, err := p.t.url("chat/completions")
 	if err != nil {
 		return nil, err
@@ -128,10 +131,14 @@ func (p *azureChat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		out.Created = time.Now().Unix()
 	}
 	out.Usage.normalize()
+	foldReasoningContent(&out)
 	return &out, nil
 }
 
 func (p *azureChat) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return err
+	}
 	endpoint, err := p.t.url("chat/completions")
 	if err != nil {
 		return err
@@ -180,6 +187,7 @@ func (p *azureChat) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 			return true
 		}
 		chunk.Usage.normalize()
+		foldReasoningDelta(&chunk)
 		select {
 		case out <- chunk:
 			return true
