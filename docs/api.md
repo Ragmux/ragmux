@@ -995,7 +995,9 @@ Accepts the OpenAI Chat Completions payload: `model`, `messages` (text or
 `max_completion_tokens`, `stop`, `n`, `tools`, `tool_choice`, `response_format`,
 `stream_options`, `user`. Unknown fields are forwarded to OpenAI-compatible upstreams
 unchanged (see [Providers](providers.md)), with one exception: an optional `ragmux`
-object is consumed by the gateway and never sent upstream. `messages` is required; the
+object is consumed by the gateway and never sent upstream. A `tool` message may carry
+`"ragmux_is_error": true` to mark a failed tool call (see
+[Anthropic](providers.md#anthropic)). `messages` is required; the
 body may not exceed 4 MiB.
 
 ```json

@@ -9,7 +9,7 @@ Version 1.0 is where they are frozen.
 
 ## v0.4.2 — fixes and hygiene
 
-The next release. It fixes what hurts today, makes silent failures loud and corrects the
+Released in 0.4.2. It fixes what hurts today, makes silent failures loud and corrects the
 documentation. No schema change.
 
 - Gemini 3 tool-calling turns keep their thought signature, and Gemini honours
@@ -24,6 +24,8 @@ documentation. No schema change.
 - Corrected reference docs, a contributor guide and this roadmap.
 
 ## v0.5 — shared request pipeline, routing and resilience
+
+Released in 0.5.0.
 
 The foundation for everything that follows: every endpoint goes through one request
 pipeline, so new endpoints and routing do not each re-implement authentication, limits,
@@ -40,6 +42,8 @@ logging and metrics.
 
 ## v0.6 — RAG quality
 
+Released in 0.6.0.
+
 - Choose where retrieved context goes in the prompt, so a cached system prompt stays
   cacheable across turns.
 - A retrieval policy that skips retrieval for greetings and tool turns, and a query strategy
@@ -51,6 +55,8 @@ logging and metrics.
   on-premises for Turkish content.
 
 ## v0.7 — reasoning and agents
+
+Done and waiting for its release tag.
 
 - A single `reasoning_effort` setting mapped onto each provider's thinking controls, and
   thinking blocks carried across turns.
