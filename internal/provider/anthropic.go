@@ -157,7 +157,12 @@ type anthropicThinkingSetup struct {
 	stripHistory bool
 	// dropTopP: the API takes top_p with thinking only from 0.95 up.
 	dropTopP bool
-	warnings []string
+	// format is how response_format is carried (anthropic_format.go).
+	format anthropicFormatPlan
+	// autoToolChoice: the client asked for a forced tool (required, or one
+	// named) and the model cannot take that, so tool_choice becomes auto.
+	autoToolChoice bool
+	warnings       []string
 }
 
 // anthropicMinThinkingTopP is the lowest top_p the API accepts while thinking
@@ -210,6 +215,22 @@ func setupAnthropicThinking(model string, req ChatRequest) (anthropicThinkingSet
 	if err != nil {
 		return su, err
 	}
+	if su.format, err = planAnthropicFormat(caps, req); err != nil {
+		return su, err
+	}
+	// The forced ragmux_response call is a forced tool_choice, which the API
+	// refuses next to thinking. Only the tool path forces; the native schema
+	// and the instruction leave thinking alone.
+	// Thinking already switched off ("disabled", from reasoning_effort none)
+	// is what the request asked for and sits next to a forced tool.
+	if su.format.toolMode() && plan.Thinking != nil && plan.Thinking.Type != "disabled" {
+		plan.dropThinking(req.MaxOutputTokens(), anthropicFormatThinkingWarning)
+	}
+	if !caps.ForcedToolChoice && forcedToolChoice(req) {
+		su.autoToolChoice = true
+		su.warnings = append(su.warnings, "tool_choice required or naming a tool is not supported by this model; auto is used")
+	}
+	su.warnings = append(su.warnings, su.format.warnings...)
 	if plan.Thinking != nil && plan.Thinking.Type == "enabled" {
 		// Manual (budget) thinking has two rules the adaptive mode does not:
 		// the API refuses a forced tool_choice next to it, and a tool round
@@ -254,6 +275,12 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 	out.Thinking = su.plan.Thinking
 	if su.plan.Effort != "" {
 		out.OutputConfig = &anthropicOutputConfig{Effort: su.plan.Effort}
+	}
+	if su.format.mode == formatNative {
+		if out.OutputConfig == nil {
+			out.OutputConfig = &anthropicOutputConfig{}
+		}
+		out.OutputConfig.Format = &anthropicOutputFormat{Type: "json_schema", Schema: su.format.schema}
 	}
 	if !su.plan.DropTemperature {
 		out.Temperature = req.Temperature
@@ -326,6 +353,9 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 			out.Messages = appendAnthropic(out.Messages, "user", []anthropicContent{result})
 		}
 	}
+	if su.format.mode == formatInstruction {
+		system = append(system, anthropicContent{Type: "text", Text: anthropicJSONInstruction})
+	}
 	if len(system) > 0 {
 		sys, err := anthropicSystem(system)
 		if err != nil {
@@ -367,7 +397,11 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 				case "auto":
 					out.ToolChoice = json.RawMessage(`{"type":"auto"}`)
 				case "required":
-					out.ToolChoice = json.RawMessage(`{"type":"any"}`)
+					if su.autoToolChoice {
+						out.ToolChoice = json.RawMessage(`{"type":"auto"}`)
+					} else {
+						out.ToolChoice = json.RawMessage(`{"type":"any"}`)
+					}
 				case "none":
 					out.Tools = nil
 				}
@@ -378,60 +412,35 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 					} `json:"function"`
 				}
 				if json.Unmarshal(req.ToolChoice, &obj) == nil && obj.Function.Name != "" {
-					b, _ := json.Marshal(map[string]string{"type": "tool", "name": obj.Function.Name})
+					choice := map[string]string{"type": "tool", "name": obj.Function.Name}
+					if su.autoToolChoice {
+						choice = map[string]string{"type": "auto"}
+					}
+					b, _ := json.Marshal(choice)
 					out.ToolChoice = b
 				}
 			}
 		}
 	}
+	if su.format.toolMode() {
+		if err := userToolClash(out.Tools); err != nil {
+			return out, err
+		}
+		su.format.applyToolChoice(&out)
+	}
 	if len(out.Messages) == 0 {
 		return out, &Error{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "messages must contain at least one user message"}
-	}
-	if rf := ignoredResponseFormat(req); rf != "" {
-		// The request is still forwarded: the Messages API has no
-		// response_format, and failing a request that would otherwise
-		// succeed is worse than answering in prose. The client learns of
-		// the drop through the Warning header (RequestWarnings).
-		cfg.logger().Info("response_format ignored", "provider", "anthropic", "response_format", rf)
 	}
 	return out, nil
 }
 
-// anthropicResponseFormatWarning is the Warning text for a dropped
-// response_format. The gateway wraps it as `299 ragmux "<text>"`.
-const anthropicResponseFormatWarning = "response_format is not supported for anthropic connections; ignored"
-
-// ignoredResponseFormat returns the response_format type the adapter drops,
-// or "" when there is nothing to drop. Only the JSON modes count: "text" is
-// what the Messages API does anyway.
-func ignoredResponseFormat(req ChatRequest) string {
-	if len(req.ResponseFormat) == 0 {
-		return ""
-	}
-	var rf struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(req.ResponseFormat, &rf) != nil {
-		return ""
-	}
-	switch rf.Type {
-	case "json_schema", "json_object":
-		return rf.Type
-	}
-	return ""
-}
-
 // RequestWarnings implements RequestWarner.
 func (p *anthropic) RequestWarnings(req ChatRequest) []string {
-	var out []string
-	if ignoredResponseFormat(req) != "" {
-		out = append(out, anthropicResponseFormatWarning)
-	}
 	// A request the adapter will reject has nothing to warn about.
 	if su, err := setupAnthropicThinking(p.cfg.Model, req); err == nil {
-		out = append(out, su.warnings...)
+		return su.warnings
 	}
-	return out
+	return nil
 }
 
 // appendAnthropic merges consecutive same-role messages, which the Messages
@@ -580,6 +589,14 @@ func anthropicFinish(log *slog.Logger, stop string) *string {
 	return strPtr("stop")
 }
 
+// anthropicFormatOf recomputes the response_format plan Chat and ChatStream
+// read the answer with. translateAnthropic already planned the same request
+// and accepted it, so an error here cannot happen.
+func anthropicFormatOf(model string, req ChatRequest) anthropicFormatPlan {
+	plan, _ := planAnthropicFormat(CapabilitiesFor("anthropic", model), req)
+	return plan
+}
+
 func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	body, err := translateAnthropic(ctx, p.cfg, req)
 	if err != nil {
@@ -589,6 +606,8 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 	if err := doJSON(ctx, p.cfg, opChat, p.base+"/v1/messages", p.headers(), body, &ar); err != nil {
 		return nil, err
 	}
+	format := anthropicFormatOf(p.cfg.Model, req)
+	var structured *string
 	var text strings.Builder
 	var calls []toolCall
 	var thinking []ThinkingBlock
@@ -605,17 +624,29 @@ func (p *anthropic) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		case "text":
 			text.WriteString(c.Text)
 		case "tool_use":
+			if format.toolMode() && c.Name == ragmuxResponseTool {
+				// The structured answer is the message content, not a call.
+				structured = strPtr(format.answer(c.Input))
+				continue
+			}
 			calls = append(calls, toolCall{ID: c.ID, Name: c.Name, Arguments: string(c.Input)})
 		}
 	}
-	msg := ResponseMessage{Role: "assistant", Content: strPtr(text.String()), ToolCalls: toolCallsJSON(calls), Thinking: thinking}
+	content, finish := strPtr(text.String()), anthropicFinish(p.cfg.logger(), ar.StopReason)
+	if structured != nil {
+		content = structured
+		if len(calls) == 0 && ar.StopReason == "tool_use" {
+			finish = strPtr("stop")
+		}
+	}
+	msg := ResponseMessage{Role: "assistant", Content: content, ToolCalls: toolCallsJSON(calls), Thinking: thinking}
 	id := ar.ID
 	if id == "" {
 		id = chatID()
 	}
 	return &ChatResponse{
 		ID: id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model,
-		Choices: []Choice{{Index: 0, Message: msg, FinishReason: anthropicFinish(p.cfg.logger(), ar.StopReason)}},
+		Choices: []Choice{{Index: 0, Message: msg, FinishReason: finish}},
 		Usage:   ar.Usage.usage(),
 	}, nil
 }
@@ -654,6 +685,17 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 	var tools toolCallStream
 	var streamErr error
 	sentRole := false
+	// A ragmux_response call is the answer itself: its argument fragments go
+	// out as content, by content-block index.
+	format := anthropicFormatOf(p.cfg.Model, req)
+	answers := map[int]*formatStream{}
+	answered := false
+	emitContent := func(text string) bool {
+		if text == "" {
+			return true
+		}
+		return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{Content: strPtr(text)}}}})
+	}
 
 	err = readSSE(resp.Body, func(ev sseEvent) bool {
 		var base struct {
@@ -693,6 +735,11 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 			}
 			switch cb.ContentBlock.Type {
 			case "tool_use":
+				if format.toolMode() && cb.ContentBlock.Name == ragmuxResponseTool {
+					answers[cb.Index] = newFormatStream(format.wrapped)
+					answered = true
+					return true
+				}
 				tc := tools.Open(cb.Index, cb.ContentBlock.ID, cb.ContentBlock.Name)
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
 			case thinkingBlockThinking:
@@ -729,11 +776,26 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 			case "signature_delta":
 				return emitThinking(ThinkingBlock{Index: &d.Index, Type: thinkingBlockThinking, Signature: d.Delta.Signature})
 			case "input_json_delta":
+				if a, ok := answers[d.Index]; ok {
+					return emitContent(a.Feed(d.Delta.PartialJSON))
+				}
 				tc := tools.Args(d.Index, d.Delta.PartialJSON)
 				if tc == nil {
 					return true
 				}
 				return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{ToolCalls: tc}}}})
+			}
+			return true
+		case "content_block_stop":
+			var cs struct {
+				Index int `json:"index"`
+			}
+			if json.Unmarshal([]byte(ev.Data), &cs) != nil {
+				return true
+			}
+			if a, ok := answers[cs.Index]; ok {
+				delete(answers, cs.Index)
+				return emitContent(a.Flush())
 			}
 			return true
 		case "message_delta":
@@ -747,7 +809,11 @@ func (p *anthropic) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 				return true
 			}
 			usage.merge(md.Usage)
-			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: anthropicFinish(p.cfg.logger(), md.Delta.StopReason)}}})
+			finish := anthropicFinish(p.cfg.logger(), md.Delta.StopReason)
+			if answered && tools.Len() == 0 && md.Delta.StopReason == "tool_use" {
+				finish = strPtr("stop")
+			}
+			return emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: Delta{}, FinishReason: finish}}})
 		case "message_stop":
 			// Final usage-only chunk, mirroring OpenAI's include_usage behaviour.
 			return emit(StreamChunk{Choices: []StreamChoice{}, Usage: usage.usage()})

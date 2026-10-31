@@ -379,13 +379,8 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   array of blocks instead — see [Prompt caching](#prompt-caching).
 - `max_tokens` is required by Anthropic; when the client sends neither `max_tokens` nor
   `max_completion_tokens` the gateway uses **4096**.
-- `temperature`, `top_p` and `stop` are mapped; `n`, `response_format`, `user` and unknown
-  fields are dropped.
-- `response_format` of type `json_schema` or `json_object` is not an error: the request is
-  still sent, without it, so the model is not held to the schema. The response carries
-  `Warning: 299 ragmux "response_format is not supported for anthropic connections;
-  ignored"` (set before the first byte, so streams have it too) and the gateway logs the
-  event at info level with the format type only. Ask for JSON in the prompt instead.
+- `temperature`, `top_p` and `stop` are mapped; `n`, `user` and unknown fields are dropped.
+- `response_format` is applied; see [Structured output](#structured-output).
 - Consecutive messages with the same role are merged, as the Messages API requires.
 - `reasoning_effort` becomes `thinking` and `output_config.effort`, or `thinking` with
   `budget_tokens`, depending on the model ([Reasoning effort](#reasoning-effort)).
@@ -398,7 +393,10 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
 - Tools: OpenAI `tools[].function` definitions become Anthropic `tools` (`input_schema`
   from `parameters`, `{"type":"object","properties":{}}` when absent); `tool_choice`
   `"auto"` → `{"type":"auto"}`, `"required"` → `{"type":"any"}`, a named function →
-  `{"type":"tool","name":…}`, `"none"` removes the tools. Assistant `tool_calls` become
+  `{"type":"tool","name":…}`, `"none"` removes the tools. On a model that cannot be forced
+  to call a tool (`forced_tool_choice` is false, see
+  [Model-level capabilities](#model-level-capabilities)), `"required"` and a named function
+  are sent as `{"type":"auto"}` and the response carries a `Warning`. Assistant `tool_calls` become
   `tool_use` blocks, `tool` messages become `tool_result` blocks, and `tool_use` in the
   reply becomes OpenAI `tool_calls` (also in streams, via `input_json_delta`). OpenAI has
   no way to say that a tool call failed, so a `tool` message may carry the gateway's own
@@ -417,6 +415,50 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   value Anthropic adds later) → `stop`, logged at warn level with the value. Usage is mapped to `prompt_tokens`/`completion_tokens`,
   including on streams; see [Prompt caching](#prompt-caching) for how the cache
   counters are folded in.
+
+### Structured output
+
+`response_format` of type `json_schema` or `json_object` is enforced. Which way depends on
+the model's [capabilities](#model-level-capabilities), never on the connection:
+
+| Request | Model | What is sent | Warning |
+|---|---|---|---|
+| `json_schema` | `native_json_schema` | `output_config.format = {"type":"json_schema","schema":…}` | no |
+| `json_schema` | otherwise | a forced tool, `ragmux_response`, whose `input_schema` is the schema | no |
+| `json_object` | `forced_tool_choice` | the same forced tool with `{"type":"object"}` as its schema | no |
+| `json_object` | otherwise | one sentence appended to the system prompt asking for a JSON object | yes |
+
+When the model answers with the structured output, the reply's `message.content` is the JSON
+text and `finish_reason` is `stop` (`length` if the answer was cut off); a forced tool's input
+is moved into `content`, so the client sees no `ragmux_response` call. When the schema's root is not an object, the tool takes
+`{"value": <schema>}` and the gateway unwraps the value. In a stream the tool's argument
+fragments arrive as `content` deltas, which join to the same JSON. Only the instruction
+path is without a guarantee: the model may still answer in prose, and the response says so
+with `Warning: 299 ragmux "response_format json_object is approximated by an instruction on
+this model"`. A schema without a usable `json_schema.schema` object is a `400`.
+
+- OpenAI's `strict` and `name` are not sent.
+- With the **native** path the schema is Anthropic's to judge; a feature it does not
+  support is the upstream's `400`, relayed as it comes. A schema that works at OpenAI can
+  therefore fail here:
+
+  | OpenAI accepts | Anthropic's native schema |
+  |---|---|
+  | `additionalProperties: true` or a schema | only `false` |
+  | `minimum`, `maximum`, `multipleOf` | not supported |
+  | `minLength`, `maxLength` | not supported |
+  | `minItems`/`maxItems` of any value | `minItems` 0 or 1 only |
+  | recursive schemas, external `$ref` | not supported |
+
+  Thinking and the client's `tools` go next to the native schema unchanged.
+- With the **tool** path the model must call a tool, so thinking is switched off for the
+  request and the response carries a `Warning`. With client `tools` the synthetic tool
+  sits next to them: `tool_choice` `auto` or `required` (or none sent) becomes "any tool,
+  one at a time", so a text answer arrives as `ragmux_response`; a named function stays
+  forced, and that turn answers with the call instead of the structured output; `"none"`
+  leaves only `ragmux_response`. A client tool named `ragmux_response` is a `400`.
+- Before v0.7 the field was dropped with a `Warning`; a client that sent it and got prose
+  now gets JSON.
 
 Anthropic has no embeddings API; choose another connection for RAG stores.
 

@@ -144,62 +144,55 @@ func TestAnthropicFinishUnknownReason(t *testing.T) {
 	}
 }
 
-// A json_schema / json_object request to an Anthropic connection is still
-// forwarded (without the field, which the Messages API does not have),
-// logged at Info, and reported through RequestWarnings.
-func TestAnthropicResponseFormatIsForwardedWithWarning(t *testing.T) {
+// response_format never reaches the Messages API as such: a json_schema goes
+// as output_config.format on a model with a native schema, and a request that
+// does it right carries no Warning and logs nothing about a dropped field.
+func TestAnthropicResponseFormatIsCarriedWithoutWarning(t *testing.T) {
 	for _, rfType := range []string{"json_schema", "json_object"} {
 		t.Run(rfType, func(t *testing.T) {
 			var sent map[string]any
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_ = json.NewDecoder(r.Body).Decode(&sent)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"{}"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}`))
+				_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t","name":"ragmux_response","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":1}}`))
 			}))
 			defer srv.Close()
 			var logged strings.Builder
-			p, err := New(Config{ProviderType: "anthropic", BaseURL: srv.URL, APIKey: "ak", Model: "claude",
+			// claude-3-5-sonnet has no native schema, so both types take the tool.
+			p, err := New(Config{ProviderType: "anthropic", BaseURL: srv.URL, APIKey: "ak", Model: "claude-3-5-sonnet-latest",
 				Logger: slog.New(slog.NewTextHandler(&logged, nil))})
 			if err != nil {
 				t.Fatal(err)
 			}
-			var req ChatRequest
 			body := `{"model":"c","messages":[{"role":"user","content":"secret prompt"}],"response_format":{"type":"` + rfType + `","json_schema":{"name":"x","schema":{"type":"object"}}}}`
-			if err := json.Unmarshal([]byte(body), &req); err != nil {
-				t.Fatal(err)
-			}
+			req := parseReq(t, body)
 
 			rw, ok := p.(RequestWarner)
 			if !ok {
 				t.Fatal("anthropic adapter does not implement RequestWarner")
 			}
-			if w := rw.RequestWarnings(req); len(w) != 1 || w[0] != anthropicResponseFormatWarning {
+			if w := rw.RequestWarnings(req); len(w) != 0 {
 				t.Errorf("warnings = %q", w)
 			}
-
 			resp, err := p.Chat(context.Background(), req)
 			if err != nil {
 				t.Fatalf("chat: %v", err)
 			}
-			if len(resp.Choices) != 1 {
+			if len(resp.Choices) != 1 || *resp.Choices[0].Message.Content != "{}" {
 				t.Fatalf("resp = %+v", resp)
 			}
 			if _, has := sent["response_format"]; has || sent == nil {
 				t.Errorf("upstream body = %v", sent)
 			}
-			line := logged.String()
-			if !strings.Contains(line, "level=INFO") || !strings.Contains(line, "response_format="+rfType) {
+			if line := logged.String(); strings.Contains(line, "response_format") || strings.Contains(line, "secret prompt") {
 				t.Errorf("log = %q", line)
-			}
-			if strings.Contains(line, "secret prompt") {
-				t.Errorf("log leaks content: %q", line)
 			}
 		})
 	}
 }
 
 func TestAnthropicRequestWarningsOnlyForJSONModes(t *testing.T) {
-	p := newAnthropic(Config{})
+	p := newAnthropic(Config{Model: "claude-opus-5-5"})
 	for _, rf := range []string{``, `{"type":"text"}`, `"json_object"`, `{"type":"other"}`} {
 		req := ChatRequest{ResponseFormat: json.RawMessage(rf)}
 		if w := p.RequestWarnings(req); len(w) != 0 {

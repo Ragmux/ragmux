@@ -106,6 +106,13 @@ type anthropicThinking struct {
 
 type anthropicOutputConfig struct {
 	Effort string `json:"effort,omitempty"`
+	// Format is the native response schema (response_format json_schema).
+	Format *anthropicOutputFormat `json:"format,omitempty"`
+}
+
+type anthropicOutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 // anthropicEffortPlan is what reasoning_effort turns into on an Anthropic
@@ -126,8 +133,9 @@ type anthropicEffortPlan struct {
 // restores what the request would have had without it: the client's own
 // max_tokens (or the default) and temperature. The effort stays: it is a
 // separate parameter (Opus 4.5 takes it next to the budget) that the reasons
-// for dropping thinking do not forbid. The Warning says why. Manual (budget)
-// thinking is the only mode this is used for.
+// for dropping thinking do not forbid. The Warning says why. It is used for
+// manual (budget) thinking next to a forced tool_choice or a tool round, and
+// for any thinking next to the forced ragmux_response tool.
 func (p *anthropicEffortPlan) dropThinking(maxTokens int, warning string) {
 	p.Thinking, p.DropTemperature = nil, false
 	p.MaxTokens = maxTokens
