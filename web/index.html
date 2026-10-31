@@ -307,6 +307,13 @@ td.json{font-family:var(--mono);font-size:11.5px;color:var(--tx2);max-width:360p
   .status-kv .k{margin-top:4px}
 }
 
+/* v0.7 sessions */
+.link-btn{display:block;max-width:100%;padding:0;border:0;border-radius:4px;background:none;font:inherit;color:var(--link);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link-btn:hover{color:var(--link-hover);text-decoration:underline}
+tr.rowlink{cursor:pointer}
+.sess-id{max-width:200px}
+.sess-cap{display:flex;flex-direction:column;gap:6px}
+
 /* responsive */
 @media (max-width:1100px){
   .side{width:64px}
@@ -417,7 +424,7 @@ const ICON = {
 };
 
 const state = { user: null, needsSetup: false, tab: 'overview', models: [], rag: [], projects: [], providerTypes: [], searchBackends: [], presets: [], users: [], keys: [], system: null, sessionExp: null,
-  overview: { window: '24h' }, openStore: null, openProject: null, users_filter: { q: '', role: 'all' },
+  overview: { window: '24h' }, openStore: null, openProject: null, sessions: null, users_filter: { q: '', role: 'all' },
   keys_filter: { q: '', kind: 'all', mine: true },
   playground: { key: '', system: '', stream: true, sources: true, msgs: [], last: null } };
 // The first-run wizard spans three screens and one of them creates the
@@ -1411,6 +1418,7 @@ async function renderStorePanel() {
 // ---------------------------------------------------------------------------
 let ringTimer;
 function renderProjects() {
+  state.sessions = null;
   const app = $('#app'); const w = can('editor');
   if (state.openProject && !state.projects.some(p => p.id === state.openProject)) state.openProject = null;
   if (!state.openProject && state.projects.length) state.openProject = state.projects[0].id;
@@ -1419,7 +1427,7 @@ function renderProjects() {
     <div class="split wide"><section class="stack" style="gap:10px">
       ${state.projects.map(p => `<div class="card tight stack ${p.id === state.openProject ? 'sel' : ''}" style="gap:10px" data-card="${p.id}">
         <div class="row between"><div style="font-weight:600;font-size:15px" class="ellip">${esc(p.name)}</div><code class="pill">${esc(p.api_key_prefix)}…</code></div>
-        <div class="kv" style="font-size:12.5px;gap:4px 12px"><span class="k">model</span><span class="mono ellip">${esc(modelName(p.model_connection_id))}</span><span class="k">rag</span><span class="ellip">${esc(ragName(p.rag_store_id))}</span><span class="k">limits</span><span class="mono dim ellip">${esc(limitSummary(p))}</span>${p.rag_store_id ? `<span class="k">retrieval</span><span class="mono dim ellip" title="${esc(ragBehaviourSummary(p) || 'default behaviour')}">${esc(ragBehaviourSummary(p) || 'default')}</span>` : ''}</div>
+        <div class="kv" style="font-size:12.5px;gap:4px 12px"><span class="k">model</span><span class="mono ellip">${esc(modelName(p.model_connection_id))}</span><span class="k">rag</span><span class="ellip">${esc(ragName(p.rag_store_id))}</span><span class="k">limits</span><span class="mono dim ellip">${esc(limitSummary(p))}</span>${p.rag_store_id ? `<span class="k">retrieval</span><span class="mono dim ellip" title="${esc(ragBehaviourSummary(p) || 'default behaviour')}">${esc(ragBehaviourSummary(p) || 'default')}</span>` : ''}${toolPolicySummary(p) ? `<span class="k">tools</span><span class="mono dim ellip" title="${esc(toolPolicySummary(p))}">${esc(toolPolicySummary(p))}</span>` : ''}</div>
         <div class="row between" style="margin-top:2px"><span class="hint ellip">${(p.member_ids || []).length} member${(p.member_ids || []).length === 1 ? '' : 's'}${state.users.length ? ' · ' + esc((p.member_ids || []).map(userName).join(', ')) : ''}</span><span class="row" style="gap:6px"><button class="btn sm ghost" data-metrics="${p.id}" aria-pressed="${p.id === state.openProject}">Metrics</button>${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button>` : ''}</span></div></div>`).join('') || `<div class="empty">No projects yet.${state.models.length ? '' : ' Add a model connection first.'}</div>`}</section>
     <section class="stack" style="gap:16px" id="projPanel"></section></div>`;
   if (w) $('#addProject').onclick = () => projectForm();
@@ -1447,6 +1455,38 @@ function ragBehaviourSummary(p) {
   if (ragCur(p, 'query_strategy') === 'condense') parts.push(`condense (${ragCur(p, 'history_turns_for_query')} turns${p.query_model_connection_id ? ' · ' + modelName(p.query_model_connection_id) : ''})`);
   return parts.join(' · ');
 }
+// Tool governance and the session cap (ADR-032). The patterns mirror the
+// server's rules (admin validateToolList), so most mistakes are caught before
+// the request; the server stays the authority and its message is shown too.
+const TOOL_PATTERN = /^[A-Za-z0-9_.*:-]{1,128}$/, MAX_TOOL_PATTERNS = 64;
+// One pattern per line, like the form says. A line with a space or a comma in it stays one entry, so it
+// fails the pattern check below instead of being split into patterns nobody typed.
+const parseToolList = text => [...new Set(String(text || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean))];
+function toolListError(name, list) {
+  if (list.length > MAX_TOOL_PATTERNS) return `${name} holds at most ${MAX_TOOL_PATTERNS} patterns`;
+  const bad = list.find(x => !TOOL_PATTERN.test(x));
+  return bad === undefined ? '' : `${name}: "${bad}" is not a tool pattern; use 1 to 128 of letters, digits and . _ : - *`;
+}
+// "allow 2 · deny 1 · 200k tokens/session", or '' when nothing is set.
+function toolPolicySummary(p) {
+  const parts = [];
+  if ((p.tool_allow || []).length) parts.push(`allow ${p.tool_allow.length}`);
+  if ((p.tool_deny || []).length) parts.push(`deny ${p.tool_deny.length}`);
+  if (p.session_token_cap) parts.push(`${fmtK(p.session_token_cap)} tokens/session`);
+  return parts.join(' · ');
+}
+// Shows each non-empty message under its tool-policy field, marks the field
+// invalid and focuses the first one. Returns true when there was anything to show.
+function showToolErrors(form, errs) {
+  let first = null;
+  for (const name of ['tool_allow', 'tool_deny', 'session_token_cap']) {
+    const el = $(`[name=${name}]`, form), box = $(`#${name}-err`, form); if (!el || !box) continue;
+    box.textContent = errs[name] || '';
+    if (errs[name]) { el.setAttribute('aria-invalid', 'true'); first = first || el; } else el.removeAttribute('aria-invalid');
+  }
+  if (first) first.focus();
+  return !!first;
+}
 function projectForm(p) {
   const form = drawer({ eyebrow: p ? 'Edit' : 'New', title: 'Project', submitLabel: p ? 'Save project' : 'Create project', body: `
     ${field('name', 'Name', input('name', p ? p.name : '', 'required'))}
@@ -1462,23 +1502,40 @@ function projectForm(p) {
     ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', p ? p.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', p ? p.rate_limit_tpm : 0, 'type=number min=0 step=1')))}
     ${twoCol(field('budget_daily_tokens', 'Daily token budget', input('budget_daily_tokens', p ? p.budget_daily_tokens : 0, 'type=number min=0 step=1')), field('budget_monthly_tokens', 'Monthly token budget', input('budget_monthly_tokens', p ? p.budget_monthly_tokens : 0, 'type=number min=0 step=1')))}
     <p class="hint">0 = unlimited. Windows are UTC minute / day / month; budgets count prompt + completion tokens and are checked before each call, so one request can overshoot by its own size. Over the limit the API answers <code>429</code> with <code>Retry-After</code>.</p>
+    <h3 style="margin-top:4px">Tool policy</h3>
+    <p class="hint" style="margin-top:-8px">Decides which tools a request may offer the model. A pattern is a tool name where <code>*</code> stands for any run of characters, for example <code>mcp__github__*</code>. One per line.</p>
+    ${field('tool_allow', 'Allowed tools', textarea('tool_allow', p ? (p.tool_allow || []).join('\n') : '', 'rows=4 spellcheck=false autocomplete=off aria-describedby=tool_allow-err placeholder="empty: every tool not denied"') + '<div class="meta-err" id="tool_allow-err" role="alert"></div>', 'When not empty, only matching tools are kept.')}
+    ${field('tool_deny', 'Denied tools', textarea('tool_deny', p ? (p.tool_deny || []).join('\n') : '', 'rows=4 spellcheck=false autocomplete=off aria-describedby=tool_deny-err placeholder="none"') + '<div class="meta-err" id="tool_deny-err" role="alert"></div>', 'Deny always wins over allow. A denied tool is stripped from the request, which still goes through.')}
+    ${field('session_token_cap', 'Session token cap', input('session_token_cap', p ? p.session_token_cap || 0 : 0, 'type=number min=0 step=1 aria-describedby=session_token_cap-err') + '<div class="meta-err" id="session_token_cap-err" role="alert"></div>', '0 = unlimited. Prompt + completion tokens one <code>X-Ragmux-Session</code> may spend; after that its requests get <code>429</code>.')}
     <div class="field"><span class="field"><label>Members</label></span>${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p ? p.member_ids || [] : [state.user.id])}<div class="hint">You stay a member of projects you create; an editor cannot remove themselves.</div></div>`,
     onSubmit: async (d, form) => { const members = checkedValues(form, 'members');
       const body = { name: d.name, model_connection_id: Number(d.model_connection_id), rag_store_id: Number(d.rag_store_id) || null, system_prompt: d.system_prompt, rate_limit_rpm: Number(d.rate_limit_rpm) || 0, rate_limit_tpm: Number(d.rate_limit_tpm) || 0, budget_daily_tokens: Number(d.budget_daily_tokens) || 0, budget_monthly_tokens: Number(d.budget_monthly_tokens) || 0 };
       // Only settings that differ from the project's current (or default) value
       // are sent. The fields that only matter for condense are disabled, and so
       // absent from d, while the strategy is last_user.
+      const allow = parseToolList(d.tool_allow), deny = parseToolList(d.tool_deny);
+      const capText = String(d.session_token_cap ?? '').trim(), cap = capText === '' ? 0 : Number(capText);
+      const toolErr = { tool_allow: toolListError('tool_allow', allow), tool_deny: toolListError('tool_deny', deny),
+        session_token_cap: Number.isSafeInteger(cap) && cap >= 0 ? '' : 'session_token_cap must be 0 (unlimited) or a positive whole number' };
+      if (showToolErrors(form, toolErr)) throw new Error('Fix the tool policy fields');
+      // Lists and the cap are sent only when they changed, like the RAG settings.
+      if (JSON.stringify(allow) !== JSON.stringify(p ? p.tool_allow || [] : [])) body.tool_allow = allow;
+      if (JSON.stringify(deny) !== JSON.stringify(p ? p.tool_deny || [] : [])) body.tool_deny = deny;
+      if (cap !== (p ? p.session_token_cap || 0 : 0)) body.session_token_cap = cap;
       for (const k of ['context_placement', 'retrieval_policy', 'query_strategy']) if (d[k] !== ragCur(p, k)) body[k] = d[k];
       if (d.history_turns_for_query != null && Number(d.history_turns_for_query) !== ragCur(p, 'history_turns_for_query')) body.history_turns_for_query = Number(d.history_turns_for_query);
       if (d.query_model_connection_id != null && (Number(d.query_model_connection_id) || 0) !== ragCur(p, 'query_model_connection_id')) body.query_model_connection_id = Number(d.query_model_connection_id) || null;
-      if (p) { await api('/projects/' + p.id, { method: 'PUT', body }); await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: members } }); toast('Saved', 3000, 'ok'); }
-      else { const r = await api('/projects', { method: 'POST', body: { ...body, member_user_ids: members } }); state.openProject = r.project.id; showKey(r.project, r.api_key); }
+      try {
+        if (p) { await api('/projects/' + p.id, { method: 'PUT', body }); await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: members } }); toast('Saved', 3000, 'ok'); }
+        else { const r = await api('/projects', { method: 'POST', body: { ...body, member_user_ids: members } }); state.openProject = r.project.id; showKey(r.project, r.api_key); }
+      } catch (err) { showToolErrors(form, { [(/^(tool_allow|tool_deny|session_token_cap)\b/.exec(err.message) || [])[1]]: err.message }); throw err; }
       await loadAll(); render(); } });
   // The two condense-only fields follow the strategy: disabled fields are not
   // submitted, which is what keeps them out of the request body.
   const strategySel = $('[name=query_strategy]', form);
   const syncCondense = () => { for (const n of ['history_turns_for_query', 'query_model_connection_id']) $(`[name=${n}]`, form).disabled = strategySel.value !== 'condense'; };
   strategySel.onchange = syncCondense; syncCondense();
+  for (const name of ['tool_allow', 'tool_deny', 'session_token_cap']) $(`[name=${name}]`, form).addEventListener('input', e => { e.target.removeAttribute('aria-invalid'); $(`#${name}-err`, form).textContent = ''; });
 }
 function membersForm(p) {
   drawer({ eyebrow: 'Members', title: p.name, submitLabel: 'Save members', body: `${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p.member_ids || [])}<p class="hint">Members see the project, its metrics and usage; editors among them can change it. An editor cannot remove themselves.</p>`,
@@ -1593,6 +1650,7 @@ function routeForm(projectId, route, routes, onSaved) {
 
 async function projectPanel() {
   const id = state.openProject; const panel = $('#projPanel'); const p = state.projects.find(x => x.id === id); if (!p || !panel) return;
+  const sessFocus = sessionFocus();
   panel.innerHTML = '<div class="card">Loading…</div>'; clearInterval(ringTimer);
   let m, u; try { [m, u] = await Promise.all([api(`/projects/${id}/metrics?window=24h`), api(`/projects/${id}/usage`)]); } catch (e) { panel.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`; return; }
   if (state.openProject !== id) return;
@@ -1614,10 +1672,12 @@ async function projectPanel() {
       <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(win.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(win.p95_latency_ms)} ms</div></div>
       <div class="stat" title="Estimated from the price table; not a bill"><div class="l">Spend 24h (est.)</div><div class="v">${fmtUSD(win.cost_usd)}</div><div class="d">${fmtUSD(t.cost_usd)} all time · ${fmtN(t.requests)} requests</div></div></div>
     <div class="card" id="routesCard"></div>
+    <div class="card" id="sessionsCard"></div>
     <div class="card"><div class="card-head"><h2>Recent</h2><span class="hint">last 50 · newest first</span></div>
       <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th title="Estimated from the price table">$ (est.)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
       ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}${r.cached_prompt_tokens ? ` <span class="pill info" title="prompt tokens served from the provider cache">cache ${fmtK(r.cached_prompt_tokens)}</span>` : ''}</td><td class="mono ${r.cost_source === 'none' ? 'muted' : ''}" title="${r.cost_source === 'none' ? 'no price for this model' : 'estimated · ' + esc(r.cost_source) + ' price'}">${r.cost_source === 'none' ? '—' : fmtUSD(r.cost_usd)}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
   renderRoutes(id);
+  renderSessions(id, sessFocus);
   // Live countdown on the reset labels; the minute ring is refetched when its window rolls over.
   const resets = { minute: u.minute.resets_at, day: u.day.resets_at, month: u.month.resets_at };
   ringTimer = setInterval(() => { if (state.tab !== 'projects' || state.openProject !== id) { clearInterval(ringTimer); return; }
@@ -1629,6 +1689,128 @@ async function projectPanel() {
     $('#delProject').onclick = async () => { if (!await confirmDialog('Delete this project and its metrics?', { label: 'Delete project' })) return; try { await api('/projects/' + id, { method: 'DELETE' }); state.openProject = null; await loadAll(); render(); } catch (e) { toast(e.message, 5000, 'err'); } };
     const raise = $('#raise'); if (raise) raise.onclick = () => projectForm(p);
   }
+}
+
+// ---------------------------------------------------------------------------
+// sessions (ADR-032): a project's X-Ragmux-Session runs, list and detail
+// ---------------------------------------------------------------------------
+const SESSION_PAGE = 50, SESSION_REQUESTS = 100;
+const toolPills = r => {
+  const names = (r.tool_names || []).map(n => `<span class="pill violet" title="${esc(n)}">${esc(n)}</span>`);
+  if (r.tools_denied) names.push(`<span class="pill warn" title="Tools the project's allow and deny lists stripped from the request">${fmtN(r.tools_denied)} stripped</span>`);
+  return names.length ? `<div class="meta-pills">${names.join('')}</div>` : '<span class="muted">—</span>';
+};
+// sessionFocus names the control inside the sessions card that has focus, so a
+// repaint of the panel (projectPanel clears it first) can put focus back.
+function sessionFocus() {
+  const a = document.activeElement;
+  if (!a || !a.closest || !a.closest('#sessionsCard')) return null;
+  return a.dataset && a.dataset.sid ? { sid: a.dataset.sid } : a.id ? { id: a.id } : null;
+}
+// state.sessions outlives a repaint of the project panel (a usage window
+// rolling over), so the pages already loaded and the session being read
+// survive it. A save or a tab change redraws the whole screen through
+// renderProjects, which drops it on purpose: the list starts fresh then. gen counts list loads (Refresh drops what an older load
+// returns); vseq counts view changes (a reply for a view the user has left
+// is dropped).
+async function renderSessions(projectId, refocus = null) {
+  const card = $('#sessionsCard'); if (!card) return;
+  if (!state.sessions || state.sessions.projectId !== projectId) state.sessions = { projectId, rows: [], offset: 0, more: false, loaded: false, gen: 0, vseq: 0, pending: null, sid: null, detail: null };
+  const st = state.sessions;
+  const gone = () => state.openProject !== projectId || $('#sessionsCard') !== card;
+  const cap = () => (state.projects.find(x => x.id === projectId) || {}).session_token_cap || 0;
+  const head = (extra = '') => `<div class="card-head"><div><h2>Sessions</h2><div class="hint">Runs that sent <code>X-Ragmux-Session</code>, most recently active first. Totals follow the request log retention.</div></div><div class="row wrap">${extra}</div></div>`;
+  const back = '<button type="button" class="btn sm ghost" id="sessBack">&larr; All sessions</button>';
+  const restore = rf => {
+    if (!rf) return;
+    const el = rf.sid !== undefined ? $$('[data-sid]', card).find(x => x.dataset.sid === rf.sid) : $('#' + rf.id, card);
+    if (el) el.focus();
+  };
+  const failure = (what, e, retry, withBack) => {
+    card.innerHTML = head(withBack ? back : '') + `<div class="note err" role="alert"><span class="hint">Could not load ${what}: ${esc(e.message)}</span><span class="grow"></span><button class="btn sm" id="sessRetry">Retry</button></div>`;
+    $('#sessRetry').onclick = retry; if (withBack) $('#sessBack').onclick = () => toList(st.sid);
+  };
+
+  // One page of the list. A page is merged by session id: sessions that are
+  // active while the user pages move to the top and would otherwise show up
+  // twice (offset paging); offset counts what the server returned, not rows.
+  // At most one page is in flight: a second call (a Load more drawn again by
+  // a repaint) joins it instead of asking for the same offset and counting it twice.
+  function loadPage() {
+    if (st.pending) return st.pending;
+    const gen = st.gen;
+    const p = (async () => {
+      const page = (await api(`/projects/${projectId}/sessions?limit=${SESSION_PAGE}&offset=${st.offset}`)) || [];
+      if (gen !== st.gen) return false;
+      for (const r of page) { const i = st.rows.findIndex(x => x.session_id === r.session_id); if (i >= 0) st.rows[i] = r; else st.rows.push(r); }
+      st.offset += page.length; st.more = page.length === SESSION_PAGE; st.loaded = true;
+      return true;
+    })();
+    st.pending = p;
+    const clear = () => { if (st.pending === p) st.pending = null; };
+    p.then(clear, clear);
+    return p;
+  }
+  const toList = sid => { st.vseq++; st.sid = null; st.detail = null; return st.loaded ? paintList(sid) : firstLoad(sid); };
+  async function firstLoad(focusSid) {
+    st.gen++; st.vseq++; st.pending = null; st.sid = null; st.detail = null; st.rows = []; st.offset = 0; st.more = false; st.loaded = false;
+    const my = st.vseq;
+    card.innerHTML = head() + '<div class="hint" role="status">Loading sessions…</div>';
+    try { await loadPage(); } catch (e) { if (!gone() && my === st.vseq) failure('sessions', e, () => firstLoad()); return; }
+    if (!gone() && my === st.vseq) paintList(focusSid);
+  }
+  function paintList(focusSid, rf) {
+    const c = cap();
+    card.innerHTML = head('<button class="btn sm" id="sessRefresh">Refresh</button>') + (st.rows.length
+      ? `<div class="tbl"><table><caption class="sr">Sessions of this project</caption><thead><tr><th>Session</th><th class="right">Requests</th><th>Tokens p / c</th><th>Total${c ? ` · cap ${fmtK(c)}` : ''}</th><th>Last active</th></tr></thead><tbody>
+        ${st.rows.map(r => `<tr class="rowlink" data-row="${esc(r.session_id)}"><td class="sess-id"><button type="button" class="link-btn mono" data-sid="${esc(r.session_id)}" title="${esc(r.session_id)}">${esc(r.session_id)}</button></td><td class="mono right">${fmtN(r.requests)}</td><td class="mono nowrap" title="${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}">${fmtK(r.prompt_tokens)} / ${fmtK(r.completion_tokens)}</td><td class="mono nowrap" title="${fmtN(r.tokens)} tokens">${fmtK(r.tokens)}${c ? ` ${pctPill(pct(r.tokens, c))}` : ''}</td><td class="mono nowrap" title="${esc(fmtDate(r.last_seen))}">${esc(fmtDay(r.last_seen))}</td></tr>`).join('')}</tbody></table></div>
+        ${st.more ? '<div class="row wrap" style="margin-top:12px"><button class="btn sm" id="sessMore">Load more</button><span class="hint">Active sessions move to the top while you page; Refresh if the list looks off.</span></div>' : ''}`
+      : '<div class="empty">No sessions yet. A client opts in by sending <code>X-Ragmux-Session: &lt;id&gt;</code> with its requests.</div>');
+    $('#sessRefresh').onclick = () => firstLoad();
+    on(card, '[data-sid]', 'click', b => openDetail(b.dataset.sid));
+    on(card, 'tr[data-row]', 'click', (tr, e) => { if (!e.target.closest('button')) openDetail(tr.dataset.row); });
+    const moreBtn = $('#sessMore');
+    if (moreBtn) moreBtn.onclick = async () => {
+      const my = st.vseq; moreBtn.disabled = true;
+      try { await loadPage(); } catch (e) { toast('Error: ' + e.message, 5000, 'err'); if (!gone() && my === st.vseq) moreBtn.disabled = false; return; }
+      if (!gone() && my === st.vseq) paintList(null, { id: 'sessMore' });
+    };
+    if (focusSid) restore({ sid: focusSid }); else restore(rf);
+  }
+  async function openDetail(sid, focus = true, rf = null) {
+    st.vseq++; st.sid = sid; st.detail = null;
+    const my = st.vseq;
+    card.innerHTML = head(back) + '<div class="hint" role="status">Loading session…</div>';
+    $('#sessBack').onclick = () => toList(sid); if (focus) $('#sessBack').focus();
+    let d;
+    try { d = await api(`/projects/${projectId}/sessions/${encodeURIComponent(sid)}?limit=${SESSION_REQUESTS}`); }
+    catch (e) { if (!gone() && my === st.vseq) failure('this session', e, () => openDetail(sid), true); return; }
+    if (gone() || my !== st.vseq) return;
+    st.detail = d; paintDetail(d, focus ? { id: 'sessBack' } : rf);
+  }
+  function paintDetail(d, rf) {
+    const s = d.session, reqs = d.requests || [], c = cap();
+    const used = c ? pct(s.tokens, c) : 0;
+    card.innerHTML = head(back) + `<div class="stack" style="gap:16px">
+      <div><div class="eyebrow">Session</div><div class="mono" style="font-size:14px;overflow-wrap:anywhere">${esc(s.session_id)}</div></div>
+      <div class="stats four">
+        <div class="stat"><div class="l">Requests</div><div class="v">${fmtN(s.requests)}</div></div>
+        <div class="stat" title="${fmtN(s.prompt_tokens)} prompt / ${fmtN(s.completion_tokens)} completion"><div class="l">Tokens</div><div class="v">${fmtK(s.tokens)}</div><div class="d">${fmtK(s.prompt_tokens)} p / ${fmtK(s.completion_tokens)} c</div></div>
+        <div class="stat"><div class="l">First seen</div><div class="v" style="font-size:18px">${esc(fmtDay(s.first_seen))}</div></div>
+        <div class="stat"><div class="l">Last active</div><div class="v" style="font-size:18px">${esc(fmtDay(s.last_seen))}</div></div></div>
+      ${c ? `<div class="sess-cap"><div class="row between wrap"><span class="hint">Session token cap</span><span class="mono dim">${fmtN(s.tokens)} / ${fmtN(c)} (${used}%)</span></div>${meter(used)}
+        ${s.tokens >= c ? '<div class="note err" role="status"><span class="pill err">cap</span><span class="dim">This session has spent its cap: its next request gets <code>429 session_token_cap</code>. The client has to start a new session.</span></div>' : ''}</div>` : ''}
+      <div class="tbl"><table><caption class="sr">Requests of this session, newest first</caption><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th>Latency</th><th>Tools called</th><th>Error</th></tr></thead><tbody>
+        ${reqs.map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${esc(fmtDay(r.created_at))}</td><td class="mono nowrap">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono nowrap">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}</td><td class="mono nowrap">${fmtMs(r.latency_ms)}</td><td>${toolPills(r)}</td><td class="muted ellip" style="max-width:240px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No request rows left for this session.</td></tr>'}</tbody></table></div>
+      ${reqs.length >= SESSION_REQUESTS ? `<div class="hint">Showing the newest ${SESSION_REQUESTS} requests.</div>` : ''}</div>`;
+    $('#sessBack').onclick = () => toList(s.session_id); restore(rf);
+  }
+
+  // First paint: what the panel showed before it was repainted, else the list.
+  if (st.sid && st.detail) paintDetail(st.detail, refocus);
+  else if (st.sid) openDetail(st.sid, false, refocus);
+  else if (st.loaded) paintList(null, refocus);
+  else firstLoad();
 }
 
 // ---------------------------------------------------------------------------
