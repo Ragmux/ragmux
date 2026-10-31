@@ -560,7 +560,7 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]pt, 0, len(types))
 	for _, t := range types {
-		caps := provider.CapabilitiesFor(t.typ)
+		caps := provider.CapabilitiesFor(t.typ, "")
 		out = append(out, pt{Type: t.typ, Label: t.label, DefaultURL: t.url,
 			Embeddings: caps.Embeddings, NeedsKey: t.needsKey,
 			Tools: caps.Tools, Streaming: caps.Streaming, Capabilities: caps})

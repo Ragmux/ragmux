@@ -111,7 +111,7 @@ func (p *azureChat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		return nil, err
 	}
 	req.Model = p.t.cfg.Model
-	req.Messages = stripToolCallSignatures(req.Messages)
+	req.Messages = stripGatewayExtensions(req.Messages)
 	req.Stream = false
 	req.StreamOptions = nil
 	var out ChatResponse
@@ -137,7 +137,7 @@ func (p *azureChat) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 		return err
 	}
 	req.Model = p.t.cfg.Model
-	req.Messages = stripToolCallSignatures(req.Messages)
+	req.Messages = stripGatewayExtensions(req.Messages)
 	req.Stream = true
 	req.StreamOptions = json.RawMessage(`{"include_usage":true}`)
 	resp, err := doStream(ctx, p.t.cfg, endpoint, p.t.headers(), req)

@@ -19,6 +19,14 @@ type Message struct {
 	Name       string          `json:"name,omitempty"`
 	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
+	// IsError is the gateway's extension for a role "tool" message: the tool
+	// call failed, and the model should read the content as an error. OpenAI's
+	// format has no such flag, so a client that wants Anthropic's is_error
+	// sends ragmux_is_error: true next to tool_call_id. Only the Anthropic
+	// adapter acts on it; the adapters that forward messages verbatim strip it
+	// (stripGatewayExtensions), because an upstream that validates its input
+	// would reject the unknown field.
+	IsError bool `json:"ragmux_is_error,omitempty"`
 }
 
 // Text extracts plain text from a string or parts-array content.
@@ -61,15 +69,27 @@ func contentText(raw json.RawMessage) string {
 // outside the provider that issued it.
 const toolCallSignatureField = "ragmux_signature"
 
-// stripToolCallSignatures returns msgs with the signature extension removed
-// from every assistant tool call, for upstreams that speak the OpenAI wire
-// format and were never meant to see it. The caller's slice is left alone:
-// a fallback may still hand the same request to the provider that does want
-// the signature. A tool_calls value that does not decode is passed through
-// untouched; the upstream judges it as it would without the gateway.
-func stripToolCallSignatures(msgs []Message) []Message {
+// stripGatewayExtensions returns msgs with the gateway's own message
+// extensions removed, for upstreams that speak the OpenAI wire format and
+// were never meant to see them: the signature on an assistant tool call
+// (toolCallSignatureField) and the error flag on a tool message
+// (Message.IsError). The caller's slice is left alone: a fallback may still
+// hand the same request to a provider that does want them. A tool_calls
+// value that does not decode is passed through untouched; the upstream
+// judges it as it would without the gateway.
+func stripGatewayExtensions(msgs []Message) []Message {
 	var out []Message
+	// own copies msgs the first time a message has to change.
+	own := func() []Message {
+		if out == nil {
+			out = append([]Message(nil), msgs...)
+		}
+		return out
+	}
 	for i, m := range msgs {
+		if m.IsError {
+			own()[i].IsError = false
+		}
 		if len(m.ToolCalls) == 0 {
 			continue
 		}
@@ -91,10 +111,7 @@ func stripToolCallSignatures(msgs []Message) []Message {
 		if err != nil {
 			continue
 		}
-		if out == nil {
-			out = append([]Message(nil), msgs...)
-		}
-		out[i].ToolCalls = b
+		own()[i].ToolCalls = b
 	}
 	if out == nil {
 		return msgs
@@ -311,6 +328,10 @@ type Choice struct {
 	Index        int             `json:"index"`
 	Message      ResponseMessage `json:"message"`
 	FinishReason *string         `json:"finish_reason"`
+	// Logprobs is OpenAI's token log-probability object, relayed verbatim
+	// (including an explicit null). It is only present when the request asked
+	// for logprobs, which travel upstream as unknown request fields.
+	Logprobs json.RawMessage `json:"logprobs,omitempty"`
 }
 
 // ResponseMessage is the assistant reply.
@@ -318,6 +339,11 @@ type ResponseMessage struct {
 	Role      string          `json:"role"`
 	Content   *string         `json:"content"`
 	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	// Refusal and Annotations are OpenAI's fields, relayed as the upstream
+	// sent them. A refusal is the model declining in place of content;
+	// annotations are citations (web search) attached to the content.
+	Refusal     *string         `json:"refusal,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
 }
 
 // ChatResponse is the OpenAI non-streaming response.
@@ -328,6 +354,9 @@ type ChatResponse struct {
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
 	Usage   *Usage   `json:"usage,omitempty"`
+	// SystemFingerprint identifies the upstream backend configuration that
+	// served the request; relayed as sent.
+	SystemFingerprint string `json:"system_fingerprint,omitempty"`
 }
 
 // Delta is the incremental payload in a streaming choice.
@@ -335,6 +364,10 @@ type Delta struct {
 	Role      string          `json:"role,omitempty"`
 	Content   *string         `json:"content,omitempty"`
 	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	// Refusal and Annotations are the streaming halves of the ResponseMessage
+	// fields of the same name.
+	Refusal     *string         `json:"refusal,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
 }
 
 // StreamChoice is one streaming choice.
@@ -342,6 +375,8 @@ type StreamChoice struct {
 	Index        int     `json:"index"`
 	Delta        Delta   `json:"delta"`
 	FinishReason *string `json:"finish_reason"`
+	// Logprobs is the streaming half of Choice.Logprobs.
+	Logprobs json.RawMessage `json:"logprobs,omitempty"`
 }
 
 // StreamChunk is one OpenAI "chat.completion.chunk" event.
@@ -352,6 +387,8 @@ type StreamChunk struct {
 	Model   string         `json:"model"`
 	Choices []StreamChoice `json:"choices"`
 	Usage   *Usage         `json:"usage,omitempty"`
+	// SystemFingerprint is the streaming half of ChatResponse.SystemFingerprint.
+	SystemFingerprint string `json:"system_fingerprint,omitempty"`
 }
 
 // Provider is a chat backend.

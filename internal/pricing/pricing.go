@@ -18,7 +18,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"strings"
+
+	"github.com/ragmux/ragmux/internal/glob"
 )
 
 // Price is the cost of one model per million tokens. CacheWrite and
@@ -76,11 +77,8 @@ func NewTable(rows []Row) *Table {
 	copy(sorted, rows)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		a, b := sorted[i], sorted[j]
-		if ea, eb := !hasWildcard(a.Pattern), !hasWildcard(b.Pattern); ea != eb {
-			return ea
-		}
-		if la, lb := len(literalPrefix(a.Pattern)), len(literalPrefix(b.Pattern)); la != lb {
-			return la > lb
+		if c := glob.Compare(a.Pattern, b.Pattern); c != 0 {
+			return c < 0
 		}
 		return a.ID < b.ID
 	})
@@ -97,7 +95,7 @@ func (t *Table) Lookup(providerType, model string) (Price, bool) {
 		return Price{}, false
 	}
 	for _, r := range t.rows {
-		if r.ProviderType == providerType && matchGlob(r.Pattern, model) {
+		if r.ProviderType == providerType && glob.Match(r.Pattern, model) {
 			return r.Price, true
 		}
 	}
@@ -189,39 +187,6 @@ func nonNegativeRate(v float64) float64 {
 		return 0
 	}
 	return v
-}
-
-func hasWildcard(pattern string) bool { return strings.Contains(pattern, "*") }
-
-// literalPrefix is the part of a pattern before its first wildcard.
-func literalPrefix(pattern string) string {
-	if i := strings.IndexByte(pattern, '*'); i >= 0 {
-		return pattern[:i]
-	}
-	return pattern
-}
-
-// matchGlob reports whether pattern matches s, with "*" standing for any run
-// of characters. path.Match is unusable here: it gives "/" a meaning of its
-// own and model names routinely contain one ("deepseek-ai/DeepSeek-V3").
-func matchGlob(pattern, s string) bool {
-	parts := strings.Split(pattern, "*")
-	if len(parts) == 1 {
-		return pattern == s
-	}
-	head, tail := parts[0], parts[len(parts)-1]
-	if !strings.HasPrefix(s, head) {
-		return false
-	}
-	s = s[len(head):]
-	for _, mid := range parts[1 : len(parts)-1] {
-		i := strings.Index(s, mid)
-		if i < 0 {
-			return false
-		}
-		s = s[i+len(mid):]
-	}
-	return len(s) >= len(tail) && strings.HasSuffix(s, tail)
 }
 
 // builtinFile is the JSON shape of prices.json.

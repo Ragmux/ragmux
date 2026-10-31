@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -60,8 +61,12 @@ type anthropicContent struct {
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	Source    *anthropicImage `json:"source,omitempty"`
+	// Content is a tool_result's payload: a JSON string, or an array of text
+	// and image blocks when the tool returned pictures.
+	Content json.RawMessage `json:"content,omitempty"`
+	// IsError marks a tool_result whose tool call failed.
+	IsError bool            `json:"is_error,omitempty"`
+	Source  *anthropicImage `json:"source,omitempty"`
 	// CacheControl is the client's prompt-caching breakpoint, relayed
 	// verbatim: the gateway does not interpret its contents.
 	CacheControl json.RawMessage `json:"cache_control,omitempty"`
@@ -182,9 +187,11 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (anthr
 			}
 			out.Messages = appendAnthropic(out.Messages, "assistant", parts)
 		case "tool":
-			out.Messages = appendAnthropic(out.Messages, "user", []anthropicContent{{
-				Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Text(),
-			}})
+			result, err := toolResultContent(images, m)
+			if err != nil {
+				return out, err
+			}
+			out.Messages = appendAnthropic(out.Messages, "user", []anthropicContent{result})
 		}
 	}
 	if len(system) > 0 {
@@ -367,6 +374,44 @@ func openAIPartsToAnthropic(images *imageBudget, raw json.RawMessage) ([]anthrop
 		out = []anthropicContent{{Type: "text", Text: ""}}
 	}
 	return out, nil
+}
+
+// toolResultContent builds the tool_result block for a role "tool" message.
+// The content stays a plain string, byte for byte what it was before this
+// carried anything else, unless the tool returned images: then it is the
+// array of text and image blocks the Messages API takes there. The failure
+// flag (Message.IsError) becomes is_error.
+func toolResultContent(images *imageBudget, m Message) (anthropicContent, error) {
+	block := anthropicContent{Type: "tool_result", ToolUseID: m.ToolCallID, IsError: m.IsError}
+	if bytes.HasPrefix(bytes.TrimSpace(m.Content), []byte("[")) {
+		parts, err := openAIPartsToAnthropic(images, m.Content)
+		if err != nil {
+			return block, err
+		}
+		hasImage := false
+		for i := range parts {
+			hasImage = hasImage || parts[i].Type == "image"
+			// A breakpoint on a nested block is not one the API takes there;
+			// before images were carried at all it was dropped with the rest.
+			parts[i].CacheControl = nil
+		}
+		if hasImage {
+			raw, err := json.Marshal(parts)
+			if err != nil {
+				return block, err
+			}
+			block.Content = raw
+			return block, nil
+		}
+	}
+	if t := m.Text(); t != "" {
+		raw, err := json.Marshal(t)
+		if err != nil {
+			return block, err
+		}
+		block.Content = raw
+	}
+	return block, nil
 }
 
 // maxLoggedStopReason bounds an unknown stop_reason in the log line; the

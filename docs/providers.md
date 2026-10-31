@@ -108,13 +108,48 @@ argument fragments, because that is how the upstream sends them — see
 see [Images](#images).
 ³ OpenAI and Azure OpenAI cache prompts automatically, so there is no marker to send.
 
-The table gates nothing: an adapter answers for itself with a typed error when a request
+### Model-level capabilities
+
+Some behavior is decided by the **model**, not the provider type, because models of one
+provider disagree on the wire shape they accept (Anthropic's `budget_tokens` is a `400` on
+Claude 4.7 and later, `adaptive` thinking is a `400` on 4.5 and earlier, and Opus 5.5
+rejects a forced `tool_choice`). `CapabilitiesFor(providerType, model)` therefore also
+reports these flags, resolved from a table compiled into the gateway:
+
+| Flag | Meaning |
+|---|---|
+| `native_json_schema` | The upstream enforces a response schema itself |
+| `forced_tool_choice` | `tool_choice` may require a tool or name one |
+| `thinking` | `none`, `budget`, `adaptive`, `level`, `toggle` or `passthrough` |
+| `thinking_off` | How thinking is switched off: `disabled`, `between_tools` or `none` (it cannot be); empty when not applicable |
+| `effort_levels` | The effort values the model accepts, lowest first; absent when it has no effort parameter |
+| `thinking_prefix_bound` | The upstream validates a replayed thinking block against everything before it (Claude 5.1 and later) |
+
+A row is a pattern with `*` standing for any run of characters; the row with the longest
+literal prefix wins, the rule the [price table](api.md#model-prices) uses. For Anthropic the
+rows follow Anthropic's own model pages (thinking, effort, structured outputs, tool use).
+A model no row matches gets the provider's **current generation**, so a model released
+after this gateway keeps working. For Anthropic that is the most restrictive common
+denominator of the newest generation: native JSON schema, adaptive thinking that cannot be
+switched off, effort `low`/`medium`/`high`, no forced tool choice, prefix-bound thinking.
+The cost is that a newer model which does allow forced tool choice is treated as if it did
+not until a row is added. OpenAI-compatible and Azure connections report `passthrough`
+and are not looked up by model, because a deployment name says nothing about the model.
+`GET /admin/api/provider-types` reports the provider-level answer (no model).
+
+These flags select which request the gateway builds, so a wrong row shows up as the
+upstream's own `400`, fixed in a patch release. The flags themselves change nothing a
+client sends; the thinking and structured-output translations that read them are
+described with those features.
+
+The table above gates nothing: an adapter answers for itself with a typed error when a request
 asks for something it cannot do, and a second copy of those rules in front of it would
 only drift. It is a description, for the dashboard and for this page.
 
 `GET /admin/api/provider-types` reports it per type: the flat `supports_embeddings`,
 `requires_api_key`, `supports_streaming` and `supports_tools` fields, plus a
-`capabilities` object with the full table above.
+`capabilities` object with the full table above and the
+[model-level flags](#model-level-capabilities) (for the provider's current generation).
 
 ## Rerank providers (`cohere_rerank`, `voyage_rerank`)
 
@@ -158,21 +193,34 @@ non-streaming calls).
 
 Top-level request fields travel as sent (see
 [Request field passthrough](#request-field-passthrough-extra)), but inside `messages` only
-`role`, `content`, `name`, `tool_calls` and `tool_call_id` are kept; the **response** is
-rewritten as well. Replies and SSE chunks are
-decoded into the gateway's own OpenAI-shaped structures and written back out, so only the
-fields it knows come through:
+`role`, `content`, `name`, `tool_calls` and `tool_call_id` are kept. The gateway's own
+message extensions (`ragmux_signature` on a tool call, `ragmux_is_error` on a tool
+message) are removed before the request leaves.
 
-- top level: `id`, `object`, `created`, `model`, `choices` and `usage` (with
-  `prompt_tokens_details` and `completion_tokens_details`);
-- per choice: `index`, `finish_reason` and a `message` (a `delta` on streams) holding
-  `role`, `content` and `tool_calls`.
+The **response** is decoded into the gateway's own OpenAI-shaped structures and written
+back out, so only the fields it knows come through. Those are:
 
-Anything else the upstream adds is **not** forwarded: `reasoning_content`, `refusal`,
-`annotations`, `logprobs` and `system_fingerprint` are all dropped, even when the request
-asked for them (`logprobs: true` reaches the upstream, as the passthrough below says, and
-its answer does not come back). A client that needs one of them cannot get it through the
-gateway in this release.
+- top level: `id`, `object`, `created`, `model`, `system_fingerprint`, `choices` and
+  `usage` (with `prompt_tokens_details` and `completion_tokens_details`);
+- per choice: `index`, `finish_reason`, `logprobs` and a `message` (a `delta` on streams)
+  holding `role`, `content`, `tool_calls`, `refusal` and `annotations`.
+
+`refusal`, `annotations`, `logprobs` and `system_fingerprint` are relayed exactly as the
+upstream sent them, in non-streaming replies and in every SSE chunk that carries them,
+and a request-side `logprobs` / `top_logprobs` reaches the upstream (see the passthrough
+below). The one thing still dropped is `reasoning_content` (and any other field the
+upstream adds that is not listed above).
+
+| Response field | `openai`, `deepseek`, `custom_openai`, `azure_openai` | `anthropic` | `gemini` | `ollama` |
+|---|---|---|---|---|
+| `system_fingerprint` | relayed | — | — | — |
+| `choices[].logprobs` | relayed | — | — | — |
+| `message.refusal` / `delta.refusal` | relayed | — ¹ | — | — |
+| `message.annotations` / `delta.annotations` | relayed | — | — | — |
+| `reasoning_content` | dropped | — | — | — |
+
+¹ Anthropic's `stop_reason: "refusal"` becomes `finish_reason: "content_filter"` instead;
+there is no `refusal` text to carry.
 
 What the gateway asks the upstream for is not what it passes on: the usage-only trailer
 chunk reaches the client only when the client itself sent
@@ -279,7 +327,12 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   `"auto"` → `{"type":"auto"}`, `"required"` → `{"type":"any"}`, a named function →
   `{"type":"tool","name":…}`, `"none"` removes the tools. Assistant `tool_calls` become
   `tool_use` blocks, `tool` messages become `tool_result` blocks, and `tool_use` in the
-  reply becomes OpenAI `tool_calls` (also in streams, via `input_json_delta`).
+  reply becomes OpenAI `tool_calls` (also in streams, via `input_json_delta`). OpenAI has
+  no way to say that a tool call failed, so a `tool` message may carry the gateway's own
+  `"ragmux_is_error": true`, which becomes `is_error: true` on the `tool_result`. A `tool`
+  message whose `content` is a parts array with `image_url` parts becomes a `tool_result`
+  whose content is a block array of text and image blocks (images follow the rules
+  below); a tool message without images keeps the plain-string content it always had.
 - Image parts: `image_url` with a `data:` URL is sent as a base64 image block, any other
   URL as a URL image block — Anthropic fetches it itself, which is cheaper than relaying
   the bytes through the gateway. A Bedrock-style gateway in front of Anthropic that has no
