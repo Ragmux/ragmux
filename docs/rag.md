@@ -868,6 +868,37 @@ rate of the connection that ran the rerank, not the embedding connection's; an A
 reranker's spend is priced at its own connection's price (see
 [Rerank is priced with the connection that did it](#reranking)).
 
+## MCP clients
+
+The same search is available to MCP clients as a tool, so an AI coding agent can query the
+project's store directly. `POST /mcp` serves it (protocol, tool naming and errors are in the
+[API reference](api.md#mcp-endpoint)); the key needs the `retrieve` scope. The tool is named
+`search_<store>`, with the store's name as a slug, and **renaming the store renames the tool**,
+which a client's allow-list or prompt may mention. Create a key with only `retrieve` for it: it
+cannot call chat, and it is checked and counted like any `/v1/retrieve` call.
+
+**Claude Code.** Add the server with a static header:
+
+```sh
+claude mcp add --transport http ragmux https://ragmux.example.com/mcp \
+  --header "Authorization: Bearer sk-user-…"
+```
+
+The tool then appears as `mcp__ragmux__search_<store>`; names are cut at 48 characters so the
+prefix still fits.
+
+**Any other MCP client** that speaks Streamable HTTP takes the same two settings, in whatever
+form its configuration uses:
+
+```json
+{"mcpServers": {"ragmux": {"type": "http", "url": "https://ragmux.example.com/mcp",
+  "headers": {"Authorization": "Bearer sk-user-…"}}}}
+```
+
+A key that grants several projects also sends `X-Ragmux-Project: <name>`. Clients that only
+send `x-api-key` work too. Browser-based clients need the origin in `CORS_ORIGINS`; without one
+the server refuses every request that carries an `Origin` header.
+
 ## Embedding token accounting
 
 Ingestion embeds every chunk, and since 0.5 the tokens it spends are counted. Each

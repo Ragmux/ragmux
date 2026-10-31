@@ -31,6 +31,7 @@ import (
 	"github.com/ragmux/ragmux/internal/gateway"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/maintenance"
+	"github.com/ragmux/ragmux/internal/mcp"
 	"github.com/ragmux/ragmux/internal/metrics"
 	"github.com/ragmux/ragmux/internal/netguard"
 	"github.com/ragmux/ragmux/internal/obs"
@@ -342,6 +343,7 @@ func run(cfg config.Config) error {
 		http.Redirect(w, r, "/admin/", http.StatusFound)
 	})
 	r.Route("/v1", gw.Routes)
+	mountMCP(r, gw, log, cfg)
 	r.Route("/admin", adm.Routes)
 
 	metricsSrv := mountMetrics(r, cfg, registry)
@@ -775,6 +777,14 @@ func securityHeaders(scriptHash string) func(http.Handler) http.Handler {
 	}
 }
 
+// mountMCP serves the project's RAG store as an MCP tool at /mcp (ADR-030).
+// The endpoint checks the Origin against CORS_ORIGINS itself -- the cors
+// middleware only adds headers -- and takes its authentication, limits and
+// request log from the gateway.
+func mountMCP(r chi.Router, gw *gateway.Gateway, log *slog.Logger, cfg config.Config) {
+	r.Handle("/mcp", mcp.New(mcp.Config{Backend: gw, Log: log, Version: version, AllowedOrigins: cfg.CORSOrigins}))
+}
+
 func cors(origins []string) func(http.Handler) http.Handler {
 	allowAll := false
 	set := map[string]bool{}
@@ -791,7 +801,7 @@ func cors(origins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Vary", "Origin")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Ragmux-Project")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Ragmux-Project, MCP-Protocol-Version, Mcp-Method, Mcp-Name")
 				// Without this, browser JS cannot read a single one of the
 				// headers the gateway sets: the fetch API hides every
 				// response header that is not on the CORS safelist.

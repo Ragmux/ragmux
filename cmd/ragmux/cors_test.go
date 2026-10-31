@@ -26,3 +26,24 @@ func TestCORSExposesGatewayHeaders(t *testing.T) {
 		}
 	}
 }
+
+// The MCP request headers are not CORS-safelisted, so a browser client's
+// preflight has to be told it may send them (ADR-030).
+func TestCORSAllowsMCPHeaders(t *testing.T) {
+	h := cors([]string{"https://app.example"})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	r := httptest.NewRequest(http.MethodOptions, "/mcp", nil)
+	r.Header.Set("Origin", "https://app.example")
+	r.Header.Set("Access-Control-Request-Method", "POST")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	allowed := map[string]bool{}
+	for _, name := range strings.Split(w.Header().Get("Access-Control-Allow-Headers"), ",") {
+		allowed[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	for _, name := range []string{"Authorization", "MCP-Protocol-Version", "Mcp-Method", "Mcp-Name"} {
+		if !allowed[strings.ToLower(name)] {
+			t.Errorf("%s is not allowed: %q", name, w.Header().Get("Access-Control-Allow-Headers"))
+		}
+	}
+}

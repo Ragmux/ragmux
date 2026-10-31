@@ -1,10 +1,11 @@
 # REST API reference
 
-Ragmux exposes three HTTP surfaces:
+Ragmux exposes four HTTP surfaces:
 
 | Prefix | Audience | Authentication |
 |---|---|---|
 | `/v1/…` | your applications (OpenAI-compatible) | `Authorization: Bearer sk-proj-…` project key, or a user's `sk-user-…` key |
+| `/mcp` | MCP clients (Claude Code, IDE agents) | gateway key with the `retrieve` scope, see [MCP endpoint](#mcp-endpoint) |
 | `/admin/api/…` | dashboard and management scripts | session cookie, bearer session token, or a user's `sk-mgmt-…` key |
 | `/healthz` | load balancers, container healthchecks | none |
 
@@ -1223,3 +1224,82 @@ For a project without chat routes, with one project resolved, `{id}` is ignored 
 routes describe that project's connection. A `sk-user-…` key that grants several projects and names none lists one entry
 per granted project's connection instead, deduplicated by model name; `{id}` then has to
 match one of them (`404` otherwise). Both routes need the key's `models` scope.
+
+## MCP endpoint
+
+`POST /mcp` serves the project's RAG store to [Model Context Protocol](https://modelcontextprotocol.io)
+clients as one tool, over Streamable HTTP. It is the same search as
+[`POST /v1/retrieve`](#post-v1retrieve): same key, same `retrieve` scope, same limits, same request
+log row (`endpoint = retrieve`, one per `tools/call`). Neither the query nor the hits are logged.
+
+**Authentication.** `Authorization: Bearer <key>` or `x-api-key: <key>`, a project key or a
+`sk-user-…` key with the `retrieve` scope. The key and scope are checked on every request, the
+handshake included. A key that grants several projects names one in `X-Ragmux-Project`, as for
+chat. There is no OAuth: clients are configured with the key as a static header.
+
+**The tool.** A project has one RAG store, so `tools/list` returns one tool, named `search_` plus
+the store's name as a slug: lowercase, every character outside `[a-z0-9_]` becomes `_`, repeated
+underscores merge, leading and trailing ones are trimmed, and the whole name is cut at 48
+characters. A name that leaves nothing (one written entirely in non-ASCII characters) gives
+`search_store_<id>`. **Renaming the store renames the tool.** A project without a store lists no
+tools. The description carries the store's name and document count.
+
+| Argument | |
+|---|---|
+| `query` | Required. What to look for, up to 32 KiB. |
+| `top_k` | Optional, 1 to 50. Omitted uses the store's `top_k`. |
+| `filter` | Optional metadata filter ([grammar](rag.md#metadata-and-filters)). `null` means no filter. |
+
+The result is one text content item holding JSON, `{"hits": [{"content", "score", "filename",
+"section", "page", "chunk_index", "document_id", "chunk_id", "document_metadata"}]}`. The store's
+search mode, rerank and distance settings apply, as for `/v1/retrieve`. A bad argument (an unknown one included) or a failed
+search (the embedding provider is down, say) comes back as a tool result with `isError: true`, so
+the model can read it; a rerank or lexical backend that is unavailable falls back as it does for
+chat.
+
+**Protocol.** The server keeps no state: it mints no `Mcp-Session-Id` and ignores one a client
+sends, so any replica can answer any request. Responses are `application/json`; no event stream is
+opened. `GET` and `DELETE` answer `405`. Each request is read on its own to decide which protocol
+era it speaks:
+
+1. `initialize` is legacy.
+2. A request whose `params._meta["io.modelcontextprotocol/protocolVersion"]` is set is modern
+   (`2026-07-28`); its `MCP-Protocol-Version` header must carry the same value.
+3. Otherwise the `MCP-Protocol-Version` header decides: a legacy version is legacy, `2026-07-28`
+   without `_meta` is a header mismatch, anything else is unsupported.
+4. No header at all is `2025-03-26`.
+
+| Era | Versions | Methods |
+|---|---|---|
+| Modern | `2026-07-28` | `server/discover`, `tools/list`, `tools/call`. `Mcp-Method` must equal the body's method, and `Mcp-Name` the tool name on `tools/call` (a value sent as `=?base64?…?=` is decoded first). Every result carries `"resultType": "complete"`; `server/discover` names the server in `_meta["io.modelcontextprotocol/serverInfo"]`. |
+| Legacy | `2025-11-25`, `2025-06-18`, `2025-03-26` | `initialize`, `notifications/initialized` (`202`), `ping`, `tools/list`, `tools/call`. |
+
+| Status | JSON-RPC code | When |
+|---|---|---|
+| `400` | `-32020` | A modern request whose `Mcp-Method`, `Mcp-Name` or `MCP-Protocol-Version` is missing or differs from the body. |
+| `400` | `-32022` | An unsupported protocol version (for example `2024-11-05`). `error.data.supported` lists the supported ones. |
+| `404` | `-32601` | A modern request for a method the server does not have. A legacy request gets the same error in a `200`. |
+| `405` | | `GET`, `DELETE` and any other method. |
+| `400` | `-32700`, `-32600` | Unparseable JSON, batches, a malformed envelope. |
+| `200` | `-32602` | `tools/call` for a tool the project does not have. |
+
+**Refusals.** Authentication, scope, project and limit refusals keep the status `/v1/retrieve`
+gives them (`401`, `403`, `400 project_required`, `429` with `Retry-After`), with the OpenAI error
+body replaced by a JSON-RPC error. Those that happen before the request is read (key, scope,
+project, Origin) have no `id`; a limit refusal of a `tools/call` carries the call's `id`:
+
+```json
+{"jsonrpc": "2.0", "error": {"code": -32001, "message": "api key is not authorised for retrieval",
+ "data": {"code": "insufficient_scope"}}}
+```
+
+`data.code` is the Ragmux code (`invalid_api_key`, `key_revoked`, `insufficient_scope`,
+`project_required`, `rate_limited`, …). An unknown key's message is fixed, as for `/v1`.
+
+**Origin.** A request that carries an `Origin` header is checked against `CORS_ORIGINS`: one that
+is not listed answers `403`, an empty list refuses every request with an `Origin`, and `*` lets
+every one through. A request without `Origin`, which is what non-browser MCP clients send, always
+passes. For browser clients the preflight allows `MCP-Protocol-Version`, `Mcp-Method` and
+`Mcp-Name`.
+
+The endpoint and the supported protocol versions are part of the public contract frozen at v1.0.
