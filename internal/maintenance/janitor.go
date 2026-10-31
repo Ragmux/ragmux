@@ -79,6 +79,9 @@ type Report struct {
 	Sessions      int64
 	// APIKeys counts retired api keys removed in the pass.
 	APIKeys int64
+	// SessionUsage counts session totals removed in the pass: sessions idle
+	// for longer than the request log window.
+	SessionUsage int64
 	// UsagePurged reports whether the usage counter purge ran.
 	UsagePurged bool
 	// DocumentsFailed counts documents that ran out of ingestion attempts.
@@ -88,7 +91,7 @@ type Report struct {
 // Deleted is the number of rows the pass removed across every table.
 // DocumentsFailed is an update, not a deletion, and is not counted.
 func (r Report) Deleted() int64 {
-	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys
+	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys + r.SessionUsage
 }
 
 func (j *Janitor) now() time.Time {
@@ -125,6 +128,9 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 		into   *int64
 	}{
 		{store.RetainRequestLogs, "request logs", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.RequestLogs},
+		// Session totals follow the request logs they summarise: a session idle
+		// for longer than the window has no row left to open (ADR-032).
+		{store.RetainSessionUsage, "session usage", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.SessionUsage},
 		{store.RetainAuditLogs, "audit logs", now.AddDate(0, 0, -j.AuditDays), j.AuditDays <= 0, &rep.AuditLogs},
 		{store.RetainLoginAttempts, "login attempts", now.Add(-LoginAttemptRetention), false, &rep.LoginAttempts},
 		{store.RetainSessions, "sessions", now, false, &rep.Sessions},
@@ -302,5 +308,5 @@ func (j *Janitor) runLogged(ctx context.Context) {
 		"interrupted", ctx.Err() != nil,
 		"request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
 		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "api_keys", rep.APIKeys,
-		"usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
+		"session_usage", rep.SessionUsage, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
 }

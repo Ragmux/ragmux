@@ -482,6 +482,8 @@ log as `rag_store.reindex`. See [Embedding width](rag.md#embedding-width).
 | GET | `/projects/{id}/metrics?window=24h` | member | Metrics for one project (see below; takes the same `compare`, `days` and `by_project` options as the summary) |
 | GET | `/projects/{id}/metrics.csv?window=24h` | member | The project's request logs in the window as a CSV download (see below) |
 | GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
+| GET | `/projects/{id}/sessions?limit=50&offset=0` | member | The project's [sessions](users-and-limits.md#sessions), most recently active first (`limit` defaults to 50, larger values are cut to 500) |
+| GET | `/projects/{id}/sessions/{sessionId}?limit=100` | member | One session's totals and its request log rows, newest first (`limit` defaults to 100, larger values are cut to 1000); `404` for an unknown session |
 
 Project body:
 
@@ -491,7 +493,8 @@ Project body:
  "member_user_ids": [4],
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
- "history_turns_for_query": 3, "query_model_connection_id": null}
+ "history_turns_for_query": 3, "query_model_connection_id": null,
+ "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0}
 ```
 
 `rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
@@ -514,6 +517,22 @@ value is `400`, and so is a `query_model_connection_id` that is not an existing 
 connection. A connection a project names there cannot be deleted (`409`). A change is
 written to the audit log on the `project.update` entry, under `details.rag_settings_changed`
 (`from` and `to` for each field that changed).
+The last three fields of the body govern tools and sessions
+([Users, roles and limits](users-and-limits.md#tool-governance)):
+
+| Field | Values | Default |
+|---|---|---|
+| `tool_allow` | up to 64 patterns; when not empty, only tools whose name matches one are offered to the model | `[]` (every tool) |
+| `tool_deny` | up to 64 patterns; a tool whose name matches one is removed from the request, and deny wins over allow | `[]` |
+| `session_token_cap` | prompt plus completion tokens one session may spend; `0` is unlimited | `0` |
+
+A pattern is 1 to 128 characters of `A-Z a-z 0-9 _ . : -` and `*` (any run of characters, the
+only wildcard; matching is case sensitive), so `mcp__github__*` covers a whole MCP server.
+Like the RAG fields, **these three left out keep their current value** on update and take
+the default on create; `[]` clears a list. A pattern that is not of that shape, a list of
+more than 64 and a negative cap are `400`. A change is written to the audit log on the
+`project.update` entry, under `details.tool_settings_changed`.
+
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
 full key is never returned again. The project object:
 
@@ -523,6 +542,7 @@ full key is never returned again. The project object:
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
+ "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
  "member_ids": [4], "created_at": "…", "updated_at": "…"}
 ```
 
@@ -544,6 +564,20 @@ full key is never returned again. The project object:
 each budget would run out at that pace. A value is `null` when the budget is not set,
 nothing was consumed in the last hour, or the projection lands after the window resets
 (`resets_at`); an already exhausted budget projects to `generated_at`.
+
+`GET /projects/{id}/sessions` lists the sessions the project's requests carried in
+`X-Ragmux-Session`; it reads one running total per session, not the request logs:
+
+```json
+[{"project_id": 3, "session_id": "agent-run-42", "requests": 18, "prompt_tokens": 91000,
+  "completion_tokens": 7400, "tokens": 98400,
+  "first_seen": "2026-10-31T09:12:00Z", "last_seen": "2026-10-31T09:41:10Z"}]
+```
+
+`tokens` is `prompt_tokens + completion_tokens`, the figure `session_token_cap` is compared
+with. `GET /projects/{id}/sessions/{sessionId}` returns `{"session": {…}, "requests": […]}`:
+the same object, and the session's request log rows in the shape of
+[`recent` below](#metrics). The roles are those of the request logs: any member can read them.
 
 ### Routes
 
@@ -693,7 +727,9 @@ The summary response (also used by `/projects/{id}/metrics`):
              "cache_write_tokens": 0, "cost_micros": 1860, "cost_usd": 0.00186,
              "cost_source": "builtin", "error": "", "api_key_id": 7, "user_id": 4,
              "request_id": "3f2a9c1e", "endpoint": "chat.completions", "requested_model": "smart",
-             "route": "smart", "attempt": 2, "fallback_from": 1, "created_at": "…"}],
+             "route": "smart", "attempt": 2, "fallback_from": 1,
+             "session_id": "agent-run-42", "tool_names": ["get_weather"], "tools_denied": 1,
+             "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
                "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70,
@@ -709,7 +745,10 @@ deleting the key later leaves `user_id` in place. `request_id`, `endpoint`,
 are left out of a row when empty (always for rows written before migration `0016`);
 `attempt` is the number of upstream calls, `fallback_from` the connection id of the first
 target when the request moved to another one, and `route` is absent for the implicit
-route. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
+route. `session_id` (the request's `X-Ragmux-Session`), `tool_names` (the tools the model
+called in its answer: sorted, without duplicates, at most 32 names of at most 64 bytes;
+names only, never arguments) and `tools_denied` (how many tools the project's lists removed)
+are left out when empty or `0`. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
 `502`, `503`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
@@ -737,7 +776,8 @@ request logs, oldest first and at most 50 000 rows, as `text/csv` with a
 ```
 created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
 estimated, latency_ms, streamed, rag_used, rag_hits, error,
-cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id
+cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id,
+session_id, tool_names, tools_denied
 ```
 
 New columns are appended at the end and existing ones never move, so an importer that
@@ -749,6 +789,8 @@ which has no owner; an empty cell says that where a `0` would read as user zero.
 Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
+
+`tool_names` is the names joined with `;`; `session_id` is empty for a request that carried none.
 
 The CSV carries the columns above only: `request_id`, `endpoint`, `requested_model`,
 `route`, `attempt` and `fallback_from` are in the JSON log and the database, not in the
@@ -1038,6 +1080,36 @@ two counts and they were fine. So a request log row and the `usage` of the same 
 can differ when the upstream misreported. Trust the row for spend, and treat a mismatch
 as a signal about that provider.
 
+**Sessions.** A request may carry `X-Ragmux-Session: <id>` (1 to 128 characters of
+`A-Z a-z 0-9 . _ : -`, sent once) to say which agent run it belongs to. The gateway stores
+the id on the request log row and adds the request's tokens to that session's total, which
+the [admin API](#projects) lists; when the project sets `session_token_cap`, a request of a
+session that has already spent that many tokens is answered `429` (below). Without the
+header nothing changes, and the cap does not apply to it: it is a guard against a runaway
+loop, not an access control. An id outside that set is `400` with `code:
+"invalid_session_id"` and is never ignored, because ignoring it would let a malformed
+header past the cap. The session is not a metric label or a span attribute.
+
+**Tool lists.** When the project sets `tool_allow` or `tool_deny`, the gateway applies them
+to `tools` before the request goes upstream. A tool is matched by `function.name` (or
+`custom.name`); a tool that matches `tool_deny`, or matches no `tool_allow` pattern while that
+list is not empty, is removed from `tools`, and the response carries a `Warning` naming up
+to five of them. `tool_calls` and `tool` messages already in the conversation are left as
+they are. `tool_choice` is then reconciled with what is left:
+
+| `tool_choice` | After the tools are removed |
+|---|---|
+| names a tool the project does not allow | `400`, `code: "tool_not_allowed"` |
+| `"required"` and no tool is left | `400`, `code: "tool_not_allowed"` |
+| `"auto"`, absent or `"none"`, and no tool is left | `tools`, `tool_choice` and `parallel_tool_calls` are dropped, with a `Warning`. `"none"` is treated like `"auto"` here: with no tool left it has nothing to forbid, and upstreams refuse `tool_choice` without `tools` |
+| `allowed_tools` | its `tools` list loses the entries the project does not allow, with a `Warning`; a `"required"` list that ends up empty is `400`, `code: "tool_not_allowed"`, and an emptied `"auto"` list becomes `"none"`, so the model does not gain the tools the client left out (with no tool left, or none in the request, `tool_choice` is dropped) |
+| anything else | unchanged |
+
+The request log row records `tools_denied` (how many were removed) and `tool_names` (the
+tools the model *called*, names only). An upstream may refuse a request whose history holds
+tool calls but whose `tools` came out empty; that refusal is relayed as the upstream's own
+error.
+
 Response headers, only for limits that are set on the project or the key. Where both
 tiers have a limit, the header describes whichever has the smaller remaining allowance:
 
@@ -1065,13 +1137,14 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
+| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
+| `429` | the session spent `session_token_cap` tokens; no `Retry-After`, because a session does not reset; body `{"error":{"message":"Session token cap reached (N of M tokens used).","type":"insufficient_quota","code":"session_token_cap","scope":"session"}}`. A request may run a session past the cap by its own size, and concurrent requests of one session can each pass the check before any of them is counted |
 | `4xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted). A `Retry-After` the provider sent (seconds or an HTTP date) is passed through unchanged; a malformed one is dropped |
 | `503` / `504` | the provider answered `503` or `504` (or, on an Anthropic connection, `529 overloaded`, which becomes `503`): the status is kept, because both say "retry later" rather than "broken", with the provider's message and its `Retry-After`, if any |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |

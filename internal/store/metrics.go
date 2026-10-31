@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // RequestLog is one proxied chat completion.
@@ -62,7 +64,17 @@ type RequestLog struct {
 	// served the request; nil otherwise. All of these are empty on rows
 	// written before migration 0016.
 	FallbackFrom *int64 `json:"fallback_from,omitempty"`
-	CreatedAt    string `json:"created_at"`
+	// SessionID is the X-Ragmux-Session value the request carried (ADR-032);
+	// empty when it carried none. It is a row column and never a metric label
+	// or span attribute (PRD rule 10).
+	SessionID string `json:"session_id,omitempty"`
+	// ToolNames are the tools the model called in its answer: sorted, without
+	// duplicates, at most MaxToolNames of at most MaxToolNameBytes bytes. Names
+	// only, never arguments or content. ToolsDenied is how many tools the
+	// project's allow/deny lists stripped from the request.
+	ToolNames   []string `json:"tool_names,omitempty"`
+	ToolsDenied int      `json:"tools_denied,omitempty"`
+	CreatedAt   string   `json:"created_at"`
 }
 
 // MaxRequestedModelBytes bounds request_logs.requested_model. The value is the
@@ -103,14 +115,16 @@ func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO request_logs
 		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed,
 		 rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens, cost_micros, cost_source,
-		 api_key_id, user_id, request_id, endpoint, requested_model, route, attempt, fallback_from, rag_skip_reason)
+		 api_key_id, user_id, request_id, endpoint, requested_model, route, attempt, fallback_from, rag_skip_reason,
+		 session_id, tool_names, tools_denied)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
 		 NULLIF($18, ''), NULLIF($19, ''), NULLIF($20, ''), NULLIF($21, ''), NULLIF($22::int, 0)::smallint, $23,
-		 NULLIF($24, ''))`,
+		 NULLIF($24, ''), NULLIF($25, ''), $26::text[], $27)`,
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
 		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error,
 		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source, l.APIKeyID, l.UserID,
-		l.RequestID, l.Endpoint, clampRequestedModel(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom, l.RAGSkipReason)
+		l.RequestID, l.Endpoint, clampRequestedModel(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom, l.RAGSkipReason,
+		clampSessionID(l.SessionID), clampToolNames(l.ToolNames), nonNegative(l.ToolsDenied))
 	return err
 }
 
@@ -249,11 +263,7 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	q := `SELECT id, project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated,
-		latency_ms, streamed, rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens,
-		cost_micros, cost_source, api_key_id, user_id,
-		COALESCE(request_id, ''), COALESCE(endpoint, ''), COALESCE(requested_model, ''), COALESCE(route, ''),
-		COALESCE(attempt, 0), fallback_from, created_at FROM request_logs WHERE true`
+	q := `SELECT ` + requestLogCols + ` FROM request_logs WHERE true`
 	cond, args := f.where(nil)
 	args = append(args, limit)
 	q += cond + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
@@ -262,6 +272,19 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 		return nil, err
 	}
 	defer rows.Close()
+	return s.collectRequestLogs(rows, "recent_requests")
+}
+
+// requestLogCols is the column list scanRequestLog reads, in its order.
+const requestLogCols = `id, project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated,
+	latency_ms, streamed, rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens,
+	cost_micros, cost_source, api_key_id, user_id,
+	COALESCE(request_id, ''), COALESCE(endpoint, ''), COALESCE(requested_model, ''), COALESCE(route, ''),
+	COALESCE(attempt, 0), fallback_from, COALESCE(session_id, ''), tool_names, tools_denied, created_at`
+
+// collectRequestLogs reads every row of a query that selected requestLogCols.
+// surface names the caller in the log line a floored row earns.
+func (s *Store) collectRequestLogs(rows pgx.Rows, surface string) ([]*RequestLog, error) {
 	out := []*RequestLog{}
 	var clamped []int64
 	for rows.Next() {
@@ -271,7 +294,7 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.RAGHits, &l.Error,
 			&l.CachedPromptTokens, &l.CacheWriteTokens, &l.CostMicros, &l.CostSource,
 			&l.APIKeyID, &l.UserID, &l.RequestID, &l.Endpoint, &l.RequestedModel, &l.Route,
-			&l.Attempt, &l.FallbackFrom, &created); err != nil {
+			&l.Attempt, &l.FallbackFrom, &l.SessionID, &l.ToolNames, &l.ToolsDenied, &created); err != nil {
 			return nil, err
 		}
 		l.CreatedAt = ts(created)
@@ -284,7 +307,7 @@ func (s *Store) RecentRequests(ctx context.Context, f MetricsFilter, limit int) 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	s.logClamped("recent_requests", clamped)
+	s.logClamped(surface, clamped)
 	return out, nil
 }
 
@@ -397,7 +420,7 @@ func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.
 	q := `SELECT l.id, l.project_id, COALESCE(p.name, ''), l.model_name, l.status_code, l.prompt_tokens, l.completion_tokens,
 		l.estimated, l.latency_ms, l.streamed, l.rag_used, l.rag_hits, l.error,
 		l.cached_prompt_tokens, l.cache_write_tokens, l.cost_micros, l.cost_source,
-		l.api_key_id, l.user_id, l.created_at
+		l.api_key_id, l.user_id, COALESCE(l.session_id, ''), l.tool_names, l.tools_denied, l.created_at
 		FROM request_logs l LEFT JOIN projects p ON p.id = l.project_id WHERE l.created_at >= $1`
 	cond, args := f.whereCol("l.project_id", []any{since.UTC()})
 	args = append(args, MaxExportRows)
@@ -414,7 +437,7 @@ func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.
 		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.ModelName, &r.StatusCode, &r.PromptTokens, &r.CompletionTokens,
 			&r.Estimated, &r.LatencyMs, &r.Streamed, &r.RAGUsed, &r.RAGHits, &r.Error,
 			&r.CachedPromptTokens, &r.CacheWriteTokens, &r.CostMicros, &r.CostSource,
-			&r.APIKeyID, &r.UserID, &created); err != nil {
+			&r.APIKeyID, &r.UserID, &r.SessionID, &r.ToolNames, &r.ToolsDenied, &created); err != nil {
 			return err
 		}
 		r.CreatedAt = ts(created)

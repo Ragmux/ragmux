@@ -333,7 +333,8 @@ HTTP 429  Retry-After: 42
 
 `type` is `rate_limit_exceeded` for the per-minute limits and `insufficient_quota` for
 budgets; `code` is one of `rate_limit_rpm`, `rate_limit_tpm`, `budget_daily`,
-`budget_monthly`. `Retry-After` is the number of seconds until the violated window resets
+`budget_monthly`; a session over its [token cap](#sessions) gets `session_token_cap`, the
+one denial without a `Retry-After`. `Retry-After` is the number of seconds until the violated window resets
 (next minute, next UTC day or next month). Rejected requests are recorded in the request
 log with status 429 (visible as `rate_limited` in the metrics summaries and the
 dashboard) and do not consume tokens.
@@ -399,6 +400,76 @@ discount and change prices without telling the gateway, and a model with no matc
 price row adds a cost of zero and is logged with `cost_source: "none"` rather than a guess
 (a rerank that ran on another connection with a price row still adds its own cost).
 
+## Sessions
+
+An agent that calls the gateway in a loop is hard to tell apart from the traffic around it.
+A client can name the run by sending `X-Ragmux-Session: <id>` on its `/v1` requests: 1 to
+128 characters of `A-Z a-z 0-9 . _ : -`, sent once. A session is the pair of project and id,
+so two projects can use the same id without meeting.
+
+- **Recorded.** The id goes into `request_logs.session_id`, and each request adds itself and
+  its tokens to the session's running total (`session_usage`). The id is never a metric
+  label or a span attribute: it is text the client chose. The
+  [admin API](api.md#projects) lists a project's sessions, most recently active first, and
+  opens one to show its request rows; any member of the project can read them, as with the
+  request log.
+- **Capped.** `session_token_cap` on the project is the prompt plus completion tokens one
+  session may spend; `0` (the default) is unlimited. A request of a session that has
+  already spent that many is answered `429`:
+
+  ```json
+  HTTP 429
+  {"error":{"message":"Session token cap reached (52000 of 50000 tokens used).",
+            "type":"insufficient_quota","code":"session_token_cap","scope":"session"}}
+  ```
+
+  There is no `Retry-After`: a session does not reset, so waiting does not help; the
+  client starts a new session. Like the budgets, the cap compares tokens already spent and
+  adds no estimate, so the request that crosses it is served in full and the next one is
+  refused; requests of one session that are in flight together can each pass the check
+  before any is counted, so the cap can be overshot by more than one request. The denied request is a `429` row in the request log and is counted by
+  `ragmux_limits_denied_total{reason="session_token_cap"}`.
+- **Invalid ids.** A value outside the allowed set, an empty one, or a header sent twice is
+  `400` with `code: "invalid_session_id"`. It is never ignored, because ignoring it would
+  let a request escape the cap by being malformed.
+- **A guard, not a lock.** The cap protects against a runaway loop that sends its session
+  header. A client that sends no header is not subject to it; use the key and project
+  [limits](#rate-limits-and-budgets) for that. A binary older than this feature ignores the
+  header and the cap during a rolling update.
+- **Retention.** A session's total is deleted when its last request is older than the
+  request log retention window (`LOG_RETENTION_DAYS`), in the same pass.
+
+## Tool governance
+
+A project can decide which tools its requests may offer the model, which matters when an
+agent sends every tool it has on every request. Two lists on the project,
+`tool_allow` and `tool_deny`, hold patterns matched against each tool's name
+(`function.name` on chat completions):
+
+- a pattern is literal text with `*` standing for any run of characters, and nothing else;
+  matching is case sensitive. `mcp__github__*` covers every tool of one MCP server. It is
+  not a regular expression, so a pattern cannot be made to run long;
+- **deny always wins.** A tool that matches `tool_deny` is removed;
+- an empty `tool_allow` allows everything not denied; a non-empty one allows only what it
+  matches.
+
+A removed tool is stripped from the request before it goes upstream and the response
+carries a `Warning` header; the request itself is not refused, so a client that sends its
+whole tool box keeps working, and the model cannot call what it was never shown. Tool
+calls and tool results already in the conversation are left alone, because they happened.
+A `tool_choice` that cannot be honoured after the stripping is refused with `400`
+(`code: "tool_not_allowed"`): naming a removed tool, or requiring a tool when none is
+left. The table is in [the chat completions reference](api.md#post-v1chatcompletions).
+
+Each request log row records `tools_denied`, the number removed, and `tool_names`, the
+tools the model *called* in its answer. Only names are stored — never arguments or results —
+and the names the gateway removed are written to its log at `warn` level, not to the row.
+The lists are validated when the project is saved: patterns of 1 to 128 characters of
+`A-Z a-z 0-9 _ . : - *`, at most 64 per list.
+
+This is a policy on what the model is offered, not a sandbox for what a tool does. A binary
+older than this feature ignores both lists during a rolling update.
+
 ## Metrics and retention
 
 Every `/v1` call that reaches the upstream or is turned away by a limit (chat completions,
@@ -435,11 +506,12 @@ them.
 Each row also records which user-owned key made the request (`api_key_id`) and who owns
 it (`user_id`); both are `null` for a project's default key. The owner is denormalised so
 deleting a key never destroys the history: `api_key_id` becomes `null` and `user_id`
-stays. The CSV export does not carry the two columns yet.
+stays. Both are in the CSV export.
 
 A retention job (the janitor in `internal/maintenance`) runs one minute after start and
 then hourly: request logs older than `LOG_RETENTION_DAYS` (default 90) and audit entries
 older than `AUDIT_RETENTION_DAYS` (default 365) are deleted, `0` keeps a table forever.
 The same pass removes login attempts older than 24 hours, expired dashboard sessions,
-stale usage counters on both tiers, and api keys revoked or expired more than 30 days ago
+stale usage counters on both tiers, session totals idle for longer than the request log
+window, and api keys revoked or expired more than 30 days ago
 that no request log still references.

@@ -605,6 +605,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// What the client asked for, before an empty model is defaulted below.
 	c.requestedModel = req.Model
+	if !g.applyToolPolicy(c, &req, &opts) {
+		return
+	}
 	if !g.resolveRoute(c, req.Model) {
 		return
 	}
@@ -729,9 +732,12 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 		return err
 	}
 	c.obs.noteResponseModel(resp.Model, req.Model, conn.ModelName)
+	var called toolNameSet
 	for i := range resp.Choices {
 		c.obs.noteFinishReason(resp.Choices[i].FinishReason)
+		called.add(resp.Choices[i].Message.ToolCalls)
 	}
+	c.rec.ToolNames = called.names()
 	resp.Model = req.Model
 	fillUsage(c.rec, resp.Usage, in.promptChars, completionChars(resp))
 	c.rec.StatusCode = http.StatusOK
@@ -744,6 +750,34 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	}
 	_ = json.NewEncoder(c.w).Encode(resp)
 	return nil
+}
+
+// applyToolPolicy applies the project's tool allow/deny lists to the request
+// (ADR-032). It runs right after the body is decoded, so a refused request
+// costs no route lookup and no limit slot. It answers the client itself and
+// returns false when the request names a tool the project does not allow.
+func (g *Gateway) applyToolPolicy(c *call, req *provider.ChatRequest, opts *ragmuxRequest) bool {
+	verdict, terr := governTools(policyOf(c.project), req)
+	if terr != nil {
+		if terr.code == "" {
+			writeError(c.w, http.StatusBadRequest, "invalid_request_error", terr.message)
+		} else {
+			writeErrorCode(c.w, http.StatusBadRequest, "invalid_request_error", terr.code, terr.message)
+		}
+		return false
+	}
+	if len(verdict.denied) == 0 && len(verdict.warnings) == 0 {
+		return true
+	}
+	c.toolsDenied = len(verdict.denied)
+	// Ahead of the ragmux warnings: those are bounded, and this one must not be
+	// the one that is left out.
+	opts.Warnings = append(append([]string(nil), verdict.warnings...), opts.Warnings...)
+	if c.toolsDenied > 0 {
+		// The names are the client's; the log field is bounded and quoted by slog.
+		c.log.Warn("tools stripped by project policy", "denied", c.toolsDenied, "tools", boundedNames(verdict.denied))
+	}
+	return true
 }
 
 // decodeChat reads and validates the chat request body, answering the client
@@ -1282,8 +1316,16 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 	wantUsage := req.IncludeUsage()
 
 	var usage *provider.Usage
+	var called toolNameSet
 	compChars := 0
 	clientGone := false
+	defer func() {
+		// Names only. A stream that failed before its first chunk called
+		// nothing, and rec stays untouched for the next target.
+		if names := called.names(); len(names) > 0 {
+			rec.ToolNames = names
+		}
+	}()
 	for chunk := range out {
 		sm.Chunk()
 		if obsv.ttft == 0 {
@@ -1294,6 +1336,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 		obsv.noteResponseModel(chunk.Model, req.Model, conn.ModelName)
 		for i := range chunk.Choices {
 			obsv.noteFinishReason(chunk.Choices[i].FinishReason)
+			called.add(chunk.Choices[i].Delta.ToolCalls)
 		}
 		if clientGone {
 			continue // drain until the provider notices the cancellation
@@ -1420,12 +1463,19 @@ func writeLimitError(w http.ResponseWriter, d limits.Decision) {
 	case limits.ReasonBudgetMonthly:
 		typ = "insufficient_quota"
 		msg = fmt.Sprintf("Monthly token budget exhausted (%d of %d tokens used).", d.MonthlyUsed, d.MonthlyLimit)
+	case limits.ReasonSessionTokenCap:
+		typ = "insufficient_quota"
+		msg = fmt.Sprintf("Session token cap reached (%d of %d tokens used).", d.SessionUsed, d.SessionLimit)
 	default:
 		msg = "Rate limit reached for " + subject + "."
 	}
-	retry := ceilSeconds(d.RetryAfter)
-	msg += fmt.Sprintf(" Retry after %d seconds.", retry)
-	w.Header().Set("Retry-After", strconv.Itoa(retry))
+	// A session never resets, so waiting would not help and no retry hint is
+	// given (ADR-032).
+	if d.Reason != limits.ReasonSessionTokenCap {
+		retry := ceilSeconds(d.RetryAfter)
+		msg += fmt.Sprintf(" Retry after %d seconds.", retry)
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusTooManyRequests)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{

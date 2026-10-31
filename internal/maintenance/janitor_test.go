@@ -83,6 +83,15 @@ func seed(t *testing.T) *fixture {
 			t.Fatal(err)
 		}
 	}
+	// session_usage: one session idle for 100 days and one for 10 days.
+	for id, age := range map[string]int{"old": 100, "fresh": 10} {
+		if err := st.RecordSessionUsage(ctx, p.ID, id, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB().Exec(ctx, "UPDATE session_usage SET last_seen = $2 WHERE session_id = $1", id, now.AddDate(0, 0, -age)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// usage: a minute row from three hours ago and the current minute.
 	lim := &limits.Limiter{Store: st, Now: func() time.Time { return now.Add(-3 * time.Hour) }}
 	if err := lim.Record(ctx, p.ID, 1, 1, true); err != nil {
@@ -111,11 +120,11 @@ func TestRunOnceDeletesOnlyExpiredRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Report{RequestLogs: 1, AuditLogs: 1, LoginAttempts: 1, Sessions: 1, UsagePurged: true}
+	want := Report{RequestLogs: 1, AuditLogs: 1, LoginAttempts: 1, Sessions: 1, SessionUsage: 1, UsagePurged: true}
 	if rep != want {
 		t.Errorf("report = %+v, want %+v", rep, want)
 	}
-	for _, tb := range []string{"request_logs", "audit_logs", "login_attempts", "sessions"} {
+	for _, tb := range []string{"request_logs", "audit_logs", "login_attempts", "sessions", "session_usage"} {
 		if n := f.count(tb); n != 1 {
 			t.Errorf("%s: %d rows left, want 1", tb, n)
 		}
@@ -128,7 +137,7 @@ func TestRunOnceDeletesOnlyExpiredRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.RequestLogs+rep.AuditLogs+rep.LoginAttempts+rep.Sessions != 0 {
+	if rep.Deleted() != 0 {
 		t.Errorf("second pass removed rows: %+v", rep)
 	}
 }
@@ -148,6 +157,9 @@ func TestZeroDaysKeepsForever(t *testing.T) {
 	}
 	if n := f.count("audit_logs"); n != 2 {
 		t.Errorf("audit_logs = %d, want 2", n)
+	}
+	if n := f.count("session_usage"); n != 2 {
+		t.Errorf("session_usage = %d, want 2: session totals are kept as long as the request logs", n)
 	}
 	// Login attempts and sessions are not configurable and still go.
 	if n := f.count("login_attempts"); n != 1 {
@@ -399,9 +411,9 @@ func TestRetentionCancelStopsCleanlyAndResumes(t *testing.T) {
 }
 
 func TestReportDeleted(t *testing.T) {
-	r := Report{RequestLogs: 1, AuditLogs: 2, LoginAttempts: 3, Sessions: 4, APIKeys: 5, DocumentsFailed: 100}
-	if got := r.Deleted(); got != 15 {
-		t.Errorf("Deleted() = %d, want 15", got)
+	r := Report{RequestLogs: 1, AuditLogs: 2, LoginAttempts: 3, Sessions: 4, APIKeys: 5, SessionUsage: 6, DocumentsFailed: 100}
+	if got := r.Deleted(); got != 21 {
+		t.Errorf("Deleted() = %d, want 21", got)
 	}
 }
 
