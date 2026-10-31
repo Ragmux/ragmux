@@ -27,7 +27,7 @@ func schemaFormat(schema string) string {
 	return `"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":` + schema + `}}`
 }
 
-func translated(t *testing.T, model, reqJSON string) (anthropicRequest, map[string]json.RawMessage) {
+func translated(t *testing.T, model, reqJSON string) (AnthropicRequest, map[string]json.RawMessage) {
 	t.Helper()
 	a, err := translateAnthropic(context.Background(), Config{Model: model}, parseReq(t, reqJSON))
 	if err != nil {
@@ -175,7 +175,7 @@ func TestFormatJSONObject(t *testing.T) {
 	cached := `{"messages":[{"role":"system","content":[{"type":"text","text":"Rules","cache_control":{"type":"ephemeral"}}]},` +
 		`{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}`
 	a, _ = translated(t, modelNoForce, cached)
-	var blocks []anthropicContent
+	var blocks []AnthropicContent
 	if err := json.Unmarshal(a.System, &blocks); err != nil || len(blocks) != 2 || len(blocks[0].CacheControl) == 0 ||
 		blocks[1].Text != anthropicJSONInstruction || len(blocks[1].CacheControl) != 0 {
 		t.Errorf("system = %s (%v)", a.System, err)

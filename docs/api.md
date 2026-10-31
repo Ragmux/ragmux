@@ -4,7 +4,7 @@ Ragmux exposes four HTTP surfaces:
 
 | Prefix | Audience | Authentication |
 |---|---|---|
-| `/v1/…` | your applications (OpenAI-compatible) | `Authorization: Bearer sk-proj-…` project key, or a user's `sk-user-…` key |
+| `/v1/…` | your applications (OpenAI-compatible, plus the Anthropic Messages API at `/v1/messages`) | `Authorization: Bearer sk-proj-…` or `x-api-key: sk-proj-…`: a project key, or a user's `sk-user-…` key |
 | `/mcp` | MCP clients (Claude Code, IDE agents) | gateway key with the `retrieve` scope, see [MCP endpoint](#mcp-endpoint) |
 | `/admin/api/…` | dashboard and management scripts | session cookie, bearer session token, or a user's `sk-mgmt-…` key |
 | `/healthz` | load balancers, container healthchecks | none |
@@ -103,7 +103,18 @@ case-insensitively.
   of granted projects, its own scopes and its own limits under the project's, and can be
   revoked or given an expiry.
 
-Missing or unknown keys answer `401` with type `invalid_request_error` (no bearer header)
+The key goes in `Authorization: Bearer <key>` or, as the Anthropic SDKs send it, in
+`x-api-key: <key>`. Both headers are read on every `/v1` route and on `/mcp`. A request that
+carries both is accepted when they hold the same key, which is what Claude Code sends, and
+answered `401` when they differ: a credential check does not pick one of two keys. A `sk-mgmt-…`
+management key is no gateway key under either header and is answered like an unknown one.
+
+PRD rule 2 says a management key is accepted from the `Authorization` header only. It binds
+management keys and the admin API, not the header a *gateway* key arrives in. The admin
+API still reads `Authorization` alone, so `x-api-key` never opens it, and the cross-site
+reasoning behind the rule is unchanged there.
+
+Missing or unknown keys answer `401` with type `invalid_request_error` (no key header)
 or `invalid_api_key`. An unknown key's body is exactly
 `{"error":{"message":"invalid project api key","type":"invalid_api_key","code":null}}`
 whatever its shape. A key that *is* known but no longer resolves carries a `code` on top
@@ -168,6 +179,9 @@ The client API uses the OpenAI shape with a `code` field:
 ```json
 {"error": {"message": "invalid project api key", "type": "invalid_api_key", "code": null}}
 ```
+
+[`POST /v1/messages`](#post-v1messages) answers in Anthropic's shape instead, with the same
+`code` carried inside `error`.
 
 ## Management endpoints
 
@@ -970,7 +984,9 @@ only gain fields.
 
 ## Client API (`/v1`)
 
-Point any OpenAI SDK at `http://<host>:8765/v1` with the project key as `api_key`.
+Point any OpenAI SDK at `http://<host>:8765/v1` with the project key as `api_key`. The
+Anthropic SDKs and Claude Code use `http://<host>:8765` as their base URL (they add
+`/v1/messages` themselves); see [`POST /v1/messages`](#post-v1messages).
 
 ### `POST /v1/chat/completions`
 
@@ -1240,6 +1256,113 @@ Status codes:
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
 | `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
+
+### `POST /v1/messages`
+
+The Anthropic Messages API, so the official Anthropic SDKs and Claude Code work after a base
+URL change and nothing else:
+
+```bash
+ANTHROPIC_BASE_URL=http://<host>:8765 ANTHROPIC_API_KEY=<key> claude
+```
+
+Everything around the call is `POST /v1/chat/completions`: the same key (in `x-api-key` or
+`Authorization`), the same `chat` scope, project selection, [routes](providers.md#routing),
+retry and fallback, rate limits and budgets, the request log (`endpoint = messages`), the
+[tool lists](#post-v1chatcompletions) and sessions. A query string such as `?beta=true` is
+ignored. `POST /v1/messages/count_tokens` and Anthropic-shaped model listings are not served.
+
+The optional `ragmux` object has the same grammar as on chat, as a top-level field of the
+body. It is consumed by the gateway and never sent upstream, which matters because the
+Anthropic API refuses an unknown field. `"sources": "inline"` returns the sources as a
+top-level `ragmux` field of the answer, or in `message_start.message.ragmux` when streaming.
+
+**Two paths.** Each attempt of a request takes the path its target allows, so a route whose
+first target is Anthropic and whose fallback is Gemini serves one client with both.
+
+| | Anthropic connection (native) | any other connection (translated) |
+|---|---|---|
+| Request | the client's body, with the changes listed below | translated to the chat request every adapter takes |
+| `anthropic-version`, `anthropic-beta` | sent upstream as the client sent them (`2023-06-01` if absent) | not applied; a `Warning` lists the beta values, and a version other than `2023-06-01` |
+| Answer | the upstream's bytes, JSON or SSE, `ping` events included | written as a Messages answer |
+| `model` in the answer | the `model` the client sent (written over the one the upstream reports, in the message and in `message_start`) | the `model` the client sent |
+| Upstream `4xx` | the upstream's body, unchanged, with its status | n/a |
+
+**Native path.** The gateway changes only these parts of the body: `model` (the connection's
+model is written in, and the client's own `model` string is written back into the answer, so
+a route alias such as `fast` reads the same whichever target served the call, as on
+[chat completions](#post-v1chatcompletions)), `system`, `ragmux` (removed), the tools the project denies, the thinking
+blocks of earlier turns under the retrieval rule below, and `tool_choice` where the model
+cannot take it. Every other field, `context_management`, `container`, `mcp_servers`, strict
+tools, cache breakpoints, passes through. Where the project's context goes differs from
+chat: the project's system prompt, and retrieved context under the `system` placement, are
+added after the client's own system blocks, not in front of them. A Claude Code attribution
+block therefore stays first. Under the `before_last_user` placement the context is a text
+block in the last user message, after its `tool_result` blocks, which the API requires to come
+first.
+
+For a model that does not take a forced tool choice (`forced_tool_choice` in
+[Capabilities](providers.md#capabilities), true of Opus 5.5 and of models the table does not
+know yet), `tool_choice: {"type":"any"}` and `{"type":"tool",…}` are sent as `{"type":"auto"}`,
+with a `Warning`. For a model with manual thinking (`thinking: {"type":"enabled",…}`), thinking is
+left out, with a `Warning`, when `tool_choice` is forced or when the request returns tool
+results to an assistant turn that has no thinking block; `top_p` below `0.95` is left out
+while thinking is on, for manual and adaptive thinking alike.
+
+**Not metered.** The native path sends the body and `anthropic-beta` on as they are. Some
+features are billed by use, not by token: server tools such as `web_search_*`, `container` and
+code execution, and `mcp_servers`. That spend does not reach Ragmux's cost figures or token
+budgets. A project can switch the server tools off with a `tool_deny` pattern (they are matched by
+`name`, `web_search*` for example). `mcp_servers` and `container` are not in `tools`, so the
+lists do not reach them.
+
+**Translated path.** The request becomes a chat request: `system` (one system message per
+block, with its cache breakpoint), text and image blocks, `tool_use` and `tool_result` (a user
+message that returns tool results becomes `tool` messages, then a `user` message for the rest),
+`tools`, `tool_choice` (`any` is `required`, `disable_parallel_tool_use` is
+`parallel_tool_calls: false`), `stop_sequences`, `metadata.user_id` as `user`, `thinking` and
+`output_config.effort` as `reasoning_effort` (a `budget_tokens` is mapped to the nearest effort,
+with a `Warning`), and a `json_schema` `output_config.format` as `response_format`. Thinking
+blocks of earlier turns go through as `ragmux_thinking`. What has no counterpart is dropped and
+named in a `Warning`: `top_k`, `context_management`, `container`, `mcp_servers`, server tools,
+`citations`, `document` and `search_result` blocks, and any other field the gateway does not know.
+The native path forwards such blocks to Anthropic as the client wrote them.
+
+The answer is written as a message. `stop_reason` follows `finish_reason` (`stop` is
+`end_turn`, `length` is `max_tokens`, `tool_calls` is `tool_use`, `content_filter` is
+`refusal`); `stop_sequence` is always `null`, because which sequence matched is not known on
+this path. A stream is `message_start`, the content blocks, `message_delta` and `message_stop`;
+while the upstream is quiet a `ping` event is written every 10 seconds. Tool calls arrive as
+`tool_use` blocks with their input in `input_json_delta` events. A model that returns
+several text blocks, or thinking between them, is rebuilt as thinking, then text, then tool
+calls, so the known limit stated for [chat completions](#post-v1chatcompletions) (the order
+and number of blocks do not survive the round trip, which can invalidate a replay on Claude 5.1
+and later) applies to this path. The native path has no such limit.
+
+**Sessions and retrieval.** `X-Ragmux-Session` names the session; when it is absent, the
+`x-claude-code-session-id` header Claude Code sends stands in, under the same rules (an
+unusable value is `400`, `code: "invalid_session_id"`). A turn whose last user message holds a
+`tool_result` is a tool turn, whatever else the message holds (Claude Code adds a reminder
+text next to the result), and retrieval is skipped for it. For a model that binds thinking to the
+prompt prefix, in a project whose retrieval is active, earlier turns' `thinking` and
+`redacted_thinking` blocks are not sent, with a `Warning`: this is the retrieval rule of
+[chat](#post-v1chatcompletions), and it applies on both paths.
+
+**Errors.** Errors the gateway makes (`401`, `403`, `404`, `429`, a refused request, `5xx`) are
+Anthropic's envelope, with Ragmux's own code, when there is one, in `error.code` (an unknown
+key has none, as in the body above):
+
+```json
+{"type": "error", "error": {"type": "permission_error", "message": "api key is not authorised for chat completions", "code": "insufficient_scope"}, "request_id": "…"}
+```
+
+The `request_id` is the `X-Request-Id` of the response, also sent as `request-id`. `error.type`
+follows the status: `400` `invalid_request_error`, `401` `authentication_error`, `403`
+`permission_error`, `404` `not_found_error`, `413` `request_too_large`, `429` `rate_limit_error`,
+`503` `overloaded_error`, `504` `timeout_error`, any other `5xx` `api_error`. The statuses
+are the ones of [chat completions](#post-v1chatcompletions), above. On the native path a `4xx`
+from Anthropic reaches the client with Anthropic's own body. An error after a stream began is an
+`error` event.
 
 ### `POST /v1/embeddings`
 

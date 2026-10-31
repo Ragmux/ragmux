@@ -100,9 +100,9 @@ func TestAnthropicUsageCacheTokens(t *testing.T) {
 // TestAnthropicUsageCacheDeltaKeepsStartValues guards the merge rule: an
 // omitted cache counter in message_delta must not erase message_start's.
 func TestAnthropicUsageCacheDeltaKeepsStartValues(t *testing.T) {
-	var u anthropicUsageBlock
-	u.merge(anthropicUsageBlock{InputTokens: 10, CacheReadInputTokens: 200})
-	u.merge(anthropicUsageBlock{OutputTokens: 5})
+	var u AnthropicUsageBlock
+	u.merge(AnthropicUsageBlock{InputTokens: 10, CacheReadInputTokens: 200})
+	u.merge(AnthropicUsageBlock{OutputTokens: 5})
 	got := u.usage()
 	if got.PromptTokens != 210 || got.CachedTokens() != 200 || got.CompletionTokens != 5 {
 		t.Errorf("merged usage = %+v (cached %d)", got, got.CachedTokens())
@@ -122,7 +122,7 @@ func TestAnthropicCacheControlPlacements(t *testing.T) {
 		t.Fatal(err)
 	}
 	// System becomes a block array carrying the marker.
-	var sysBlocks []anthropicContent
+	var sysBlocks []AnthropicContent
 	if err := json.Unmarshal(ar.System, &sysBlocks); err != nil {
 		t.Fatalf("system is not a block array: %s", ar.System)
 	}

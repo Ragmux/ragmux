@@ -99,18 +99,21 @@ const (
 	anthropicAdaptiveMaxTokens = 16000
 )
 
-type anthropicThinking struct {
+// AnthropicThinking is the Messages API thinking parameter.
+type AnthropicThinking struct {
 	Type         string `json:"type"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
-type anthropicOutputConfig struct {
+// AnthropicOutputConfig is the Messages API output_config parameter.
+type AnthropicOutputConfig struct {
 	Effort string `json:"effort,omitempty"`
 	// Format is the native response schema (response_format json_schema).
-	Format *anthropicOutputFormat `json:"format,omitempty"`
+	Format *AnthropicOutputFormat `json:"format,omitempty"`
 }
 
-type anthropicOutputFormat struct {
+// AnthropicOutputFormat is the native response schema of output_config.
+type AnthropicOutputFormat struct {
 	Type   string          `json:"type"`
 	Schema json.RawMessage `json:"schema"`
 }
@@ -118,7 +121,7 @@ type anthropicOutputFormat struct {
 // anthropicEffortPlan is what reasoning_effort turns into on an Anthropic
 // request.
 type anthropicEffortPlan struct {
-	Thinking *anthropicThinking
+	Thinking *AnthropicThinking
 	Effort   string
 	// MaxTokens is the max_tokens to send, with the client's value or the
 	// gateway default already folded in.
@@ -199,7 +202,7 @@ func budgetPlan(plan anthropicEffortPlan, caps Capabilities, effort string, maxT
 			maxTokens, anthropicMinBudget))
 		return plan
 	}
-	plan.Thinking = &anthropicThinking{Type: "enabled", BudgetTokens: budget}
+	plan.Thinking = &AnthropicThinking{Type: "enabled", BudgetTokens: budget}
 	plan.DropTemperature = true
 	return plan
 }
@@ -209,16 +212,16 @@ func adaptivePlan(plan anthropicEffortPlan, caps Capabilities, effort string, ma
 	if effort == "none" {
 		switch caps.ThinkingOff {
 		case ThinkingOffDisabled:
-			plan.Thinking = &anthropicThinking{Type: "disabled"}
+			plan.Thinking = &AnthropicThinking{Type: "disabled"}
 			return plan
 		case ThinkingOffBetweenTools:
-			plan.Thinking = &anthropicThinking{Type: "between_tools"}
+			plan.Thinking = &AnthropicThinking{Type: "between_tools"}
 			return plan
 		}
 		effort = "low"
 		plan.Warnings = append(plan.Warnings, "reasoning_effort none cannot switch thinking off on this model; using low")
 	}
-	plan.Thinking = &anthropicThinking{Type: "adaptive"}
+	plan.Thinking = &AnthropicThinking{Type: "adaptive"}
 	plan.DropTemperature = true
 	if len(caps.EffortLevels) == 0 {
 		plan.Warnings = append(plan.Warnings, "this model takes no effort setting; reasoning_effort ignored")

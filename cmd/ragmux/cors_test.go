@@ -47,3 +47,38 @@ func TestCORSAllowsMCPHeaders(t *testing.T) {
 		}
 	}
 }
+
+// The Anthropic SDKs send x-api-key and the anthropic-* headers, and the
+// gateway reads X-Ragmux-Session on every endpoint, so a browser client's
+// preflight must be told it may send them (ADR-028, ADR-032). request-id is
+// the response header those SDKs read an error's id from.
+func TestCORSAllowsAnthropicHeaders(t *testing.T) {
+	h := cors([]string{"https://app.example"})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	r := httptest.NewRequest(http.MethodOptions, "/v1/messages", nil)
+	r.Header.Set("Origin", "https://app.example")
+	r.Header.Set("Access-Control-Request-Method", "POST")
+	r.Header.Set("Access-Control-Request-Headers", "x-api-key, anthropic-version, anthropic-beta, X-Ragmux-Session")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", w.Code)
+	}
+	allowed := map[string]bool{}
+	for _, name := range strings.Split(w.Header().Get("Access-Control-Allow-Headers"), ",") {
+		allowed[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	for _, name := range []string{"x-api-key", "anthropic-version", "anthropic-beta",
+		"anthropic-dangerous-direct-browser-access", "X-Ragmux-Session"} {
+		if !allowed[strings.ToLower(name)] {
+			t.Errorf("%s is not allowed: %q", name, w.Header().Get("Access-Control-Allow-Headers"))
+		}
+	}
+	exposed := map[string]bool{}
+	for _, name := range strings.Split(w.Header().Get("Access-Control-Expose-Headers"), ",") {
+		exposed[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	if !exposed["request-id"] {
+		t.Errorf("request-id is not exposed: %q", w.Header().Get("Access-Control-Expose-Headers"))
+	}
+}

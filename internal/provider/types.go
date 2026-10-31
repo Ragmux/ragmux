@@ -458,6 +458,22 @@ type Provider interface {
 	ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error
 }
 
+// MessagesPassthrough is implemented by an adapter that can take a Messages
+// request as it is. The gateway asks each attempt's adapter for it: the one
+// that has it is called natively, any other gets the canonical translation.
+type MessagesPassthrough interface {
+	// PrepareMessages applies the gateway's changes to the client's body for
+	// this connection's model and says, as Warning texts, what it had to
+	// change beyond what the project asked for.
+	PrepareMessages(in MessagesInput) (MessagesPrepared, error)
+	// MessagesCall sends a prepared non-streaming request.
+	MessagesCall(ctx context.Context, p MessagesPrepared) (*MessagesReply, error)
+	// MessagesStream sends a prepared streaming request and returns once the
+	// upstream answered with a success status. Nothing has been read from the
+	// stream yet, so an error here leaves the client untouched.
+	MessagesStream(ctx context.Context, p MessagesPrepared) (*MessagesStream, error)
+}
+
 // RequestWarner is implemented by adapters that forward a request although
 // they ignore part of it. The gateway relays each returned text to the client
 // as a Warning header (code 299), so the silent drop becomes visible without
@@ -521,6 +537,10 @@ type Error struct {
 	// the gateway neither retries it, nor falls back on it, nor counts it
 	// against the target. NotSent and Retryable are never set alongside it.
 	ClientInput bool
+	// UpstreamBody is the upstream's own answer body, kept only for a 4xx
+	// that the /v1/messages native path relays to the client unchanged
+	// (ADR-028). It is nil everywhere else.
+	UpstreamBody []byte
 }
 
 func (e *Error) Error() string {

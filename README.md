@@ -19,6 +19,11 @@ database. More at <https://ragmux.com>.
 - **OpenAI-compatible API:** `/v1/chat/completions` (JSON and SSE streaming), `/v1/models`,
   `/v1/embeddings`, `/v1/retrieve` and `/v1/rerank`. The official SDKs work after changing
   `base_url` and `api_key`; Anthropic and Gemini requests are translated, tool calls included.
+- **Anthropic-compatible API:** `/v1/messages`. The Anthropic SDKs and Claude Code work after
+  changing the base URL. On an Anthropic connection the request and the answer pass through
+  as they are, beta headers included; on any other connection the request is translated, so
+  one Claude client can be routed to Gemini or an OpenAI-compatible server. See
+  [`POST /v1/messages`](docs/api.md#post-v1messages).
 - **Routes, retry and fallback:** named routes with prioritised, weighted targets, retries
   before the first byte and a circuit breaker per connection; see
   [Routing](docs/providers.md#routing).
@@ -186,6 +191,21 @@ for chunk in resp:
     # asking for usage adds a final chunk that carries only the token counts.
     if chunk.choices:
         print(chunk.choices[0].delta.content or "", end="")
+```
+
+The Anthropic SDKs and Claude Code take the same key in `x-api-key`; point them at the
+gateway's base URL, without `/v1`:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:8765 ANTHROPIC_API_KEY=<PROJECT_KEY> claude
+```
+
+```python
+from anthropic import Anthropic
+client = Anthropic(base_url="http://localhost:8765", api_key="<PROJECT_KEY>")
+msg = client.messages.create(model="default", max_tokens=256,
+    messages=[{"role": "user", "content": "How many vacation days do I get?"}])
+print(msg.content[0].text)
 ```
 
 Endpoints, roles per endpoint and the error envelope are in the

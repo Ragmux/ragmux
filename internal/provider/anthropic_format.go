@@ -140,13 +140,13 @@ func wrapSchema(schema json.RawMessage) json.RawMessage {
 }
 
 // tool is the synthetic tool the request carries in formatTool mode.
-func (f anthropicFormatPlan) tool() anthropicTool {
-	return anthropicTool{Name: ragmuxResponseTool,
+func (f anthropicFormatPlan) tool() AnthropicTool {
+	return AnthropicTool{Name: ragmuxResponseTool,
 		Description: "Return the final answer as this tool's input.", InputSchema: f.schema}
 }
 
 // userToolClash is the 400 for a client tool that already uses the name.
-func userToolClash(tools []anthropicTool) error {
+func userToolClash(tools []AnthropicTool) error {
 	for _, t := range tools {
 		if t.Name == ragmuxResponseTool {
 			return &Error{Status: http.StatusBadRequest, Type: "invalid_request_error",
@@ -163,7 +163,7 @@ func userToolClash(tools []anthropicTool) error {
 // client tool the caller named stays forced: that turn answers with the tool
 // call and not with the structured output. Otherwise the model must call some
 // tool, one at a time, and ragmux_response is how it answers in prose.
-func (f anthropicFormatPlan) applyToolChoice(out *anthropicRequest) {
+func (f anthropicFormatPlan) applyToolChoice(out *AnthropicRequest) {
 	named := false
 	if len(out.ToolChoice) > 0 {
 		var c struct {

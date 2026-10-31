@@ -100,6 +100,11 @@ func (c Config) baseURL(def string) string {
 	return def
 }
 
+// rawBody is a request body that is already JSON and is sent as it is, where
+// any other body value is marshalled. The /v1/messages native path uses it:
+// the client's fields reach the upstream with the bytes the client wrote.
+type rawBody []byte
+
 // doJSON posts a JSON body and decodes a JSON response, mapping non-2xx
 // statuses to *Error.
 func doJSON(ctx context.Context, cfg Config, op, url string, headers map[string]string, body any, out any) error {
@@ -152,6 +157,12 @@ func spanFailed(span *tracing.Span, reason string) {
 // The body is bounded in bytes and wall time (Config.StreamMaxBytes /
 // StreamMaxDuration); closing it releases the timeout.
 func doStream(ctx context.Context, cfg Config, url string, headers map[string]string, body any) (*http.Response, error) {
+	return doStreamKeep(ctx, cfg, url, headers, body, false)
+}
+
+// doStreamKeep is doStream that can also keep a 4xx answer's body on the
+// returned *Error (Error.UpstreamBody), for the one caller that relays it.
+func doStreamKeep(ctx context.Context, cfg Config, url string, headers map[string]string, body any, keepBody bool) (*http.Response, error) {
 	sctx, cancel := context.WithTimeout(ctx, cfg.streamMaxDuration())
 	resp, span, err := doRequest(sctx, cfg, opChat, url, headers, body)
 	if err != nil {
@@ -163,6 +174,9 @@ func doStream(ctx context.Context, cfg Config, url string, headers map[string]st
 		_ = resp.Body.Close()
 		cancel()
 		e := upstreamStatusError(cfg, resp, raw)
+		if keepBody {
+			keepUpstreamBody(cfg, e, resp, raw)
+		}
 		spanFailed(span, e.Type)
 		span.End()
 		return nil, e
@@ -249,14 +263,18 @@ func doRequest(ctx context.Context, cfg Config, op, url string, headers map[stri
 		}
 	}
 	var rdr io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
+	switch b := body.(type) {
+	case nil:
+	case rawBody:
+		rdr = bytes.NewReader(b)
+	default:
+		enc, err := json.Marshal(body)
 		if err != nil {
 			spanFailed(span, "encode_failed")
 			span.End()
 			return nil, span, err
 		}
-		rdr = bytes.NewReader(b)
+		rdr = bytes.NewReader(enc)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, rdr)
 	if err != nil {

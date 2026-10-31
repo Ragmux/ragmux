@@ -356,15 +356,11 @@ type MCPRefuseFunc func(w http.ResponseWriter, status int, code, message string)
 // answered through refuse, with the headers the gateway set (Retry-After,
 // X-Ragmux-Projects) kept.
 //
-// The x-api-key header is taken for the Authorization bearer when that one is
-// absent, as the other client-facing surfaces do.
+// identify reads the key from Authorization: Bearer or from x-api-key
+// (ADR-028), so /mcp takes the same credentials as /v1.
 func (g *Gateway) MCPAuth(refuse MCPRefuseFunc) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if k := strings.TrimSpace(r.Header.Get("x-api-key")); k != "" && r.Header.Get("Authorization") == "" {
-				r = r.Clone(r.Context())
-				r.Header.Set("Authorization", "Bearer "+k)
-			}
 			// identify and the checks write OpenAI-shaped errors; rw holds
 			// them back so refuse can render them. next gets the real writer.
 			rw := &captureWriter{ResponseWriter: w}

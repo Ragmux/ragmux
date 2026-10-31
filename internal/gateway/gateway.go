@@ -236,8 +236,10 @@ const projectsHeader = "X-Ragmux-Projects"
 // answer across every granted project and only need the scope middleware.
 func (g *Gateway) Routes(r chi.Router) {
 	r.Use(g.requestID)
+	r.Use(g.anthropicEnvelope)
 	r.Use(g.identify)
 	r.Post("/chat/completions", g.chatCompletions)
+	r.Post("/messages", g.messages)
 	r.Post("/embeddings", g.embeddings)
 	r.Post("/retrieve", g.retrieve)
 	r.Post("/rerank", g.rerank)
@@ -338,18 +340,67 @@ func invalidKey(w http.ResponseWriter, code, msg string) {
 	writeErrorCode(w, http.StatusUnauthorized, "invalid_api_key", code, msg)
 }
 
+// gatewayCredential reads the gateway key of a /v1 or /mcp request: the bearer
+// of the Authorization header, or the x-api-key header the Anthropic SDKs send
+// (ADR-028). Both may be present, as Claude Code sends them, when they carry
+// the same key; two different keys are refused, because there is no telling
+// which one the client means and a credential check must not pick. problem is
+// the 401 message, empty when key is usable. The prefix rule (an sk-mgmt- key
+// is no gateway key under either header) is the caller's.
+//
+// This is the gateway's credential only. The admin API reads Authorization
+// alone (internal/auth), which PRD rule 2 keeps.
+func gatewayCredential(r *http.Request) (key, problem string) {
+	var bearer, xkey string
+	sawBearer := false
+	for _, h := range r.Header.Values("Authorization") {
+		if !strings.HasPrefix(h, "Bearer ") {
+			continue
+		}
+		v := strings.TrimSpace(h[7:])
+		if sawBearer && v != bearer {
+			return "", conflictingKeys
+		}
+		bearer, sawBearer = v, true
+	}
+	for _, h := range r.Header.Values("x-api-key") {
+		h = strings.TrimSpace(h)
+		if xkey != "" && h != xkey {
+			return "", conflictingKeys
+		}
+		xkey = h
+	}
+	switch {
+	case sawBearer && xkey != "" && bearer != xkey:
+		// An empty bearer next to an x-api-key is a different value too.
+		return "", conflictingKeys
+	case bearer != "":
+		return bearer, ""
+	case xkey != "":
+		return xkey, ""
+	case sawBearer:
+		// An empty bearer is a credential that does not resolve, not a missing one.
+		return "", ""
+	}
+	return "", missingCredential
+}
+
+const (
+	missingCredential = "missing Authorization: Bearer <project api key> header (or x-api-key)"
+	conflictingKeys   = "Authorization and x-api-key carry different keys; send one"
+)
+
 // identify resolves the bearer credential into a principal on the request
 // context. It stays a router middleware so every /v1 path, including unknown
 // ones, answers 401 before anything else; the pipeline's authenticate step
 // then applies scope and project selection to the principal found here.
 func (g *Gateway) identify(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := r.Header.Get("Authorization")
-		if !strings.HasPrefix(h, "Bearer ") {
-			writeError(w, http.StatusUnauthorized, "invalid_request_error", "missing Authorization: Bearer <project api key> header")
+		key, problem := gatewayCredential(r)
+		if problem != "" {
+			writeError(w, http.StatusUnauthorized, "invalid_request_error", problem)
 			return
 		}
-		key := strings.TrimSpace(h[7:])
 		if !strings.HasPrefix(key, store.ProjectKeyPrefix) && !strings.HasPrefix(key, store.GatewayKeyPrefix) {
 			invalidKey(w, "", "")
 			return
@@ -859,7 +910,25 @@ func (p chatPrep) apply(rec *store.RequestLog) {
 // the messages that go upstream with the project's system prompt and the RAG
 // context. Other endpoints have no such step.
 func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.ChatRequest, opts ragmuxRequest) chatPrep {
+	prep := g.prepareContext(c, prov, req, opts)
+	// Warnings go out before the first byte of either response shape; a
+	// stream's headers are only written once its first chunk arrives.
+	setRequestWarnings(c.w.Header(), prov, *req)
+	addRagmuxWarnings(c.w.Header(), prep.opts.Warnings)
+	return prep
+}
+
+// prepareContext is prepareChat without the Warning headers: the project's
+// system prompt and the RAG context, shaped into req, and the facts about
+// them. The Messages endpoint calls it directly because its warnings depend on
+// which path each attempt takes.
+func (g *Gateway) prepareContext(c *call, prov provider.Provider, req *provider.ChatRequest, opts ragmuxRequest) chatPrep {
 	p, ctx, w := c.project, c.ctx(), c.w
+	// Retrieval may have changed the prompt of this conversation, or may have
+	// on an earlier turn, whatever this request asks for (ADR-031, RAG x
+	// prefix). The Anthropic adapter reads it to drop replayed thinking blocks
+	// on models that bind them to the prompt prefix.
+	req.RAGActive = ragActive(p)
 	// A narrowing that cannot narrow anything is not refused, because no
 	// document reaches the context anyway; it earns a warning (PRD rule 12).
 	if p.RAGStoreID == nil {
@@ -901,6 +970,13 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 	if ragOn {
 		prep.skipReason = rag.SkipReason(p.RetrievalPolicy, opts.RetrievalOff,
 			p.QueryStrategy == store.QueryStrategyCondense, req.Messages)
+		if opts.ToolTurn && (prep.skipReason == "" || prep.skipReason == obs.RAGSkipGreeting || prep.skipReason == obs.RAGSkipAck) {
+			// The Messages endpoint decided the turn is a tool turn from the
+			// client's message, which the canonical form no longer shows
+			// (ADR-028). It ranks where SkipReason ranks the tool role: after
+			// policy_off and client_off, before the small-talk classes.
+			prep.skipReason = obs.RAGSkipToolTurn
+		}
 	}
 	if prep.skipReason != "" {
 		// A filter on a request whose retrieval does not run narrows nothing.
@@ -955,11 +1031,15 @@ func (g *Gateway) prepareChat(c *call, prov provider.Provider, req *provider.Cha
 			c.log.Warn("rag store missing", "id", *p.RAGStoreID, "err", err)
 		}
 	}
-	// Warnings go out before the first byte of either response shape; a
-	// stream's headers are only written once its first chunk arrives.
-	setRequestWarnings(w.Header(), prov, *req)
-	addRagmuxWarnings(w.Header(), opts.Warnings)
 	return prep
+}
+
+// ragActive is the "RAG active" fact of ADR-031: the project has a store and
+// its retrieval policy is not off. A client's ragmux.retrieval = "off" does not
+// change it, because an earlier turn of the same conversation may have had
+// context injected.
+func ragActive(p *store.Project) bool {
+	return p.RAGStoreID != nil && p.RetrievalPolicy != store.RetrievalPolicyOff
 }
 
 // injectRetrieved puts the retrieved-context block where the project's
@@ -1000,6 +1080,10 @@ type ragmuxRequest struct {
 	Filter *store.MetadataFilter
 	// Warnings are the texts of the Warning headers the object earns.
 	Warnings []string
+	// ToolTurn is set by the Messages endpoint, never read from a body: the
+	// last message of the client's request returns tool results, so
+	// retrieval is skipped (ADR-024, ADR-028).
+	ToolTurn bool
 }
 
 // errInvalidRagmux is the code of the 400 an unusable ragmux object gets.
@@ -1103,6 +1187,11 @@ func addRagmuxWarnings(h http.Header, texts []string) {
 		kept := texts[: maxRagmuxWarnings-1 : maxRagmuxWarnings-1]
 		texts = append(kept, strconv.Itoa(n-maxRagmuxWarnings+1)+" more ragmux warnings omitted")
 	}
+	addWarnings(h, texts)
+}
+
+// addWarnings writes one Warning header per text, as ragmux's own (code 299).
+func addWarnings(h http.Header, texts []string) {
 	for _, text := range texts {
 		h.Add("Warning", `299 ragmux "`+warnTextEscaper.Replace(text)+`"`)
 	}
@@ -1224,7 +1313,19 @@ type streamConfig struct {
 	// inline is the "ragmux" object for the first chunk that has choices; nil
 	// leaves every chunk as the upstream's.
 	inline []byte
+	// msg, when set, writes the stream as Messages events instead of OpenAI
+	// chunks (POST /v1/messages on a non-Anthropic target, ADR-028).
+	msg *provider.MessagesEncoder
 }
+
+// withMessagesEncoder makes the stream a Messages event stream.
+func withMessagesEncoder(enc *provider.MessagesEncoder) streamOption {
+	return func(c *streamConfig) { c.msg = enc }
+}
+
+// messagesPingInterval is how long a Messages stream may be quiet before a
+// ping event is written.
+var messagesPingInterval = 10 * time.Second
 
 // withInlineRagmux makes the stream carry the given "ragmux" object, once, on
 // the first chunk that has choices. The object goes there rather than in a
@@ -1313,7 +1414,16 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 	// client only sees that trailer when it asked for it: OpenAI sends none
 	// without stream_options.include_usage, and a chunk with an empty
 	// choices array is exactly what breaks a client indexing choices[0].
-	wantUsage := req.IncludeUsage()
+	wantUsage := req.IncludeUsage() || cfg.msg != nil
+
+	// A Messages stream pings while the upstream is quiet.
+	var pingC <-chan time.Time
+	var pingTimer *time.Ticker
+	if cfg.msg != nil {
+		pingTimer = time.NewTicker(messagesPingInterval)
+		defer pingTimer.Stop()
+		pingC = pingTimer.C
+	}
 
 	var usage *provider.Usage
 	var called toolNameSet
@@ -1326,7 +1436,29 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 			rec.ToolNames = names
 		}
 	}()
-	for chunk := range out {
+chunks:
+	for {
+		var chunk provider.StreamChunk
+		select {
+		case ch, ok := <-out:
+			if !ok {
+				break chunks
+			}
+			chunk = ch
+			if pingTimer != nil {
+				pingTimer.Reset(messagesPingInterval)
+			}
+		case <-pingC:
+			if headersSent && !clientGone {
+				if _, err := w.Write(provider.MessagesPing()); err != nil {
+					clientGone = true
+					cancel()
+				} else {
+					flusher.Flush()
+				}
+			}
+			continue
+		}
 		sm.Chunk()
 		if obsv.ttft == 0 {
 			obsv.ttft = time.Since(upstreamStart)
@@ -1356,6 +1488,17 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 			if c.Delta.Content != nil {
 				compChars += len(*c.Delta.Content)
 			}
+		}
+		if cfg.msg != nil {
+			if ev := cfg.msg.Chunk(chunk); len(ev) > 0 {
+				if _, err := w.Write(ev); err != nil {
+					clientGone = true
+					cancel()
+					continue
+				}
+				flusher.Flush()
+			}
+			continue
 		}
 		b, _ := json.Marshal(chunk)
 		if cfg.inline != nil && len(chunk.Choices) > 0 {
@@ -1403,11 +1546,20 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 		_, pe := providerError(err)
 		rec.StatusCode, rec.Error, obsv.errType = http.StatusBadGateway, pe.Message, pe.Type
 		g.Log.Warn("upstream stream failed", "project", rec.ProjectID, "msg", pe.Message)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", pe.ErrorJSON())
+		if cfg.msg != nil {
+			_, _ = w.Write(cfg.msg.Error(pe.Status, pe.Message))
+		} else {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", pe.ErrorJSON())
+		}
 	} else {
 		rec.StatusCode = http.StatusOK
+		if cfg.msg != nil {
+			_, _ = w.Write(cfg.msg.Finish())
+		}
 	}
-	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	if cfg.msg == nil {
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}
 	flusher.Flush()
 	fillUsage(rec, usage, promptChars, compChars)
 	return nil
@@ -1487,6 +1639,14 @@ func writeLimitError(w http.ResponseWriter, d limits.Decision) {
 func writeProviderError(w http.ResponseWriter, status int, pe *provider.Error) {
 	w.Header().Set("Content-Type", "application/json")
 	setRetryAfter(w.Header(), pe)
+	if len(pe.UpstreamBody) > 0 {
+		// A 4xx the native Messages path got from Anthropic: its own body, as
+		// it came (ADR-028).
+		keepErrorBody(w)
+		w.WriteHeader(status)
+		_, _ = w.Write(pe.UpstreamBody) //nolint:gosec // G705: the upstream's JSON error, relayed unchanged as application/json
+		return
+	}
 	w.WriteHeader(status)
 	_, _ = w.Write(pe.ErrorJSON())
 }
@@ -1516,9 +1676,7 @@ func setRequestWarnings(h http.Header, prov provider.Provider, req provider.Chat
 	if !ok {
 		return
 	}
-	for _, text := range rw.RequestWarnings(req) {
-		h.Add("Warning", `299 ragmux "`+warnTextEscaper.Replace(text)+`"`)
-	}
+	addWarnings(h, rw.RequestWarnings(req))
 }
 
 func providerError(err error) (int, *provider.Error) {
