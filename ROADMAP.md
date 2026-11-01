@@ -56,7 +56,7 @@ Released in 0.6.0.
 
 ## v0.7 — reasoning and agents
 
-Done and waiting for its release tag.
+Released in 0.7.0.
 
 - A single `reasoning_effort` setting mapped onto each provider's thinking controls, and
   thinking blocks carried across turns.
