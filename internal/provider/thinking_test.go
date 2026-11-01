@@ -20,15 +20,6 @@ const (
 	fixtureRedactedData      = "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YYDeXYZ2Js6vb3x+Zq/0r="
 )
 
-func contains(list []string, want string) bool {
-	for _, s := range list {
-		if s == want {
-			return true
-		}
-	}
-	return false
-}
-
 func hasWarning(list []string, substr string) bool {
 	for _, s := range list {
 		if strings.Contains(s, substr) {

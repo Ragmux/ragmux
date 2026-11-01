@@ -795,7 +795,7 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	c.w.Header().Set("Content-Type", "application/json")
 	if inline != nil {
 		if b, err := withRagmuxField(resp, inline); err == nil {
-			_, _ = c.w.Write(b)
+			_, _ = c.w.Write(b) //nolint:gosec // G705: json.Marshal output, sent as application/json
 			return nil
 		}
 	}
@@ -1648,7 +1648,7 @@ func writeProviderError(w http.ResponseWriter, status int, pe *provider.Error) {
 		return
 	}
 	w.WriteHeader(status)
-	_, _ = w.Write(pe.ErrorJSON())
+	_, _ = w.Write(pe.ErrorJSON()) //nolint:gosec // G705: json.Marshal output, sent as application/json
 }
 
 // setRetryAfter writes the error's retry hint. The gateway's own figure

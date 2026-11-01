@@ -60,7 +60,7 @@ func messagesID(id string) string {
 	case strings.HasPrefix(id, "msg_"):
 		return id
 	case id == "":
-		return "msg_" + randomID(24)
+		return "msg_" + randomID()
 	}
 	return "msg_" + strings.TrimPrefix(id, "chatcmpl-")
 }
@@ -124,7 +124,7 @@ func ChatToMessages(resp *ChatResponse, model string, inline []byte) MessagesRes
 		}
 		id := c.ID
 		if id == "" {
-			id = "toolu_" + randomID(24)
+			id = "toolu_" + randomID()
 		}
 		out.Content = append(out.Content, messagesBlock{Type: "tool_use", ID: id, Name: c.Function.Name, Input: input})
 	}
@@ -205,7 +205,7 @@ type MessagesEncoder struct {
 // NewMessagesEncoder starts the event sequence of one answer. model is echoed;
 // inline is the "ragmux" object for message_start, or nil.
 func NewMessagesEncoder(model string, inline []byte) *MessagesEncoder {
-	return &MessagesEncoder{model: model, id: "msg_" + randomID(24), inline: inline, open: -1,
+	return &MessagesEncoder{model: model, id: "msg_" + randomID(), inline: inline, open: -1,
 		thinking: map[int]int{}, tools: map[int]int{}}
 }
 
@@ -336,7 +336,7 @@ func (e *MessagesEncoder) toolUpdate(out *[]byte, raw json.RawMessage) {
 		if !ok {
 			id := tc.ID
 			if id == "" {
-				id = "toolu_" + randomID(24)
+				id = "toolu_" + randomID()
 			}
 			idx = e.openBlock(out, "tool_use", map[string]any{"type": "tool_use", "id": id, "name": tc.Function.Name, "input": map[string]any{}})
 			e.tools[tc.Index] = idx

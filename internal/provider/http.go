@@ -507,5 +507,5 @@ func isDigits(s string) bool {
 }
 
 func chatID() string {
-	return "chatcmpl-" + randomID(24)
+	return "chatcmpl-" + randomID()
 }

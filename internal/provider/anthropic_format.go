@@ -24,8 +24,8 @@ const (
 type formatMode int
 
 const (
-	// formatNone: no JSON response_format on the request.
-	formatNone formatMode = iota
+	// The zero value: no JSON response_format on the request.
+	_ formatMode = iota
 	// formatNative: output_config.format carries the schema.
 	formatNative
 	// formatTool: a forced ragmux_response tool carries the answer.

@@ -451,7 +451,7 @@ func (g *Gateway) MCPSearch(w http.ResponseWriter, r *http.Request, args MCPSear
 	}
 	defer c.span.End()
 
-	req := retrieveRequest{Query: args.Query, TopK: args.TopK, Filter: args.Filter}
+	req := retrieveRequest(args)
 	filter, msg := checkRetrieve(req)
 	if msg != "" {
 		return nil, &MCPFailure{Status: http.StatusBadRequest, Code: "invalid_request_error", Message: msg, Tool: true}
