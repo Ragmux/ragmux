@@ -549,7 +549,7 @@ func TestRunLoggedReportsTotals(t *testing.T) {
 		t.Errorf("interrupted = %v, want false", pass["interrupted"])
 	}
 	want := pass["request_logs"].(float64) + pass["audit_logs"].(float64) + pass["login_attempts"].(float64) +
-		pass["sessions"].(float64) + pass["api_keys"].(float64)
+		pass["sessions"].(float64) + pass["api_keys"].(float64) + pass["session_usage"].(float64)
 	if pass["deleted"] != want || want == 0 {
 		t.Errorf("deleted = %v, want the per-table sum %v (non-zero)", pass["deleted"], want)
 	}
