@@ -41,6 +41,9 @@ type geminiPart struct {
 	// part. On a functionCall part it has to come back verbatim on the next
 	// turn, or Gemini 3 rejects the tool round with a 400.
 	ThoughtSignature string `json:"thoughtSignature,omitempty"`
+	// Thought marks a part as a thought summary, which Gemini returns when
+	// thinkingConfig.includeThoughts is set. It is thinking, not answer text.
+	Thought bool `json:"thought,omitempty"`
 }
 
 // Gemini correlates tool calls by function name; there are no call ids in
@@ -113,8 +116,45 @@ type geminiResponse struct {
 	} `json:"usageMetadata"`
 }
 
+// geminiThinkingSetup is the adapter's decisions about thinking for one
+// request; see anthropicThinkingSetup.
+type geminiThinkingSetup struct {
+	plan     geminiThinkingPlan
+	warnings []string
+}
+
+func setupGeminiThinking(model string, req ChatRequest) (geminiThinkingSetup, error) {
+	var su geminiThinkingSetup
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return su, err
+	}
+	effort, set := req.ReasoningEffort()
+	plan, err := planGeminiThinking(CapabilitiesFor("gemini", model), model, effort, set)
+	if err != nil {
+		return su, err
+	}
+	su.plan = plan
+	su.warnings = append(su.warnings, plan.Warnings...)
+	if hasReasoningContent(req.Messages) {
+		su.warnings = append(su.warnings, reasoningContentDropped("gemini"))
+	}
+	return su, nil
+}
+
+// RequestWarnings implements RequestWarner.
+func (p *gemini) RequestWarnings(req ChatRequest) []string {
+	if su, err := setupGeminiThinking(p.cfg.Model, req); err == nil {
+		return su.warnings
+	}
+	return nil
+}
+
 func translateGemini(ctx context.Context, cfg Config, req ChatRequest) (geminiRequest, error) {
 	out := geminiRequest{}
+	su, err := setupGeminiThinking(cfg.Model, req)
+	if err != nil {
+		return out, err
+	}
 	images := cfg.imageBudget(ctx)
 	var system []string
 	for i, m := range req.Messages {
@@ -172,6 +212,11 @@ func translateGemini(ctx context.Context, cfg Config, req ChatRequest) (geminiRe
 		gc["stopSequences"] = stops
 	}
 	geminiResponseFormat(cfg, req.ResponseFormat, gc)
+	// maxOutputTokens above covers thinking too; it is left as the client
+	// set it.
+	if su.plan.Config != nil {
+		gc["thinkingConfig"] = su.plan.Config
+	}
 	if len(gc) > 0 {
 		out.GenerationConfig = gc
 	}
@@ -445,7 +490,20 @@ func geminiFinish(reason string) *string {
 func geminiText(c geminiContent) string {
 	var b strings.Builder
 	for _, p := range c.Parts {
-		b.WriteString(p.Text)
+		if !p.Thought {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
+}
+
+// geminiThoughts joins the thought summaries of one candidate.
+func geminiThoughts(c geminiContent) string {
+	var b strings.Builder
+	for _, p := range c.Parts {
+		if p.Thought {
+			b.WriteString(p.Text)
+		}
 	}
 	return b.String()
 }
@@ -522,7 +580,8 @@ func (p *gemini) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return resp, nil
 	}
 	for i, c := range gr.Candidates {
-		msg := ResponseMessage{Role: "assistant", Content: strPtr(geminiText(c.Content))}
+		msg := ResponseMessage{Role: "assistant", Content: strPtr(geminiText(c.Content)),
+			Thinking: thinkingBlocksOf(geminiThoughts(c.Content))}
 		finish := geminiFinish(c.FinishReason)
 		if msg.ToolCalls = toolCallsJSON(geminiToolCalls(c.Content)); msg.ToolCalls != nil {
 			// Gemini reports STOP for a turn that only called tools; clients
@@ -571,12 +630,13 @@ func (p *gemini) ChatStream(ctx context.Context, req ChatRequest, out chan<- Str
 		for _, c := range gr.Candidates {
 			text := geminiText(c.Content)
 			calls := sigs.collect(c.Content)
-			delta := Delta{Content: strPtr(text)}
+			thoughts := geminiThoughts(c.Content)
+			delta := Delta{Content: strPtr(text), Thinking: thinkingDeltaOf(thoughts)}
 			if !sentRole {
 				delta.Role = "assistant"
 				sentRole = true
 			}
-			if text != "" || len(calls) == 0 {
+			if text != "" || thoughts != "" || len(calls) == 0 {
 				if !emit(StreamChunk{Choices: []StreamChoice{{Index: 0, Delta: delta}}}) {
 					return false
 				}

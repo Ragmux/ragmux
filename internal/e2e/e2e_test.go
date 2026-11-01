@@ -1351,7 +1351,7 @@ func TestMetricsExportAndSummaryOptions(t *testing.T) {
 		t.Fatalf("csv: %d %v", code, h)
 	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error,cached_prompt_tokens,cache_write_tokens,cost_usd,cost_source,api_key_id,user_id" {
+	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error,cached_prompt_tokens,cache_write_tokens,cost_usd,cost_source,api_key_id,user_id,session_id,tool_names,tools_denied" {
 		t.Fatalf("csv lines: %q", lines)
 	}
 	if !strings.Contains(lines[1], fmt.Sprintf(",%d,alpha,x,200,10,3,false,40,true,true,2,", idA)) {
@@ -2130,5 +2130,133 @@ func TestStreamSourcesEndToEnd(t *testing.T) {
 	}
 	if rm := ragmuxOf(t, bl[0]); rm == nil || len(rm["sources"].([]any)) != 0 {
 		t.Errorf("bare inline first line = %s", bl[0])
+	}
+}
+
+// chatWithSession posts a chat completion with an X-Ragmux-Session header and
+// returns the status, headers and decoded body.
+func (e *env) chatWithSession(apiKey, session string, body map[string]any) (int, http.Header, map[string]any) {
+	e.t.Helper()
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/chat/completions", bytes.NewReader(mustJSON(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if session != "" {
+		req.Header.Set("X-Ragmux-Session", session)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	return resp.StatusCode, resp.Header, out
+}
+
+// Tool lists and the session cap, set through the admin API and acted on by
+// the gateway, with the session visible in the admin API afterwards (ADR-032).
+func TestToolGovernanceAndSessionsEndToEnd(t *testing.T) {
+	up := mockUpstream(t)
+	defer up.Close()
+	e := newEnv(t, testdb.Config(t))
+	conn := e.call("POST", "/admin/api/models", map[string]any{"name": "chat", "provider_type": "custom_openai",
+		"base_url": up.URL + "/v1", "api_key": "k", "model_name": "m"}, "")
+	if conn["_status"] != float64(201) {
+		t.Fatalf("create connection: %v", conn)
+	}
+	created := e.call("POST", "/admin/api/projects", map[string]any{"name": "agents", "model_connection_id": conn["id"],
+		"tool_deny": []string{"shell", "mcp__github__*"}, "session_token_cap": 20}, "")
+	if created["_status"] != float64(201) {
+		t.Fatalf("create project: %v", created)
+	}
+	proj := created["project"].(map[string]any)
+	key := created["api_key"].(string)
+	pid := int64(proj["id"].(float64))
+	if proj["session_token_cap"] != float64(20) || len(proj["tool_deny"].([]any)) != 2 {
+		t.Fatalf("project = %v", proj)
+	}
+	tool := func(name string) map[string]any {
+		return map[string]any{"type": "function", "function": map[string]any{"name": name, "parameters": map[string]any{"type": "object"}}}
+	}
+	body := map[string]any{"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"tools": []any{tool("lookup"), tool("shell")}}
+
+	// A bad session id is refused before anything is spent.
+	if status, _, out := e.chatWithSession(key, "bad id", body); status != 400 || out["error"].(map[string]any)["code"] != "invalid_session_id" {
+		t.Errorf("bad session: %d %v", status, out)
+	}
+	// Naming a removed tool is a 400 naming tool_not_allowed.
+	named := map[string]any{"messages": body["messages"], "tools": body["tools"],
+		"tool_choice": map[string]any{"type": "function", "function": map[string]any{"name": "shell"}}}
+	if status, _, out := e.chatWithSession(key, "run-1", named); status != 400 || out["error"].(map[string]any)["code"] != "tool_not_allowed" {
+		t.Errorf("denied tool_choice: %d %v", status, out)
+	}
+
+	// Two requests spend 12 tokens each; the cap is 20, so the second is still
+	// served and the third is not.
+	for i := 1; i <= 2; i++ {
+		status, hdr, out := e.chatWithSession(key, "run-1", body)
+		if status != 200 {
+			t.Fatalf("request %d: %d %v", i, status, out)
+		}
+		if i == 1 && !strings.Contains(strings.Join(hdr.Values("Warning"), "|"), "1 tool(s) removed") {
+			t.Errorf("Warning = %v", hdr.Values("Warning"))
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			list := e.call("GET", fmt.Sprintf("/admin/api/projects/%d/sessions", pid), nil, "")["_list"].([]any)
+			if len(list) == 1 && list[0].(map[string]any)["requests"] == float64(i) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("session total never reached %d requests: %v", i, list)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	status, hdr, out := e.chatWithSession(key, "run-1", body)
+	errObj, _ := out["error"].(map[string]any)
+	if status != 429 || errObj["code"] != "session_token_cap" || errObj["scope"] != "session" || hdr.Get("Retry-After") != "" {
+		t.Fatalf("third request: %d %v Retry-After %q", status, out, hdr.Get("Retry-After"))
+	}
+	// Another session, and a request without one, are served.
+	if status, _, out := e.chatWithSession(key, "run-2", body); status != 200 {
+		t.Errorf("another session: %d %v", status, out)
+	}
+	if status, _, out := e.chatWithSession(key, "", body); status != 200 {
+		t.Errorf("no session: %d %v", status, out)
+	}
+
+	detail := e.call("GET", fmt.Sprintf("/admin/api/projects/%d/sessions/run-1", pid), nil, "")
+	sess, _ := detail["session"].(map[string]any)
+	if detail["_status"] != float64(200) || sess["tokens"] != float64(24) || sess["requests"] != float64(2) {
+		t.Fatalf("detail: %v", detail)
+	}
+	rows := detail["requests"].([]any)
+	var served, denied int
+	for _, r := range rows {
+		row := r.(map[string]any)
+		if row["session_id"] != "run-1" {
+			t.Errorf("row of another session: %v", row)
+		}
+		switch row["status_code"] {
+		case float64(200):
+			served++
+			if row["tools_denied"] != float64(1) {
+				t.Errorf("tools_denied = %v, want 1", row["tools_denied"])
+			}
+		case float64(429):
+			denied++
+		}
+	}
+	if served != 2 || denied != 1 {
+		t.Errorf("rows: %d served, %d denied, want 2 and 1", served, denied)
+	}
+
+	// The CSV carries the new columns at the end.
+	status2, raw, _ := e.fetch(fmt.Sprintf("/admin/api/projects/%d/metrics.csv", pid), e.session)
+	if status2 != 200 || !strings.Contains(strings.SplitN(string(raw), "\n", 2)[0], ",session_id,tool_names,tools_denied") {
+		t.Errorf("csv header: %d %q", status2, strings.SplitN(string(raw), "\n", 2)[0])
 	}
 }

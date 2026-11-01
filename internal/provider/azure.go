@@ -106,12 +106,15 @@ func newAzure(cfg Config) *azureChat {
 }
 
 func (p *azureChat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return nil, err
+	}
 	endpoint, err := p.t.url("chat/completions")
 	if err != nil {
 		return nil, err
 	}
 	req.Model = p.t.cfg.Model
-	req.Messages = stripToolCallSignatures(req.Messages)
+	req.Messages = stripGatewayExtensions(req.Messages)
 	req.Stream = false
 	req.StreamOptions = nil
 	var out ChatResponse
@@ -128,16 +131,20 @@ func (p *azureChat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, e
 		out.Created = time.Now().Unix()
 	}
 	out.Usage.normalize()
+	foldReasoningContent(&out)
 	return &out, nil
 }
 
 func (p *azureChat) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return err
+	}
 	endpoint, err := p.t.url("chat/completions")
 	if err != nil {
 		return err
 	}
 	req.Model = p.t.cfg.Model
-	req.Messages = stripToolCallSignatures(req.Messages)
+	req.Messages = stripGatewayExtensions(req.Messages)
 	req.Stream = true
 	req.StreamOptions = json.RawMessage(`{"include_usage":true}`)
 	resp, err := doStream(ctx, p.t.cfg, endpoint, p.t.headers(), req)
@@ -180,6 +187,7 @@ func (p *azureChat) ChatStream(ctx context.Context, req ChatRequest, out chan<- 
 			return true
 		}
 		chunk.Usage.normalize()
+		foldReasoningDelta(&chunk)
 		select {
 		case out <- chunk:
 			return true

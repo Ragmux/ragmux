@@ -541,17 +541,17 @@ func TestStripToolCallSignatures(t *testing.T) {
 	plain := parseReq(t, `{"messages":[{"role":"user","content":"hi"},
 		{"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{}"}}]}]}`)
 	// Nothing to strip: the very same slice comes back, bytes untouched.
-	if got := stripToolCallSignatures(plain.Messages); &got[0] != &plain.Messages[0] {
+	if got := stripGatewayExtensions(plain.Messages); &got[0] != &plain.Messages[0] {
 		t.Error("unsigned history was copied")
 	}
 	// A key spelled with a JSON escape is the same key to every decoder.
 	escaped := parseReq(t, `{"messages":[{"role":"assistant","tool_calls":[{"id":"a","ragmux\u005fsignature":"s","function":{"name":"f","arguments":"{}"}}]}]}`)
-	if got := stripToolCallSignatures(escaped.Messages); strings.Contains(string(got[0].ToolCalls), `"s"`) {
+	if got := stripGatewayExtensions(escaped.Messages); strings.Contains(string(got[0].ToolCalls), `"s"`) {
 		t.Errorf("escaped key survived: %s", got[0].ToolCalls)
 	}
 	// Malformed tool_calls pass through for the upstream to judge.
 	bad := []Message{{Role: "assistant", ToolCalls: json.RawMessage(`"oops"`)}}
-	if got := stripToolCallSignatures(bad); string(got[0].ToolCalls) != `"oops"` {
+	if got := stripGatewayExtensions(bad); string(got[0].ToolCalls) != `"oops"` {
 		t.Errorf("malformed = %s", got[0].ToolCalls)
 	}
 }

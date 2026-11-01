@@ -141,29 +141,6 @@ func TestLookupPrecedence(t *testing.T) {
 	}
 }
 
-func TestMatchGlob(t *testing.T) {
-	cases := []struct {
-		pattern, s string
-		want       bool
-	}{
-		{"gpt-4o", "gpt-4o", true},
-		{"gpt-4o", "gpt-4o-mini", false},
-		{"*", "anything/at-all:v2", true},
-		{"gpt-4o*", "gpt-4o", true},
-		{"a*b*c", "axxbyyc", true},
-		{"a*b*c", "abc", true},
-		{"a*b*c", "acb", false},
-		{"*/DeepSeek-R1", "deepseek-ai/DeepSeek-R1", true},
-		{"*/DeepSeek-R1", "DeepSeek-R1", false},
-		{"llama3*", "llama2", false},
-	}
-	for _, c := range cases {
-		if got := matchGlob(c.pattern, c.s); got != c.want {
-			t.Errorf("matchGlob(%q, %q) = %v, want %v", c.pattern, c.s, got, c.want)
-		}
-	}
-}
-
 func TestCostMicros(t *testing.T) {
 	// Anthropic-shaped: writes at 1.25x input, reads at 0.1x.
 	p := Price{Input: 3, Output: 15, CacheWrite: 3.75, CacheRead: 0.30}

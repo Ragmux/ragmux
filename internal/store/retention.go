@@ -23,6 +23,9 @@ const (
 	// RetainAPIKeys removes retired keys only while no request log
 	// attributes spend to them; see PurgeRetiredAPIKeys.
 	RetainAPIKeys
+	// RetainSessionUsage removes the totals of sessions idle for as long as
+	// request logs are kept (ADR-032).
+	RetainSessionUsage
 )
 
 type retentionSpec struct {
@@ -42,6 +45,7 @@ var retentionSpecs = map[RetentionTable]retentionSpec{
 	RetainAuditLogs:     {"audit_logs", "created_at < $1", "created_at"},   // idx_audit_logs_created
 	RetainLoginAttempts: {"login_attempts", "created_at < $1", ""},         // kept a day; small
 	RetainSessions:      {"sessions", "expires_at <= $1", "expires_at"},    // idx_sessions_expires
+	RetainSessionUsage:  {"session_usage", "last_seen < $1", "last_seen"},  // idx_session_usage_retention
 	// The NOT EXISTS is what makes the ON DELETE SET NULL on
 	// request_logs.api_key_id safe: attribution is never erased, the row
 	// just outlives the key it names.

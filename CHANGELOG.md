@@ -6,6 +6,104 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-01
+
+### Added
+
+- **`reasoning_effort` reaches every provider's thinking controls.** One setting (`none`,
+  `minimal`, `low`, `medium`, `high`, `xhigh` and `max`) becomes Anthropic's
+  `thinking` and `output_config.effort` (or a `budget_tokens` on models that take a budget),
+  Gemini's `thinkingConfig` and Ollama's `think`. Which levels a model takes is read from
+  its capabilities, not from the provider. See
+  [Reasoning effort](docs/providers.md#reasoning-effort).
+- **Thinking blocks are carried across turns: `ragmux_thinking`.** A reply carries the model's
+  thinking as `message.ragmux_thinking` (and `delta.ragmux_thinking` in streams): Anthropic
+  `thinking` and `redacted_thinking` blocks with their signatures, Gemini thought summaries,
+  Ollama `message.thinking` and an OpenAI-compatible upstream's `reasoning_content`. Sent back
+  on the assistant message of the next request, signed blocks are placed in front of that
+  message's content unchanged, so a tool round on Anthropic keeps working; a malformed `ragmux_thinking` is
+  `400` with `code: "invalid_ragmux_thinking"`. See
+  [`POST /v1/chat/completions`](docs/api.md#post-v1chatcompletions).
+- **Structured output on Anthropic.** `response_format` is honoured: `json_schema` uses the
+  model's native structured output where it has one and otherwise a forced `ragmux_response`
+  tool; `json_object` uses a forced tool or, on a model that cannot be forced to call a tool,
+  an instruction in the system prompt (with a `Warning`). The tool's input comes back as
+  `message.content`. See [Structured output](docs/providers.md#structured-output).
+- **Fields that were dropped in translation now pass through.** `refusal`, `annotations`,
+  `logprobs` and `system_fingerprint` of an OpenAI-compatible or Azure upstream reach the
+  client, streamed or not. A `tool` message may carry the gateway's `ragmux_is_error: true`,
+  which becomes `is_error: true` on Anthropic's `tool_result`, and an `image_url` in a `tool`
+  message's content parts becomes an image block of that result. See
+  [OpenAI-compatible](docs/providers.md#openai-compatible-openai-deepseek-custom_openai).
+- **Capabilities are resolved per model.** The adapters decide from what the model in the request
+  can do (native structured output, forced tool choice, thinking, effort levels), not from its
+  provider type. `GET /admin/api/provider-types` takes no model, so it reports the new
+  model-level flags for the provider's current generation. See
+  [Model-level capabilities](docs/providers.md#model-level-capabilities).
+- **An MCP server at `/mcp`.** The project's RAG store is a `search_<store>` tool for MCP
+  clients such as Claude Code. A gateway key with the `retrieve` scope authenticates (in
+  `Authorization` or `x-api-key`); the search, limits and request log are those of
+  `/v1/retrieve`. The server keeps no state and speaks the `2026-07-28` protocol as well as
+  `2025-11-25`, `2025-06-18` and `2025-03-26`. See [MCP endpoint](docs/api.md#mcp-endpoint).
+- **Tool allow and deny lists per project.** `tool_allow` and `tool_deny` take names or
+  `*` patterns; deny wins, and an empty allow list allows everything. A tool the project does
+  not allow is removed from the request with a `Warning`, and a `tool_choice` that the lists
+  make impossible is `400` with `code: "tool_not_allowed"`. The tools the model called are
+  recorded by name in `request_logs.tool_names`, never their arguments. See
+  [Tool governance](docs/users-and-limits.md#tool-governance).
+- **Agent sessions: `X-Ragmux-Session`.** The header is stored in `request_logs.session_id`
+  (never a metric label) and every request adds its tokens to the session's running total. An
+  optional per-project `session_token_cap` answers `429` with `code: "session_token_cap"`
+  once a session passes it. `GET /admin/api/projects/{id}/sessions` and
+  `.../sessions/{sessionId}` list sessions and their requests. A malformed header is `400`
+  with `code: "invalid_session_id"`, a session over its cap counts in
+  `ragmux_limits_denied_total` with the new `reason` value `session_token_cap`, the request
+  log CSV export gains `session_id`, `tool_names` and `tools_denied` as its last columns, and
+  session totals are deleted with the request log window. On `/v1/messages` the
+  `x-claude-code-session-id` header Claude Code sends stands in for `X-Ragmux-Session`. See
+  [Sessions](docs/users-and-limits.md#sessions).
+- **`POST /v1/messages`, the Anthropic Messages API.** The Anthropic SDKs and Claude Code work
+  after a base URL change. On an Anthropic connection the request and the answer pass through
+  as they are; on any other connection the request is translated and the answer comes back in
+  the Anthropic shape, streams included. The gateway key may be sent in `x-api-key`, which
+  every `/v1` route and `/mcp` now accept, and errors use Anthropic's envelope on this route.
+  See [`POST /v1/messages`](docs/api.md#post-v1messages).
+- **Dashboard.** A Sessions card on the project panel (sessions, their usage against the cap,
+  the requests of one session with the tools they called) and a Tool policy section in the
+  project form. See [Dashboard](docs/dashboard.md).
+- Migrations `0029` and `0030`. They only add columns, a table and a partial index (built
+  `CONCURRENTLY`), so a rolling update with older replicas keeps working.
+
+### Changed
+
+- **Behaviour change: `response_format` on an Anthropic connection is no longer ignored.** It
+  used to be dropped with a `Warning`; a client that sent `json_schema` or `json_object` and
+  got prose back now gets JSON. A `json_schema` without a schema is `400`, and a user tool
+  named `ragmux_response` is `400` on the forced-tool path.
+- **Behaviour change: an unknown `reasoning_effort` is `400`** with
+  `code: "invalid_reasoning_effort"` on Anthropic, Gemini and Ollama connections. These
+  adapters used to drop the field; OpenAI-compatible and Azure connections still forward it as
+  sent. A model that cannot think drops it with a `Warning`, and on Anthropic `temperature` is
+  dropped with a `Warning` while thinking is on.
+- **Behaviour change: `x-api-key` is read on every `/v1` route and on `/mcp`, and a request
+  whose `Authorization` and `x-api-key` carry different keys is `401`.** Before, `x-api-key`
+  was ignored, so a client or proxy that added an unrelated `x-api-key` next to a valid
+  `Authorization: Bearer` worked; it now gets `401` ("Authorization and x-api-key carry
+  different keys; send one"). Send one header, or the same key in both.
+- **Behaviour change: an `image_url` the Anthropic adapter cannot take in a `tool` message is
+  `400`,** as it already was in a user message. The images of tool results used to be dropped
+  before they were checked.
+- **Behaviour change: a `required` or named `tool_choice` on an Anthropic model that cannot be
+  forced to call a tool is sent as `auto`,** with a `Warning`.
+- CORS: `X-Ragmux-Session`, `x-api-key`, `anthropic-*` and `MCP-*` request headers are allowed,
+  and `request-id` is exposed, for origins in `CORS_ORIGINS`.
+
+### Removed
+
+- The `Warning: 299 ragmux` that said `response_format` was ignored on Anthropic. The header
+  remains for the other ignored parts of a request, and for `json_object` on a model that can
+  only be told in the system prompt.
+
 ## [0.6.1] - 2026-10-30
 
 ### Added
@@ -1051,7 +1149,8 @@ projects with `sk-proj-` keys, metrics and an embedded dashboard.
 No git tag was created for this release, so there is no release page for it. The first
 tagged release is [0.2.0](https://github.com/ragmux/ragmux/releases/tag/v0.2.0).
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ragmux/ragmux/releases/tag/v0.7.0
 [0.6.1]: https://github.com/ragmux/ragmux/releases/tag/v0.6.1
 [0.6.0]: https://github.com/ragmux/ragmux/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ragmux/ragmux/releases/tag/v0.5.0

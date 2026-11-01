@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -73,27 +74,37 @@ func (g *Gateway) decodeRetrieve(c *call) (retrieveRequest, *store.MetadataFilte
 		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
 		return req, nil, false
 	}
+	filter, msg := checkRetrieve(req)
+	if msg != "" {
+		writeError(c.w, http.StatusBadRequest, "invalid_request_error", msg)
+		return req, nil, false
+	}
+	return req, filter, true
+}
+
+// checkRetrieve validates a decoded retrieve request and parses its filter.
+// A non-empty message says what is wrong with it. The REST endpoint answers
+// that with a 400 and the MCP tool (MCPSearch) reports it as a tool error, so
+// both accept exactly the same requests.
+func checkRetrieve(req retrieveRequest) (*store.MetadataFilter, string) {
 	// An absent filter is no filter; one that is present must be in the
 	// grammar, "null" and the empty string included.
 	var filter *store.MetadataFilter
 	if req.Filter != nil {
 		var err error
 		if filter, err = store.ParseMetadataFilter(req.Filter); err != nil {
-			writeError(c.w, http.StatusBadRequest, "invalid_request_error", err.Error())
-			return req, nil, false
+			return nil, err.Error()
 		}
 	}
 	switch {
 	case strings.TrimSpace(req.Query) == "":
-		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "query is required")
+		return nil, "query is required"
 	case len(req.Query) > maxRetrieveQueryBytes:
-		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "query is too long")
+		return nil, "query is too long"
 	case req.TopK < 0 || req.TopK > maxRetrieveTopK:
-		writeError(c.w, http.StatusBadRequest, "invalid_request_error", "top_k must be 0 (the store's default) or between 1 and 50")
-	default:
-		return req, filter, true
+		return nil, "top_k must be 0 (the store's default) or between 1 and 50"
 	}
-	return req, nil, false
+	return filter, ""
 }
 
 // retrieveTargets loads the project's RAG store and installs its embedding
@@ -325,4 +336,203 @@ type retrieveResponse struct {
 	RetrievalLatencyMS int64           `json:"retrieval_latency_ms"`
 	RerankLatencyMS    *int64          `json:"rerank_latency_ms"`
 	Usage              embeddingsUsage `json:"usage"`
+}
+
+// The MCP entry points (ADR-030). internal/mcp speaks the protocol; it
+// reaches the gateway's authentication, limits and request log only through
+// the three functions below, which wrap the steps /v1/retrieve itself runs.
+// Nothing here searches or accounts on its own.
+
+// MCPRefuseFunc renders a refusal the gateway wrote in its own error shape in
+// the caller's: status is the HTTP status, code the machine-readable code
+// (invalid_api_key, insufficient_scope, project_required, ...) and message
+// the text for the client.
+type MCPRefuseFunc func(w http.ResponseWriter, status int, code, message string)
+
+// MCPAuth is the authentication of an MCP request: the credential is resolved
+// like /v1 does (identify), then the retrieve scope and the project are
+// checked. It runs for every request, the handshake included. A request that
+// passes reaches next with the principal on its context; one that does not is
+// answered through refuse, with the headers the gateway set (Retry-After,
+// X-Ragmux-Projects) kept.
+//
+// identify reads the key from Authorization: Bearer or from x-api-key
+// (ADR-028), so /mcp takes the same credentials as /v1.
+func (g *Gateway) MCPAuth(refuse MCPRefuseFunc) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// identify and the checks write OpenAI-shaped errors; rw holds
+			// them back so refuse can render them. next gets the real writer.
+			rw := &captureWriter{ResponseWriter: w}
+			passed := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				pr := principalFrom(r.Context())
+				if !checkScope(rw, pr, retrieveOperation.scope, retrieveOperation.what) || !checkProject(rw, pr) {
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+			g.requestID(g.identify(passed)).ServeHTTP(rw, r)
+			if rw.status != 0 {
+				f := rw.failure(false)
+				refuse(w, f.Status, f.Code, f.Message)
+			}
+		})
+	}
+}
+
+// MCPStore is the RAG store of the project an MCP request resolved to.
+type MCPStore struct {
+	ID            int64
+	Name          string
+	DocumentCount int
+}
+
+// MCPStoreFor returns the RAG store of the request's project, or nil when the
+// project has none. The request must have passed MCPAuth.
+func (g *Gateway) MCPStoreFor(ctx context.Context) (*MCPStore, error) {
+	p := projectFrom(ctx)
+	if p == nil || p.RAGStoreID == nil {
+		return nil, nil
+	}
+	rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
+	if err != nil {
+		return nil, err
+	}
+	return &MCPStore{ID: rs.ID, Name: rs.Name, DocumentCount: rs.DocumentCount}, nil
+}
+
+// MCPSearchArgs are the arguments of the search tool: the retrieve request's
+// query, top_k and filter.
+type MCPSearchArgs struct {
+	Query  string
+	TopK   int
+	Filter json.RawMessage
+}
+
+// MCPHit is one retrieved passage as the tool returns it.
+type MCPHit struct {
+	Content          string          `json:"content"`
+	Score            float64         `json:"score"`
+	Filename         string          `json:"filename"`
+	Section          string          `json:"section,omitempty"`
+	Page             int             `json:"page,omitempty"`
+	ChunkIndex       int             `json:"chunk_index"`
+	DocumentID       int64           `json:"document_id"`
+	ChunkID          int64           `json:"chunk_id"`
+	DocumentMetadata json.RawMessage `json:"document_metadata"`
+}
+
+// MCPSearchResult is what a successful search returns.
+type MCPSearchResult struct {
+	Hits []MCPHit `json:"hits"`
+}
+
+// MCPFailure is a search that did not produce hits. Tool reports that it
+// belongs to the search itself (a bad argument, a failed embedding call) and
+// is the tool's answer; otherwise it is a refusal of the request (limits,
+// project, server configuration) and the HTTP status stands.
+type MCPFailure struct {
+	Status  int
+	Code    string
+	Message string
+	Tool    bool
+}
+
+// MCPSearch is one tools/call: the same steps as POST /v1/retrieve --
+// authenticate, limits, request log, the shared retrieval core -- with the
+// arguments of the tool in place of a request body. The answer is captured
+// instead of written, except for the headers the steps set (rate limit,
+// Retry-After). The request must have passed MCPAuth.
+func (g *Gateway) MCPSearch(w http.ResponseWriter, r *http.Request, args MCPSearchArgs) (*MCPSearchResult, *MCPFailure) {
+	cw := &captureWriter{ResponseWriter: w}
+	c, ok := g.authenticate(cw, r, retrieveOperation)
+	if !ok {
+		return nil, cw.failure(false)
+	}
+	defer c.span.End()
+
+	req := retrieveRequest(args)
+	filter, msg := checkRetrieve(req)
+	if msg != "" {
+		return nil, &MCPFailure{Status: http.StatusBadRequest, Code: "invalid_request_error", Message: msg, Tool: true}
+	}
+	rs, ok := g.retrieveTargets(c)
+	if !ok {
+		return nil, cw.failure(false)
+	}
+	if !g.checkLimits(c, (len(req.Query)+3)/4, false) {
+		return nil, cw.failure(false)
+	}
+	g.openRecord(c, false, nil)
+	defer g.record(c)
+
+	prov, rerankConn := g.rerankProvider(c, rs)
+	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: req.Query, topK: req.TopK, filter: filter,
+		prov: prov, rerankConn: rerankConn})
+	if cw.status >= http.StatusBadRequest || cw.body.Len() == 0 {
+		return nil, cw.failure(true)
+	}
+	var resp retrieveResponse
+	if err := json.Unmarshal(cw.body.Bytes(), &resp); err != nil {
+		c.log.Error("mcp search: decode retrieve answer", "err", err)
+		return nil, &MCPFailure{Status: http.StatusInternalServerError, Code: "server_error", Message: "retrieval failed", Tool: true}
+	}
+	out := &MCPSearchResult{Hits: make([]MCPHit, len(resp.Hits))}
+	for i, h := range resp.Hits {
+		out.Hits[i] = MCPHit{Content: h.Content, Score: h.Score, Filename: h.Metadata.Filename, Section: h.Metadata.Section,
+			Page: h.Metadata.Page, ChunkIndex: h.Metadata.ChunkIndex, DocumentID: h.DocumentID, ChunkID: h.ChunkID,
+			DocumentMetadata: h.DocumentMetadata}
+	}
+	return out, nil
+}
+
+// captureWriter holds back what the pipeline steps write -- status and body --
+// and shares the real writer's headers, so the ones they set on the response
+// (rate limit, Retry-After, X-Ragmux-Projects) reach the client directly.
+type captureWriter struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *captureWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+}
+
+func (w *captureWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(b)
+}
+
+func (w *captureWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// failure reads the OpenAI-shaped error the steps wrote. A body that is not
+// one (a client that went away writes nothing) is a plain server error.
+func (w *captureWriter) failure(tool bool) *MCPFailure {
+	f := &MCPFailure{Status: w.status, Code: "server_error", Message: "request failed", Tool: tool}
+	if f.Status < http.StatusBadRequest {
+		f.Status = http.StatusInternalServerError
+	}
+	var body struct {
+		Error struct {
+			Message string  `json:"message"`
+			Type    string  `json:"type"`
+			Code    *string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(w.body.Bytes(), &body) != nil || body.Error.Message == "" {
+		return f
+	}
+	f.Message = body.Error.Message
+	switch {
+	case body.Error.Code != nil && *body.Error.Code != "":
+		f.Code = *body.Error.Code
+	case body.Error.Type != "":
+		f.Code = body.Error.Type
+	}
+	return f
 }

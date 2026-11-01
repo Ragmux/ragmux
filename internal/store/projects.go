@@ -39,6 +39,18 @@ type Project struct {
 	QueryStrategy          string `json:"query_strategy"`
 	HistoryTurnsForQuery   int    `json:"history_turns_for_query"`
 	QueryModelConnectionID *int64 `json:"query_model_connection_id"`
+	// ToolAllow and ToolDeny are the project's tool lists (ADR-032): glob
+	// patterns, "*" the only wildcard, matched against the name of each tool a
+	// request offers. A tool matching ToolDeny is stripped from the request;
+	// when ToolAllow is not empty, so is every tool that matches none of it.
+	// Both empty means no governance. They are never nil on a Project read
+	// from the store, so the JSON shows [] and not null.
+	ToolAllow []string `json:"tool_allow"`
+	ToolDeny  []string `json:"tool_deny"`
+	// SessionTokenCap is the prompt+completion tokens one session
+	// (X-Ragmux-Session) may spend before its requests are answered 429; zero
+	// is unlimited (ADR-032).
+	SessionTokenCap int64 `json:"session_token_cap"`
 	// MemberIDs lists the users attached to the project.
 	MemberIDs []int64 `json:"member_ids"`
 	CreatedAt string  `json:"created_at"`
@@ -93,6 +105,15 @@ func (p *Project) withRAGDefaults() {
 	}
 }
 
+// nonNilStrings is v, or an empty slice for nil: the tool lists are NOT NULL
+// columns and pgx writes a nil slice as NULL.
+func nonNilStrings(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
+}
+
 // unknownSettingLogged remembers which columns have already logged an
 // unrecognised value, so a long-lived replica logs each once per process.
 var unknownSettingLogged sync.Map
@@ -121,6 +142,7 @@ func (p *Project) normalizeRAGSettings() {
 const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, system_prompt,
 	rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens, created_at, updated_at,
 	context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
+	tool_allow, tool_deny, session_token_cap,
 	ARRAY(SELECT user_id FROM project_members pm WHERE pm.project_id = projects.id ORDER BY user_id)`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
@@ -129,11 +151,17 @@ func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	err := row.Scan(&p.ID, &p.Name, &p.ModelConnectionID, &p.RAGStoreID, &p.APIKeyPrefix, &p.SystemPrompt,
 		&p.RateLimitRPM, &p.RateLimitTPM, &p.BudgetDailyTokens, &p.BudgetMonthlyTokens,
 		&created, &updated, &p.ContextPlacement, &p.RetrievalPolicy, &p.QueryStrategy,
-		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.MemberIDs)
+		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.MemberIDs)
 	if err != nil {
 		return nil, scanErr(err)
 	}
 	p.normalizeRAGSettings()
+	if p.ToolAllow == nil {
+		p.ToolAllow = []string{}
+	}
+	if p.ToolDeny == nil {
+		p.ToolDeny = []string{}
+	}
 	if p.MemberIDs == nil {
 		p.MemberIDs = []int64{}
 	}
@@ -197,11 +225,13 @@ func (s *Store) CreateProjectWithMembers(ctx context.Context, p *Project, member
 	err = tx.QueryRow(ctx, `INSERT INTO projects
 		(name, model_connection_id, rag_store_id, api_key_hash, api_key_prefix, system_prompt,
 		rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens,
-		context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
+		context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
+		tool_allow, tool_deny, session_token_cap)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING id`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
-		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID).Scan(&id)
+		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
+		nonNilStrings(p.ToolAllow), nonNilStrings(p.ToolDeny), p.SessionTokenCap).Scan(&id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -227,17 +257,22 @@ func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error)
 	// than writing the default: a value this build does not know -- written by
 	// a newer release -- reads as the default, and writing that read value
 	// back would overwrite it. The nullif/coalesce pairs are the only place
-	// that distinction survives.
+	// that distinction survives. The tool lists follow the same rule with nil
+	// as "unset": a Project built by hand keeps them, an empty non-nil slice
+	// clears them.
 	_, err := s.pool.Exec(ctx, `UPDATE projects SET name=$1, model_connection_id=$2, rag_store_id=$3,
 		system_prompt=$4, rate_limit_rpm=$5, rate_limit_tpm=$6, budget_daily_tokens=$7, budget_monthly_tokens=$8,
 		context_placement=COALESCE(NULLIF($9, ''), context_placement),
 		retrieval_policy=COALESCE(NULLIF($10, ''), retrieval_policy),
 		query_strategy=COALESCE(NULLIF($11, ''), query_strategy),
 		history_turns_for_query=COALESCE(NULLIF($12::int, 0), history_turns_for_query),
-		query_model_connection_id=$13, updated_at=now() WHERE id=$14`,
+		query_model_connection_id=$13, tool_allow=COALESCE($14::text[], tool_allow), tool_deny=COALESCE($15::text[], tool_deny),
+		session_token_cap=$16,
+		updated_at=now() WHERE id=$17`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
-		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID, p.ID)
+		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
+		p.ToolAllow, p.ToolDeny, p.SessionTokenCap, p.ID)
 	if err != nil {
 		return nil, err
 	}

@@ -94,11 +94,12 @@ func TestCSVRecordEscapesFormulas(t *testing.T) {
 	row.CachedPromptTokens, row.CacheWriteTokens, row.CostUSD, row.CostSource = 6, 4, 0.001234, "builtin"
 	keyID := int64(7)
 	row.APIKeyID = &keyID
+	row.SessionID, row.ToolNames, row.ToolsDenied = "run-1", []string{"=cmd", "get_weather"}, 2
 	got := csvRecord(row)
 	// user_id stays empty: a request made with a project's default key has no
 	// owner, and an empty cell says that where a 0 would read as user zero.
 	want := []string{"2026-09-18T10:00:00Z", "3", "'=HYPERLINK(\"x\")", "m", "200", "10", "2", "false", "45", "true", "true", "2", "'-DDE",
-		"6", "4", "0.001234", "builtin", "7", ""}
+		"6", "4", "0.001234", "builtin", "7", "", "run-1", "'=cmd;get_weather", "2"}
 	if len(got) != len(csvHeader) || strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("record = %q\nwant     %q", got, want)
 	}

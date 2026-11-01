@@ -108,13 +108,107 @@ argument fragments, because that is how the upstream sends them — see
 see [Images](#images).
 ³ OpenAI and Azure OpenAI cache prompts automatically, so there is no marker to send.
 
-The table gates nothing: an adapter answers for itself with a typed error when a request
+### Model-level capabilities
+
+Some behavior is decided by the **model**, not the provider type, because models of one
+provider disagree on the wire shape they accept (Anthropic's `budget_tokens` is a `400` on
+Claude 4.7 and later, `adaptive` thinking is a `400` on 4.5 and earlier, and Opus 5.5
+rejects a forced `tool_choice`). `CapabilitiesFor(providerType, model)` therefore also
+reports these flags, resolved from a table compiled into the gateway:
+
+| Flag | Meaning |
+|---|---|
+| `native_json_schema` | The upstream enforces a response schema itself |
+| `forced_tool_choice` | `tool_choice` may require a tool or name one |
+| `thinking` | `none`, `budget`, `adaptive`, `level`, `toggle` or `passthrough` |
+| `thinking_off` | How thinking is switched off: `disabled`, `between_tools` or `none` (it cannot be); empty when not applicable |
+| `effort_levels` | The effort values the model accepts, lowest first; absent when it has no effort parameter |
+| `thinking_prefix_bound` | The upstream validates a replayed thinking block against everything before it (Claude 5.1 and later) |
+
+A row is a pattern with `*` standing for any run of characters; the row with the longest
+literal prefix wins, the rule the [price table](api.md#model-prices) uses. For Anthropic the
+rows follow Anthropic's own model pages (thinking, effort, structured outputs, tool use).
+A model no row matches gets the provider's **current generation**, so a model released
+after this gateway keeps working. For Anthropic that is the most restrictive common
+denominator of the newest generation: native JSON schema, adaptive thinking that cannot be
+switched off, effort `low`/`medium`/`high`, no forced tool choice, prefix-bound thinking.
+The cost is that a newer model which does allow forced tool choice is treated as if it did
+not until a row is added. OpenAI-compatible and Azure connections report `passthrough`
+and are not looked up by model, because a deployment name says nothing about the model.
+`GET /admin/api/provider-types` reports the provider-level answer (no model).
+
+These flags select which request the gateway builds, so a wrong row shows up as the
+upstream's own `400`, fixed in a patch release. The flags themselves change nothing a
+client sends; the thinking and structured-output translations that read them are
+described with those features.
+
+The table above gates nothing: an adapter answers for itself with a typed error when a request
 asks for something it cannot do, and a second copy of those rules in front of it would
 only drift. It is a description, for the dashboard and for this page.
 
 `GET /admin/api/provider-types` reports it per type: the flat `supports_embeddings`,
 `requires_api_key`, `supports_streaming` and `supports_tools` fields, plus a
-`capabilities` object with the full table above.
+`capabilities` object with the full table above and the
+[model-level flags](#model-level-capabilities) (for the provider's current generation).
+
+## Reasoning effort
+
+`reasoning_effort` is mapped onto the thinking setting each provider has, chosen by the
+[model-level capabilities](#model-level-capabilities). The values are `none`, `minimal`,
+`low`, `medium`, `high`, `xhigh` and `max` (`max` is Ragmux's own); without the field nothing
+is sent. How the thinking comes back, and how it is sent back, is described with
+[the client API](api.md#post-v1chatcompletions) (`ragmux_thinking`).
+
+| `reasoning_effort` | Anthropic `adaptive` | Anthropic `budget` | Gemini `level` | Gemini `budget` (2.5) | Ollama | OpenAI-compatible, Azure |
+|---|---|---|---|---|---|---|
+| `none` | `thinking: disabled` or `between_tools`; where thinking cannot be switched off, `low` + Warning | no thinking | `minimal` if the model has it, else its lowest level + Warning | `0`; on Pro `128` + Warning | `think: false` | as sent |
+| `minimal` | `low` | `budget_tokens` 1024 | `minimal` if the model has it, else `low` | 512 | `true`, or `low` | as sent |
+| `low` | `low` | 2048 | `low` | 1024 | `true`, or `low` | as sent |
+| `medium` | `medium` | 8192 | `medium` if the model has it, else `high` | 8192 | `true`, or `medium` | as sent |
+| `high` | `high` | 16384 | `high` | 24576 | `true`, or `high` | as sent |
+| `xhigh` | `xhigh` if the model has it, else the level below + Warning | 32768 | `high` + Warning | the model's upper bound | `true`, or `high` + Warning | as sent |
+| `max` | `max` if the model has it, else the level below + Warning | 32768 | `high` + Warning | the model's upper bound | `true`, or `high` + Warning | as sent |
+| anything else | `400` | `400` | `400` | `400` | `400` | as sent |
+
+- **Anthropic** has two modes and the model decides which. An `adaptive` model (Claude 4.6 and
+  later) gets `thinking: {"type": "adaptive"}` and `output_config.effort`, never
+  `budget_tokens` (Claude 4.7 and later reject it). A `budget` model (4.5 and earlier) gets
+  `thinking: {"type": "enabled", "budget_tokens": N}`; Opus 4.5 takes an effort as well and
+  gets both. `thinking: disabled` is what `none` sends where the model accepts it (Claude
+  Sonnet 5.5 takes `between_tools` instead; Opus 5.5, Fable and Mythos cannot switch thinking
+  off). The effort sets each model accepts are in the capability table
+  (`effort_levels`). A model the table does not list gets `low`/`medium`/`high`. The gateway
+  never sends `display`, so the provider's default applies (Claude 5 omits the thinking text
+  and returns only the signature).
+- **Gemini** 3 and later take `thinkingConfig.thinkingLevel`, from the set the model has
+  (`gemini-3-pro`: `low`, `high`; `gemini-3-flash`: `minimal` to `high`; a model not listed:
+  `low`, `high`). The 2.5 models take `thinkingBudget`, clipped to the model's bounds (Pro
+  128 to 32768 and no off switch, Flash 0 to 24576, Flash-Lite 512 to 24576). Level and
+  budget are never sent together. `includeThoughts` is set whenever thinking is on, which is
+  what makes Gemini return thought summaries. The bounds follow the Gemini 2.5 documentation
+  as it stood when this was written; Google's current thinking page no longer lists them,
+  so a wrong bound shows up as the upstream's own `400`.
+- **Ollama** takes `think`: a boolean, or a level for models that have levels (`gpt-oss`).
+  `none` is `false`, which `gpt-oss` ignores because it cannot stop thinking.
+- **A model without thinking** (Claude 3.5, Gemini 2.0 and 1.x) drops the field and the
+  response carries a `Warning`. Nothing is returned as an error: the request would otherwise
+  succeed.
+- **`max_tokens`** (Anthropic only; on Gemini and Ollama the output limit already covers
+  thinking and is not touched). With a `budget` model and no `max_tokens` the gateway sends
+  the budget plus 4096. A `max_tokens` that does not exceed the budget lowers the budget to
+  `max_tokens - 1024`, and if that is under 1024, thinking is dropped with a `Warning`. With
+  an `adaptive` model and no `max_tokens`, an effort of `high` or above sets `max_tokens` to
+  16000, so thinking cannot use the whole default of 4096.
+- **`temperature`** is removed from an Anthropic request that has thinking on, with a
+  `Warning`; the API does not accept the two together. **`top_p`** below 0.95 is removed the
+  same way, because the API takes it with thinking only from 0.95 up.
+- **Manual (`budget`) thinking gives way, with a `Warning`, in two cases**, because the
+  API answers `400` to both and the request worked before `reasoning_effort` was translated:
+  a forced `tool_choice` (`required`, or a named function) next to it, and a tool round (the
+  request ends in a `tool` message) whose assistant turn has no signed thinking block to
+  send back. Only the thinking budget is left out; on Opus 4.5 the effort is still sent.
+  Send `ragmux_thinking` back to keep thinking across tool calls on these models. Adaptive
+  models have neither rule.
 
 ## Rerank providers (`cohere_rerank`, `voyage_rerank`)
 
@@ -158,21 +252,37 @@ non-streaming calls).
 
 Top-level request fields travel as sent (see
 [Request field passthrough](#request-field-passthrough-extra)), but inside `messages` only
-`role`, `content`, `name`, `tool_calls` and `tool_call_id` are kept; the **response** is
-rewritten as well. Replies and SSE chunks are
-decoded into the gateway's own OpenAI-shaped structures and written back out, so only the
-fields it knows come through:
+`role`, `content`, `name`, `tool_calls` and `tool_call_id` are kept. The gateway's own
+message extensions (`ragmux_signature` on a tool call, `ragmux_is_error` on a tool
+message) are removed before the request leaves.
 
-- top level: `id`, `object`, `created`, `model`, `choices` and `usage` (with
-  `prompt_tokens_details` and `completion_tokens_details`);
-- per choice: `index`, `finish_reason` and a `message` (a `delta` on streams) holding
-  `role`, `content` and `tool_calls`.
+The **response** is decoded into the gateway's own OpenAI-shaped structures and written
+back out, so only the fields it knows come through. Those are:
 
-Anything else the upstream adds is **not** forwarded: `reasoning_content`, `refusal`,
-`annotations`, `logprobs` and `system_fingerprint` are all dropped, even when the request
-asked for them (`logprobs: true` reaches the upstream, as the passthrough below says, and
-its answer does not come back). A client that needs one of them cannot get it through the
-gateway in this release.
+- top level: `id`, `object`, `created`, `model`, `system_fingerprint`, `choices` and
+  `usage` (with `prompt_tokens_details` and `completion_tokens_details`);
+- per choice: `index`, `finish_reason`, `logprobs` and a `message` (a `delta` on streams)
+  holding `role`, `content`, `tool_calls`, `refusal`, `annotations` and `reasoning_content`.
+
+`refusal`, `annotations`, `logprobs` and `system_fingerprint` are relayed exactly as the
+upstream sent them, in non-streaming replies and in every SSE chunk that carries them,
+and a request-side `logprobs` / `top_logprobs` reaches the upstream (see the passthrough
+below). Any other field the upstream adds that is not listed above is dropped.
+`reasoning_content` is relayed too, and also written as an unsigned `ragmux_thinking`
+block so a client reads thinking from one field on every provider (see
+[the client API](api.md#post-v1chatcompletions)).
+
+| Response field | `openai`, `deepseek`, `custom_openai`, `azure_openai` | `anthropic` | `gemini` | `ollama` |
+|---|---|---|---|---|
+| `system_fingerprint` | relayed | — | — | — |
+| `choices[].logprobs` | relayed | — | — | — |
+| `message.refusal` / `delta.refusal` | relayed | — ¹ | — | — |
+| `message.annotations` / `delta.annotations` | relayed | — | — | — |
+| `reasoning_content` | relayed | — | — | — |
+| `ragmux_thinking` | `reasoning_content` as an unsigned block | signed `thinking` and `redacted_thinking` blocks | thought summaries, unsigned | `message.thinking`, unsigned |
+
+¹ Anthropic's `stop_reason: "refusal"` becomes `finish_reason: "content_filter"` instead;
+there is no `refusal` text to carry.
 
 What the gateway asks the upstream for is not what it passes on: the usage-only trailer
 chunk reaches the client only when the client itself sent
@@ -196,7 +306,10 @@ top-level field verbatim. For OpenAI-compatible providers those extra fields are
 the upstream unchanged, so provider-specific options (`seed`, a request-side `logprobs`,
 `reasoning_effort`, vLLM's `guided_json`, …) work without gateway support. For `ollama` a
 defined subset is
-mapped (below); `anthropic` and `gemini` ignore unknown fields.
+mapped (below). `anthropic`, `gemini` and `ollama` translate `reasoning_effort` themselves
+([Reasoning effort](#reasoning-effort)); `anthropic` and `gemini` ignore every other unknown
+field. On the request side, an assistant message's `reasoning_content` is forwarded to the
+OpenAI-compatible and Azure connections as sent, and its `ragmux_thinking` is removed.
 
 ## Azure OpenAI
 
@@ -266,20 +379,31 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   array of blocks instead — see [Prompt caching](#prompt-caching).
 - `max_tokens` is required by Anthropic; when the client sends neither `max_tokens` nor
   `max_completion_tokens` the gateway uses **4096**.
-- `temperature`, `top_p` and `stop` are mapped; `n`, `response_format`, `user` and unknown
-  fields are dropped.
-- `response_format` of type `json_schema` or `json_object` is not an error: the request is
-  still sent, without it, so the model is not held to the schema. The response carries
-  `Warning: 299 ragmux "response_format is not supported for anthropic connections;
-  ignored"` (set before the first byte, so streams have it too) and the gateway logs the
-  event at info level with the format type only. Ask for JSON in the prompt instead.
+- `temperature`, `top_p` and `stop` are mapped; `n`, `user` and unknown fields are dropped.
+- `response_format` is applied; see [Structured output](#structured-output).
 - Consecutive messages with the same role are merged, as the Messages API requires.
+- `reasoning_effort` becomes `thinking` and `output_config.effort`, or `thinking` with
+  `budget_tokens`, depending on the model ([Reasoning effort](#reasoning-effort)).
+  Thinking in the reply (`thinking` and `redacted_thinking` blocks, with their signatures)
+  is returned as `ragmux_thinking` and sent back byte for byte on the next request, which a
+  tool round requires. A model that binds thinking to its prompt prefix (Claude 5.1 and
+  later) rejects the replay once retrieval has changed the prefix, so in a project with
+  active retrieval the blocks of earlier turns are left out and the response carries a
+  `Warning`. A `reasoning_content` on a message is dropped with a `Warning`.
 - Tools: OpenAI `tools[].function` definitions become Anthropic `tools` (`input_schema`
   from `parameters`, `{"type":"object","properties":{}}` when absent); `tool_choice`
   `"auto"` → `{"type":"auto"}`, `"required"` → `{"type":"any"}`, a named function →
-  `{"type":"tool","name":…}`, `"none"` removes the tools. Assistant `tool_calls` become
+  `{"type":"tool","name":…}`, `"none"` removes the tools. On a model that cannot be forced
+  to call a tool (`forced_tool_choice` is false, see
+  [Model-level capabilities](#model-level-capabilities)), `"required"` and a named function
+  are sent as `{"type":"auto"}` and the response carries a `Warning`. Assistant `tool_calls` become
   `tool_use` blocks, `tool` messages become `tool_result` blocks, and `tool_use` in the
-  reply becomes OpenAI `tool_calls` (also in streams, via `input_json_delta`).
+  reply becomes OpenAI `tool_calls` (also in streams, via `input_json_delta`). OpenAI has
+  no way to say that a tool call failed, so a `tool` message may carry the gateway's own
+  `"ragmux_is_error": true`, which becomes `is_error: true` on the `tool_result`. A `tool`
+  message whose `content` is a parts array with `image_url` parts becomes a `tool_result`
+  whose content is a block array of text and image blocks (images follow the rules
+  below); a tool message without images keeps the plain-string content it always had.
 - Image parts: `image_url` with a `data:` URL is sent as a base64 image block, any other
   URL as a URL image block — Anthropic fetches it itself, which is cheaper than relaying
   the bytes through the gateway. A Bedrock-style gateway in front of Anthropic that has no
@@ -291,6 +415,50 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   value Anthropic adds later) → `stop`, logged at warn level with the value. Usage is mapped to `prompt_tokens`/`completion_tokens`,
   including on streams; see [Prompt caching](#prompt-caching) for how the cache
   counters are folded in.
+
+### Structured output
+
+`response_format` of type `json_schema` or `json_object` is enforced. Which way depends on
+the model's [capabilities](#model-level-capabilities), never on the connection:
+
+| Request | Model | What is sent | Warning |
+|---|---|---|---|
+| `json_schema` | `native_json_schema` | `output_config.format = {"type":"json_schema","schema":…}` | no |
+| `json_schema` | otherwise | a forced tool, `ragmux_response`, whose `input_schema` is the schema | no |
+| `json_object` | `forced_tool_choice` | the same forced tool with `{"type":"object"}` as its schema | no |
+| `json_object` | otherwise | one sentence appended to the system prompt asking for a JSON object | yes |
+
+When the model answers with the structured output, the reply's `message.content` is the JSON
+text and `finish_reason` is `stop` (`length` if the answer was cut off); a forced tool's input
+is moved into `content`, so the client sees no `ragmux_response` call. When the schema's root is not an object, the tool takes
+`{"value": <schema>}` and the gateway unwraps the value. In a stream the tool's argument
+fragments arrive as `content` deltas, which join to the same JSON. Only the instruction
+path is without a guarantee: the model may still answer in prose, and the response says so
+with `Warning: 299 ragmux "response_format json_object is approximated by an instruction on
+this model"`. A schema without a usable `json_schema.schema` object is a `400`.
+
+- OpenAI's `strict` and `name` are not sent.
+- With the **native** path the schema is Anthropic's to judge; a feature it does not
+  support is the upstream's `400`, relayed as it comes. A schema that works at OpenAI can
+  therefore fail here:
+
+  | OpenAI accepts | Anthropic's native schema |
+  |---|---|
+  | `additionalProperties: true` or a schema | only `false` |
+  | `minimum`, `maximum`, `multipleOf` | not supported |
+  | `minLength`, `maxLength` | not supported |
+  | `minItems`/`maxItems` of any value | `minItems` 0 or 1 only |
+  | recursive schemas, external `$ref` | not supported |
+
+  Thinking and the client's `tools` go next to the native schema unchanged.
+- With the **tool** path the model must call a tool, so thinking is switched off for the
+  request and the response carries a `Warning`. With client `tools` the synthetic tool
+  sits next to them: `tool_choice` `auto` or `required` (or none sent) becomes "any tool,
+  one at a time", so a text answer arrives as `ragmux_response`; a named function stays
+  forced, and that turn answers with the call instead of the structured output; `"none"`
+  leaves only `ragmux_response`. A client tool named `ragmux_response` is a `400`.
+- Before v0.7 the field was dropped with a `Warning`; a client that sent it and got prose
+  now gets JSON.
 
 Anthropic has no embeddings API; choose another connection for RAG stores.
 
@@ -314,6 +482,11 @@ Requests are translated to `generateContent` / `streamGenerateContent`:
   no distinct reason for it. `usageMetadata` is mapped to OpenAI usage, including
   `cachedContentTokenCount` — see [Prompt caching](#prompt-caching). Explicit caching
   (`cachedContents`) is not supported.
+- `reasoning_effort` becomes `generationConfig.thinkingConfig`
+  ([Reasoning effort](#reasoning-effort)) with `includeThoughts`; thought-summary parts
+  (`thought: true`) are returned as unsigned `ragmux_thinking`, not as answer text. A
+  `reasoning_content` or `ragmux_thinking` on a request message is dropped (the first with a
+  `Warning`); Gemini's own thought signatures keep travelling in `ragmux_signature`.
 - Embeddings use `batchEmbedContents`; the model name gets a `models/` prefix if missing.
 
 ### Tool calling
@@ -449,6 +622,11 @@ gives access to Ollama-only options:
   option, e.g. `{"options":{"num_gpu":1,"repeat_penalty":1.1}}`).
 - `response_format` `json_object` sets `format: "json"`; `json_schema` sends the schema as
   `format`.
+- `reasoning_effort` becomes `think` ([Reasoning effort](#reasoning-effort)). The reply's
+  `message.thinking` is returned as unsigned `ragmux_thinking`, in streams as it arrives. An
+  assistant message's unsigned `ragmux_thinking` goes back to Ollama as `message.thinking`,
+  so a thinking model keeps its reasoning across a tool round; signed blocks (Anthropic's)
+  are not sent. A `reasoning_content` is dropped with a `Warning`.
 - Tools use OpenAI's `{type:"function", function:{…}}` shape natively, so `tools` are
   forwarded; assistant `tool_calls` and `tool` messages (with `tool_name`) are translated
   both ways. Ollama sends no call ids, so the gateway generates them (`call_…`).

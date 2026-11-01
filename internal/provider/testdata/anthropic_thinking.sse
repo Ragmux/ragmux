@@ -1,0 +1,36 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_think_2","usage":{"input_tokens":20}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user wants "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"the weather."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EuYBCkYIDBgCKkB7Qm1v3fJ0yR8nA4sL2pT6uW9eZ5cH3kD1gV7oN0qYSWgHR7YpuX2q9eL4mC8vB1nK6sT3wJ0aF5dG7hE2iU9oP4rQ1yZ8xC3vN6bM0lK2jH5gF8dS1a+W4eR7tY0uI3oP6/Zq9=="}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YYDeXYZ2Js6vb3x+Zq/0r="}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_01","name":"get_weather"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Ankara\"}"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

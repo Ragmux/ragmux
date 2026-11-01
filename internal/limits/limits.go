@@ -23,12 +23,17 @@ const (
 	ReasonBudgetDaily   = "budget_daily"
 	ReasonBudgetMonth   = "budget_monthly"
 	ReasonBudgetMonthly = ReasonBudgetMonth
+	// ReasonSessionTokenCap is the project's per-session token cap (ADR-032).
+	ReasonSessionTokenCap = "session_token_cap"
 )
 
 // Limit tiers reported in Decision.Scope.
 const (
 	ScopeProject = "project"
 	ScopeKey     = "key"
+	// ScopeSession is the per-session cap; it applies only to a request that
+	// carried a session id.
+	ScopeSession = "session"
 )
 
 // Retention for project_usage and key_usage rows, applied by PurgeUsage.
@@ -50,7 +55,7 @@ type Decision struct {
 	Allowed bool
 	// Reason is one of the Reason* constants when Allowed is false.
 	Reason string
-	// Scope is the tier that denied (ScopeProject or ScopeKey), empty while
+	// Scope is the tier that denied (ScopeProject, ScopeKey or ScopeSession), empty while
 	// Allowed. The figures below always describe the tighter of the two, so
 	// a client sees the bound it will actually hit first.
 	Scope string
@@ -64,6 +69,9 @@ type Decision struct {
 	// Token budgets; limits are 0 when unset.
 	DailyUsed, DailyLimit     int64
 	MonthlyUsed, MonthlyLimit int64
+	// Session cap (ADR-032); the limit is 0 when the request has no session or
+	// the project sets no cap.
+	SessionUsed, SessionLimit int64
 	// Reserved reports whether the project's minute request slot was taken
 	// by Check, in which case Record must not count the request again. The
 	// key tier is reserved independently, under its own RPM limit.
@@ -105,10 +113,15 @@ func projectCaps(p *store.Project) Caps {
 // Subject is what a request is charged to: always a project, plus the api key
 // that made the call when it was a user-owned one. A nil KeyID means only the
 // project tier applies, which is exactly the pre-0.4 behaviour.
+//
+// SessionID, when not empty, is the validated X-Ragmux-Session value. The
+// session tier is the project's SessionTokenCap compared with that session's
+// own running total; a request without a session is not subject to it.
 type Subject struct {
-	Project *store.Project
-	KeyID   *int64
-	Key     Caps
+	Project   *store.Project
+	KeyID     *int64
+	Key       Caps
+	SessionID string
 }
 
 // Check decides whether a request may proceed against the project alone.
@@ -149,6 +162,20 @@ func (l *Limiter) CheckSubject(ctx context.Context, s Subject, estimatedPromptTo
 	d.DailyLimit, d.DailyUsed = tighter(pc.DailyTokens, pDay.Tokens(), kc.DailyTokens, kDay.Tokens())
 	d.MonthlyLimit, d.MonthlyUsed = tighter(pc.MonthlyTokens, pMonth.Tokens(), kc.MonthlyTokens, kMonth.Tokens())
 
+	// The session cap reads one row, and only for a request that has a session
+	// under a project that set a cap. Like the budgets it compares usage so far
+	// with the cap, no estimate: a request may run a session past its cap by
+	// one request.
+	var sUsed int64
+	if sessionCapped(s) {
+		su, err := l.Store.GetSessionUsage(ctx, s.Project.ID, s.SessionID)
+		if err != nil {
+			return d, err
+		}
+		sUsed = su.Tokens
+		d.SessionLimit, d.SessionUsed = s.Project.SessionTokenCap, sUsed
+	}
+
 	est := int64(estimatedPromptTokens)
 	for _, c := range []struct {
 		over    bool
@@ -160,6 +187,9 @@ func (l *Limiter) CheckSubject(ctx context.Context, s Subject, estimatedPromptTo
 		{kc.MonthlyTokens > 0 && kMonth.Tokens() >= kc.MonthlyTokens, ReasonBudgetMonthly, ScopeKey, nextMonth(w.Month).Sub(now)},
 		{pc.DailyTokens > 0 && pDay.Tokens() >= pc.DailyTokens, ReasonBudgetDaily, ScopeProject, nextDay(w.Day).Sub(now)},
 		{kc.DailyTokens > 0 && kDay.Tokens() >= kc.DailyTokens, ReasonBudgetDaily, ScopeKey, nextDay(w.Day).Sub(now)},
+		// Permanent for the session, so it is reported ahead of the per-minute
+		// limit that would clear by itself.
+		{d.SessionLimit > 0 && sUsed >= d.SessionLimit, ReasonSessionTokenCap, ScopeSession, 0},
 		{pc.TPM > 0 && pMinute.Tokens()+est > int64(pc.TPM), ReasonTPM, ScopeProject, d.ResetRequests},
 		{kc.TPM > 0 && kMinute.Tokens()+est > int64(kc.TPM), ReasonTPM, ScopeKey, d.ResetRequests},
 	} {
@@ -275,6 +305,11 @@ func (l *Limiter) rollback(ctx context.Context, s Subject, w store.UsageWindows,
 	return nil
 }
 
+// sessionCapped reports whether the session cap applies to the subject.
+func sessionCapped(s Subject) bool {
+	return s.SessionID != "" && s.Project.SessionTokenCap > 0
+}
+
 func zeroRows(w store.UsageWindows) (minute, day, month store.UsageRow) {
 	return store.UsageRow{Period: store.PeriodMinute, PeriodStart: w.Minute},
 		store.UsageRow{Period: store.PeriodDay, PeriodStart: w.Day},
@@ -306,7 +341,8 @@ func (l *Limiter) deny(d Decision, reason, scope string, retryAfter time.Duratio
 	d.Reason = reason
 	d.Scope = scope
 	d.RetryAfter = retryAfter
-	if d.RetryAfter < time.Second {
+	// A session never resets, so its denial carries no retry hint at all.
+	if d.RetryAfter < time.Second && reason != ReasonSessionTokenCap {
 		d.RetryAfter = time.Second
 	}
 	return d
@@ -327,10 +363,18 @@ func (l *Limiter) RecordSubject(ctx context.Context, s Subject, promptTokens, co
 	if err := l.Store.RecordUsage(ctx, s.Project.ID, w, promptTokens, completionTokens, countRequest); err != nil {
 		return err
 	}
-	if s.KeyID == nil {
-		return nil
+	if s.KeyID != nil {
+		if err := l.Store.RecordKeyUsage(ctx, *s.KeyID, w, promptTokens, completionTokens, s.Key.RPM == 0); err != nil {
+			return err
+		}
 	}
-	return l.Store.RecordKeyUsage(ctx, *s.KeyID, w, promptTokens, completionTokens, s.Key.RPM == 0)
+	if s.SessionID != "" {
+		// Counted whether or not the project sets a cap: the admin session
+		// list reads these totals, and a cap set later should see the tokens
+		// the session already spent.
+		return l.Store.RecordSessionUsage(ctx, s.Project.ID, s.SessionID, promptTokens, completionTokens)
+	}
+	return nil
 }
 
 // PeriodUsage is one window of a UsageReport.

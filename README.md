@@ -19,6 +19,18 @@ database. More at <https://ragmux.com>.
 - **OpenAI-compatible API:** `/v1/chat/completions` (JSON and SSE streaming), `/v1/models`,
   `/v1/embeddings`, `/v1/retrieve` and `/v1/rerank`. The official SDKs work after changing
   `base_url` and `api_key`; Anthropic and Gemini requests are translated, tool calls included.
+- **Anthropic-compatible API:** `/v1/messages`. The Anthropic SDKs and Claude Code work after
+  changing the base URL. On an Anthropic connection the request and the answer pass through
+  as they are, beta headers included; on any other connection the request is translated, so
+  one Claude client can be routed to Gemini or an OpenAI-compatible server. See
+  [`POST /v1/messages`](docs/api.md#post-v1messages).
+- **Reasoning:** one `reasoning_effort` setting is mapped onto each provider's thinking
+  controls, thinking blocks travel between turns in `ragmux_thinking`, and `response_format`
+  works on Anthropic too; see [Reasoning effort](docs/providers.md#reasoning-effort).
+- **Agents:** an MCP server at `/mcp` that exposes the project's RAG store as a search tool,
+  per-project tool allow and deny lists, and `X-Ragmux-Session` to follow, and cap, an agent's
+  run; see [MCP endpoint](docs/api.md#mcp-endpoint) and
+  [Tool governance](docs/users-and-limits.md#tool-governance).
 - **Routes, retry and fallback:** named routes with prioritised, weighted targets, retries
   before the first byte and a circuit breaker per connection; see
   [Routing](docs/providers.md#routing).
@@ -188,6 +200,21 @@ for chunk in resp:
         print(chunk.choices[0].delta.content or "", end="")
 ```
 
+The Anthropic SDKs and Claude Code take the same key in `x-api-key`; point them at the
+gateway's base URL, without `/v1`:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:8765 ANTHROPIC_API_KEY=<PROJECT_KEY> claude
+```
+
+```python
+from anthropic import Anthropic
+client = Anthropic(base_url="http://localhost:8765", api_key="<PROJECT_KEY>")
+msg = client.messages.create(model="default", max_tokens=256,
+    messages=[{"role": "user", "content": "How many vacation days do I get?"}])
+print(msg.content[0].text)
+```
+
 Endpoints, roles per endpoint and the error envelope are in the
 [API reference](docs/api.md).
 
@@ -269,10 +296,10 @@ Reference pages are on <https://ragmux.com> and in this repository.
 | Page | Contents |
 |---|---|
 | [Configuration](docs/configuration.md) | every environment variable and default, flags, subcommands, Compose variables, reverse-proxy notes |
-| [API reference](docs/api.md) | authentication, roles per endpoint, the `/v1` surface, error envelope, `/healthz` |
+| [API reference](docs/api.md) | authentication, roles per endpoint, the `/v1` surface including `/v1/messages`, the MCP endpoint, error envelope, `/healthz` |
 | [Retrieval (RAG)](docs/rag.md) | formats, chunking, hybrid search, store language, metadata filters, reranking, context placement, retrieval policy, context format |
-| [Users, roles and limits](docs/users-and-limits.md) | roles matrix, login protection, audit log, rate limits, budgets, retention |
-| [Providers](docs/providers.md) | provider types and presets, translation details, routing, retry, fallback |
+| [Users, roles and limits](docs/users-and-limits.md) | roles matrix, login protection, audit log, rate limits, budgets, tool governance, sessions, retention |
+| [Providers](docs/providers.md) | provider types and presets, translation details, reasoning effort, structured output, model-level capabilities, routing, retry, fallback |
 | [Backup and restore](docs/backup-restore.md) | what to back up, scripts, scheduled backups, restore runbook |
 | [Scaling](docs/scaling.md) | several replicas, shared state, leased ingestion, rolling restarts |
 | [Observability](docs/observability.md) | `/metrics`, the metric table, `/readyz` vs `/healthz`, tracing |

@@ -41,8 +41,11 @@ func (p *openAICompat) headers() map[string]string {
 }
 
 func (p *openAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return nil, err
+	}
 	req.Model = p.cfg.Model
-	req.Messages = stripToolCallSignatures(req.Messages)
+	req.Messages = stripGatewayExtensions(req.Messages)
 	req.Stream = false
 	req.StreamOptions = nil
 	var out ChatResponse
@@ -61,12 +64,16 @@ func (p *openAICompat) Chat(ctx context.Context, req ChatRequest) (*ChatResponse
 	// DeepSeek reports its cache split at the top level and some servers
 	// omit total_tokens; normalize brings both into the OpenAI shape.
 	out.Usage.normalize()
+	foldReasoningContent(&out)
 	return &out, nil
 }
 
 func (p *openAICompat) ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error {
+	if err := ValidateRequestThinking(req.Messages); err != nil {
+		return err
+	}
 	req.Model = p.cfg.Model
-	req.Messages = stripToolCallSignatures(req.Messages)
+	req.Messages = stripGatewayExtensions(req.Messages)
 	req.Stream = true
 	// Ask for usage in the final chunk; providers that do not understand this
 	// field generally ignore it.
@@ -101,6 +108,7 @@ func (p *openAICompat) ChatStream(ctx context.Context, req ChatRequest, out chan
 			chunk.Object = "chat.completion.chunk"
 		}
 		chunk.Usage.normalize()
+		foldReasoningDelta(&chunk)
 		select {
 		case out <- chunk:
 			return true

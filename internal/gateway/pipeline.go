@@ -57,6 +57,10 @@ type operation struct {
 	scope, what string
 	// endpoint is the request_logs.endpoint value of the rows it writes.
 	endpoint string
+	// claudeSession lets x-claude-code-session-id stand in for a missing
+	// X-Ragmux-Session (ADR-032). Only the Anthropic-compatible endpoint sets
+	// it: it is the one Claude Code talks to.
+	claudeSession bool
 }
 
 // chatOperation is POST /v1/chat/completions.
@@ -290,6 +294,11 @@ type call struct {
 	// end up on the request log row.
 	requestID      string
 	requestedModel string
+	// sessionID is the validated X-Ragmux-Session, empty when the request has
+	// none (ADR-032); toolsDenied is how many tools the project's lists
+	// stripped from the request. Both end up on every request log row.
+	sessionID   string
+	toolsDenied int
 	// routeName is the route that resolved the call; empty for the implicit
 	// route (the project's own connection), which logs NULL.
 	routeName string
@@ -348,6 +357,12 @@ func (g *Gateway) authenticate(w http.ResponseWriter, r *http.Request, op operat
 		writeError(w, http.StatusInternalServerError, "server_error", "project lookup failed")
 		return nil, false
 	}
+	session, ok := sessionFrom(r, op.claudeSession)
+	if !ok {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_request_error", errInvalidSession,
+			"X-Ragmux-Session must be 1 to 128 characters of letters, digits and . _ : -, sent once.")
+		return nil, false
+	}
 	start := time.Now()
 	// Every span below -- rag.retrieve, rag.embed_query, rag.rerank and the
 	// provider client spans -- hangs beneath this one, so the traced context
@@ -364,6 +379,10 @@ func (g *Gateway) authenticate(w http.ResponseWriter, r *http.Request, op operat
 	if pr != nil {
 		c.subject = pr.subject()
 	}
+	// The session is not a span attribute, a metric label or a log field: it
+	// is the client's own string (PRD rule 10). It reaches the request log row
+	// and the session totals.
+	c.sessionID, c.subject.SessionID = session, session
 	return c, true
 }
 
@@ -574,6 +593,8 @@ func (c *call) stamp(rec *store.RequestLog, attempt int) {
 	rec.RequestedModel = c.requestedModel
 	rec.Route = c.routeName
 	rec.Attempt = attempt
+	rec.SessionID = c.sessionID
+	rec.ToolsDenied = c.toolsDenied
 }
 
 // upstreamCall is the endpoint-specific half of invoke: one attempt at one

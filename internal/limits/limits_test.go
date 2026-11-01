@@ -450,3 +450,92 @@ func TestPurgeUsageCoversBothTiers(t *testing.T) {
 		t.Fatalf("key usage after purge: %+v", ku)
 	}
 }
+
+// The session cap (ADR-032) reads the session's own running total, applies only
+// to a request that carries a session, and answers without a retry hint.
+func TestSessionTokenCap(t *testing.T) {
+	l, p, _ := setup(t, store.Project{SessionTokenCap: 100})
+	ctx := context.Background()
+	s := Subject{Project: p, SessionID: "run-1"}
+
+	d, err := l.CheckSubject(ctx, s, 5)
+	if err != nil || !d.Allowed || d.SessionLimit != 100 || d.SessionUsed != 0 {
+		t.Fatalf("first check = %+v (%v)", d, err)
+	}
+	if err := l.RecordSubject(ctx, s, 60, 30, !d.Reserved); err != nil {
+		t.Fatal(err)
+	}
+	d, err = l.CheckSubject(ctx, s, 5)
+	if err != nil || !d.Allowed || d.SessionUsed != 90 {
+		t.Fatalf("under the cap = %+v (%v)", d, err)
+	}
+	// The request that crosses the cap is served: the cap compares what was
+	// spent, with no estimate, so it can be overshot by one request.
+	if err := l.RecordSubject(ctx, s, 40, 10, !d.Reserved); err != nil {
+		t.Fatal(err)
+	}
+	d, err = l.CheckSubject(ctx, s, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Allowed || d.Reason != ReasonSessionTokenCap || d.Scope != ScopeSession || d.SessionUsed != 140 || d.SessionLimit != 100 {
+		t.Fatalf("over the cap = %+v", d)
+	}
+	if d.RetryAfter != 0 {
+		t.Errorf("RetryAfter = %v, want 0: a session does not reset", d.RetryAfter)
+	}
+
+	// Another session of the project, and a request without a session, are
+	// not affected.
+	if d, _ := l.CheckSubject(ctx, Subject{Project: p, SessionID: "run-2"}, 1); !d.Allowed {
+		t.Errorf("another session denied: %+v", d)
+	}
+	if d, _ := l.CheckSubject(ctx, Subject{Project: p}, 1); !d.Allowed || d.SessionLimit != 0 {
+		t.Errorf("a request without a session was held to the cap: %+v", d)
+	}
+}
+
+// Without a cap the session is still counted, so a cap set later sees it.
+func TestSessionCountedWithoutCap(t *testing.T) {
+	l, p, _ := setup(t, store.Project{})
+	ctx := context.Background()
+	s := Subject{Project: p, SessionID: "run-1"}
+	d, err := l.CheckSubject(ctx, s, 5)
+	if err != nil || !d.Allowed || d.SessionLimit != 0 {
+		t.Fatalf("check = %+v (%v)", d, err)
+	}
+	if err := l.RecordSubject(ctx, s, 7, 3, !d.Reserved); err != nil {
+		t.Fatal(err)
+	}
+	u, err := l.Store.GetSessionUsage(ctx, p.ID, "run-1")
+	if err != nil || u.Tokens != 10 || u.Requests != 1 {
+		t.Errorf("session usage = %+v (%v)", u, err)
+	}
+	// A request without a session writes no session row.
+	if err := l.RecordSubject(ctx, Subject{Project: p}, 1, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	list, err := l.Store.ListSessions(ctx, p.ID, 0, 0)
+	if err != nil || len(list) != 1 {
+		t.Errorf("sessions = %d (%v), want 1", len(list), err)
+	}
+}
+
+// A per-minute denial that clears by itself is reported after the cap that
+// never clears, and a session denial leaves no phantom request slot.
+func TestSessionCapBeforeRPMReservation(t *testing.T) {
+	l, p, _ := setup(t, store.Project{SessionTokenCap: 10, RateLimitRPM: 5})
+	ctx := context.Background()
+	s := Subject{Project: p, SessionID: "run-1"}
+	if err := l.Store.RecordSessionUsage(ctx, p.ID, "run-1", 10, 0); err != nil {
+		t.Fatal(err)
+	}
+	d, err := l.CheckSubject(ctx, s, 1)
+	if err != nil || d.Allowed || d.Reason != ReasonSessionTokenCap || d.Reserved {
+		t.Fatalf("check = %+v (%v)", d, err)
+	}
+	u, err := l.Usage(ctx, p)
+	if err != nil || u.Minute.Requests != 0 {
+		t.Errorf("a denied session request took a minute slot: %+v (%v)", u.Minute, err)
+	}
+}

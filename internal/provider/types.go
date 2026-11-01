@@ -19,6 +19,27 @@ type Message struct {
 	Name       string          `json:"name,omitempty"`
 	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
+	// IsError is the gateway's extension for a role "tool" message: the tool
+	// call failed, and the model should read the content as an error. OpenAI's
+	// format has no such flag, so a client that wants Anthropic's is_error
+	// sends ragmux_is_error: true next to tool_call_id. Only the Anthropic
+	// adapter acts on it; the adapters that forward messages verbatim strip it
+	// (stripGatewayExtensions), because an upstream that validates its input
+	// would reject the unknown field.
+	IsError bool `json:"ragmux_is_error,omitempty"`
+	// Thinking is the gateway's extension carrying the thinking blocks an
+	// earlier assistant turn produced (ragmux_thinking), so the next request
+	// can hand them back. It stays raw: a malformed value must surface as the
+	// gateway's own invalid_ragmux_thinking error (ValidateRequestThinking),
+	// not as a decode failure of the whole request. Only the Anthropic
+	// adapter acts on it; every other adapter strips it.
+	Thinking json.RawMessage `json:"ragmux_thinking,omitempty"`
+	// ReasoningContent is the OpenAI-compatible ecosystem's field for the
+	// reasoning text of an assistant turn (DeepSeek and others). It is raw
+	// for the same reason as every other pass-through field: the gateway
+	// forwards it to OpenAI-compatible upstreams as the client sent it and
+	// judges nothing. The adapters that translate the request drop it.
+	ReasoningContent json.RawMessage `json:"reasoning_content,omitempty"`
 }
 
 // Text extracts plain text from a string or parts-array content.
@@ -61,15 +82,32 @@ func contentText(raw json.RawMessage) string {
 // outside the provider that issued it.
 const toolCallSignatureField = "ragmux_signature"
 
-// stripToolCallSignatures returns msgs with the signature extension removed
-// from every assistant tool call, for upstreams that speak the OpenAI wire
-// format and were never meant to see it. The caller's slice is left alone:
-// a fallback may still hand the same request to the provider that does want
-// the signature. A tool_calls value that does not decode is passed through
-// untouched; the upstream judges it as it would without the gateway.
-func stripToolCallSignatures(msgs []Message) []Message {
+// stripGatewayExtensions returns msgs with the gateway's own message
+// extensions removed, for upstreams that speak the OpenAI wire format and
+// were never meant to see them: the signature on an assistant tool call
+// (toolCallSignatureField), the error flag on a tool message
+// (Message.IsError) and the thinking blocks (Message.Thinking).
+// reasoning_content is not one of them: it is the OpenAI-compatible
+// ecosystem's own field and goes through as sent. The caller's slice is left alone: a fallback may still
+// hand the same request to a provider that does want them. A tool_calls
+// value that does not decode is passed through untouched; the upstream
+// judges it as it would without the gateway.
+func stripGatewayExtensions(msgs []Message) []Message {
 	var out []Message
+	// own copies msgs the first time a message has to change.
+	own := func() []Message {
+		if out == nil {
+			out = append([]Message(nil), msgs...)
+		}
+		return out
+	}
 	for i, m := range msgs {
+		if m.IsError {
+			own()[i].IsError = false
+		}
+		if len(m.Thinking) > 0 {
+			own()[i].Thinking = nil
+		}
 		if len(m.ToolCalls) == 0 {
 			continue
 		}
@@ -91,10 +129,7 @@ func stripToolCallSignatures(msgs []Message) []Message {
 		if err != nil {
 			continue
 		}
-		if out == nil {
-			out = append([]Message(nil), msgs...)
-		}
-		out[i].ToolCalls = b
+		own()[i].ToolCalls = b
 	}
 	if out == nil {
 		return msgs
@@ -125,6 +160,13 @@ type ChatRequest struct {
 	ResponseFormat   json.RawMessage `json:"response_format,omitempty"`
 	StreamOptions    json.RawMessage `json:"stream_options,omitempty"`
 	User             string          `json:"user,omitempty"`
+	// RAGActive is set by the gateway when retrieval may have changed the
+	// prompt of this conversation: the project has a store and its
+	// retrieval policy is not off, whatever the client sent for this request
+	// (an earlier turn may have had context injected). The Anthropic adapter
+	// reads it to drop replayed thinking blocks on models that bind them to
+	// the prompt prefix. It never goes on the wire or into a client payload.
+	RAGActive bool `json:"-"`
 	// Extra holds unknown client fields; it is merged into the wire object by
 	// MarshalJSON and must never be serialised as a field itself.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -207,6 +249,28 @@ func (r ChatRequest) IncludeUsage() bool {
 		return false
 	}
 	return o.IncludeUsage
+}
+
+// ReasoningEffort returns the client's reasoning_effort and whether one was
+// set. It lives in Extra because OpenAI-compatible upstreams take it as sent;
+// only the adapters that translate it into a provider's own thinking setting
+// read it. null and "" count as not set. A value that is not a string comes
+// back as its JSON text, which no effort level matches, so the translating
+// adapters reject it like any other unknown value.
+func (r ChatRequest) ReasoningEffort() (string, bool) {
+	raw, ok := r.Extra["reasoning_effort"]
+	if !ok {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, s != ""
+	}
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return "", false
+	}
+	return t, true
 }
 
 // StopSequences normalises the stop field into a slice.
@@ -311,6 +375,10 @@ type Choice struct {
 	Index        int             `json:"index"`
 	Message      ResponseMessage `json:"message"`
 	FinishReason *string         `json:"finish_reason"`
+	// Logprobs is OpenAI's token log-probability object, relayed verbatim
+	// (including an explicit null). It is only present when the request asked
+	// for logprobs, which travel upstream as unknown request fields.
+	Logprobs json.RawMessage `json:"logprobs,omitempty"`
 }
 
 // ResponseMessage is the assistant reply.
@@ -318,6 +386,17 @@ type ResponseMessage struct {
 	Role      string          `json:"role"`
 	Content   *string         `json:"content"`
 	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	// Refusal and Annotations are OpenAI's fields, relayed as the upstream
+	// sent them. A refusal is the model declining in place of content;
+	// annotations are citations (web search) attached to the content.
+	Refusal     *string         `json:"refusal,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
+	// ReasoningContent is the reasoning text an OpenAI-compatible upstream
+	// returned (DeepSeek and others), relayed as sent.
+	ReasoningContent *string `json:"reasoning_content,omitempty"`
+	// Thinking is ragmux_thinking: the thinking the model produced, as
+	// Anthropic-shaped blocks, whichever provider answered.
+	Thinking []ThinkingBlock `json:"ragmux_thinking,omitempty"`
 }
 
 // ChatResponse is the OpenAI non-streaming response.
@@ -328,6 +407,9 @@ type ChatResponse struct {
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
 	Usage   *Usage   `json:"usage,omitempty"`
+	// SystemFingerprint identifies the upstream backend configuration that
+	// served the request; relayed as sent.
+	SystemFingerprint string `json:"system_fingerprint,omitempty"`
 }
 
 // Delta is the incremental payload in a streaming choice.
@@ -335,6 +417,15 @@ type Delta struct {
 	Role      string          `json:"role,omitempty"`
 	Content   *string         `json:"content,omitempty"`
 	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	// Refusal and Annotations are the streaming halves of the ResponseMessage
+	// fields of the same name.
+	Refusal     *string         `json:"refusal,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
+	// ReasoningContent and Thinking are the streaming halves of the
+	// ResponseMessage fields of the same name. Thinking entries are partial:
+	// a client merges them by Index.
+	ReasoningContent *string         `json:"reasoning_content,omitempty"`
+	Thinking         []ThinkingBlock `json:"ragmux_thinking,omitempty"`
 }
 
 // StreamChoice is one streaming choice.
@@ -342,6 +433,8 @@ type StreamChoice struct {
 	Index        int     `json:"index"`
 	Delta        Delta   `json:"delta"`
 	FinishReason *string `json:"finish_reason"`
+	// Logprobs is the streaming half of Choice.Logprobs.
+	Logprobs json.RawMessage `json:"logprobs,omitempty"`
 }
 
 // StreamChunk is one OpenAI "chat.completion.chunk" event.
@@ -352,6 +445,8 @@ type StreamChunk struct {
 	Model   string         `json:"model"`
 	Choices []StreamChoice `json:"choices"`
 	Usage   *Usage         `json:"usage,omitempty"`
+	// SystemFingerprint is the streaming half of ChatResponse.SystemFingerprint.
+	SystemFingerprint string `json:"system_fingerprint,omitempty"`
 }
 
 // Provider is a chat backend.
@@ -361,6 +456,22 @@ type Provider interface {
 	// ChatStream emits normalised chunks on out until the completion ends.
 	// The implementation closes nothing; the caller owns the channel.
 	ChatStream(ctx context.Context, req ChatRequest, out chan<- StreamChunk) error
+}
+
+// MessagesPassthrough is implemented by an adapter that can take a Messages
+// request as it is. The gateway asks each attempt's adapter for it: the one
+// that has it is called natively, any other gets the canonical translation.
+type MessagesPassthrough interface {
+	// PrepareMessages applies the gateway's changes to the client's body for
+	// this connection's model and says, as Warning texts, what it had to
+	// change beyond what the project asked for.
+	PrepareMessages(in MessagesInput) (MessagesPrepared, error)
+	// MessagesCall sends a prepared non-streaming request.
+	MessagesCall(ctx context.Context, p MessagesPrepared) (*MessagesReply, error)
+	// MessagesStream sends a prepared streaming request and returns once the
+	// upstream answered with a success status. Nothing has been read from the
+	// stream yet, so an error here leaves the client untouched.
+	MessagesStream(ctx context.Context, p MessagesPrepared) (*MessagesStream, error)
 }
 
 // RequestWarner is implemented by adapters that forward a request although
@@ -426,6 +537,10 @@ type Error struct {
 	// the gateway neither retries it, nor falls back on it, nor counts it
 	// against the target. NotSent and Retryable are never set alongside it.
 	ClientInput bool
+	// UpstreamBody is the upstream's own answer body, kept only for a 4xx
+	// that the /v1/messages native path relays to the client unchanged
+	// (ADR-028). It is nil everywhere else.
+	UpstreamBody []byte
 }
 
 func (e *Error) Error() string {

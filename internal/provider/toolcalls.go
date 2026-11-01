@@ -111,7 +111,7 @@ func callID(id string) string {
 	if id != "" {
 		return id
 	}
-	return "call_" + randomID(24)
+	return "call_" + randomID()
 }
 
 // toolCallsJSON renders finished calls in the non-streaming shape, which

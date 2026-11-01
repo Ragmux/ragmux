@@ -38,7 +38,24 @@ form; afterwards a sign-in screen that reports remaining attempts and lockouts. 
   (those two are disabled under `last_user`). The project card summarises any setting that
   differs from the default. The form sends only the RAG fields you changed, so saving a
   project from an older tab or script cannot reset them. See
-  [Context injection](rag.md#context-injection).
+  [Context injection](rag.md#context-injection). Two more things live on a project:
+  - **Tool policy.** The form has an *Allowed tools* and a *Denied tools* box (one pattern per
+    line, `*` matches any run of characters, deny wins) and a *Session token cap* (`0` is
+    unlimited). The patterns and the cap are checked in the browser against the same rules the
+    server applies, and a message from the server is shown under the field it names. Like the
+    RAG fields, they are sent only when you changed them. The project card shows a *tools* line
+    when any of them is set. See [Tool governance](users-and-limits.md#tool-governance).
+  - **Sessions.** The project panel lists the project's sessions, most recently active first,
+    with their request count, prompt and completion tokens, and (when a cap is set) how much of
+    it each has spent. *Load more* pages through a long list (a session that is active while you
+    page moves to the top, so the list merges pages by session id and *Refresh* reloads it from
+    the start). The page keeps the pages you loaded and the session you opened when it redraws
+    itself, for example when a usage window rolls over. Selecting
+    a session opens its totals and request rows (the newest 100), each with the tools the model
+    called and, when the allow and deny lists removed any from the request, how many. A session
+    over its cap says so. Everyone who can open the project can read its sessions; the data is
+    the project's [admin API](api.md#projects) `sessions` endpoints. See
+    [Sessions](users-and-limits.md#sessions).
 - **API keys:** mint and revoke your own `sk-user-…` and `sk-mgmt-…` keys with a scope
   checklist, grants and limits.
 - **Playground:** real `/v1/chat/completions` calls with a project key, streaming or JSON,

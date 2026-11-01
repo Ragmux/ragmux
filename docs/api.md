@@ -1,10 +1,11 @@
 # REST API reference
 
-Ragmux exposes three HTTP surfaces:
+Ragmux exposes four HTTP surfaces:
 
 | Prefix | Audience | Authentication |
 |---|---|---|
-| `/v1/…` | your applications (OpenAI-compatible) | `Authorization: Bearer sk-proj-…` project key, or a user's `sk-user-…` key |
+| `/v1/…` | your applications (OpenAI-compatible, plus the Anthropic Messages API at `/v1/messages`) | `Authorization: Bearer sk-proj-…` or `x-api-key: sk-proj-…`: a project key, or a user's `sk-user-…` key |
+| `/mcp` | MCP clients (Claude Code, IDE agents) | gateway key with the `retrieve` scope, see [MCP endpoint](#mcp-endpoint) |
 | `/admin/api/…` | dashboard and management scripts | session cookie, bearer session token, or a user's `sk-mgmt-…` key |
 | `/healthz` | load balancers, container healthchecks | none |
 
@@ -102,7 +103,18 @@ case-insensitively.
   of granted projects, its own scopes and its own limits under the project's, and can be
   revoked or given an expiry.
 
-Missing or unknown keys answer `401` with type `invalid_request_error` (no bearer header)
+The key goes in `Authorization: Bearer <key>` or, as the Anthropic SDKs send it, in
+`x-api-key: <key>`. Both headers are read on every `/v1` route and on `/mcp`. A request that
+carries both is accepted when they hold the same key, which is what Claude Code sends, and
+answered `401` when they differ: a credential check does not pick one of two keys. A `sk-mgmt-…`
+management key is no gateway key under either header and is answered like an unknown one.
+
+PRD rule 2 says a management key is accepted from the `Authorization` header only. It binds
+management keys and the admin API, not the header a *gateway* key arrives in. The admin
+API still reads `Authorization` alone, so `x-api-key` never opens it, and the cross-site
+reasoning behind the rule is unchanged there.
+
+Missing or unknown keys answer `401` with type `invalid_request_error` (no key header)
 or `invalid_api_key`. An unknown key's body is exactly
 `{"error":{"message":"invalid project api key","type":"invalid_api_key","code":null}}`
 whatever its shape. A key that *is* known but no longer resolves carries a `code` on top
@@ -168,6 +180,9 @@ The client API uses the OpenAI shape with a `code` field:
 {"error": {"message": "invalid project api key", "type": "invalid_api_key", "code": null}}
 ```
 
+[`POST /v1/messages`](#post-v1messages) answers in Anthropic's shape instead, with the same
+`code` carried inside `error`.
+
 ## Management endpoints
 
 All paths are relative to `/admin/api`.
@@ -200,18 +215,21 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
 | GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
 | POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
-| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`chat`, `streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`) — see [Capabilities](providers.md#capabilities) |
+| GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`chat`, `streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`, plus the model-level `native_json_schema`, `forced_tool_choice`, `thinking`, `thinking_off`, `effort_levels` and `thinking_prefix_bound`, reported for the provider's current generation) — see [Capabilities](providers.md#capabilities) |
 | GET | `/provider-presets` | viewer | Ready-made `custom_openai` setups for hosted OpenAI-compatible providers (Mistral, xAI, Groq), each with `id`, `label`, `provider_type`, `base_url`, suggested `models`, an optional `embedding_model` and `requires_api_key`. A preset is not stored: create the connection with `POST /models` using its `provider_type` and `base_url`. No preset carries a price — see [Presets](providers.md#presets) |
 
 `GET /provider-types` answers an array with one object per type:
 
 ```json
-[{"type": "openai", "label": "OpenAI", "default_base_url": "https://api.openai.com/v1",
-  "supports_embeddings": true, "requires_api_key": true,
+[{"type": "anthropic", "label": "Anthropic", "default_base_url": "https://api.anthropic.com",
+  "supports_embeddings": false, "requires_api_key": true,
   "supports_tools": true, "supports_streaming": true,
-  "capabilities": {"chat": true, "streaming": true, "embeddings": true, "tools": true,
+  "capabilities": {"chat": true, "streaming": true, "embeddings": false, "tools": true,
                    "tool_streaming": true, "vision": true, "remote_images": true,
-                   "prompt_caching": false, "cached_token_usage": true, "rerank": false}}]
+                   "prompt_caching": true, "cached_token_usage": true, "rerank": false,
+                   "native_json_schema": true, "forced_tool_choice": false,
+                   "thinking": "adaptive", "thinking_off": "none",
+                   "effort_levels": ["low", "medium", "high"], "thinking_prefix_bound": true}}]
 ```
 
 `GET /provider-presets` answers an array:
@@ -478,6 +496,8 @@ log as `rag_store.reindex`. See [Embedding width](rag.md#embedding-width).
 | GET | `/projects/{id}/metrics?window=24h` | member | Metrics for one project (see below; takes the same `compare`, `days` and `by_project` options as the summary) |
 | GET | `/projects/{id}/metrics.csv?window=24h` | member | The project's request logs in the window as a CSV download (see below) |
 | GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
+| GET | `/projects/{id}/sessions?limit=50&offset=0` | member | The project's [sessions](users-and-limits.md#sessions), most recently active first (`limit` defaults to 50, larger values are cut to 500) |
+| GET | `/projects/{id}/sessions/{sessionId}?limit=100` | member | One session's totals and its request log rows, newest first (`limit` defaults to 100, larger values are cut to 1000); `404` for an unknown session |
 
 Project body:
 
@@ -487,7 +507,8 @@ Project body:
  "member_user_ids": [4],
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
- "history_turns_for_query": 3, "query_model_connection_id": null}
+ "history_turns_for_query": 3, "query_model_connection_id": null,
+ "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0}
 ```
 
 `rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
@@ -510,6 +531,22 @@ value is `400`, and so is a `query_model_connection_id` that is not an existing 
 connection. A connection a project names there cannot be deleted (`409`). A change is
 written to the audit log on the `project.update` entry, under `details.rag_settings_changed`
 (`from` and `to` for each field that changed).
+The last three fields of the body govern tools and sessions
+([Users, roles and limits](users-and-limits.md#tool-governance)):
+
+| Field | Values | Default |
+|---|---|---|
+| `tool_allow` | up to 64 patterns; when not empty, only tools whose name matches one are offered to the model | `[]` (every tool) |
+| `tool_deny` | up to 64 patterns; a tool whose name matches one is removed from the request, and deny wins over allow | `[]` |
+| `session_token_cap` | prompt plus completion tokens one session may spend; `0` is unlimited | `0` |
+
+A pattern is 1 to 128 characters of `A-Z a-z 0-9 _ . : -` and `*` (any run of characters, the
+only wildcard; matching is case sensitive), so `mcp__github__*` covers a whole MCP server.
+Like the RAG fields, **these three left out keep their current value** on update and take
+the default on create; `[]` clears a list. A pattern that is not of that shape, a list of
+more than 64 and a negative cap are `400`. A change is written to the audit log on the
+`project.update` entry, under `details.tool_settings_changed`.
+
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
 full key is never returned again. The project object:
 
@@ -519,6 +556,7 @@ full key is never returned again. The project object:
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
+ "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
  "member_ids": [4], "created_at": "…", "updated_at": "…"}
 ```
 
@@ -540,6 +578,20 @@ full key is never returned again. The project object:
 each budget would run out at that pace. A value is `null` when the budget is not set,
 nothing was consumed in the last hour, or the projection lands after the window resets
 (`resets_at`); an already exhausted budget projects to `generated_at`.
+
+`GET /projects/{id}/sessions` lists the sessions the project's requests carried in
+`X-Ragmux-Session`; it reads one running total per session, not the request logs:
+
+```json
+[{"project_id": 3, "session_id": "agent-run-42", "requests": 18, "prompt_tokens": 91000,
+  "completion_tokens": 7400, "tokens": 98400,
+  "first_seen": "2026-10-31T09:12:00Z", "last_seen": "2026-10-31T09:41:10Z"}]
+```
+
+`tokens` is `prompt_tokens + completion_tokens`, the figure `session_token_cap` is compared
+with. `GET /projects/{id}/sessions/{sessionId}` returns `{"session": {…}, "requests": […]}`:
+the same object, and the session's request log rows in the shape of
+[`recent` below](#metrics). The roles are those of the request logs: any member can read them.
 
 ### Routes
 
@@ -689,7 +741,9 @@ The summary response (also used by `/projects/{id}/metrics`):
              "cache_write_tokens": 0, "cost_micros": 1860, "cost_usd": 0.00186,
              "cost_source": "builtin", "error": "", "api_key_id": 7, "user_id": 4,
              "request_id": "3f2a9c1e", "endpoint": "chat.completions", "requested_model": "smart",
-             "route": "smart", "attempt": 2, "fallback_from": 1, "created_at": "…"}],
+             "route": "smart", "attempt": 2, "fallback_from": 1,
+             "session_id": "agent-run-42", "tool_names": ["get_weather"], "tools_denied": 1,
+             "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
                "completion_tokens": 6000, "rate_limited": 1, "rag_requests": 70,
@@ -705,7 +759,10 @@ deleting the key later leaves `user_id` in place. `request_id`, `endpoint`,
 are left out of a row when empty (always for rows written before migration `0016`);
 `attempt` is the number of upstream calls, `fallback_from` the connection id of the first
 target when the request moved to another one, and `route` is absent for the implicit
-route. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
+route. `session_id` (the request's `X-Ragmux-Session`), `tool_names` (the tools the model
+called in its answer: sorted, without duplicates, at most 32 names of at most 64 bytes;
+names only, never arguments) and `tools_denied` (how many tools the project's lists removed)
+are left out when empty or `0`. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
 `502`, `503`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
@@ -733,7 +790,8 @@ request logs, oldest first and at most 50 000 rows, as `text/csv` with a
 ```
 created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
 estimated, latency_ms, streamed, rag_used, rag_hits, error,
-cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id
+cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id,
+session_id, tool_names, tools_denied
 ```
 
 New columns are appended at the end and existing ones never move, so an importer that
@@ -745,6 +803,8 @@ which has no owner; an empty cell says that where a `0` would read as user zero.
 Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage return)
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
+
+`tool_names` is the names joined with `;`; `session_id` is empty for a request that carried none.
 
 The CSV carries the columns above only: `request_id`, `endpoint`, `requested_model`,
 `route`, `attempt` and `fallback_from` are in the JSON log and the database, not in the
@@ -924,7 +984,9 @@ only gain fields.
 
 ## Client API (`/v1`)
 
-Point any OpenAI SDK at `http://<host>:8765/v1` with the project key as `api_key`.
+Point any OpenAI SDK at `http://<host>:8765/v1` with the project key as `api_key`. The
+Anthropic SDKs and Claude Code use `http://<host>:8765` as their base URL (they add
+`/v1/messages` themselves); see [`POST /v1/messages`](#post-v1messages).
 
 ### `POST /v1/chat/completions`
 
@@ -933,7 +995,9 @@ Accepts the OpenAI Chat Completions payload: `model`, `messages` (text or
 `max_completion_tokens`, `stop`, `n`, `tools`, `tool_choice`, `response_format`,
 `stream_options`, `user`. Unknown fields are forwarded to OpenAI-compatible upstreams
 unchanged (see [Providers](providers.md)), with one exception: an optional `ragmux`
-object is consumed by the gateway and never sent upstream. `messages` is required; the
+object is consumed by the gateway and never sent upstream. A `tool` message may carry
+`"ragmux_is_error": true` to mark a failed tool call (see
+[Anthropic](providers.md#anthropic)). `messages` is required; the
 body may not exceed 4 MiB.
 
 ```json
@@ -999,6 +1063,96 @@ relayed as it comes, and some send frames of their own with an empty `choices` a
 Azure's content-filter chunk, a proxy's keep-alive. Ragmux does not drop those: they
 carry information it does not own. Guard the array before indexing it.
 
+**Reasoning and thinking.** `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`; `max` is Ragmux's addition to OpenAI's set) is translated into each
+provider's own thinking setting, and the thinking a model produces comes back in one field
+whichever provider answered. Which setting a model takes is decided per model
+([Model-level capabilities](providers.md#model-level-capabilities)); the tables are in
+[Reasoning effort](providers.md#reasoning-effort).
+
+- **Not sent, nothing sent.** Without `reasoning_effort` no thinking setting is sent and the
+  model's own default applies.
+- **An unknown value is `400`** (`code: "invalid_reasoning_effort"`) on `anthropic`, `gemini`
+  and `ollama`, because the gateway translates the field itself and a typo (`"hgih"`) would
+  otherwise run silently at the provider's default. OpenAI-compatible and Azure connections
+  relay the field as sent and the upstream judges it.
+- **A model without thinking** (a Claude 3.5, Gemini 2.0, ...) is not an error: the field is
+  dropped and the response carries a `Warning`. The same goes for the value the model cannot
+  take (`xhigh` on a model without it is the next level down; `none` on a model that cannot
+  switch thinking off is the lowest effort), and for `temperature`, which Anthropic does not
+  accept while thinking is on and is therefore left out.
+- **`max_tokens`.** On Anthropic a thinking budget has to fit under `max_tokens`, so the
+  gateway adjusts it: with no `max_tokens` it sends the budget plus 4096 (budget models) or
+  16000 at `high` and above (adaptive models); a budget at or above the client's own
+  `max_tokens` is lowered to leave 1024 tokens for the answer, and below that thinking is
+  dropped with a `Warning`. On Gemini and Ollama the output limit covers thinking as well
+  and is left as the client set it.
+
+`ragmux_thinking` carries the thinking as Anthropic-shaped blocks, in a non-streaming
+`choices[].message` and in the streaming `choices[].delta`:
+
+```json
+"message": {"role": "assistant", "content": "...",
+  "ragmux_thinking": [
+    {"type": "thinking", "thinking": "…", "signature": "EuYBCkYI…"},
+    {"type": "redacted_thinking", "data": "EmwKAhgB…"}]}
+```
+
+In a stream the entries are partial updates, and a client merges them by `index` the way it
+accumulates `tool_calls`: text arrives in `thinking`, the `signature` arrives last for its
+block, and a `redacted_thinking` block arrives whole.
+
+```json
+{"delta": {"ragmux_thinking": [{"index": 0, "type": "thinking", "thinking": "The user "}]}}
+{"delta": {"ragmux_thinking": [{"index": 0, "type": "thinking", "signature": "EuYBCkYI…"}]}}
+```
+
+- The blocks are always sent when the model produced thinking; there is no opt-in, because a
+  tool round on Anthropic fails unless the client can hand them back. OpenAI SDKs ignore the
+  unknown field. Claude 5 returns the thinking text omitted: `thinking` is then empty or
+  absent and the `signature` carries the block. The gateway does not log thinking.
+- **Gemini** thought summaries and **Ollama** `message.thinking` become unsigned `thinking`
+  blocks. Gemini only returns thoughts when `reasoning_effort` is set. Gemini's own
+  signatures stay in `ragmux_signature` on the tool calls.
+- **OpenAI-compatible** upstreams: `reasoning_content` is relayed as the upstream sent it, and
+  also written as an unsigned `thinking` block, so a client can read one field everywhere.
+  A `reasoning_content` on an assistant message of the request is forwarded to these
+  connections as sent; the adapters that translate the request (Anthropic, Gemini, Ollama)
+  drop it and the response carries a `Warning`.
+
+**Sending thinking back.** Put the `ragmux_thinking` the response gave you on the same
+assistant message of the next request, unchanged, together with its `tool_calls`. On
+Anthropic the signed blocks (`thinking` with a `signature`, `redacted_thinking` with
+`data`) are written at the start of that assistant turn, in order and with their bytes
+unchanged. Unsigned blocks (from Gemini, Ollama or a compat upstream) are not sent to
+Anthropic, which cannot read them. Ollama takes unsigned thinking back as `message.thinking`;
+every other adapter removes the field. Only the shape is checked: the value is an array
+whose elements have `type` `thinking` or `redacted_thinking`, string `thinking` and
+`signature`, and a non-empty string `data` for a redacted block, and it appears only on
+`assistant` messages. Anything else is `400` with `code: "invalid_ragmux_thinking"`. The
+signature itself is the upstream's to verify.
+
+On Anthropic models with a thinking budget (Claude 4.5 and earlier), sending the blocks
+back is what keeps thinking on across a tool round: a request that ends in a tool result
+whose assistant turn carries no signed block is sent without thinking, and the response has
+a `Warning`. The same models take no forced `tool_choice` with thinking, so there thinking is
+left out as well, with a `Warning`.
+
+Known limit: the gateway rebuilds an assistant message as thinking blocks, then text, then
+tool calls. If the model produced several text blocks, or thinking between text blocks, the
+order and the number of blocks do not survive the round trip through this endpoint. On
+Claude 5.1 and later, where the API checks a block against everything before it, that can
+make the replay invalid.
+
+**Retrieval and thinking blocks.** Claude 5.1 and later bind a thinking block to the system
+prompt and messages that preceded it, and retrieval changes that prefix on every turn. For a
+model with that binding (`thinking_prefix_bound`), in a project whose retrieval is active (a
+store, and a `retrieval_policy` other than `off`; a request that sends `ragmux.retrieval:
+"off"` counts, because earlier turns may have had context injected), the thinking blocks of
+earlier turns are not sent to Anthropic and the response carries a `Warning`. The model
+loses its earlier reasoning in exchange for a request that is not rejected. Models without
+that binding keep their blocks.
+
 `usage` carries OpenAI's breakdown objects whenever the provider reports them:
 
 ```json
@@ -1034,6 +1188,36 @@ two counts and they were fine. So a request log row and the `usage` of the same 
 can differ when the upstream misreported. Trust the row for spend, and treat a mismatch
 as a signal about that provider.
 
+**Sessions.** A request may carry `X-Ragmux-Session: <id>` (1 to 128 characters of
+`A-Z a-z 0-9 . _ : -`, sent once) to say which agent run it belongs to. The gateway stores
+the id on the request log row and adds the request's tokens to that session's total, which
+the [admin API](#projects) lists; when the project sets `session_token_cap`, a request of a
+session that has already spent that many tokens is answered `429` (below). Without the
+header nothing changes, and the cap does not apply to it: it is a guard against a runaway
+loop, not an access control. An id outside that set is `400` with `code:
+"invalid_session_id"` and is never ignored, because ignoring it would let a malformed
+header past the cap. The session is not a metric label or a span attribute.
+
+**Tool lists.** When the project sets `tool_allow` or `tool_deny`, the gateway applies them
+to `tools` before the request goes upstream. A tool is matched by `function.name` (or
+`custom.name`); a tool that matches `tool_deny`, or matches no `tool_allow` pattern while that
+list is not empty, is removed from `tools`, and the response carries a `Warning` naming up
+to five of them. `tool_calls` and `tool` messages already in the conversation are left as
+they are. `tool_choice` is then reconciled with what is left:
+
+| `tool_choice` | After the tools are removed |
+|---|---|
+| names a tool the project does not allow | `400`, `code: "tool_not_allowed"` |
+| `"required"` and no tool is left | `400`, `code: "tool_not_allowed"` |
+| `"auto"`, absent or `"none"`, and no tool is left | `tools`, `tool_choice` and `parallel_tool_calls` are dropped, with a `Warning`. `"none"` is treated like `"auto"` here: with no tool left it has nothing to forbid, and upstreams refuse `tool_choice` without `tools` |
+| `allowed_tools` | its `tools` list loses the entries the project does not allow, with a `Warning`; a `"required"` list that ends up empty is `400`, `code: "tool_not_allowed"`, and an emptied `"auto"` list becomes `"none"`, so the model does not gain the tools the client left out (with no tool left, or none in the request, `tool_choice` is dropped) |
+| anything else | unchanged |
+
+The request log row records `tools_denied` (how many were removed) and `tool_names` (the
+tools the model *called*, names only). An upstream may refuse a request whose history holds
+tool calls but whose `tools` came out empty; that refusal is relayed as the upstream's own
+error.
+
 Response headers, only for limits that are set on the project or the key. Where both
 tiers have a limit, the header describes whichever has the smaller remaining allowance:
 
@@ -1049,7 +1233,7 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-rag-skip` | present when the project has a store and this request did not retrieve, with the reason: `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack` (then `x-ragmux-rag-hits` is `0`). Absent when retrieval ran. See [Retrieval policy](rag.md#retrieval-policy) |
 | `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
-| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` (`json_schema`/`json_object`) on an Anthropic connection (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
+| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` `json_object` on an Anthropic model that cannot be forced to call a tool, where an instruction in the system prompt stands in for it (see [Structured output](providers.md#structured-output)), or a `tool_choice` the model cannot take (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
 `Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and
@@ -1061,18 +1245,126 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), or a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values) |
+| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
+| `429` | the session spent `session_token_cap` tokens; no `Retry-After`, because a session does not reset; body `{"error":{"message":"Session token cap reached (N of M tokens used).","type":"insufficient_quota","code":"session_token_cap","scope":"session"}}`. A request may run a session past the cap by its own size, and concurrent requests of one session can each pass the check before any of them is counted |
 | `4xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted). A `Retry-After` the provider sent (seconds or an HTTP date) is passed through unchanged; a malformed one is dropped |
 | `503` / `504` | the provider answered `503` or `504` (or, on an Anthropic connection, `529 overloaded`, which becomes `503`): the status is kept, because both say "retry later" rather than "broken", with the provider's message and its `Retry-After`, if any |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
 | `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
+
+### `POST /v1/messages`
+
+The Anthropic Messages API, so the official Anthropic SDKs and Claude Code work after a base
+URL change and nothing else:
+
+```bash
+ANTHROPIC_BASE_URL=http://<host>:8765 ANTHROPIC_API_KEY=<key> claude
+```
+
+Everything around the call is `POST /v1/chat/completions`: the same key (in `x-api-key` or
+`Authorization`), the same `chat` scope, project selection, [routes](providers.md#routing),
+retry and fallback, rate limits and budgets, the request log (`endpoint = messages`), the
+[tool lists](#post-v1chatcompletions) and sessions. A query string such as `?beta=true` is
+ignored. `POST /v1/messages/count_tokens` and Anthropic-shaped model listings are not served.
+
+The optional `ragmux` object has the same grammar as on chat, as a top-level field of the
+body. It is consumed by the gateway and never sent upstream, which matters because the
+Anthropic API refuses an unknown field. `"sources": "inline"` returns the sources as a
+top-level `ragmux` field of the answer, or in `message_start.message.ragmux` when streaming.
+
+**Two paths.** Each attempt of a request takes the path its target allows, so a route whose
+first target is Anthropic and whose fallback is Gemini serves one client with both.
+
+| | Anthropic connection (native) | any other connection (translated) |
+|---|---|---|
+| Request | the client's body, with the changes listed below | translated to the chat request every adapter takes |
+| `anthropic-version`, `anthropic-beta` | sent upstream as the client sent them (`2023-06-01` if absent) | not applied; a `Warning` lists the beta values, and a version other than `2023-06-01` |
+| Answer | the upstream's bytes, JSON or SSE, `ping` events included | written as a Messages answer |
+| `model` in the answer | the `model` the client sent (written over the one the upstream reports, in the message and in `message_start`) | the `model` the client sent |
+| Upstream `4xx` | the upstream's body, unchanged, with its status | n/a |
+
+**Native path.** The gateway changes only these parts of the body: `model` (the connection's
+model is written in, and the client's own `model` string is written back into the answer, so
+a route alias such as `fast` reads the same whichever target served the call, as on
+[chat completions](#post-v1chatcompletions)), `system`, `ragmux` (removed), the tools the project denies, the thinking
+blocks of earlier turns under the retrieval rule below, and `tool_choice` where the model
+cannot take it. Every other field, `context_management`, `container`, `mcp_servers`, strict
+tools, cache breakpoints, passes through. Where the project's context goes differs from
+chat: the project's system prompt, and retrieved context under the `system` placement, are
+added after the client's own system blocks, not in front of them. A Claude Code attribution
+block therefore stays first. Under the `before_last_user` placement the context is a text
+block in the last user message, after its `tool_result` blocks, which the API requires to come
+first.
+
+For a model that does not take a forced tool choice (`forced_tool_choice` in
+[Capabilities](providers.md#capabilities), true of Opus 5.5 and of models the table does not
+know yet), `tool_choice: {"type":"any"}` and `{"type":"tool",…}` are sent as `{"type":"auto"}`,
+with a `Warning`. For a model with manual thinking (`thinking: {"type":"enabled",…}`), thinking is
+left out, with a `Warning`, when `tool_choice` is forced or when the request returns tool
+results to an assistant turn that has no thinking block; `top_p` below `0.95` is left out
+while thinking is on, for manual and adaptive thinking alike.
+
+**Not metered.** The native path sends the body and `anthropic-beta` on as they are. Some
+features are billed by use, not by token: server tools such as `web_search_*`, `container` and
+code execution, and `mcp_servers`. That spend does not reach Ragmux's cost figures or token
+budgets. A project can switch the server tools off with a `tool_deny` pattern (they are matched by
+`name`, `web_search*` for example). `mcp_servers` and `container` are not in `tools`, so the
+lists do not reach them.
+
+**Translated path.** The request becomes a chat request: `system` (one system message per
+block, with its cache breakpoint), text and image blocks, `tool_use` and `tool_result` (a user
+message that returns tool results becomes `tool` messages, then a `user` message for the rest),
+`tools`, `tool_choice` (`any` is `required`, `disable_parallel_tool_use` is
+`parallel_tool_calls: false`), `stop_sequences`, `metadata.user_id` as `user`, `thinking` and
+`output_config.effort` as `reasoning_effort` (a `budget_tokens` is mapped to the nearest effort,
+with a `Warning`), and a `json_schema` `output_config.format` as `response_format`. Thinking
+blocks of earlier turns go through as `ragmux_thinking`. What has no counterpart is dropped and
+named in a `Warning`: `top_k`, `context_management`, `container`, `mcp_servers`, server tools,
+`citations`, `document` and `search_result` blocks, and any other field the gateway does not know.
+The native path forwards such blocks to Anthropic as the client wrote them.
+
+The answer is written as a message. `stop_reason` follows `finish_reason` (`stop` is
+`end_turn`, `length` is `max_tokens`, `tool_calls` is `tool_use`, `content_filter` is
+`refusal`); `stop_sequence` is always `null`, because which sequence matched is not known on
+this path. A stream is `message_start`, the content blocks, `message_delta` and `message_stop`;
+while the upstream is quiet a `ping` event is written every 10 seconds. Tool calls arrive as
+`tool_use` blocks with their input in `input_json_delta` events. A model that returns
+several text blocks, or thinking between them, is rebuilt as thinking, then text, then tool
+calls, so the known limit stated for [chat completions](#post-v1chatcompletions) (the order
+and number of blocks do not survive the round trip, which can invalidate a replay on Claude 5.1
+and later) applies to this path. The native path has no such limit.
+
+**Sessions and retrieval.** `X-Ragmux-Session` names the session; when it is absent, the
+`x-claude-code-session-id` header Claude Code sends stands in, under the same rules (an
+unusable value is `400`, `code: "invalid_session_id"`). A turn whose last user message holds a
+`tool_result` is a tool turn, whatever else the message holds (Claude Code adds a reminder
+text next to the result), and retrieval is skipped for it. For a model that binds thinking to the
+prompt prefix, in a project whose retrieval is active, earlier turns' `thinking` and
+`redacted_thinking` blocks are not sent, with a `Warning`: this is the retrieval rule of
+[chat](#post-v1chatcompletions), and it applies on both paths.
+
+**Errors.** Errors the gateway makes (`401`, `403`, `404`, `429`, a refused request, `5xx`) are
+Anthropic's envelope, with Ragmux's own code, when there is one, in `error.code` (an unknown
+key has none, as in the body above):
+
+```json
+{"type": "error", "error": {"type": "permission_error", "message": "api key is not authorised for chat completions", "code": "insufficient_scope"}, "request_id": "…"}
+```
+
+The `request_id` is the `X-Request-Id` of the response, also sent as `request-id`. `error.type`
+follows the status: `400` `invalid_request_error`, `401` `authentication_error`, `403`
+`permission_error`, `404` `not_found_error`, `413` `request_too_large`, `429` `rate_limit_error`,
+`503` `overloaded_error`, `504` `timeout_error`, any other `5xx` `api_error`. The statuses
+are the ones of [chat completions](#post-v1chatcompletions), above. On the native path a `4xx`
+from Anthropic reaches the client with Anthropic's own body. An error after a stream began is an
+`error` event.
 
 ### `POST /v1/embeddings`
 
@@ -1220,3 +1512,82 @@ For a project without chat routes, with one project resolved, `{id}` is ignored 
 routes describe that project's connection. A `sk-user-…` key that grants several projects and names none lists one entry
 per granted project's connection instead, deduplicated by model name; `{id}` then has to
 match one of them (`404` otherwise). Both routes need the key's `models` scope.
+
+## MCP endpoint
+
+`POST /mcp` serves the project's RAG store to [Model Context Protocol](https://modelcontextprotocol.io)
+clients as one tool, over Streamable HTTP. It is the same search as
+[`POST /v1/retrieve`](#post-v1retrieve): same key, same `retrieve` scope, same limits, same request
+log row (`endpoint = retrieve`, one per `tools/call`). Neither the query nor the hits are logged.
+
+**Authentication.** `Authorization: Bearer <key>` or `x-api-key: <key>`, a project key or a
+`sk-user-…` key with the `retrieve` scope. The key and scope are checked on every request, the
+handshake included. A key that grants several projects names one in `X-Ragmux-Project`, as for
+chat. There is no OAuth: clients are configured with the key as a static header.
+
+**The tool.** A project has one RAG store, so `tools/list` returns one tool, named `search_` plus
+the store's name as a slug: lowercase, every character outside `[a-z0-9_]` becomes `_`, repeated
+underscores merge, leading and trailing ones are trimmed, and the whole name is cut at 48
+characters. A name that leaves nothing (one written entirely in non-ASCII characters) gives
+`search_store_<id>`. **Renaming the store renames the tool.** A project without a store lists no
+tools. The description carries the store's name and document count.
+
+| Argument | |
+|---|---|
+| `query` | Required. What to look for, up to 32 KiB. |
+| `top_k` | Optional, 1 to 50. Omitted uses the store's `top_k`. |
+| `filter` | Optional metadata filter ([grammar](rag.md#metadata-and-filters)). `null` means no filter. |
+
+The result is one text content item holding JSON, `{"hits": [{"content", "score", "filename",
+"section", "page", "chunk_index", "document_id", "chunk_id", "document_metadata"}]}`. The store's
+search mode, rerank and distance settings apply, as for `/v1/retrieve`. A bad argument (an unknown one included) or a failed
+search (the embedding provider is down, say) comes back as a tool result with `isError: true`, so
+the model can read it; a rerank or lexical backend that is unavailable falls back as it does for
+chat.
+
+**Protocol.** The server keeps no state: it mints no `Mcp-Session-Id` and ignores one a client
+sends, so any replica can answer any request. Responses are `application/json`; no event stream is
+opened. `GET` and `DELETE` answer `405`. Each request is read on its own to decide which protocol
+era it speaks:
+
+1. `initialize` is legacy.
+2. A request whose `params._meta["io.modelcontextprotocol/protocolVersion"]` is set is modern
+   (`2026-07-28`); its `MCP-Protocol-Version` header must carry the same value.
+3. Otherwise the `MCP-Protocol-Version` header decides: a legacy version is legacy, `2026-07-28`
+   without `_meta` is a header mismatch, anything else is unsupported.
+4. No header at all is `2025-03-26`.
+
+| Era | Versions | Methods |
+|---|---|---|
+| Modern | `2026-07-28` | `server/discover`, `tools/list`, `tools/call`. `Mcp-Method` must equal the body's method, and `Mcp-Name` the tool name on `tools/call` (a value sent as `=?base64?…?=` is decoded first). Every result carries `"resultType": "complete"`; `server/discover` names the server in `_meta["io.modelcontextprotocol/serverInfo"]`. |
+| Legacy | `2025-11-25`, `2025-06-18`, `2025-03-26` | `initialize`, `notifications/initialized` (`202`), `ping`, `tools/list`, `tools/call`. |
+
+| Status | JSON-RPC code | When |
+|---|---|---|
+| `400` | `-32020` | A modern request whose `Mcp-Method`, `Mcp-Name` or `MCP-Protocol-Version` is missing or differs from the body. |
+| `400` | `-32022` | An unsupported protocol version (for example `2024-11-05`). `error.data.supported` lists the supported ones. |
+| `404` | `-32601` | A modern request for a method the server does not have. A legacy request gets the same error in a `200`. |
+| `405` | | `GET`, `DELETE` and any other method. |
+| `400` | `-32700`, `-32600` | Unparseable JSON, batches, a malformed envelope. |
+| `200` | `-32602` | `tools/call` for a tool the project does not have. |
+
+**Refusals.** Authentication, scope, project and limit refusals keep the status `/v1/retrieve`
+gives them (`401`, `403`, `400 project_required`, `429` with `Retry-After`), with the OpenAI error
+body replaced by a JSON-RPC error. Those that happen before the request is read (key, scope,
+project, Origin) have no `id`; a limit refusal of a `tools/call` carries the call's `id`:
+
+```json
+{"jsonrpc": "2.0", "error": {"code": -32001, "message": "api key is not authorised for retrieval",
+ "data": {"code": "insufficient_scope"}}}
+```
+
+`data.code` is the Ragmux code (`invalid_api_key`, `key_revoked`, `insufficient_scope`,
+`project_required`, `rate_limited`, …). An unknown key's message is fixed, as for `/v1`.
+
+**Origin.** A request that carries an `Origin` header is checked against `CORS_ORIGINS`: one that
+is not listed answers `403`, an empty list refuses every request with an `Origin`, and `*` lets
+every one through. A request without `Origin`, which is what non-browser MCP clients send, always
+passes. For browser clients the preflight allows `MCP-Protocol-Version`, `Mcp-Method` and
+`Mcp-Name`.
+
+The endpoint and the supported protocol versions are part of the public contract frozen at v1.0.

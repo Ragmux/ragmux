@@ -272,7 +272,7 @@ func TestAzureEmbeddings(t *testing.T) {
 }
 
 func TestAzureCapabilities(t *testing.T) {
-	c := CapabilitiesFor(AzureProviderType)
+	c := CapabilitiesFor(AzureProviderType, "")
 	if !c.Chat || !c.Streaming || !c.Embeddings {
 		t.Errorf("capabilities = %+v", c)
 	}

@@ -159,7 +159,7 @@ counts is a trap for anyone doing cost maths. Divide the estimated request count
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `ragmux_limits_denied_total` | counter | `project`, `reason` | `reason` is `rate_limit_rpm`, `rate_limit_tpm`, `budget_daily` or `budget_monthly`. |
+| `ragmux_limits_denied_total` | counter | `project`, `reason` | `reason` is `rate_limit_rpm`, `rate_limit_tpm`, `budget_daily`, `budget_monthly` or `session_token_cap` (a [session](users-and-limits.md#sessions) over its token cap; the session id itself is never a label). |
 | `ragmux_budget_used_ratio` | gauge | `project` | Tokens used over the token budget, for projects that have one: the larger of the daily and the monthly ratio, so `1` means the project is about to be refused. Read from the database at most every 30 s; the same on every replica. Projects without a budget have no series. New projects count against `METRICS_MAX_SERIES` like any other series. |
 
 The denied request itself is still counted by `ragmux_http_requests_total` with
@@ -349,9 +349,14 @@ cost columns, a row identifies the request:
 | `route` | The name of the route that picked the connection. `NULL` for the implicit route and for projects without routes. Like `requested_model`, it lives in the table only, never in a metric label |
 | `attempt` | How many upstream calls the request took in total, retries and fallbacks included; `1` for a call that went upstream once, `NULL` for a denial that never reached the upstream |
 | `fallback_from` | The `connection_id` of the first target, whenever the request moved past it to another target (also when no target answered; the row then records the last failure). `NULL` otherwise |
+| `session_id` | The `X-Ragmux-Session` the request carried (1 to 128 characters of `A-Z a-z 0-9 . _ : -`), `NULL` when it carried none. Client-chosen text, so it lives in the table and the admin API only, never in a metric label or a span attribute. Indexed `(project_id, session_id, created_at)` for the session detail view |
+| `tool_names` | The tools the model *called* in its answer: sorted, without duplicates, at most 32 names of at most 64 bytes; `NULL` when it called none. Names only — no arguments, no results. The tools offered in the request are not recorded |
+| `tools_denied` | How many tools the project's [tool lists](users-and-limits.md#tool-governance) removed from the request; `0` when none. The names go to the gateway log at `warn` level |
 | `rag_skip_reason` | Why a request of a project with a RAG store did not retrieve: `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack`; `NULL` when it retrieved, when the project has no store and on rows from before migration `0022`. Like the metric label, a closed set — never text a client wrote. It is in the table only: the admin API's request log and the CSV export do not carry it |
 
 `rag_used` and `rag_hits` say whether retrieved context reached the model and how many passages it held; a request whose context was refused by the second per-minute token check (see [Context and limits](rag.md#context-and-limits)) is a `429` with `rag_used = false`. The condense and rerank calls of a request add their tokens to its row.
+
+`session_id`, `tool_names` and `tools_denied` are added by migration `0029` (the session index by `0030`, built `CONCURRENTLY` like the request id index); the rows of sessions are summarised in `session_usage`, which retention trims with the request logs.
 
 `request_id` is a column, never a metric label (see the
 [cardinality checklist](#cardinality-checklist)). The identifying columns are added by

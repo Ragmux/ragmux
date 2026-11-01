@@ -56,7 +56,7 @@ func (in *priceInput) validate(create bool) error {
 		in.ModelPattern = strings.TrimSpace(in.ModelPattern)
 		// A rerank-only type (cohere_rerank, voyage_rerank) has no chat
 		// adapter but bills like any other, so it is a valid price row.
-		if caps := provider.CapabilitiesFor(in.ProviderType); !caps.Chat && !caps.Rerank {
+		if caps := provider.CapabilitiesFor(in.ProviderType, ""); !caps.Chat && !caps.Rerank {
 			return errors.New("provider_type must be one of the supported provider types")
 		}
 		if in.ModelPattern == "" || len(in.ModelPattern) > 128 {

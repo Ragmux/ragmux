@@ -546,6 +546,8 @@ func driftCases(t *testing.T) []driftCase {
 			brace: []string{"user_ids"}},
 		{name: "project member", code: jsonFieldNames(typeOf[store.ProjectMember]()), sections: []string{"Projects"},
 			brace: []string{"id", "username", "role", "added_at"}},
+		{name: "session", code: jsonFieldNames(typeOf[store.SessionUsage]()), sections: []string{"Projects"},
+			obj: &jsonSel{"[]", "session_id", ""}},
 		{name: "usage report", code: jsonFieldNames(typeOf[limits.UsageReport]()), sections: []string{"Projects", "API keys"},
 			obj: &jsonSel{"", "generated_at", ""}, prose: []string{"api_key_id"}},
 		{name: "usage period", code: jsonFieldNames(typeOf[limits.PeriodUsage]()), sections: []string{"Projects"},

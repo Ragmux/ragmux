@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -185,6 +186,8 @@ func (a *Admin) authenticated(r chi.Router) {
 	read.Get("/api/projects/{id}/routes/{routeId}", a.getRoute)
 	editor.Put("/api/projects/{id}/routes/{routeId}", a.updateRoute)
 	editor.Delete("/api/projects/{id}/routes/{routeId}", a.deleteRoute)
+	read.Get("/api/projects/{id}/sessions", a.listSessions)
+	read.Get("/api/projects/{id}/sessions/{sessionId}", a.getSession)
 
 	// API keys: ownership is checked inside the handlers (404 for someone
 	// else's key). Deleting one is admin-only; everyone else revokes.
@@ -560,7 +563,7 @@ func (a *Admin) providerTypes(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]pt, 0, len(types))
 	for _, t := range types {
-		caps := provider.CapabilitiesFor(t.typ)
+		caps := provider.CapabilitiesFor(t.typ, "")
 		out = append(out, pt{Type: t.typ, Label: t.label, DefaultURL: t.url,
 			Embeddings: caps.Embeddings, NeedsKey: t.needsKey,
 			Tools: caps.Tools, Streaming: caps.Streaming, Capabilities: caps})
@@ -1807,6 +1810,13 @@ type projectInput struct {
 	QueryStrategy          *string         `json:"query_strategy"`
 	HistoryTurnsForQuery   *int            `json:"history_turns_for_query"`
 	QueryModelConnectionID json.RawMessage `json:"query_model_connection_id"`
+
+	// Tool governance and the session cap (ADR-032). A field left out keeps the
+	// project's current value on update and takes the default (no lists, no
+	// cap) on create; an empty list clears a list.
+	ToolAllow       *[]string `json:"tool_allow"`
+	ToolDeny        *[]string `json:"tool_deny"`
+	SessionTokenCap *int64    `json:"session_token_cap"`
 }
 
 // project builds the store record from validated input (id and key aside).
@@ -1823,6 +1833,18 @@ func (in *projectInput) project(base *store.Project) *store.Project {
 		BudgetDailyTokens: in.BudgetDailyTokens, BudgetMonthlyTokens: in.BudgetMonthlyTokens}
 	if base != nil {
 		p.HistoryTurnsForQuery, p.QueryModelConnectionID = base.HistoryTurnsForQuery, base.QueryModelConnectionID
+		p.SessionTokenCap = base.SessionTokenCap
+	}
+	// A list left nil stays as it is: the store keeps the column on update and
+	// writes an empty list on create.
+	if in.ToolAllow != nil {
+		p.ToolAllow = uniqueStrings(*in.ToolAllow)
+	}
+	if in.ToolDeny != nil {
+		p.ToolDeny = uniqueStrings(*in.ToolDeny)
+	}
+	if in.SessionTokenCap != nil {
+		p.SessionTokenCap = *in.SessionTokenCap
 	}
 	if in.ContextPlacement != nil {
 		p.ContextPlacement = *in.ContextPlacement
@@ -1858,6 +1880,64 @@ func ragSettingFields(p *store.Project) map[string]any {
 	return map[string]any{"context_placement": p.ContextPlacement, "retrieval_policy": p.RetrievalPolicy,
 		"query_strategy": p.QueryStrategy, "history_turns_for_query": p.HistoryTurnsForQuery,
 		"query_model_connection_id": query}
+}
+
+// toolSettingFields lists the ADR-032 settings with their current values, for
+// the audit trail's "changed" view.
+func toolSettingFields(p *store.Project) map[string]any {
+	return map[string]any{"tool_allow": p.ToolAllow, "tool_deny": p.ToolDeny, "session_token_cap": p.SessionTokenCap}
+}
+
+// uniqueStrings is v without repeated entries, in order, and never nil.
+func uniqueStrings(v []string) []string {
+	out := make([]string, 0, len(v))
+	seen := make(map[string]struct{}, len(v))
+	for _, s := range v {
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// Bounds of a tool list (ADR-032).
+const maxToolPatterns = 64
+
+// toolPattern is what a tool allow/deny pattern may look like: letters, digits
+// and _ . : - plus the "*" wildcard, 1 to 128 characters. No regular
+// expression is accepted, so a pattern cannot be made to backtrack.
+var toolPattern = regexp.MustCompile(`^[A-Za-z0-9_.*:-]{1,128}$`)
+
+// validateToolList checks one tool list; field names it in the error.
+func validateToolList(field string, list *[]string) error {
+	if list == nil {
+		return nil
+	}
+	if n := len(uniqueStrings(*list)); n > maxToolPatterns {
+		return fmt.Errorf("%s holds at most %d patterns", field, maxToolPatterns)
+	}
+	for _, pat := range *list {
+		if !toolPattern.MatchString(pat) {
+			return fmt.Errorf("%s: %q is not a tool pattern; use 1 to 128 of letters, digits and . _ : - *", field, pat)
+		}
+	}
+	return nil
+}
+
+// validateToolSettings checks the ADR-032 settings the body carries.
+func validateToolSettings(in *projectInput) error {
+	if err := validateToolList("tool_allow", in.ToolAllow); err != nil {
+		return err
+	}
+	if err := validateToolList("tool_deny", in.ToolDeny); err != nil {
+		return err
+	}
+	if in.SessionTokenCap != nil && *in.SessionTokenCap < 0 {
+		return errors.New("session_token_cap must be 0 (unlimited) or positive")
+	}
+	return nil
 }
 
 // limitFields lists the limit columns with their current values.
@@ -1909,6 +1989,9 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	}
 	if in.RateLimitRPM < 0 || in.RateLimitTPM < 0 || in.BudgetDailyTokens < 0 || in.BudgetMonthlyTokens < 0 {
 		return errors.New("rate limits and budgets must be 0 (unlimited) or positive")
+	}
+	if err := validateToolSettings(in); err != nil {
+		return err
 	}
 	return a.validateRAGSettings(r, in)
 }
@@ -1989,7 +2072,8 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p), "rag_settings": ragSettingFields(p)})
+	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p), "rag_settings": ragSettingFields(p),
+		"tool_settings": toolSettingFields(p)})
 	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
 }
 
@@ -2043,6 +2127,16 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(ragChanged) > 0 {
 		details["rag_settings_changed"] = ragChanged
+	}
+	oldTool, curTool := toolSettingFields(before), toolSettingFields(p)
+	toolChanged := map[string]any{}
+	for k, v := range curTool {
+		if !reflect.DeepEqual(oldTool[k], v) {
+			toolChanged[k] = map[string]any{"from": oldTool[k], "to": v}
+		}
+	}
+	if len(toolChanged) > 0 {
+		details["tool_settings_changed"] = toolChanged
 	}
 	a.audit(r, "project.update", "project", ptr(p.ID), details)
 	writeJSON(w, http.StatusOK, p)
@@ -2306,7 +2400,8 @@ func (a *Admin) requestsCSV(w http.ResponseWriter, r *http.Request) {
 // only at the end, so an importer that reads by position keeps working.
 var csvHeader = []string{"created_at", "project_id", "project_name", "model_name", "status_code", "prompt_tokens",
 	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error",
-	"cached_prompt_tokens", "cache_write_tokens", "cost_usd", "cost_source", "api_key_id", "user_id"}
+	"cached_prompt_tokens", "cache_write_tokens", "cost_usd", "cost_source", "api_key_id", "user_id",
+	"session_id", "tool_names", "tools_denied"}
 
 // exportCSV streams the window's request logs (oldest first, at most
 // store.MaxExportRows) as a CSV download. Errors after the first row can
@@ -2346,7 +2441,10 @@ func csvRecord(row *store.RequestExportRow) []string {
 		// shorter would round a cheap request to zero.
 		strconv.FormatFloat(row.CostUSD, 'f', 6, 64), row.CostSource,
 		// Empty rather than 0 for a project's default key, which has no owner.
-		optInt64(row.APIKeyID), optInt64(row.UserID)}
+		optInt64(row.APIKeyID), optInt64(row.UserID),
+		// Tool names are the model's own output, so they pass csvCell like
+		// every other cell a third party could shape.
+		row.SessionID, strings.Join(row.ToolNames, ";"), strconv.Itoa(row.ToolsDenied)}
 	for i, c := range rec {
 		rec[i] = csvCell(c)
 	}

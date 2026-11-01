@@ -16,10 +16,13 @@ import (
 	"github.com/ragmux/ragmux/internal/store"
 )
 
-const anthropicWarning = `299 ragmux "response_format is not supported for anthropic connections; ignored"`
+// anthropicWarning is what the adapter says for json_object on a model that
+// cannot be forced to answer through a tool (the fake's model is unknown to
+// the capability table, so it is treated as the newest generation).
+const anthropicWarning = `299 ragmux "response_format json_object is approximated by an instruction on this model"`
 
 // fakeAnthropic is a scripted Messages API: JSON or SSE, depending on the
-// request's stream flag. It records whether response_format reached it.
+// request's stream flag. It fails the test if response_format reaches it as such.
 func fakeAnthropic(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -111,12 +114,15 @@ func TestSetRequestWarnings(t *testing.T) {
 }
 
 // The stream path writes the Warning header before its first byte, with
-// the real Anthropic adapter behind it. This runs without a database.
+// the real Anthropic adapter behind it (a json_object request is the one
+// response_format that still warns). This runs without a database.
 func TestAnthropicStreamWarningBeforeFirstByte(t *testing.T) {
 	prov := newAnthropicProvider(t, fakeAnthropic(t).URL)
 	g := &Gateway{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	var req provider.ChatRequest
-	raw, _ := json.Marshal(jsonSchemaRequest(true))
+	jsonObject := jsonSchemaRequest(true)
+	jsonObject["response_format"] = map[string]any{"type": "json_object"}
+	raw, _ := json.Marshal(jsonObject)
 	if err := json.Unmarshal(raw, &req); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +136,30 @@ func TestAnthropicStreamWarningBeforeFirstByte(t *testing.T) {
 		t.Fatalf("status=%d Warning=%q", res.StatusCode, res.Header.Get("Warning"))
 	}
 	if body := w.Body.String(); !strings.Contains(body, `"content":"{}"`) || !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Errorf("body = %q", body)
+	}
+}
+
+// A json_schema request carries no Warning on either path, and the fake
+// Messages API (which fails the test on a raw response_format) accepts it.
+// This runs without a database.
+func TestAnthropicJSONSchemaStreamHasNoWarning(t *testing.T) {
+	prov := newAnthropicProvider(t, fakeAnthropic(t).URL)
+	g := &Gateway{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var req provider.ChatRequest
+	raw, _ := json.Marshal(jsonSchemaRequest(true))
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	setRequestWarnings(w.Header(), prov, req)
+	_ = g.stream(w, r, 0, prov, &store.ModelConnection{ProviderType: "anthropic"}, req, &store.RequestLog{}, &requestObs{}, 0)
+	res := w.Result()
+	if res.StatusCode != http.StatusOK || len(res.Header.Values("Warning")) != 0 {
+		t.Fatalf("status=%d Warning=%q", res.StatusCode, res.Header.Values("Warning"))
+	}
+	if body := w.Body.String(); !strings.Contains(body, `"content":"{}"`) {
 		t.Errorf("body = %q", body)
 	}
 }
@@ -172,7 +202,10 @@ func TestUpstream5xxStatusMapping(t *testing.T) {
 	}
 }
 
-func TestAnthropicResponseFormatWarning(t *testing.T) {
+// Since ADR-029 the Anthropic adapter carries response_format itself, so no
+// path of it answers with a Warning header. The fake connection's model is
+// unknown to the capability table and takes the native schema.
+func TestAnthropicResponseFormatHasNoWarning(t *testing.T) {
 	e := newEnv(t, nil)
 	base := fakeAnthropic(t).URL
 	e.gw.Providers = func(*store.ModelConnection) (provider.Provider, error) {
@@ -182,13 +215,17 @@ func TestAnthropicResponseFormatWarning(t *testing.T) {
 		resp := e.post(context.Background(), "/v1/chat/completions", jsonSchemaRequest(stream), e.key)
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK || resp.Header.Get("Warning") != anthropicWarning {
-			t.Errorf("stream=%v: %d Warning=%q %s", stream, resp.StatusCode, resp.Header.Get("Warning"), body)
+		if resp.StatusCode != http.StatusOK || len(resp.Header.Values("Warning")) != 0 {
+			t.Errorf("stream=%v: %d Warning=%q %s", stream, resp.StatusCode, resp.Header.Values("Warning"), body)
 		}
 	}
-	// Without response_format there is nothing to warn about.
-	resp, _ := e.chat(map[string]any{"messages": userMsg})
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("Warning") != "" {
-		t.Errorf("plain request: %d Warning=%q", resp.StatusCode, resp.Header.Get("Warning"))
+	// json_object takes the instruction on this model and says so; that is the
+	// only response_format Warning left.
+	req := jsonSchemaRequest(false)
+	req["response_format"] = map[string]any{"type": "json_object"}
+	resp := e.post(context.Background(), "/v1/chat/completions", req, e.key)
+	_ = resp.Body.Close()
+	if got := resp.Header.Values("Warning"); len(got) != 1 || got[0] != anthropicWarning {
+		t.Errorf("json_object: %d Warning=%q", resp.StatusCode, got)
 	}
 }

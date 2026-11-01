@@ -20,6 +20,7 @@ import (
 	"github.com/ragmux/ragmux/internal/admin"
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/config"
+	"github.com/ragmux/ragmux/internal/gateway"
 	"github.com/ragmux/ragmux/internal/testdb"
 	"github.com/ragmux/ragmux/web"
 )
@@ -304,5 +305,49 @@ func TestDashboardSelectorsResolve(t *testing.T) {
 	}
 	if checked < 20 {
 		t.Errorf("only %d id selectors examined; the selector scan is not matching the script", checked)
+	}
+}
+
+// /mcp is mounted by mountMCP: POST only, the Origin checked against
+// CORS_ORIGINS, and a request without a key refused in JSON-RPC. A zero
+// Gateway is enough, as none of these reaches the database.
+func TestMCPMount(t *testing.T) {
+	mount := func(origins ...string) http.Handler {
+		r := chi.NewRouter()
+		if len(origins) > 0 {
+			r.Use(cors(origins))
+		}
+		mountMCP(r, &gateway.Gateway{}, slog.New(slog.NewTextHandler(io.Discard, nil)), config.Config{CORSOrigins: origins})
+		return r
+	}
+	do := func(h http.Handler, method, origin string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	if w := do(mount(), http.MethodGet, ""); w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET: %d", w.Code)
+	}
+	// No key: 401 with a JSON-RPC body, not the OpenAI error shape.
+	w := do(mount(), http.MethodPost, "")
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), `"jsonrpc":"2.0"`) ||
+		!strings.Contains(w.Body.String(), `"code":-32001`) {
+		t.Errorf("POST without a key: %d %s", w.Code, w.Body)
+	}
+	// An empty CORS_ORIGINS refuses every Origin; a listed one passes the check.
+	if w := do(mount(), http.MethodPost, "https://app.example"); w.Code != http.StatusForbidden {
+		t.Errorf("origin with no CORS_ORIGINS: %d", w.Code)
+	}
+	if w := do(mount("https://app.example"), http.MethodPost, "https://evil.example"); w.Code != http.StatusForbidden {
+		t.Errorf("unlisted origin: %d", w.Code)
+	}
+	w = do(mount("https://app.example"), http.MethodPost, "https://app.example")
+	if w.Code != http.StatusUnauthorized || w.Header().Get("Access-Control-Allow-Origin") != "https://app.example" {
+		t.Errorf("listed origin: %d %v", w.Code, w.Header())
 	}
 }
