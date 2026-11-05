@@ -40,6 +40,7 @@ import (
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/tracing"
+	"github.com/ragmux/ragmux/internal/webhook"
 	"github.com/ragmux/ragmux/web"
 )
 
@@ -294,8 +295,14 @@ func run(cfg config.Config) error {
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",
 		TrustProxy: cfg.TrustProxyHeaders}
 	usage := &limits.Limiter{Store: st}
+	// One outbound webhook client for the process: the guardrail webhook
+	// (synchronous) uses it through the gateway, and the alert worker will
+	// share it. WithMetrics is applied here because the helper takes only the
+	// config; the option is a plain function over the client.
+	webhookClient := newWebhookClient(cfg)
+	webhook.WithMetrics(met)(webhookClient)
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
-		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer,
+		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer, Webhooks: webhookClient,
 		Rerankers:       func(c *store.ModelConnection) (provider.Reranker, error) { return provider.NewReranker(provCfg(c)) },
 		LLMRerank:       rag.LLMReranker{Timeout: cfg.RerankTimeout, MaxTokens: cfg.RerankMaxTokens},
 		UpstreamTimeout: cfg.UpstreamTimeout, MaxRetries: cfg.UpstreamMaxRetries,
@@ -546,6 +553,15 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 			log.Info("http", attrs...)
 		})
 	}
+}
+
+// newWebhookClient builds the process's outbound webhook client (ADR-033). It
+// dials through the SSRF guard with PRIVATE_WEBHOOK_ALLOWLIST as the only
+// exemption: PRIVATE_UPSTREAM_ALLOWLIST and ALLOW_PRIVATE_UPSTREAMS are for
+// provider URLs an operator typed and do not apply to a URL a project editor
+// typed.
+func newWebhookClient(cfg config.Config) *webhook.Client {
+	return webhook.NewClient(cfg.PrivateWebhookAllowlist, webhook.WithVersion(version))
 }
 
 // buildMetrics creates the registry and the metric set, or returns nils when

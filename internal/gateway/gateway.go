@@ -31,6 +31,7 @@ import (
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/tracing"
+	"github.com/ragmux/ragmux/internal/webhook"
 )
 
 // ProviderFactory builds a chat adapter for a model connection.
@@ -83,6 +84,10 @@ type Gateway struct {
 	// LLMRerank configures the chat-model reranker, used by POST /v1/rerank
 	// when the connection that serves it is a chat connection.
 	LLMRerank rag.LLMReranker
+	// Webhooks sends the guardrail webhook calls (ADR-034). Nil leaves a
+	// project that turned the webhook on without one: its calls fail, which
+	// its failure mode then decides.
+	Webhooks *webhook.Client
 }
 
 // requestObs collects the facts about one chat completion that the request
@@ -243,6 +248,7 @@ func (g *Gateway) Routes(r chi.Router) {
 	r.Post("/embeddings", g.embeddings)
 	r.Post("/retrieve", g.retrieve)
 	r.Post("/rerank", g.rerank)
+	r.Post("/moderations", g.moderations)
 	models := r.With(g.requireScope(store.ScopeModels, "model listings"))
 	models.Get("/models", g.listModels)
 	models.Get("/models/{id}", g.getModel)
@@ -679,9 +685,33 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// pre_request (ADR-034): after the limit check, so a blocked request still
+	// counts against the project's request limit and a webhook call is never
+	// free to a client that is over it; before prepareContext, so neither the
+	// project's prompt nor the retrieved context is scanned.
+	if !g.guardBegin(c, req.Stream) {
+		return
+	}
+	if c.guard != nil {
+		warning, ok := g.guardPreRequest(c, chatWalker(&req), req.Stream)
+		if !ok {
+			return
+		}
+		if warning != "" {
+			opts.Warnings = append([]string{warning}, opts.Warnings...)
+		}
+		if w := g.guardLogprobs(c, &req); w != "" {
+			opts.Warnings = append(opts.Warnings, w)
+		}
+	}
+
 	prep := g.prepareChat(c, prov, &req, opts)
 	g.openRecord(c, req.Stream, prep.apply)
 	defer g.record(c)
+	if prep.refusal != nil {
+		prep.refusal.apply(c)
+		return
+	}
 	if !g.checkContextLimits(c, estimate, prep.contextBlock, prep.contextLanguage) {
 		return
 	}
@@ -771,7 +801,8 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 		inline = nil
 	}
 	if req.Stream {
-		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars, withInlineRagmux(inline))
+		return in.gw.stream(c.w, c.r, c.budgetLeft(), prov, conn, req, c.rec, c.obs, in.promptChars, withInlineRagmux(inline),
+			withGuard(in.gw.postGuard(c)))
 	}
 
 	ctx, cancel := c.attemptContext()
@@ -792,6 +823,14 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	resp.Model = req.Model
 	fillUsage(c.rec, resp.Usage, in.promptChars, completionChars(resp))
 	c.rec.StatusCode = http.StatusOK
+	if pg := in.gw.postGuard(c); pg != nil {
+		// post_response (ADR-034). The tokens above are what the model
+		// produced and are charged whatever the guardrails do to the answer.
+		if pg.chatResponse(resp) {
+			c.rec.ToolNames = nil
+		}
+		pg.finish()
+	}
 	c.w.Header().Set("Content-Type", "application/json")
 	if inline != nil {
 		if b, err := withRagmuxField(resp, inline); err == nil {
@@ -899,6 +938,10 @@ type chatPrep struct {
 	// contextLanguage is the language of the store contextBlock came from; the
 	// limit check estimates the block's tokens with it (ADR-027).
 	contextLanguage string
+	// refusal is set when the guardrails could not be consulted for the
+	// retrieval query and the project fails closed; the handler answers with
+	// it once the request log row is open.
+	refusal *guardRefusal
 }
 
 // apply sets the RAG columns of the request log row.
@@ -979,14 +1022,7 @@ func (g *Gateway) prepareContext(c *call, prov provider.Provider, req *provider.
 		}
 	}
 	if prep.skipReason != "" {
-		// A filter on a request whose retrieval does not run narrows nothing.
-		if !opts.Filter.Empty() {
-			opts.Warnings = append(opts.Warnings, "ragmux.filter has no effect: retrieval was skipped for this request ("+prep.skipReason+")")
-			prep.opts = opts
-		}
-		g.Metrics.RecordRAGSkipped(c.projectID, prep.skipReason)
-		w.Header().Set("x-ragmux-rag-skip", prep.skipReason)
-		w.Header().Set("x-ragmux-rag-hits", "0")
+		g.noteRetrievalSkip(c, &prep, &opts)
 	} else if ragOn {
 		rs, err := g.Store.GetRAGStore(ctx, *p.RAGStoreID)
 		if err == nil {
@@ -996,6 +1032,25 @@ func (g *Gateway) prepareContext(c *call, prov provider.Provider, req *provider.
 				// back to q, and its tokens go on the row through c.sideCharges.
 				q = g.condenseQuery(c, prov, req.Messages, q)
 			}
+			// pre_retrieval (ADR-034): the query as it will be searched,
+			// condensed or not. A block does not fail the request, it only
+			// goes without context (PRD rule 8); an outage of a webhook that
+			// fails closed does.
+			gq := g.guardQuery(c, q)
+			switch {
+			case gq.unavailable:
+				prep.refusal = &guardRefusal{status: http.StatusServiceUnavailable, typ: "server_error",
+					code: codeGuardrailUnavailable, msg: guardUnavailableMessage, rowError: codeGuardrailUnavailable}
+				return prep
+			case gq.blocked:
+				prep.skipReason = obs.RAGSkipGuardrail
+				g.noteRetrievalSkip(c, &prep, &opts)
+				return prep
+			case gq.redactions > 0:
+				opts.Warnings = append(opts.Warnings, guardRedactWarning(gq.redactions, " in the retrieval query"))
+				prep.opts = opts
+			}
+			q = gq.query
 			// The rerank of this retrieval is a side call of the chat request:
 			// its tokens (an LLM rerank is a chat call, an API rerank a scoring
 			// call) go on this request's log row through c.sideCharges.
@@ -1032,6 +1087,19 @@ func (g *Gateway) prepareContext(c *call, prov provider.Provider, req *provider.
 		}
 	}
 	return prep
+}
+
+// noteRetrievalSkip records that retrieval did not run for prep.skipReason: the
+// Warning for a filter that now narrows nothing, the counter and the headers.
+func (g *Gateway) noteRetrievalSkip(c *call, prep *chatPrep, opts *ragmuxRequest) {
+	// A filter on a request whose retrieval does not run narrows nothing.
+	if !opts.Filter.Empty() {
+		opts.Warnings = append(opts.Warnings, "ragmux.filter has no effect: retrieval was skipped for this request ("+prep.skipReason+")")
+		prep.opts = *opts
+	}
+	g.Metrics.RecordRAGSkipped(c.projectID, prep.skipReason)
+	c.w.Header().Set("x-ragmux-rag-skip", prep.skipReason)
+	c.w.Header().Set("x-ragmux-rag-hits", "0")
 }
 
 // ragActive is the "RAG active" fact of ADR-031: the project has a store and
@@ -1316,6 +1384,9 @@ type streamConfig struct {
 	// msg, when set, writes the stream as Messages events instead of OpenAI
 	// chunks (POST /v1/messages on a non-Anthropic target, ADR-028).
 	msg *provider.MessagesEncoder
+	// guard filters the chunks through the project's post_response rules
+	// (ADR-034); nil when it has none.
+	guard *streamGuard
 }
 
 // withMessagesEncoder makes the stream a Messages event stream.
@@ -1326,6 +1397,16 @@ func withMessagesEncoder(enc *provider.MessagesEncoder) streamOption {
 // messagesPingInterval is how long a Messages stream may be quiet before a
 // ping event is written.
 var messagesPingInterval = 10 * time.Second
+
+// withGuard makes the stream go through the post_response guardrails. A nil
+// guard leaves the stream as it is.
+func withGuard(p *postGuard) streamOption {
+	return func(c *streamConfig) {
+		if p != nil {
+			c.guard = p.stream()
+		}
+	}
+}
 
 // withInlineRagmux makes the stream carry the given "ragmux" object, once, on
 // the first chunk that has choices. The object goes there rather than in a
@@ -1429,6 +1510,38 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, firstByte time.
 	var called toolNameSet
 	compChars := 0
 	clientGone := false
+	// guardStopped is set when a block rule ended the answer; the upstream is
+	// cancelled and what it still sends is dropped.
+	guardStopped := false
+	// writeChunk writes one chunk in the shape of the stream and reports
+	// whether the client is still there.
+	writeChunk := func(chunk provider.StreamChunk) bool {
+		if cfg.msg != nil {
+			if ev := cfg.msg.Chunk(chunk); len(ev) > 0 {
+				if _, err := w.Write(ev); err != nil {
+					clientGone = true
+					cancel()
+					return false
+				}
+				flusher.Flush()
+			}
+			return true
+		}
+		b, _ := json.Marshal(chunk)
+		if cfg.inline != nil && len(chunk.Choices) > 0 {
+			b = withRagmuxChunk(b, cfg.inline)
+			cfg.inline = nil
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			// Writing to a closed client: stop the upstream call. The
+			// goroutine exits once ChatStream observes ctx and closes out.
+			clientGone = true
+			cancel()
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
 	defer func() {
 		// Names only. A stream that failed before its first chunk called
 		// nothing, and rec stays untouched for the next target.
@@ -1489,33 +1602,43 @@ chunks:
 				compChars += len(*c.Delta.Content)
 			}
 		}
-		if cfg.msg != nil {
-			if ev := cfg.msg.Chunk(chunk); len(ev) > 0 {
-				if _, err := w.Write(ev); err != nil {
-					clientGone = true
-					cancel()
-					continue
+		if cfg.guard != nil {
+			if guardStopped {
+				continue // the answer was refused; only the usage above is still wanted
+			}
+			outs, stopped := cfg.guard.process(chunk)
+			if stopped {
+				guardStopped = true
+				cancel() // no more of the model's answer is wanted
+			}
+			for _, oc := range outs {
+				if !writeChunk(oc) {
+					break
 				}
-				flusher.Flush()
 			}
 			continue
 		}
-		b, _ := json.Marshal(chunk)
-		if cfg.inline != nil && len(chunk.Choices) > 0 {
-			b = withRagmuxChunk(b, cfg.inline)
-			cfg.inline = nil
-		}
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
-			// Writing to a closed client: stop the upstream call. The
-			// goroutine exits once ChatStream observes ctx and closes out.
-			clientGone = true
-			cancel()
-			continue
-		}
-		flusher.Flush()
+		writeChunk(chunk)
 	}
 	err := <-errc
 	obsv.upstream = time.Since(upstreamStart)
+	if cfg.guard != nil {
+		defer cfg.guard.p.finish()
+		if !guardStopped && !clientGone && err == nil {
+			// The windows still hold the tail of the answer.
+			outs, stopped := cfg.guard.end()
+			guardStopped = stopped
+			for _, oc := range outs {
+				if !writeChunk(oc) {
+					break
+				}
+			}
+		}
+		if guardStopped {
+			// The cancellation above is ours, not a failure of the upstream.
+			err = nil
+		}
+	}
 	if clientGone || r.Context().Err() != nil {
 		// The client disconnected before the completion finished. cancel()
 		// (deferred, or called above) has already torn down the upstream

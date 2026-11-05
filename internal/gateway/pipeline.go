@@ -28,6 +28,8 @@ import (
 //	(decode)       the endpoint's own step: read and validate its request body
 //	resolveRoute   which model connections serve the request (c.targets)
 //	checkLimits    rate limits and budgets; a denial is answered and logged here
+//	guardBegin     the project's guardrails (chat, messages): pre_request runs on
+//	               the decoded body, so a block is logged like a limit denial
 //	(prepare)      an optional endpoint hook that shapes what goes upstream;
 //	               chat's is prepareChat (system prompt and RAG)
 //	openRecord     opens the request log row; must run before record is deferred
@@ -327,6 +329,13 @@ type call struct {
 	// searchUnits is what the call itself billed in search units, set by the
 	// /v1/rerank attempt that went through a Cohere connection.
 	searchUnits int
+	// guard is what the project's guardrails know and have found about the
+	// request (ADR-034); nil until guardBegin runs, and for a project without
+	// guardrails.
+	guard *guardState
+	// free marks a call that spends nothing upstream by design (moderation):
+	// its row is not an unpriced request.
+	free bool
 }
 
 // addSideCharge records a side call's spend; one that spent nothing is dropped.
@@ -842,6 +851,7 @@ func (g *Gateway) failInvoke(c *call, err error) {
 func (g *Gateway) record(c *call) {
 	rec, conn, obsv := c.rec, c.conn, c.obs
 	rec.LatencyMs = time.Since(c.start).Milliseconds()
+	c.guard.apply(rec)
 	// Side tokens count toward limits and usage, so they go on the row; they
 	// are priced apart, with the price of the connection that did the work,
 	// because the row's connection is not that one.
@@ -888,7 +898,7 @@ func (g *Gateway) record(c *call) {
 		PromptTokens: rec.PromptTokens, CompletionTokens: rec.CompletionTokens,
 		Estimated: rec.Estimated, CostUSD: rec.CostUSD, ErrorType: obsv.errType,
 		ClientDisconnected: rec.StatusCode == statusClientClosed,
-		Unpriced:           rec.CostSource == store.CostSourceNone,
+		Unpriced:           rec.CostSource == store.CostSourceNone && !c.free,
 	})
 	if c.span.IsRecording() {
 		c.span.SetAttributes(

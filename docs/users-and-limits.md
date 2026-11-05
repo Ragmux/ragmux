@@ -470,6 +470,42 @@ The lists are validated when the project is saved: patterns of 1 to 128 characte
 This is a policy on what the model is offered, not a sandbox for what a tool does. A binary
 older than this feature ignores both lists during a rolling update.
 
+## Guardrails
+
+A project's **guardrails** are rules that read what the project's clients send and what the
+model answers, and block, redact or flag a match: Turkish citizen ids (`tckn`), IBANs, a regular
+expression or a word list. They are a project setting like the [tool lists](#tool-governance):
+the rules, the stream window and the webhook settings live on the project, and a project
+without rules is served exactly as before. The shape, the stages and the exact behaviour are in
+the [API reference](api.md#guardrails); this section is about who can do what and what to expect.
+
+- **Who edits them.** The same people who edit the project: a member with the `editor` role
+  or an admin (`PUT /admin/api/projects/{id}/guardrails`). Any member can read them. A change
+  is audited as `project.guardrails_update` with the rule ids; the patterns and words are not
+  written to the audit trail.
+- **What a client sees.** A `block` is a `400` with `code: "guardrail_blocked"` and a fixed
+  message that names the stage; the rule, and of course the match, are not told. A `redact`
+  is a `Warning` header on the response. If the guardrail webhook is down and the project
+  chose `fail_closed` (the default), requests get `503` with `code: "guardrail_unavailable"`.
+- **A block costs a request.** A blocked request takes a slot of the project's and the key's
+  requests-per-minute limit like any other, so a blocked client cannot probe the rules for free.
+  No tokens are spent on a request refused before the model; an answer blocked at
+  `post_response` has already been paid for and is counted.
+- **Thinking cannot be redacted.** A model's thinking is signed by its provider; changing a
+  character makes the provider refuse it when the client sends it back. A `redact` rule on
+  `post_response` therefore only flags a match inside thinking, and a `block` rule still
+  blocks. `pre_request` does not read the thinking blocks of earlier turns.
+- **Streams are delayed by the window.** With a `post_response` rule a stream holds back its last
+  `stream_window_chars - 1` characters (128 by default), which delays the first text by roughly 0.3
+  to 0.6 s. A project without a `post_response` rule streams as before. A window smaller than a
+  match cannot catch it; the API answers with a warning for a window too small for `tckn` or `iban`.
+- **No logprobs on a guarded answer.** `logprobs` and `top_logprobs` are dropped from requests to a project whose `post_response` rules block or redact (with a `Warning`; a project whose rules only flag keeps them), because token probabilities would spell out a match that was redacted or blocked.
+- **Content is not kept.** The request log records how many matches there were and which rule ids
+  matched, not the text, a hash or a position.
+- **`POST /v1/moderations`** answers with the project's `pre_request` rules, for a client that
+  wants to ask before it sends. A key needs the `chat` scope for it, and the call counts against the
+  request limit.
+
 ## Metrics and retention
 
 Every `/v1` call that reaches the upstream or is turned away by a limit (chat completions,

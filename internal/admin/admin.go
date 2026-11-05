@@ -186,6 +186,8 @@ func (a *Admin) authenticated(r chi.Router) {
 	read.Get("/api/projects/{id}/routes/{routeId}", a.getRoute)
 	editor.Put("/api/projects/{id}/routes/{routeId}", a.updateRoute)
 	editor.Delete("/api/projects/{id}/routes/{routeId}", a.deleteRoute)
+	read.Get("/api/projects/{id}/guardrails", a.getGuardrails)
+	editor.Put("/api/projects/{id}/guardrails", a.putGuardrails)
 	read.Get("/api/projects/{id}/sessions", a.listSessions)
 	read.Get("/api/projects/{id}/sessions/{sessionId}", a.getSession)
 

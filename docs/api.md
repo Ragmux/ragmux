@@ -498,6 +498,8 @@ log as `rag_store.reindex`. See [Embedding width](rag.md#embedding-width).
 | GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
 | GET | `/projects/{id}/sessions?limit=50&offset=0` | member | The project's [sessions](users-and-limits.md#sessions), most recently active first (`limit` defaults to 50, larger values are cut to 500) |
 | GET | `/projects/{id}/sessions/{sessionId}?limit=100` | member | One session's totals and its request log rows, newest first (`limit` defaults to 100, larger values are cut to 1000); `404` for an unknown session |
+| GET | `/projects/{id}/guardrails` | member | The project's [guardrails](#guardrails): rules, stream window and webhook settings, every default filled in |
+| PUT | `/projects/{id}/guardrails` | member + editor | Replace the guardrails as a whole; a rule that cannot work is a `400` naming it |
 
 Project body:
 
@@ -592,6 +594,110 @@ nothing was consumed in the last hour, or the projection lands after the window 
 with. `GET /projects/{id}/sessions/{sessionId}` returns `{"session": {…}, "requests": […]}`:
 the same object, and the session's request log rows in the shape of
 [`recent` below](#metrics). The roles are those of the request logs: any member can read them.
+
+### Guardrails
+
+A project can screen what goes into the model and what comes back (ADR-034). The rules
+live on the project; this endpoint reads and replaces them as a whole.
+
+```json
+{"rules": [
+   {"id": "citizen-id", "type": "tckn", "action": "redact", "stages": ["pre_request", "post_response"]},
+   {"id": "card-words", "type": "keywords", "action": "block", "stages": ["pre_request"], "keywords": ["card number", "cvv"]},
+   {"id": "ticket", "type": "regex", "action": "flag", "stages": ["post_response"], "pattern": "TKT-[0-9]{6}"}],
+ "stream_window_chars": 128,
+ "webhook": {"enabled": true, "timeout_ms": 2000, "failure_mode": "fail_closed"},
+ "warnings": []}
+```
+
+`warnings` is only in the answer (a `PUT` body may send it; it is ignored): what is allowed
+but risky, for instance a window too small to hold a whole `tckn` or `iban` match, a
+`regex` that can match more than the window, or a webhook that is enabled while the project
+has no [guardrail webhook endpoint](#webhook-endpoints) yet.
+
+| Field | Meaning |
+|---|---|
+| `rules[].id` | `^[a-z0-9_-]{1,32}$`, unique in the project. It names the rule in the request log, the placeholder and the moderation categories |
+| `rules[].type` | `tckn` (11 digits whose checksum holds), `iban` (mod-97 and the country's length; spaces between groups of four are read), `regex` (RE2, at most 512 bytes, must not match the empty string) or `keywords` (at most 500 words of at most 64 bytes; case-insensitive, whole words, Turkish and other Unicode letters respected) |
+| `rules[].action` | `block`, `redact` (the match becomes `[REDACTED:<id>]`) or `flag` (counted, nothing changes) |
+| `rules[].stages` | one or more of `pre_request`, `pre_retrieval`, `post_response` |
+| `rules[].pattern` / `keywords` | for `regex` / `keywords` only |
+| `stream_window_chars` | 32 to 2048, default 128: how much of a streamed answer is held back to catch a match split across chunks |
+| `webhook.enabled` | consult the project's guardrail webhook at `pre_request` and `pre_retrieval`, after the local rules |
+| `webhook.timeout_ms` | 100 to 10000, default 2000 |
+| `webhook.failure_mode` | `fail_closed` (default) or `fail_open` |
+
+At most 32 rules. A `PUT` is audited as `project.guardrails_update` with the rule ids,
+never the patterns or words.
+
+**What each stage reads.**
+
+| Stage | Reads | A `block` | A `redact` |
+|---|---|---|---|
+| `pre_request` | on `/v1/chat/completions`: every message's content (a string, or every part except an image, audio or a file, whatever the part's type is called), its `name`, the `reasoning_content` of an earlier assistant turn, the name and arguments of tool calls, tool results, and the text of a `prediction`; a content or an argument in a shape the schema does not allow (one object where a list belongs, a list of bare strings, arguments as an object) is read all the same. On `/v1/messages`: `system` and every content block: text, `document`, `search_result`, `tool_result` (and the blocks nested in it), `tool_use` name and input, and any block type the gateway does not know, whose strings are all read, URLs and names included, except ids, signatures, encrypted payloads, settings and base64 data. Not images, not the contents of a base64 document (a PDF is not searched for text), not tool definitions, not the project's own system prompt, not the signed thinking blocks of earlier turns, not `user`, `stop`, `response_format`, `metadata` or any other request field: those are the application's settings, not text a person wrote, and the [tool lists](users-and-limits.md#tool-governance) and the policy for extra request fields (ADR-041) are the operator's instruments for what a request may carry, not a content scan | | `400`, `code: "guardrail_blocked"`; nothing is sent upstream and no retrieval runs | the match is replaced before anything else happens, and the response carries `Warning: 299 ragmux "guardrail redacted N match(es)"` |
+| `pre_retrieval` | the retrieval query, after a `condense` strategy has rewritten it. Applies to chat, [`POST /v1/retrieve`](#post-v1retrieve) and the [MCP tool](#mcp-endpoint). The retrieved passages are not scanned (they are the operator's corpus) | in chat the search is skipped (`x-ragmux-rag-skip: guardrail`) and the request goes on without context; `/v1/retrieve` and MCP answer `400` `guardrail_blocked` | the search runs with the redacted query; the model still sees the client's own text |
+| `post_response` | the answer: content, refusal, tool call arguments, annotations and citations (`cited_text`, `annotations[].url_citation.title`), the results a server tool returned, and thinking. Not the RAG context | the answer is replaced by an empty one with `finish_reason: "content_filter"` (`stop_reason: "refusal"` on `/v1/messages`); the JSON answer carries `x-ragmux-guardrail: blocked`. The tokens were spent and are counted | the match is replaced. Thinking can only be flagged (see below) |
+
+All rules of a stage run, in the order they are listed: a `redact` changes the text the
+rules after it read, and a `block` anywhere wins. (One limit in a stream: a `block` rule written against text that an earlier `redact` rule has already replaced sees the replacement, because the window rewrites as it goes. The text the `redact` rule hid never leaks, but that `block` can fail to fire where it would on the whole answer, and the rest of the text it would have matched is then written. Write such a rule against the text a client would send, not against what the rules leave.) An empty rule list, or one with no rule
+for a stage, leaves that stage out entirely: no scan, no window, no latency, and a native
+`/v1/messages` stream stays a byte-for-byte copy of the upstream's.
+
+**Streams.** `post_response` on a stream holds back the last `stream_window_chars - 1`
+characters until it can tell they are not the start of a match, so the first text reaches the
+client later: about 0.3 to 0.6 s with the default 128 characters, at the speed of a typical
+model (an estimate; it is the time the model needs to write the window). A block stops the
+stream with a final chunk (`content_filter` / `refusal`) and the upstream call is cancelled;
+nothing of the match, or after it, is written. The `Warning` header and `x-ragmux-guardrail`
+cannot be set once a stream has begun. On `/v1/messages` against an Anthropic connection the SSE
+events are rewritten when the project has a `post_response` rule.
+
+**Tool call arguments** are read as JSON when they are JSON: every key, every string and every number in them. A match in a number (`{"id": 10000000146}`) or a key is replaced by a string placeholder, so the arguments stay valid JSON, and a `block` rule sees it. The JSON is also read once as a whole text, for `block` rules only, so a pattern that spans a key and its value (`"password": "…"`) stops the request too; a `redact` or `flag` rule of that shape is matched only in a streamed answer. Arguments that are not JSON are read as text. In a **stream** the arguments arrive in pieces and cannot be parsed as they come, so they are scanned as text: a `block` is caught, a `redact` hides the match, but a redacted number leaves `[REDACTED:<id>]` unquoted in the stream and the client's JSON parse of the finished arguments can fail. Use `block` on a rule meant for tool arguments if that matters.
+
+**What the webhook is sent.** The project's own rules read every key, string and number of tool call arguments. The [guardrail webhook](#webhook-endpoints) is sent the keys and the string values, one `texts` entry each, and never a number, nor the arguments as one text: a numeric value is not text a person wrote, and a receiver that is sent every `7` and `1` of a tool's input gets a body made mostly of noise. A webhook that must see a number in tool arguments cannot; a local rule can.
+
+**Names.** A tool's name and a participant's `name` are letters, digits, `_` and `-`. A `redact` rule writes `REDACTED-<id>` there instead of `[REDACTED:<id>]` (`refresh-token` becomes `refresh-REDACTED-tok`), so the call stays well formed and the request acceptable. A redacted name no longer matches the name in the client's own tool table, so the call is not executed under it: that is the price of hiding it. `block` and `flag` act on names as they do on text.
+
+**Duplicate keys.** A JSON key that appears twice is read as the first value by one parser and as the last by another. Tool arguments and inputs with a repeated key go on with the last value only, so a value the rules did not read does not travel with them.
+
+**Placeholders.** `[REDACTED:<id>]` is let alone by the rules after the one that wrote it only where the gateway wrote it. A client that types one gets no exemption: a rule reads that text like any other.
+
+**Token log-probabilities.** `logprobs` spell the answer out one token at a time and a token cannot be redacted, so a project with a `post_response` rule that blocks or redacts does not return them: `logprobs` and `top_logprobs` are removed from the request before it goes upstream, the answer carries none, and the response has `Warning: 299 ragmux "logprobs was dropped: …"` (set before the first byte, so a stream has it too). A project whose `post_response` rules only flag hides nothing and is not affected, and neither is one without a `post_response` rule.
+
+**Thinking.** A thinking block is signed by its provider, and an edited block would be refused
+when the client sends it back. `post_response` therefore scans thinking text, applies `block`
+and `flag`, and treats `redact` as `flag`; the signature is never touched. `pre_request` does not
+scan the thinking blocks of earlier turns.
+
+**What is recorded.** The request log row gets `guardrail_blocked_stage` (the stage that refused
+something), `guardrail_redactions`, `guardrail_flags`, `guardrail_rules` (the ids of the rules that
+matched, at most 16) and `guardrail_webhook` (`ok`, `error`, `timeout` or `skipped_fail_open`).
+The counters are [`ragmux_guardrail_events_total` and `ragmux_guardrail_webhook_total`](observability.md#the-metric-set).
+The matched text, its hash and its position are stored and logged nowhere. A blocked request is a
+request: it takes a slot of the request limit.
+
+**Webhook endpoints.** With `webhook.enabled`, the gateway posts the request to the project's
+guardrail webhook endpoint after the local rules ran, signed as every Ragmux webhook is:
+
+```json
+{"version": "2026-11-01", "stage": "pre_request", "request_id": "req_…", "project_id": 3,
+ "endpoint": "chat.completions",
+ "texts": [{"index": 0, "role": "system", "text": "…"}, {"index": 1, "role": "user", "text": "…"}]}
+```
+
+`stage` is `pre_request` or `pre_retrieval` (then a single text with `role: "query"`); there is no
+call at `post_response`. The receiver answers `200` with
+`{"action": "allow"|"block"|"redact"|"flag", "reason": "<a-z0-9_.-, up to 32>", "texts": […]}`;
+`texts` is only read for `redact` and must have the same length and `index` values as the request.
+The call is synchronous, has no retry, and a request body over 1 MB is not sent. A timeout, a
+transport error, a status outside 2xx, a redirect, a reply that is not this shape, or texts that do
+not line up all count as a failure: `fail_closed` answers `503` with `code: "guardrail_unavailable"` (no
+`Retry-After`; the guardrails are down, not busy), `fail_open` serves the request and counts
+`skipped_fail_open`. The `reason` is recorded as `webhook:<reason>` in `guardrail_rules`.
+
+A stored configuration this version cannot read or compile is treated like a failed closed
+webhook: the project's requests are refused with `guardrail_unavailable` rather than served
+unguarded.
 
 ### Routes
 
@@ -1230,10 +1336,11 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB. `ragmux.sources: "inline"` returns the whole list in the body |
-| `x-ragmux-rag-skip` | present when the project has a store and this request did not retrieve, with the reason: `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack` (then `x-ragmux-rag-hits` is `0`). Absent when retrieval ran. See [Retrieval policy](rag.md#retrieval-policy) |
+| `x-ragmux-rag-skip` | present when the project has a store and this request did not retrieve, with the reason: `policy_off`, `client_off`, `tool_turn`, `greeting`, `ack` or `guardrail` (then `x-ragmux-rag-hits` is `0`). Absent when retrieval ran. See [Retrieval policy](rag.md#retrieval-policy) |
 | `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
+| `x-ragmux-guardrail` | `blocked` on a JSON answer a `post_response` block rule emptied (see [Guardrails](#guardrails)) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
-| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` `json_object` on an Anthropic model that cannot be forced to call a tool, where an instruction in the system prompt stands in for it (see [Structured output](providers.md#structured-output)), or a `tool_choice` the model cannot take (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
+| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` `json_object` on an Anthropic model that cannot be forced to call a tool, where an instruction in the system prompt stands in for it (see [Structured output](providers.md#structured-output)), or a `tool_choice` the model cannot take (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), or a match a `redact` guardrail rule replaced (see [Guardrails](#guardrails)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
 `Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and
@@ -1245,7 +1352,7 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`) |
+| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`), or a request a [guardrail](#guardrails) `block` rule refused (`code: "guardrail_blocked"`, the message names the stage, never the rule or the match) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
@@ -1255,6 +1362,7 @@ Status codes:
 | `429` | the session spent `session_token_cap` tokens; no `Retry-After`, because a session does not reset; body `{"error":{"message":"Session token cap reached (N of M tokens used).","type":"insufficient_quota","code":"session_token_cap","scope":"session"}}`. A request may run a session past the cap by its own size, and concurrent requests of one session can each pass the check before any of them is counted |
 | `4xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted). A `Retry-After` the provider sent (seconds or an HTTP date) is passed through unchanged; a malformed one is dropped |
 | `503` / `504` | the provider answered `503` or `504` (or, on an Anthropic connection, `529 overloaded`, which becomes `503`): the status is kept, because both say "retry later" rather than "broken", with the provider's message and its `Retry-After`, if any |
+| `503` | the [guardrails](#guardrails) could not be consulted: the project's guardrail webhook failed under `fail_closed`, or its stored configuration cannot be used (`type: "server_error"`, `code: "guardrail_unavailable"`; no `Retry-After`) |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
 | `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
@@ -1273,6 +1381,8 @@ Everything around the call is `POST /v1/chat/completions`: the same key (in `x-a
 retry and fallback, rate limits and budgets, the request log (`endpoint = messages`), the
 [tool lists](#post-v1chatcompletions) and sessions. A query string such as `?beta=true` is
 ignored. `POST /v1/messages/count_tokens` and Anthropic-shaped model listings are not served.
+
+The project's [guardrails](#guardrails) apply here as on chat. A refusal comes in Anthropic's error shape with the same `code` (`guardrail_blocked`, `guardrail_unavailable`); a `post_response` block ends the message with `stop_reason: "refusal"` and no content.
 
 The optional `ragmux` object has the same grammar as on chat, as a top-level field of the
 body. It is consumed by the gateway and never sent upstream, which matters because the
@@ -1441,6 +1551,8 @@ unit). A project without a RAG store answers
 `rag_used`, `rag_hits`, and the embedding connection's model, tokens and price. An
 embedding failure at the provider answers with the provider's status as in chat.
 
+A project's `pre_retrieval` [guardrails](#guardrails) read `query`: a `block` rule answers `400` `guardrail_blocked`, a `redact` rule searches with the redacted query and sets a `Warning`.
+
 ### `POST /v1/rerank`
 
 Reorders documents by relevance to a query, in Cohere's request and response shape, so a
@@ -1487,6 +1599,38 @@ search unit (a row with a `per_search_unit` never adds token prices), Voyage by 
 Inside a chat or retrieve request that cost is added to the row's `cost_micros`, priced
 with the rerank connection; the `llm` backend's tokens are priced with the chat connection
 that ran the rerank. A rerank connection with no price row adds 0.
+
+### `POST /v1/moderations`
+
+The OpenAI moderation call, answered by the project's own [guardrails](#guardrails): no model is
+called. Each input is read by the project's `pre_request` rules (and the guardrail webhook, if
+the project has one) and reported, never applied.
+
+```json
+{"input": ["my id is 10000000146", "good morning"], "model": "omni-moderation-latest"}
+```
+
+`input` is a string or an array of at most 32 strings (an entry that is not a string, `null` included, is a `400`); `model` is accepted and ignored.
+
+```json
+{"id": "modr-3f9c0a7d5b1e4c2a8d6f0b13", "model": "ragmux-guardrails",
+ "results": [{"flagged": true, "categories": {"citizen-id": true, "card-words": false},
+              "category_scores": {"citizen-id": 1, "card-words": 0},
+              "ragmux": {"action": "redact"}},
+             {"flagged": false, "categories": {"citizen-id": false, "card-words": false},
+              "category_scores": {"citizen-id": 0, "card-words": 0}, "ragmux": {"action": "none"}}]}
+```
+
+Every `pre_request` rule is a category, its id the key; the score is `1` or `0`. `ragmux.action` is
+the strongest action among the rules that matched (`none`, `flag`, `redact`, `block`) and says what the
+project's rules *would* do; nothing is blocked or changed here. With the webhook on, its verdict is
+one more category, `webhook`, on the inputs it concerns (it answers once for the whole call, so a
+`block` or `flag` marks them all). The key needs the `chat` scope. The call takes a slot of the request
+limit, costs no tokens, and leaves a request log row with `endpoint = moderations`. A webhook failure
+answers as in chat (`503` `guardrail_unavailable` under `fail_closed`).
+
+A project without `pre_request` rules answers `flagged: false` with empty `categories`. An SDK that
+reads `categories` as OpenAI's fixed category set sees the project's rule ids instead.
 
 ### `GET /v1/models` and `GET /v1/models/{id}`
 

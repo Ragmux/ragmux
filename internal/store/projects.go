@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"log/slog"
 	"math/big"
 	"sync"
@@ -51,6 +52,13 @@ type Project struct {
 	// (X-Ragmux-Session) may spend before its requests are answered 429; zero
 	// is unlimited (ADR-032).
 	SessionTokenCap int64 `json:"session_token_cap"`
+	// Guardrails is the project's guardrail configuration as stored: a JSON
+	// object of rules and settings (ADR-034), nil when the project has none.
+	// The gateway reads it on every request through internal/guardrail, which
+	// owns its shape; the admin API reads and writes it on its own routes
+	// (SetProjectGuardrails), not through the project body, so it is not part
+	// of the project JSON.
+	Guardrails json.RawMessage `json:"-"`
 	// MemberIDs lists the users attached to the project.
 	MemberIDs []int64 `json:"member_ids"`
 	CreatedAt string  `json:"created_at"`
@@ -142,7 +150,7 @@ func (p *Project) normalizeRAGSettings() {
 const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, system_prompt,
 	rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens, created_at, updated_at,
 	context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
-	tool_allow, tool_deny, session_token_cap,
+	tool_allow, tool_deny, session_token_cap, guardrails,
 	ARRAY(SELECT user_id FROM project_members pm WHERE pm.project_id = projects.id ORDER BY user_id)`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
@@ -151,7 +159,7 @@ func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	err := row.Scan(&p.ID, &p.Name, &p.ModelConnectionID, &p.RAGStoreID, &p.APIKeyPrefix, &p.SystemPrompt,
 		&p.RateLimitRPM, &p.RateLimitTPM, &p.BudgetDailyTokens, &p.BudgetMonthlyTokens,
 		&created, &updated, &p.ContextPlacement, &p.RetrievalPolicy, &p.QueryStrategy,
-		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.MemberIDs)
+		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.Guardrails, &p.MemberIDs)
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -294,6 +302,24 @@ func (s *Store) RotateProjectKey(ctx context.Context, id int64) (string, error) 
 		return "", ErrNotFound
 	}
 	return key, nil
+}
+
+// SetProjectGuardrails replaces the project's guardrail configuration. raw is
+// the JSON object internal/guardrail validated; nil clears it. The project's
+// updated_at moves with it. ErrNotFound when the project does not exist.
+func (s *Store) SetProjectGuardrails(ctx context.Context, id int64, raw json.RawMessage) error {
+	var arg any
+	if raw != nil {
+		arg = []byte(raw)
+	}
+	res, err := s.pool.Exec(ctx, "UPDATE projects SET guardrails=$1::jsonb, updated_at=now() WHERE id=$2", arg, id)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // GetProject fetches one project.

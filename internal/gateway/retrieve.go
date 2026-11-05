@@ -54,11 +54,16 @@ func (g *Gateway) retrieve(w http.ResponseWriter, r *http.Request) {
 	if !g.checkLimits(c, (len(req.Query)+3)/4, false) {
 		return
 	}
+	// pre_retrieval (ADR-034): the request is a retrieval, so a block refuses it.
+	query, ok := g.guardRetrieve(c, req.Query)
+	if !ok {
+		return
+	}
 	g.openRecord(c, false, nil)
 	defer g.record(c)
 
 	prov, rerankConn := g.rerankProvider(c, rs)
-	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: req.Query, topK: req.TopK, filter: filter,
+	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: query, topK: req.TopK, filter: filter,
 		prov: prov, rerankConn: rerankConn})
 }
 
@@ -463,11 +468,17 @@ func (g *Gateway) MCPSearch(w http.ResponseWriter, r *http.Request, args MCPSear
 	if !g.checkLimits(c, (len(req.Query)+3)/4, false) {
 		return nil, cw.failure(false)
 	}
+	// pre_retrieval (ADR-034): a block is the tool's own error, like a bad
+	// argument.
+	query, ok := g.guardRetrieve(c, req.Query)
+	if !ok {
+		return nil, cw.failure(true)
+	}
 	g.openRecord(c, false, nil)
 	defer g.record(c)
 
 	prov, rerankConn := g.rerankProvider(c, rs)
-	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: req.Query, topK: req.TopK, filter: filter,
+	g.invoke(c, &retrieveInvocation{gw: g, rs: rs, query: query, topK: req.TopK, filter: filter,
 		prov: prov, rerankConn: rerankConn})
 	if cw.status >= http.StatusBadRequest || cw.body.Len() == 0 {
 		return nil, cw.failure(true)

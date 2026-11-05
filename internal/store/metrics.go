@@ -74,7 +74,44 @@ type RequestLog struct {
 	// project's allow/deny lists stripped from the request.
 	ToolNames   []string `json:"tool_names,omitempty"`
 	ToolsDenied int      `json:"tools_denied,omitempty"`
-	CreatedAt   string   `json:"created_at"`
+	// The guardrail columns (ADR-034). GuardrailBlockedStage is the stage a rule
+	// blocked the request at, empty when none did; GuardrailRedactions and
+	// GuardrailFlags count matches; GuardrailRules lists the ids of the rules
+	// that matched (at most MaxGuardrailRules); GuardrailWebhook is what the
+	// guardrail webhook did (ok, error, timeout, skipped_fail_open), empty when
+	// it was not asked. None of them holds the matched text, its hash or its
+	// position (PRD rule 10), and they are not in the JSON the admin API sends
+	// yet.
+	GuardrailBlockedStage string   `json:"-"`
+	GuardrailRedactions   int      `json:"-"`
+	GuardrailFlags        int      `json:"-"`
+	GuardrailRules        []string `json:"-"`
+	GuardrailWebhook      string   `json:"-"`
+	CreatedAt             string   `json:"created_at"`
+}
+
+// MaxGuardrailRules bounds request_logs.guardrail_rules.
+const MaxGuardrailRules = 16
+
+// clampGuardrailRules makes the rule ids fit their column: distinct, at most
+// MaxGuardrailRules, no NUL bytes. Order is kept: it is the order the rules
+// matched in. An empty list is NULL.
+func clampGuardrailRules(ids []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, id := range ids {
+		id = strings.ReplaceAll(id, "\x00", "")
+		id = cutBytes(id, MaxToolNameBytes)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if len(out) == MaxGuardrailRules {
+			break
+		}
+	}
+	return out
 }
 
 // MaxRequestedModelBytes bounds request_logs.requested_model. The value is the
@@ -116,15 +153,19 @@ func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 		(project_id, model_name, status_code, prompt_tokens, completion_tokens, estimated, latency_ms, streamed,
 		 rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens, cost_micros, cost_source,
 		 api_key_id, user_id, request_id, endpoint, requested_model, route, attempt, fallback_from, rag_skip_reason,
-		 session_id, tool_names, tools_denied)
+		 session_id, tool_names, tools_denied,
+		 guardrail_blocked_stage, guardrail_redactions, guardrail_flags, guardrail_rules, guardrail_webhook)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
 		 NULLIF($18, ''), NULLIF($19, ''), NULLIF($20, ''), NULLIF($21, ''), NULLIF($22::int, 0)::smallint, $23,
-		 NULLIF($24, ''), NULLIF($25, ''), $26::text[], $27)`,
+		 NULLIF($24, ''), NULLIF($25, ''), $26::text[], $27,
+		 NULLIF($28, ''), $29, $30, $31::text[], NULLIF($32, ''))`,
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
 		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error,
 		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source, l.APIKeyID, l.UserID,
 		l.RequestID, l.Endpoint, clampRequestedModel(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom, l.RAGSkipReason,
-		clampSessionID(l.SessionID), clampToolNames(l.ToolNames), nonNegative(l.ToolsDenied))
+		clampSessionID(l.SessionID), clampToolNames(l.ToolNames), nonNegative(l.ToolsDenied),
+		l.GuardrailBlockedStage, nonNegative(l.GuardrailRedactions), nonNegative(l.GuardrailFlags),
+		clampGuardrailRules(l.GuardrailRules), l.GuardrailWebhook)
 	return err
 }
 

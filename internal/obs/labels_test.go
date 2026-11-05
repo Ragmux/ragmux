@@ -192,3 +192,44 @@ func TestWebhookDeliveryLabelsAreBounded(t *testing.T) {
 	var nilMetrics *Metrics
 	nilMetrics.RecordWebhookDelivery(WebhookPurposeAlerts, WebhookRetry) // must not panic
 }
+
+// TestGuardrailLabelsAreBounded: the stage, the action and the webhook outcome
+// come from closed sets, and a rule id or any other string a caller passes
+// collapses into "other" instead of becoming a label (ADR-002, PRD rule 10).
+func TestGuardrailLabelsAreBounded(t *testing.T) {
+	reg := metrics.New(metrics.Options{})
+	m := New(reg)
+	m.RecordGuardrailEvents("7", GuardrailStagePreRequest, GuardrailRedact, 3)
+	m.RecordGuardrailEvents("7", GuardrailStagePostResponse, GuardrailBlock, 1)
+	m.RecordGuardrailEvents("7", GuardrailStagePostResponse, GuardrailBlock, 0) // nothing happened: no series
+	for _, bad := range []string{"tckn-rule", "10000000146", "", "x\ny"} {
+		m.RecordGuardrailEvents("7", bad, bad, 1)
+	}
+	m.RecordGuardrailWebhook("7", GuardrailWebhookOK)
+	m.RecordGuardrailWebhook("7", GuardrailWebhookSkippedFailOpen)
+	m.RecordGuardrailWebhook("7", "https://hooks.example/secret-path")
+	text := reg.Text()
+	for _, want := range []string{
+		`ragmux_guardrail_events_total{project="7",stage="pre_request",action="redact"} 3`,
+		`ragmux_guardrail_events_total{project="7",stage="post_response",action="block"} 1`,
+		`ragmux_guardrail_events_total{project="7",stage="other",action="other"} 4`,
+		`ragmux_guardrail_webhook_total{project="7",outcome="ok"} 1`,
+		`ragmux_guardrail_webhook_total{project="7",outcome="skipped_fail_open"} 1`,
+		`ragmux_guardrail_webhook_total{project="7",outcome="other"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %s in:\n%s", want, text)
+		}
+	}
+	if n := strings.Count(text, "ragmux_guardrail_events_total{"); n != 3 {
+		t.Errorf("%d event series, want 3:\n%s", n, text)
+	}
+	for _, leak := range []string{"tckn-rule", "10000000146", "hooks.example"} {
+		if strings.Contains(text, leak) {
+			t.Errorf("%q reached a label", leak)
+		}
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordGuardrailEvents("7", GuardrailStagePreRequest, GuardrailFlag, 1) // must not panic
+	nilMetrics.RecordGuardrailWebhook("7", GuardrailWebhookOK)
+}
