@@ -96,6 +96,12 @@ type Config struct {
 	// PrivateUpstreamAllowlist lists hostnames (lower-case) that may resolve
 	// to private addresses even when AllowPrivateUpstreams is false.
 	PrivateUpstreamAllowlist map[string]bool
+	// PrivateWebhookAllowlist lists hostnames (lower-case) an outbound webhook
+	// may reach even though they resolve to private, loopback or link-local
+	// addresses (ADR-033). It is deliberately separate from
+	// PrivateUpstreamAllowlist: an upstream exemption must not leak to a URL a
+	// project editor types, and ALLOW_PRIVATE_UPSTREAMS has no effect on webhooks.
+	PrivateWebhookAllowlist map[string]bool
 	// StreamMaxDuration bounds one streaming provider response end to end.
 	StreamMaxDuration time.Duration
 	// RerankTimeout overrides both reranker timeouts: the LLM backend's
@@ -414,6 +420,12 @@ func Load() (Config, error) {
 	for _, h := range strings.Split(os.Getenv("PRIVATE_UPSTREAM_ALLOWLIST"), ",") {
 		if h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), "."); h != "" {
 			c.PrivateUpstreamAllowlist[h] = true
+		}
+	}
+	c.PrivateWebhookAllowlist = map[string]bool{}
+	for _, h := range strings.Split(os.Getenv("PRIVATE_WEBHOOK_ALLOWLIST"), ",") {
+		if h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), "."); h != "" {
+			c.PrivateWebhookAllowlist[h] = true
 		}
 	}
 	c.StreamMaxDuration = 30 * time.Minute

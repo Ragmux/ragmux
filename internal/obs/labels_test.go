@@ -166,3 +166,29 @@ func TestQueryCondenseOutcomeIsBounded(t *testing.T) {
 	var nilMetrics *Metrics
 	nilMetrics.RecordQueryCondense(CondenseOK) // must not panic
 }
+
+// TestWebhookDeliveryLabelsAreBounded: purpose and outcome are chosen by the
+// webhook package from closed sets, and RecordWebhookDelivery holds the line
+// even if a caller one day passes it a URL or an error message (ADR-002).
+func TestWebhookDeliveryLabelsAreBounded(t *testing.T) {
+	reg := metrics.New(metrics.Options{})
+	m := New(reg)
+	m.RecordWebhookDelivery(WebhookPurposeAlerts, WebhookDelivered)
+	m.RecordWebhookDelivery(WebhookPurposeGuardrail, WebhookFailed)
+	for _, bad := range []string{"https://hooks.example/secret-path", "ALERTS", "", "x\ny"} {
+		m.RecordWebhookDelivery(bad, bad)
+	}
+	text := reg.Text()
+	if !strings.Contains(text, `ragmux_webhook_deliveries_total{outcome="delivered",purpose="alerts"} 1`) &&
+		!strings.Contains(text, `ragmux_webhook_deliveries_total{purpose="alerts",outcome="delivered"} 1`) {
+		t.Errorf("delivered alert not counted:\n%s", text)
+	}
+	if n := strings.Count(text, "ragmux_webhook_deliveries_total{"); n != 3 {
+		t.Errorf("%d series, want the two real ones plus other/other:\n%s", n, text)
+	}
+	if strings.Contains(text, "hooks.example") || strings.Contains(text, "secret-path") {
+		t.Error("a URL reached a label")
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordWebhookDelivery(WebhookPurposeAlerts, WebhookRetry) // must not panic
+}

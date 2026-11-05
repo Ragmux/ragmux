@@ -274,36 +274,16 @@ func (s *Store) resealRows(ctx context.Context, tx pgx.Tx, to *cipher, todo []en
 // ReencryptConnections re-encrypts every stored provider key with the key
 // given as 64 hex characters, in one transaction, and verifies each row
 // decrypts with the new key before committing. Rows come out at the current
-// key version. It returns the number of rows rewritten. The store keeps
-// using its current key; restart the gateway with the new SECRET_KEY
+// key version. It returns the number of connection rows rewritten. The store
+// keeps using its current key; restart the gateway with the new SECRET_KEY
 // afterwards.
+//
+// It is ReencryptSealed seen through its connection count: the canary and the
+// other sealed columns (webhook secrets, ...) move in the same transaction,
+// because a rotation that left any of them behind would strand it.
 func (s *Store) ReencryptConnections(ctx context.Context, newKeyHex string) (int, error) {
-	newCipher, _, err := loadCipher(newKeyHex, "", s.log)
-	if err != nil {
-		return 0, err
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
-	todo, err := lockedRows(ctx, tx, "")
-	if err != nil {
-		return 0, err
-	}
-	if err := s.resealRows(ctx, tx, newCipher, todo); err != nil {
-		return 0, err
-	}
-	// The canary moves with the credentials, in the same transaction: the
-	// next start verifies it before it reads anything, so a rotation that
-	// left it sealed with the old key would refuse to boot.
-	if err := resealCanaryTx(ctx, tx, newCipher); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return len(todo), nil
+	rep, err := s.ReencryptSealed(ctx, newKeyHex)
+	return rep.Connections, err
 }
 
 // UpgradeConnectionKeys re-seals every credential still stored without

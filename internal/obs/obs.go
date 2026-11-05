@@ -117,6 +117,27 @@ var condenseOutcomes = map[string]bool{
 	CondenseOK: true, CondenseError: true, CondenseTimeout: true, CondenseInvalid: true,
 }
 
+// Webhook purposes and delivery outcomes (ADR-033), the values of
+// ragmux_webhook_deliveries_total{purpose,outcome}. Both sets are closed on
+// purpose: the endpoint URL, the receiver's reply and err.Error() are never
+// labels (ADR-002). "retry" is an attempt that failed and was rescheduled,
+// "failed" a delivery that ran out of attempts (or a synchronous call that
+// failed), "disabled" a 410 Gone that closed the endpoint.
+const (
+	WebhookPurposeGuardrail = "guardrail"
+	WebhookPurposeAlerts    = "alerts"
+
+	WebhookDelivered = "delivered"
+	WebhookRetry     = "retry"
+	WebhookFailed    = "failed"
+	WebhookDisabled  = "disabled"
+)
+
+var (
+	webhookPurposes = map[string]bool{WebhookPurposeGuardrail: true, WebhookPurposeAlerts: true}
+	webhookOutcomes = map[string]bool{WebhookDelivered: true, WebhookRetry: true, WebhookFailed: true, WebhookDisabled: true}
+)
+
 // Metrics holds every family this process exports.
 type Metrics struct {
 	reg *metrics.Registry
@@ -160,6 +181,8 @@ type Metrics struct {
 	ingestEmbedTok  *metrics.CounterVec
 	ingestClaims    *metrics.CounterVec
 	ingestLeaseLost *metrics.CounterVec
+
+	webhookDeliveries *metrics.CounterVec
 
 	retentionLastSuccess *metrics.GaugeVec
 }
@@ -261,6 +284,10 @@ func New(reg *metrics.Registry) *Metrics {
 		"Dispatcher claim attempts by outcome.", "outcome")
 	m.ingestLeaseLost = reg.Counter("ragmux_ingest_lease_lost_total",
 		"Jobs abandoned because another replica took the document's lease.")
+
+	m.webhookDeliveries = reg.Counter("ragmux_webhook_deliveries_total",
+		"Outbound webhook attempts by purpose (guardrail, alerts) and outcome: delivered, retry, "+
+			"failed or disabled. The endpoint URL is never a label.", "purpose", "outcome")
 
 	m.retentionLastSuccess = reg.Gauge("ragmux_retention_last_success_timestamp_seconds",
 		"Unix time of the last retention pass this replica completed without error; 0 until one has. "+
@@ -526,6 +553,22 @@ func (m *Metrics) RecordQueryCondense(outcome string) {
 		outcome = otherLabel
 	}
 	m.ragCondense.With(outcome).Inc()
+}
+
+// RecordWebhookDelivery counts one webhook attempt. A purpose or outcome
+// outside the closed Webhook* sets is counted as "other" rather than becoming
+// a label.
+func (m *Metrics) RecordWebhookDelivery(purpose, outcome string) {
+	if m == nil {
+		return
+	}
+	if !webhookPurposes[purpose] {
+		purpose = otherLabel
+	}
+	if !webhookOutcomes[outcome] {
+		outcome = otherLabel
+	}
+	m.webhookDeliveries.With(purpose, outcome).Inc()
 }
 
 // RecordEmbedQuery records the query embedding call of a retrieval.

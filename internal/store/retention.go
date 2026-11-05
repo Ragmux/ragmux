@@ -26,6 +26,9 @@ const (
 	// RetainSessionUsage removes the totals of sessions idle for as long as
 	// request logs are kept (ADR-032).
 	RetainSessionUsage
+	// RetainWebhookDeliveries removes outbox rows (delivered, failed or
+	// still pending) older than the request log window (ADR-033).
+	RetainWebhookDeliveries
 )
 
 type retentionSpec struct {
@@ -51,6 +54,8 @@ var retentionSpecs = map[RetentionTable]retentionSpec{
 	// just outlives the key it names.
 	RetainAPIKeys: {"api_keys",
 		"(revoked_at < $1 OR expires_at < $1) AND NOT EXISTS (SELECT 1 FROM request_logs WHERE api_key_id = api_keys.id)", ""},
+	// Outbox rows carry an alert body only, never request content (ADR-033).
+	RetainWebhookDeliveries: {"webhook_deliveries", "created_at < $1", "created_at"}, // idx_webhook_deliveries_created
 }
 
 func (t RetentionTable) String() string {

@@ -400,3 +400,39 @@ func TestLoadOTLPInsecure(t *testing.T) {
 		t.Errorf("a bad traces value must be rejected naming its variable, got %v", err)
 	}
 }
+
+// PRIVATE_WEBHOOK_ALLOWLIST is its own list (ADR-033): an upstream exemption
+// must not leak to a webhook URL a project editor types, nor the reverse.
+func TestLoadPrivateWebhookAllowlist(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+	t.Setenv("PRIVATE_WEBHOOK_ALLOWLIST", " Guard.Internal ,pii.local.,, ")
+	t.Setenv("PRIVATE_UPSTREAM_ALLOWLIST", "ollama")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"guard.internal": true, "pii.local": true}
+	if len(c.PrivateWebhookAllowlist) != len(want) {
+		t.Fatalf("webhook allowlist = %v, want %v", c.PrivateWebhookAllowlist, want)
+	}
+	for h := range want {
+		if !c.PrivateWebhookAllowlist[h] {
+			t.Errorf("webhook allowlist = %v, missing %q", c.PrivateWebhookAllowlist, h)
+		}
+	}
+	if c.PrivateWebhookAllowlist["ollama"] {
+		t.Error("PRIVATE_UPSTREAM_ALLOWLIST filled the webhook allowlist")
+	}
+	if !c.PrivateUpstreamAllowlist["ollama"] || c.PrivateUpstreamAllowlist["guard.internal"] {
+		t.Errorf("upstream allowlist = %v, want only ollama", c.PrivateUpstreamAllowlist)
+	}
+
+	t.Setenv("PRIVATE_WEBHOOK_ALLOWLIST", "")
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PrivateWebhookAllowlist == nil || len(c.PrivateWebhookAllowlist) != 0 {
+		t.Errorf("unset webhook allowlist = %v, want an empty non-nil map", c.PrivateWebhookAllowlist)
+	}
+}

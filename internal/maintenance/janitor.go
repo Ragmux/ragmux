@@ -82,6 +82,12 @@ type Report struct {
 	// SessionUsage counts session totals removed in the pass: sessions idle
 	// for longer than the request log window.
 	SessionUsage int64
+	// WebhookDeliveries counts outbox rows removed in the pass (ADR-033).
+	WebhookDeliveries int64
+	// WebhookSecretsCleared counts endpoints whose retired signing secret
+	// (past its 24 hour rotation window) was dropped in the pass. It is an
+	// update, not a deletion, and is not counted in Deleted.
+	WebhookSecretsCleared int64
 	// UsagePurged reports whether the usage counter purge ran.
 	UsagePurged bool
 	// DocumentsFailed counts documents that ran out of ingestion attempts.
@@ -91,7 +97,7 @@ type Report struct {
 // Deleted is the number of rows the pass removed across every table.
 // DocumentsFailed is an update, not a deletion, and is not counted.
 func (r Report) Deleted() int64 {
-	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys + r.SessionUsage
+	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys + r.SessionUsage + r.WebhookDeliveries
 }
 
 func (j *Janitor) now() time.Time {
@@ -131,6 +137,9 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 		// Session totals follow the request logs they summarise: a session idle
 		// for longer than the window has no row left to open (ADR-032).
 		{store.RetainSessionUsage, "session usage", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.SessionUsage},
+		// Webhook deliveries (alert bodies and delivery outcomes) follow the
+		// request log window, LOG_RETENTION_DAYS (ADR-033).
+		{store.RetainWebhookDeliveries, "webhook deliveries", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.WebhookDeliveries},
 		{store.RetainAuditLogs, "audit logs", now.AddDate(0, 0, -j.AuditDays), j.AuditDays <= 0, &rep.AuditLogs},
 		{store.RetainLoginAttempts, "login attempts", now.Add(-LoginAttemptRetention), false, &rep.LoginAttempts},
 		{store.RetainSessions, "sessions", now, false, &rep.Sessions},
@@ -158,6 +167,14 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 		} else {
 			rep.UsagePurged = true
 		}
+	}
+	if n, err := j.Store.ClearExpiredWebhookSecrets(ctx); err != nil {
+		if ctx.Err() != nil {
+			return rep, errors.Join(errs...)
+		}
+		errs = append(errs, fmt.Errorf("expired webhook secrets: %w", err))
+	} else {
+		rep.WebhookSecretsCleared = n
 	}
 	if j.IngestMaxAttempts > 0 {
 		n, err := j.Store.FailExhaustedDocuments(ctx, j.IngestMaxAttempts)
@@ -308,5 +325,5 @@ func (j *Janitor) runLogged(ctx context.Context) {
 		"interrupted", ctx.Err() != nil,
 		"request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
 		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "api_keys", rep.APIKeys,
-		"session_usage", rep.SessionUsage, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
+		"session_usage", rep.SessionUsage, "webhook_deliveries", rep.WebhookDeliveries, "webhook_secrets_cleared", rep.WebhookSecretsCleared, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
 }

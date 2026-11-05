@@ -17,8 +17,9 @@ import (
 
 // rotateKey implements `ragmux rotate-key --new <hex>`: it opens the database
 // with the current SECRET_KEY (or SECRET_KEY_FILE / the secret.key fallback),
-// re-encrypts every provider credential with the new key in one transaction
-// and prints how many rows changed. The gateway must then be restarted with
+// re-encrypts every provider credential and every other secret the key
+// protects (webhook secrets, ...) with the new key in one transaction and
+// prints how many rows changed. The gateway must then be restarted with
 // the new key; until then it keeps working with the old one only for rows
 // that were not rewritten, i.e. none, so stop it first.
 func rotateKey(args []string) int {
@@ -26,7 +27,7 @@ func rotateKey(args []string) int {
 	fs.SetOutput(os.Stderr)
 	newKey := fs.String("new", "", "new SECRET_KEY as 64 hex characters (openssl rand -hex 32)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: ragmux rotate-key --new <hex>\n\nRe-encrypts the stored provider API keys with a new SECRET_KEY. Stop the gateway first, run this with the current key in the environment, then start the gateway with the new key.")
+		fmt.Fprintln(os.Stderr, "Usage: ragmux rotate-key --new <hex>\n\nRe-encrypts the stored provider API keys and webhook secrets with a new SECRET_KEY. Stop the gateway first, run this with the current key in the environment, then start the gateway with the new key.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -56,11 +57,26 @@ func rotateKey(args []string) int {
 		return 1
 	}
 	defer func() { _ = st.Close() }()
-	n, err := st.ReencryptConnections(ctx, key)
+	rep, err := st.ReencryptSealed(ctx, key)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "rotate-key:", err)
 		return 1
 	}
-	fmt.Printf("rotate-key: re-encrypted %d model connection(s); start the gateway with the new SECRET_KEY\n", n)
+	fmt.Print(rotateSummary(rep))
 	return 0
+}
+
+// rotateSummary is the success output of rotate-key: the connection line the
+// command has always printed, then one line per registered sealed column that
+// held rows.
+func rotateSummary(rep store.SealedReport) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "rotate-key: re-encrypted %d model connection(s)", rep.Connections)
+	b.WriteString("; start the gateway with the new SECRET_KEY\n")
+	for _, c := range rep.Columns {
+		if c.Rows > 0 {
+			fmt.Fprintf(&b, "rotate-key: re-encrypted %d %s.%s value(s)\n", c.Rows, c.Table, c.Column)
+		}
+	}
+	return b.String()
 }

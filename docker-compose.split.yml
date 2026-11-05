@@ -40,6 +40,8 @@ services:
       # local addresses unless listed here (e.g. "host.docker.internal,ollama")
       # or allowed wholesale.
       PRIVATE_UPSTREAM_ALLOWLIST: ${PRIVATE_UPSTREAM_ALLOWLIST:-}
+      # Outbound webhooks have their own list; the upstream one does not apply.
+      PRIVATE_WEBHOOK_ALLOWLIST: ${PRIVATE_WEBHOOK_ALLOWLIST:-}
       ALLOW_PRIVATE_UPSTREAMS: ${ALLOW_PRIVATE_UPSTREAMS:-false}
     depends_on:
       postgres:

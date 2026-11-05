@@ -417,6 +417,82 @@ func TestReportDeleted(t *testing.T) {
 	}
 }
 
+func TestReportDeletedCountsWebhookDeliveries(t *testing.T) {
+	if got := (Report{WebhookDeliveries: 3}).Deleted(); got != 3 {
+		t.Errorf("Deleted() = %d, want 3", got)
+	}
+}
+
+// The janitor's pass covers the webhook outbox: rows older than the request
+// log window go, newer ones stay, and the count is in the report.
+func TestRunOnceTrimsWebhookDeliveries(t *testing.T) {
+	f := seed(t)
+	ep, err := f.st.CreateWebhookEndpoint(f.ctx, &store.WebhookEndpoint{ProjectID: f.proj, Purpose: store.WebhookPurposeAlerts,
+		URL: "https://hooks.example/a", Secret: "whsec_QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"old", "fresh"} {
+		if ok, err := f.st.EnqueueWebhookDelivery(f.ctx, ep.ID, "limit.warning", k, []byte(`{}`)); err != nil || !ok {
+			t.Fatalf("enqueue %s: %v %v", k, ok, err)
+		}
+	}
+	for k, age := range map[string]int{"old": 100, "fresh": 10} {
+		if _, err := f.st.DB().Exec(f.ctx, "UPDATE webhook_deliveries SET created_at = $2 WHERE dedupe_key = $1", k, f.now.AddDate(0, 0, -age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+	rep, err := j.RunOnce(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.WebhookDeliveries != 1 {
+		t.Errorf("report = %+v, want one webhook delivery removed", rep)
+	}
+	if n := f.count("webhook_deliveries"); n != 1 {
+		t.Errorf("webhook_deliveries: %d rows left, want 1", n)
+	}
+	if rep.Deleted() != rep.RequestLogs+rep.AuditLogs+rep.LoginAttempts+rep.Sessions+rep.SessionUsage+1 {
+		t.Errorf("Deleted() = %d does not include the webhook rows: %+v", rep.Deleted(), rep)
+	}
+	// With the window off the table is kept forever, like request logs.
+	if _, err := f.st.DB().Exec(f.ctx, "UPDATE webhook_deliveries SET created_at = $1", f.now.AddDate(0, 0, -400)); err != nil {
+		t.Fatal(err)
+	}
+	j.RequestLogDays = 0
+	if rep, err = j.RunOnce(f.ctx); err != nil || rep.WebhookDeliveries != 0 || f.count("webhook_deliveries") != 1 {
+		t.Errorf("RequestLogDays=0: report %+v err %v, rows %d; want the row kept", rep, err, f.count("webhook_deliveries"))
+	}
+}
+
+// The pass drops a retired webhook secret once its 24 hour window is over.
+func TestRunOnceClearsExpiredWebhookSecrets(t *testing.T) {
+	f := seed(t)
+	ep, err := f.st.CreateWebhookEndpoint(f.ctx, &store.WebhookEndpoint{ProjectID: f.proj, Purpose: store.WebhookPurposeAlerts,
+		URL: "https://hooks.example/a", Secret: "whsec_QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.RotateWebhookSecret(f.ctx, ep.ID, "whsec_QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=", 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+	if rep, err := j.RunOnce(f.ctx); err != nil || rep.WebhookSecretsCleared != 0 {
+		t.Fatalf("inside the window: %+v, %v", rep, err)
+	}
+	if _, err := f.st.DB().Exec(f.ctx, "UPDATE webhook_endpoints SET prev_expires_at = now() - interval '1 minute'"); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := j.RunOnce(f.ctx)
+	if err != nil || rep.WebhookSecretsCleared != 1 {
+		t.Fatalf("after the window: %+v, %v", rep, err)
+	}
+	if got, _ := f.st.GetWebhookEndpointByID(f.ctx, ep.ID); got.PrevSecret != "" || got.PrevExpiresAt != nil {
+		t.Errorf("previous secret kept: %+v", got)
+	}
+}
+
 // logRecords decodes the JSON lines a slog.JSONHandler wrote.
 func logRecords(t *testing.T, buf *bytes.Buffer) []map[string]any {
 	t.Helper()
