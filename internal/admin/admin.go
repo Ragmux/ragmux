@@ -95,6 +95,9 @@ func (a *Admin) Routes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(requestIDHeader, httpx.NoStore, httpx.ReadDeadline(jsonReadDeadline))
 		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/login", a.login)
+		// Second step of an account with TOTP: unauthenticated like login, its
+		// credential is the challenge the first step handed out.
+		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/login/mfa", a.loginMFA)
 		// First-run setup: unauthenticated by design, refuses once any user exists.
 		r.Get("/api/setup", a.setupStatus)
 		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/setup", a.setup)
@@ -143,6 +146,12 @@ func (a *Admin) authenticated(r chi.Router) {
 	r.Post("/api/logout", a.logout)
 	r.Get("/api/me", a.me)
 	r.Post("/api/me/password", a.changePassword)
+	// Two-factor authentication: no scope, like the password change; each
+	// handler refuses an api-key principal itself (sessionOnly).
+	r.Post("/api/me/totp/setup", a.totpSetup)
+	r.Post("/api/me/totp/enable", a.totpEnable)
+	r.Post("/api/me/totp/disable", a.totpDisable)
+	r.Post("/api/me/totp/recovery-codes", a.totpRecoveryCodes)
 
 	read.Get("/api/provider-types", a.providerTypes)
 	read.Get("/api/provider-presets", a.providerPresets)
@@ -237,16 +246,17 @@ func (a *Admin) authenticated(r chi.Router) {
 	adminOnly.Put("/api/users/{id}", a.updateUser)
 	adminOnly.Delete("/api/users/{id}", a.deleteUser)
 	adminOnly.Post("/api/users/{id}/reset-password", a.resetPassword)
+	adminOnly.Post("/api/users/{id}/totp/reset", a.resetUserTOTP)
 	adminOnly.Post("/api/users/{id}/sessions/revoke", a.revokeSessions)
 	adminOnly.Get("/api/audit", a.listAudit)
 	adminOnly.Get("/api/audit/export", a.exportAudit)
 	adminOnly.Get("/api/security/logins", a.loginSecurity)
 }
 
-// sessionOnly refuses an api-key principal. It guards the three actions that
-// could take an account over — changing a password, resetting one and minting
-// a management key — so a leaked key cannot lock its owner out or extend its
-// own reach beyond the key that leaked.
+// sessionOnly refuses an api-key principal. It guards the actions that could
+// take an account over — changing a password, resetting one, minting a
+// management key and every two-factor action — so a leaked key cannot lock its
+// owner out or extend its own reach beyond the key that leaked.
 func sessionOnly(w http.ResponseWriter, r *http.Request) bool {
 	if auth.SessionFrom(r.Context()).IsKey() {
 		writeErrCode(w, http.StatusForbidden, "session_required",
@@ -359,7 +369,7 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 	if !a.allowAttempt(w, r, in.Username, ip) {
 		return
 	}
-	u, tok, err := a.Auth.Login(ctx, in.Username, in.Password)
+	u, err := a.Auth.Authenticate(ctx, in.Username, in.Password)
 	if a.Limiter != nil {
 		if rerr := a.Limiter.Record(ctx, in.Username, ip, err == nil); rerr != nil {
 			a.Log.Error("record login attempt", "err", rerr)
@@ -374,16 +384,19 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.Store.TouchLastLogin(ctx, u.ID); err != nil {
-		a.Log.Error("touch last login", "err", err)
+	// The password was right. An account with a second factor gets a
+	// challenge, never a session, from this endpoint (ADR-037); an account
+	// with an abandoned setup (a secret, never enabled) logs in as before.
+	st, err := a.Store.GetTOTPStatus(ctx, u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
 	}
-	a.auditAs(r, u, "login.success", "user", &u.ID, nil)
-	a.Auth.SetCookie(w, r, tok)
-	out := map[string]any{"user": u}
-	if in.Bearer {
-		out["token"] = tok
+	if st.Enabled {
+		a.startMFA(w, r, u, in.Bearer, ip)
+		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	a.finishLogin(w, r, u, in.Bearer, true)
 }
 
 // invalidCredentials answers a failed login. The body carries the number of
@@ -491,7 +504,16 @@ func (a *Admin) me(w http.ResponseWriter, r *http.Request) {
 		SessionBearer    bool     `json:"session_bearer"`
 		SessionKind      string   `json:"session_kind"`
 		Scopes           []string `json:"scopes,omitempty"`
+		// TOTPEnabled tells a client which of enable and disable to offer
+		// (ADR-037); a pending secret that was never enabled reads false.
+		TOTPEnabled bool `json:"totp_enabled"`
 	}{User: auth.UserFrom(r.Context()), SessionKind: "session"}
+	st, err := a.Store.GetTOTPStatus(r.Context(), out.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	out.TOTPEnabled = st.Enabled
 	if se := auth.SessionFrom(r.Context()); se != nil {
 		if !se.ExpiresAt.IsZero() {
 			out.SessionExpiresAt = se.ExpiresAt.UTC().Format(time.RFC3339)
@@ -518,8 +540,9 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := auth.UserFrom(r.Context())
-	if len(in.Current) > maxLoginPasswordLen || !auth.CheckPassword(u.PasswordHash, in.Current) {
-		writeErr(w, http.StatusForbidden, "current password is wrong")
+	// A session tries at most five wrong passwords, here as in the TOTP
+	// endpoints; the fifth ends the session (T10).
+	if !a.checkSessionPassword(w, r, u, in.Current, "current password is wrong") {
 		return
 	}
 	h, err := auth.HashPassword(in.New)
@@ -528,6 +551,13 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Store.UpdateUserPassword(r.Context(), u.ID, h); err != nil {
+		a.fail(w, err)
+		return
+	}
+	// A second-factor challenge opened with the old password is not answerable
+	// with the new one. The failed-code rows stay: rotating the password must
+	// not reset the MFA counter.
+	if err := a.Store.DeleteUserLoginChallenges(r.Context(), u.ID); err != nil {
 		a.fail(w, err)
 		return
 	}

@@ -41,6 +41,9 @@ const (
 	RetainAlertEventsEndUserMonth
 	RetainAlertEventsDay
 	RetainAlertEventsMonth
+	// RetainLoginChallenges removes second-factor challenges past their five
+	// minutes (ADR-037), compared with expires_at like sessions.
+	RetainLoginChallenges
 )
 
 type retentionSpec struct {
@@ -78,6 +81,8 @@ var retentionSpecs = map[RetentionTable]retentionSpec{
 		"subject_kind <> 'end_user' AND limit_kind = 'budget_daily_tokens' AND window_start < $1", "window_start"},
 	RetainAlertEventsMonth: {"alert_events",
 		"subject_kind <> 'end_user' AND limit_kind <> 'budget_daily_tokens' AND window_start < $1", "window_start"},
+	// A challenge is useless once expires_at has passed, whatever its attempts.
+	RetainLoginChallenges: {"login_challenges", "expires_at <= $1", "expires_at"}, // idx_login_challenges_expires
 }
 
 func (t RetentionTable) String() string {

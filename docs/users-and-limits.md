@@ -84,13 +84,18 @@ replace the member set freely.
   deactivate or delete their own account (`400`).
 - `POST /admin/api/users/{id}/reset-password` sets a new password and revokes the user's
   sessions; `POST /admin/api/users/{id}/sessions/revoke` only signs the user out everywhere.
+  It cannot be used on your own account (`400`): you change your own password with
+  `POST /admin/api/me/password`, which asks for the current one.
 - Passwords must be at least 12 characters and at most 72 bytes (bcrypt's input limit);
   usernames at most 64. The same rule applies everywhere a password is set: creating a
   user, resetting or changing a password, the first-run setup, `ragmux reset-password`
   and `ADMIN_PASSWORD`. Existing passwords are not re-checked; they keep working until
   they are changed.
 - Changing your own password (`POST /admin/api/me/password`) signs out every other
-  session of the account; the session that made the change stays valid.
+  session of the account; the session that made the change stays valid. A session may
+  type at most five wrong passwords for it (and for the
+  [two-factor](#two-factor-authentication-totp) actions that also ask for the password);
+  the fifth ends the session. A right password gives the five back.
 - `POST /admin/api/users` accepts `project_ids`; the memberships are written in the same
   transaction as the account, and an unknown id fails the whole request with `422`.
 - `GET /admin/api/users` reports `project_count` and `active_sessions` per user;
@@ -162,10 +167,12 @@ management key. To keep a key out of the new endpoints, edit its scopes after up
 endpoints automatically, like every other `/v1` route. It cannot be narrowed; mint a
 user-owned gateway key with the scopes you want when you need that.
 
-Three actions refuse an api-key principal outright and answer
+These actions refuse an api-key principal outright and answer
 `403 {"error":{"code":"session_required"}}`: changing your own password, resetting
-someone else's, and creating a `management` key. A leaked key must not be able to lock
-its owner out of the account or mint a successor.
+someone else's, creating a `management` key, and everything about
+[two-factor authentication](#two-factor-authentication-totp) (switching it on or off,
+new recovery codes, an admin's reset). A leaked key must not be able to lock its owner
+out of the account or mint a successor.
 
 **Projects a gateway key may call** are the grants listed on the key, not the owner's
 project memberships. Membership is a dashboard-visibility concept; requiring both would
@@ -255,6 +262,11 @@ per-minute limits still slow them down. Setting a limit to `0` disables it. Succ
 logins do not reset the counters; the windows simply expire. Attempts older than 24
 hours are purged hourly.
 
+The counters are keyed on the lower-cased username, as the account itself is: `ali`,
+`ALI` and `Ali` share one budget. They only count password failures; wrong
+[two-factor](#two-factor-authentication-totp) codes are recorded in the same table under
+their own stage and never reach these limits.
+
 A failed login (`401`) carries `attempts_remaining`: the per-user budget minus the
 failures recorded for that username in the last minute, never below zero and absent
 when `LOGIN_USER_LIMIT_PER_MIN` is `0`. The number only depends on the recorded
@@ -262,7 +274,7 @@ attempts, so a wrong password and a username that does not exist get identical
 responses and the endpoint does not reveal which accounts exist.
 
 Admins see the state of the limiter with `GET /admin/api/security/logins`: failed
-attempts in the last hour and 24 hours, and the username/address pairs currently locked
+password attempts (wrong second-factor codes are not counted) in the last hour and 24 hours, and the username/address pairs currently locked
 out with the time the lockout ends. The list is computed with the limiter's own rule, so
 it matches exactly what `POST /admin/api/login` refuses.
 
@@ -270,6 +282,84 @@ The client IP is the TCP peer address unless `TRUST_PROXY_HEADERS=true`, in whic
 the last `X-Forwarded-For` entry (or `X-Real-IP`) is used, optionally restricted with
 `TRUSTED_PROXY_CIDRS`; only enable it behind a reverse proxy (see
 [Configuration](configuration.md#behind-a-reverse-proxy)).
+
+## Two-factor authentication (TOTP)
+
+Any account can switch on a time-based one-time password (RFC 6238: HMAC-SHA1, six
+digits, 30 seconds, one step of clock drift either side) from an authenticator app.
+Nothing is required of anybody: there is no instance-wide setting that forces it.
+
+**Switching it on** takes two calls from a signed-in dashboard session; these and the two
+that manage it afterwards each ask for the account password again:
+
+1. `POST /admin/api/me/totp/setup {"password"}` returns a new `secret` and an
+   `otpauth_uri` for the app (a client draws the QR code from it). Until step 2 the login
+   stays one-step, and another `setup` replaces the pending secret. With two-factor
+   authentication already on it answers `409 totp_already_enabled` and changes nothing:
+   to move to a new phone, `disable`, then `setup` and `enable` again. There is a short
+   window between `disable` and `enable` in which the account has no second factor.
+2. `POST /admin/api/me/totp/enable {"password", "code"}` checks the first code, switches
+   it on, returns **ten recovery codes once** (`xxxxx-xxxxx`, 50 bits each, stored only as
+   SHA-256 hashes) and ends the account's other sessions.
+
+`POST /admin/api/me/totp/disable {"password", "code" | "recovery_code"}` and
+`POST /admin/api/me/totp/recovery-codes {"password", "code"}` then turn it off and replace
+the recovery codes. `GET /admin/api/me` reports `totp_enabled`, so a client knows which of
+the two sets of calls to offer.
+
+**Signing in** is then two steps: `POST /admin/api/login` with the password answers a
+`challenge_token` (five minutes, single use, closed after five wrong codes) and no
+session, and `POST /admin/api/login/mfa` with the challenge and a code (or a recovery
+code, once) opens it. A code is accepted once: a step already used is refused. This
+holds for `"bearer": true` as well. A script that logs in with a password and takes the
+token from the body therefore stops working for an account that turns two-factor
+authentication on; **automation uses a management key** (see
+[API keys](#api-keys)). Management keys minted before the account switched TOTP on stay
+valid: review them, and revoke what is not needed.
+
+**The lock.** Five wrong codes in 15 minutes, counted together over `login/mfa`, `enable`,
+`disable` and `recovery-codes`, lock the account's second factor. While it is locked every
+one of those answers `429` with `Retry-After` even for a right code or recovery code, and
+a right password at `/login` gets `429` instead of a challenge; wrong passwords keep
+answering `401` as before. The lock lifts by itself when the oldest of the five leaves
+the 15-minute window. Parallel requests cannot go past it: a check of one account runs
+alone, and a request that arrives while another is running answers `429` with
+`Retry-After: 1` and is not counted.
+
+What this costs. Someone who knows the password can keep the lock closed by typing five
+wrong codes every 15 minutes, and then neither the right code nor `disable` works for the
+real user. A user who still has a session can end the attack by changing the password
+(`POST /admin/api/me/password` closes the open challenges, so the attacker can no longer
+get to the code step). A user without a session needs another admin or the server:
+
+- another admin's `POST /admin/api/users/{id}/reset-password` forgets the account's wrong
+  codes and closes its open challenges, and leaves two-factor authentication on;
+- another admin's `POST /admin/api/users/{id}/totp/reset` does the same and switches
+  two-factor authentication off;
+- `ragmux reset-password <user> ...` on the server does what `reset-password` does, and
+  with `--disable-totp` also deletes the secret and the recovery codes. Without that flag
+  it leaves two-factor authentication alone. With one admin and no phone, this is the way.
+
+**Admins** reset another user's two-factor authentication with
+`POST /admin/api/users/{id}/totp/reset` (secret, recovery codes, wrong-code history and the
+user's sessions go; an admin cannot do it to themselves, `disable` is theirs). An admin who
+can reset a password and a second factor can sign in as that user; that is what the admin
+role is. Both are audited (`user.reset_password`, `user.totp_reset`).
+
+**Audit.** `totp.setup`, `totp.enable`, `totp.disable`, `totp.recovery_regenerate`,
+`login.mfa_failure`, `login.mfa_locked`, `login.recovery_code_used` (with the codes left),
+`user.totp_reset`. The user is the target of the entry (`target_id`); `details` never carry
+the username, and `details.via` is one of `login`, `enable`, `disable`, `recovery_codes`.
+
+**Operating notes.**
+
+- The secret is stored sealed with `SECRET_KEY` (AAD bound to the account), so
+  `ragmux rotate-key` re-encrypts it with the provider keys and a lost key loses it.
+- **Do not go back to a binary older than v0.8 after an account has turned two-factor
+  authentication on.** That binary does not know the second factor and lets the password
+  in alone.
+- An abandoned setup (a secret, never enabled) does not make the login two-step.
+- Expired challenges are removed by the hourly retention pass.
 
 ## Audit log
 
@@ -283,7 +373,9 @@ small JSON `details` object that never contains credentials. Action names are
 `project.update`, `project.delete`, `project.rotate_key`, `project.members_update`,
 `user.create`, `user.update`, `user.delete`, `user.reset_password`,
 `user.revoke_sessions`, `apikey.create`, `apikey.update`, `apikey.revoke`,
-`apikey.delete`, `password.change`, `logout`, `setup.complete` for the first
+`apikey.delete`, `password.change`, `totp.setup`, `totp.enable`, `totp.disable`,
+`totp.recovery_regenerate`, `user.totp_reset`, `login.mfa_failure`, `login.mfa_locked`,
+`login.recovery_code_used`, `logout`, `setup.complete` for the first
 administrator created through the first-run form, and `audit.exported` for every
 export of the log (its `details` hold the filters used). The `apikey.*` entries record
 the key's name, kind, owner, scopes, grants, limits and 15-character display prefix —

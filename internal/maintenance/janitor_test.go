@@ -797,3 +797,34 @@ func TestReportDeletedCountsAlertEvents(t *testing.T) {
 		t.Errorf("Deleted() = %d, want 4", got)
 	}
 }
+
+// A second-factor challenge past its expires_at goes with the next pass, one
+// still open stays. The cutoff is the pass's clock, as for sessions.
+func TestRunOnceDeletesExpiredLoginChallenges(t *testing.T) {
+	f := seed(t)
+	var uid int64
+	if err := f.st.DB().QueryRow(f.ctx, "SELECT id FROM users LIMIT 1").Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	for i, exp := range []time.Time{f.now.Add(-time.Minute), f.now.Add(5 * time.Minute)} {
+		if _, err := f.st.DB().Exec(f.ctx, `INSERT INTO login_challenges (user_id, token_hash, expires_at)
+			VALUES ($1, $2, $3)`, uid, "hash"+string(rune('a'+i)), exp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+	rep, err := j.RunOnce(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.LoginChallenges != 1 {
+		t.Errorf("LoginChallenges = %d, want 1 (%+v)", rep.LoginChallenges, rep)
+	}
+	var left string
+	if err := f.st.DB().QueryRow(f.ctx, "SELECT token_hash FROM login_challenges").Scan(&left); err != nil || left != "hashb" {
+		t.Errorf("challenge left = %q (%v), want the open one", left, err)
+	}
+	if n := f.count("login_challenges"); n != 1 {
+		t.Errorf("%d challenges left, want 1", n)
+	}
+}

@@ -154,3 +154,80 @@ func TestLoginLimiterRemainingAndLockouts(t *testing.T) {
 		t.Errorf("disabled lockout should list nothing: %+v", locks)
 	}
 }
+
+// T11: the account is one account whatever the casing, so its failures are one
+// counter. Without it "ali", "ALI" and "Ali" each had a budget of their own.
+func TestLoginLimiterCountsCasingsAsOneUser(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	l := &LoginLimiter{Store: s, PerIP: 100, PerUser: 5, LockoutFailures: 6, LockoutWindow: 15 * time.Minute}
+	for i, name := range []string{"ali", "ALI", "Ali", "aLi", "ALi"} {
+		if err := l.Record(ctx, name, "10.0.0.1", false); err != nil {
+			t.Fatal(err)
+		}
+		allowed, _, _, err := l.Check(ctx, "Ali", "10.0.0.2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := i < 4; allowed != want {
+			t.Fatalf("after %d failures spelled differently: allowed=%v, want %v", i+1, allowed, want)
+		}
+	}
+	var stored []string
+	rows, err := s.DB().Query(ctx, "SELECT DISTINCT username FROM login_attempts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			t.Fatal(err)
+		}
+		stored = append(stored, u)
+	}
+	if len(stored) != 1 || stored[0] != "ali" {
+		t.Errorf("stored usernames = %v, want [ali]", stored)
+	}
+	// The lockout counts the pair the same way: a sixth spelling from the same
+	// address locks it.
+	if err := l.Record(ctx, "aLI", "10.0.0.1", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, locked, err := l.Check(ctx, "ali", "10.0.0.1"); err != nil || !locked {
+		t.Errorf("the pair should be locked out: locked=%v err=%v", locked, err)
+	}
+	if rem, ok, err := l.Remaining(ctx, "ALI"); err != nil || !ok || rem != 0 {
+		t.Errorf("Remaining = %d %v %v, want 0", rem, ok, err)
+	}
+}
+
+// Second-factor failures live in the same table under stage 'mfa' and must not
+// show in any password counter: a locked second factor is not a password lock,
+// and a login 429 must not betray that an account has one.
+func TestLoginLimiterIgnoresMFAStage(t *testing.T) {
+	ctx := context.Background()
+	s := testdb.Open(t)
+	l := &LoginLimiter{Store: s, PerIP: 3, PerUser: 3, LockoutFailures: 3, LockoutWindow: 15 * time.Minute}
+	for i := 0; i < 10; i++ {
+		if _, err := s.DB().Exec(ctx,
+			"INSERT INTO login_attempts (username, ip, success, stage) VALUES ('ali', '10.0.0.1', false, 'mfa')"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if allowed, _, locked, err := l.Check(ctx, "ali", "10.0.0.1"); err != nil || !allowed || locked {
+		t.Errorf("mfa failures reached the password limiter: allowed=%v locked=%v err=%v", allowed, locked, err)
+	}
+	if rem, _, err := l.Remaining(ctx, "ali"); err != nil || rem != 3 {
+		t.Errorf("Remaining = %d, %v; want 3", rem, err)
+	}
+	if got, err := l.ActiveLockouts(ctx); err != nil || len(got) != 0 {
+		t.Errorf("ActiveLockouts = %v, %v; want none", got, err)
+	}
+	if err := l.Record(ctx, "ali", "10.0.0.1", false); err != nil {
+		t.Fatal(err)
+	}
+	if rem, _, _ := l.Remaining(ctx, "ali"); rem != 2 {
+		t.Errorf("a password failure after them: Remaining = %d, want 2", rem)
+	}
+}

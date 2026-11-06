@@ -33,6 +33,25 @@ bearer header wins when both are present. Sessions expire after `SESSION_TTL` (d
 sessions of the account), a password reset, a session revoke or deactivation of the
 account.
 
+An account that has switched on **two-factor authentication** (TOTP, see
+[Two-factor authentication](users-and-limits.md#two-factor-authentication-totp)) does
+not get a session from that call, with `bearer: true` or without. A right password
+answers
+
+```json
+{"mfa_required": true, "challenge_token": "…", "expires_at": "2026-09-18T10:05:00Z",
+ "methods": ["totp", "recovery_code"]}
+```
+
+with no cookie and no `token`. The challenge lives five minutes, answers once and
+closes after five wrong codes. `POST /admin/api/login/mfa` with
+`{"challenge_token": "…", "code": "123456"}` (or `"recovery_code": "abcde-fghjk"`
+instead of `code`) then answers like the one-step login: `{user}`, the cookie and,
+when the first step asked for `bearer: true`, `token`. A wrong code is
+`401 {"error":{"code":"mfa_invalid_code","attempts_left":3}}`, an expired, spent or
+unknown challenge `401 {"error":{"code":"mfa_challenge_invalid"}}`. Scripts that need
+to run without a second factor use a management key.
+
 ```bash
 TOKEN=$(curl -s localhost:8765/admin/api/login -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_PASSWORD","bearer":true}' | jq -r .token)
@@ -57,9 +76,10 @@ origins in `CORS_ORIGINS` (empty by default). The premise behind the existing ex
 therefore holds identically for management keys, and nothing about the cookie path is
 loosened.
 
-Three routes refuse an api-key principal outright with
+These routes refuse an api-key principal outright with
 `403 {"error":{"code":"session_required"}}` — `POST /me/password`,
-`POST /users/{id}/reset-password` and creating a `kind=management` key — so a leaked key
+`POST /users/{id}/reset-password`, `POST /users/{id}/totp/reset`, the four
+`/me/totp/*` routes and creating a `kind=management` key — so a leaked key
 cannot take over the account it belongs to.
 
 **What that guard assumes.** It treats a session as a person at a keyboard and an api
@@ -73,7 +93,7 @@ password reset, a session revoke or a deactivation, and cannot be listed, named 
 scoped — an api key outlives all of that until someone revokes it. Treat a bearer
 session token as a short-lived credential, keep it out of anything durable, and use a
 `sk-mgmt-…` key for automation that is supposed to persist; if a script genuinely needs
-one of the three routes above, it needs a human to sign in for it.
+one of the routes above, it needs a human to sign in for it.
 
 Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-Id`;
 unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
@@ -211,10 +231,15 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively |
+| POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively. For an account with two-factor authentication on, a right password answers `200 {mfa_required, challenge_token, expires_at, methods}` instead and issues no session (see [Authentication](#authentication)); `429` while that account's second factor is locked |
+| POST | `/login/mfa` | — | `{challenge_token, code}` or `{challenge_token, recovery_code}` → the same answer as a one-step login; `401` for a wrong code (`mfa_invalid_code`) or a dead challenge (`mfa_challenge_invalid`); `429` (`mfa_locked`, `Retry-After`) while the account's second factor is locked, even for a right code; `429` (`mfa_busy`, `Retry-After: 1`) while another check of the account is running |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
-| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
-| POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
+| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`), `totp_enabled` (`true` when the account has two-factor authentication on) and, for a key, its `scopes` |
+| POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required`. A session may try five wrong passwords here and on the `/me/totp/*` routes below; the fifth ends it, and a request after that is `401` (`code: password_attempts_exhausted` while the session still resolves, otherwise the plain `unauthorized`) |
+| POST | `/me/totp/setup` | viewer | `{password}` → `{secret, otpauth_uri}`: a new base32 secret and the `otpauth://` URI an authenticator app imports. `403 wrong_password`; `409 totp_already_enabled` when two-factor authentication is on (the secret in place is never replaced). Until `enable` the login stays one-step; another call replaces the pending secret. Session-only |
+| POST | `/me/totp/enable` | viewer | `{password, code}` → `{"ok": true, "recovery_codes": [...]}`: switches two-factor authentication on, returns ten recovery codes **once** and ends the account's other sessions. `409 totp_already_enabled` / `totp_not_set_up`; `403` for a wrong password (`wrong_password`) or code (`mfa_invalid_code`); `429` while locked. Session-only |
+| POST | `/me/totp/disable` | viewer | `{password, code}` or `{password, recovery_code}` → `{"ok": true}`: deletes the secret and the recovery codes. `409 totp_not_enabled`; errors as `enable`. Session-only |
+| POST | `/me/totp/recovery-codes` | viewer | `{password, code}` → `{"ok": true, "recovery_codes": [...]}`: ten new codes, shown once; the old ones stop working. `409 totp_not_enabled`; errors as `enable`. Session-only |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`chat`, `streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`, plus the model-level `native_json_schema`, `forced_tool_choice`, `thinking`, `thinking_off`, `effort_levels` and `thinking_prefix_bound`, reported for the provider's current generation) — see [Capabilities](providers.md#capabilities) |
 | GET | `/provider-presets` | viewer | Ready-made `custom_openai` setups for hosted OpenAI-compatible providers (Mistral, xAI, Groq), each with `id`, `label`, `provider_type`, `base_url`, suggested `models`, an optional `embedding_model` and `requires_api_key`. A preset is not stored: create the connection with `POST /models` using its `provider_type` and `base_url`. No preset carries a price — see [Presets](providers.md#presets) |
 
@@ -1030,7 +1055,8 @@ already knows.
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
 | DELETE | `/users/{id}` | admin | Delete → `{"ok": true}` |
-| POST | `/users/{id}/reset-password` | admin | `{new_password}` (at least 12 characters, at most 72 bytes); revokes the user's sessions |
+| POST | `/users/{id}/reset-password` | admin | `{new_password}` (at least 12 characters, at most 72 bytes); revokes the user's sessions and clears the account's wrong second-factor codes and open challenges; `400` for the caller's own account (use `POST /me/password`). Session-only |
+| POST | `/users/{id}/totp/reset` | admin | Removes the user's two-factor authentication (secret, recovery codes), its wrong-code history and its sessions → `{"ok": true}`; `400` for the caller's own account (use `/me/totp/disable`). Audited as `user.totp_reset`. Session-only |
 | POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
 | GET | `/audit` | admin | Audit entries, newest first, with the total for the filter |
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
@@ -1076,7 +1102,7 @@ an `audit.exported` entry whose `details` carry the filters that were used.
  "active_lockouts": [{"username": "admin", "ip": "203.0.113.7", "until": "2026-09-18T10:14:00Z"}]}
 ```
 
-The counters are failed attempts in the `login_attempts` table; `active_lockouts` lists
+The counters are failed password attempts in the `login_attempts` table (wrong second-factor codes are recorded there too but not counted); `active_lockouts` lists
 the username/address pairs the login limiter currently refuses, computed with the same
 `LOGIN_LOCKOUT_FAILURES` / `LOGIN_LOCKOUT_MINUTES` rule, with `until` the time the
 lockout ends (empty when the lockout is disabled).

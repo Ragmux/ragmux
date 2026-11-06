@@ -77,6 +77,9 @@ type Report struct {
 	AuditLogs     int64
 	LoginAttempts int64
 	Sessions      int64
+	// LoginChallenges counts second-factor challenges removed in the pass:
+	// the ones past their five minutes (ADR-037).
+	LoginChallenges int64
 	// APIKeys counts retired api keys removed in the pass.
 	APIKeys int64
 	// SessionUsage counts session totals removed in the pass: sessions idle
@@ -101,7 +104,7 @@ type Report struct {
 // Deleted is the number of rows the pass removed across every table.
 // DocumentsFailed is an update, not a deletion, and is not counted.
 func (r Report) Deleted() int64 {
-	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys + r.SessionUsage + r.WebhookDeliveries + r.AlertEvents
+	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.LoginChallenges + r.APIKeys + r.SessionUsage + r.WebhookDeliveries + r.AlertEvents
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -171,6 +174,7 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 		{store.RetainAuditLogs, "audit logs", now.AddDate(0, 0, -j.AuditDays), j.AuditDays <= 0, &rep.AuditLogs},
 		{store.RetainLoginAttempts, "login attempts", now.Add(-LoginAttemptRetention), false, &rep.LoginAttempts},
 		{store.RetainSessions, "sessions", now, false, &rep.Sessions},
+		{store.RetainLoginChallenges, "login challenges", now, false, &rep.LoginChallenges},
 		{store.RetainAPIKeys, "api keys", now.Add(-APIKeyRetention), false, &rep.APIKeys},
 	}
 	for _, st := range steps {
@@ -352,6 +356,6 @@ func (j *Janitor) runLogged(ctx context.Context) {
 	j.log().Info("retention pass", "deleted", rep.Deleted(), "duration", time.Since(start),
 		"interrupted", ctx.Err() != nil,
 		"request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
-		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "api_keys", rep.APIKeys,
+		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "login_challenges", rep.LoginChallenges, "api_keys", rep.APIKeys,
 		"session_usage", rep.SessionUsage, "webhook_deliveries", rep.WebhookDeliveries, "alert_events", rep.AlertEvents, "webhook_secrets_cleared", rep.WebhookSecretsCleared, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
 }

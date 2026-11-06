@@ -37,6 +37,7 @@ type sealedColumn struct {
 var sealedColumns = []sealedColumn{
 	{table: "webhook_endpoints", idCol: "id", blobCol: "secret_enc", versionCol: "key_version", aadPrefix: webhookAADPrefix},
 	{table: "webhook_endpoints", idCol: "id", blobCol: "prev_secret_enc", versionCol: "key_version", aadPrefix: webhookAADPrefix},
+	{table: "users", idCol: "id", blobCol: "totp_secret_enc", versionCol: "totp_key_version", aadPrefix: totpAADPrefix},
 }
 
 // sealedAAD returns the associated data of a registered column's row.

@@ -358,6 +358,39 @@ func (s *Store) DeleteUserSessionsExcept(ctx context.Context, userID int64, toke
 	return err
 }
 
+// ClaimSessionPasswordAttempt counts one password try against the session
+// before the password is checked (T10), so that parallel requests cannot try
+// more than SessionPasswordBudget passwords between them. It returns the number
+// of tries the session has made including this one, and ok=false when the
+// budget was already spent or the session is gone: the password must not be
+// tried then.
+func (s *Store) ClaimSessionPasswordAttempt(ctx context.Context, tokenHash string) (tries int, ok bool, err error) {
+	var n int16
+	err = s.pool.QueryRow(ctx, `UPDATE sessions SET password_failures = password_failures + 1
+		WHERE token_hash = $1 AND password_failures < $2 RETURNING password_failures`,
+		tokenHash, SessionPasswordBudget).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return int(n), true, nil
+}
+
+// ResetSessionPasswordAttempts clears the session's tries after a right
+// password.
+func (s *Store) ResetSessionPasswordAttempts(ctx context.Context, tokenHash string) error {
+	_, err := s.pool.Exec(ctx, "UPDATE sessions SET password_failures = 0 WHERE token_hash = $1", tokenHash)
+	return err
+}
+
+// DeleteSessionByHash revokes a session by the hash of its token.
+func (s *Store) DeleteSessionByHash(ctx context.Context, tokenHash string) error {
+	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE token_hash = $1", tokenHash)
+	return err
+}
+
 // PurgeExpiredSessions removes sessions that expired by t batch by batch
 // and reports how many rows were removed.
 func (s *Store) PurgeExpiredSessions(ctx context.Context, t time.Time) (int64, error) {
