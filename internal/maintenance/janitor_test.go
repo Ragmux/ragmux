@@ -656,3 +656,144 @@ func TestRunLoggedRecordsRetentionSuccess(t *testing.T) {
 		t.Fatalf("a completed pass did not set the retention timestamp:\n%s", text)
 	}
 }
+
+// insertAlertEvent adds one alert_events row for the fixture project.
+func (f *fixture) insertAlertEvent(subjectKind, subjectID, limitKind string, windowStart time.Time) {
+	f.t.Helper()
+	if _, err := f.st.DB().Exec(f.ctx, `INSERT INTO alert_events
+		(project_id, subject_kind, subject_id, limit_kind, threshold, window_start, limit_value)
+		VALUES ($1, $2, $3, $4, 100, $5, 1000)`, f.proj, subjectKind, subjectID, limitKind, windowStart.UTC()); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fixture) alertWindows(where string) []string {
+	f.t.Helper()
+	rows, err := f.st.DB().Query(f.ctx, "SELECT to_char(window_start, 'YYYY-MM-DD') FROM alert_events WHERE "+where+" ORDER BY window_start")
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			f.t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Alert events (ADR-036) are removed by the window they belong to. An end
+// user's go with the end-user counters -- a day window after 2 days, a month
+// window once it is older than the previous month -- because the row holds the
+// identifier as the client sent it; everybody else's after LOG_RETENTION_DAYS.
+// A window that is open, or was until a moment ago, is never deleted, so the
+// once-only key of the current alert survives whatever the window of days is.
+func TestRunOnceTrimsAlertEventsByClosedWindow(t *testing.T) {
+	f := seed(t) // now = 2026-09-18 12:00 UTC
+	day := func(d string) time.Time { x, _ := time.Parse("2006-01-02", d); return x }
+	const dayLimit, monthLimit = "budget_daily_tokens", "budget_monthly_tokens"
+	for _, d := range []string{"2026-09-18", "2026-09-17", "2026-09-16", "2026-09-15"} {
+		f.insertAlertEvent("end_user", "ali@firma.com", dayLimit, day(d))
+	}
+	for _, d := range []string{"2026-09-01", "2026-08-01", "2026-07-01"} {
+		f.insertAlertEvent("end_user", "ali@firma.com", monthLimit, day(d))
+	}
+	// The rest follow LOG_RETENTION_DAYS: 90 days back from now is 2026-06-20.
+	for _, d := range []string{"2026-09-18", "2026-09-10", "2026-06-10"} {
+		f.insertAlertEvent("project", "1", dayLimit, day(d))
+	}
+	for _, d := range []string{"2026-09-01", "2026-08-01", "2026-06-01", "2026-05-01"} {
+		f.insertAlertEvent("key", "5", monthLimit, day(d))
+	}
+	f.insertAlertEvent("project", "1", "budget_monthly_usd", day("2026-05-01"))
+	f.insertAlertEvent("project", "1", "unpriced", day("2026-09-01"))
+
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+	rep, err := j.RunOnce(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, where string
+		want        []string
+	}{
+		{"end user, day", "subject_kind = 'end_user' AND limit_kind = 'budget_daily_tokens'", []string{"2026-09-17", "2026-09-18"}},
+		{"end user, month", "subject_kind = 'end_user' AND limit_kind = 'budget_monthly_tokens'", []string{"2026-08-01", "2026-09-01"}},
+		{"project, day", "subject_kind = 'project' AND limit_kind = 'budget_daily_tokens'", []string{"2026-09-10", "2026-09-18"}},
+		{"key, month", "subject_kind = 'key'", []string{"2026-08-01", "2026-09-01"}},
+		{"money and unpriced, month", "limit_kind IN ('budget_monthly_usd', 'unpriced')", []string{"2026-09-01"}},
+	} {
+		if got := f.alertWindows(c.where); !sameStrings(got, c.want) {
+			t.Errorf("%s: windows left %v, want %v", c.name, got, c.want)
+		}
+	}
+	// 2 + 1 (end user) + 1 + 2 + 1 = 7 removed.
+	if rep.AlertEvents != 7 {
+		t.Errorf("report = %+v, want 7 alert events removed", rep)
+	}
+	if rep.Deleted() != rep.RequestLogs+rep.AuditLogs+rep.LoginAttempts+rep.Sessions+rep.SessionUsage+7 {
+		t.Errorf("Deleted() = %d does not include the alert events: %+v", rep.Deleted(), rep)
+	}
+	if rep, err = j.RunOnce(f.ctx); err != nil || rep.AlertEvents != 0 {
+		t.Errorf("second pass: %+v, %v; want nothing left to remove", rep, err)
+	}
+}
+
+// A short LOG_RETENTION_DAYS must not eat the window that is still open: the
+// current and the previous window stay (the alert job looks back at the
+// previous one), only what is older goes. With the window off the others are
+// kept for good but an end user's are not.
+func TestAlertEventsOfTheOpenWindowSurviveAShortRetention(t *testing.T) {
+	f := seed(t)
+	day := func(d string) time.Time { x, _ := time.Parse("2006-01-02", d); return x }
+	for _, d := range []string{"2026-09-18", "2026-09-17", "2026-09-16", "2026-09-10"} {
+		f.insertAlertEvent("project", "1", "budget_daily_tokens", day(d))
+	}
+	for _, d := range []string{"2026-09-01", "2026-08-01", "2026-07-01"} {
+		f.insertAlertEvent("project", "1", "budget_monthly_tokens", day(d))
+	}
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 1, AuditDays: 365}
+	if _, err := j.RunOnce(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.alertWindows("limit_kind = 'budget_daily_tokens'"), []string{"2026-09-17", "2026-09-18"}; !sameStrings(got, want) {
+		t.Errorf("day windows left %v, want %v", got, want)
+	}
+	if got, want := f.alertWindows("limit_kind = 'budget_monthly_tokens'"), []string{"2026-08-01", "2026-09-01"}; !sameStrings(got, want) {
+		t.Errorf("month windows left %v, want %v", got, want)
+	}
+
+	j.RequestLogDays = 0
+	f.insertAlertEvent("project", "1", "budget_monthly_tokens", day("2020-01-01"))
+	f.insertAlertEvent("end_user", "ali", "budget_monthly_tokens", day("2020-01-01"))
+	if _, err := j.RunOnce(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.alertWindows("subject_kind = 'project' AND window_start < '2021-01-01'")); n != 1 {
+		t.Errorf("RequestLogDays=0 removed a project event of 2020 (%d left)", n)
+	}
+	if n := len(f.alertWindows("subject_kind = 'end_user'")); n != 0 {
+		t.Errorf("RequestLogDays=0 kept %d end user events", n)
+	}
+}
+
+func TestReportDeletedCountsAlertEvents(t *testing.T) {
+	if got := (Report{AlertEvents: 4}).Deleted(); got != 4 {
+		t.Errorf("Deleted() = %d, want 4", got)
+	}
+}

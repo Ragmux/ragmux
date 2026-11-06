@@ -118,6 +118,54 @@ func TestUnpricedModelLogsCostSourceNone(t *testing.T) {
 	}
 }
 
+// A request without a price counts as unpriced traffic only when it succeeded:
+// one the upstream refused cost nothing, and the money-budget alert must not
+// tell its receiver that the figures are lower bounds because of it.
+func TestUnpricedRequestsCountOnlySuccessfulOnes(t *testing.T) {
+	failing := false
+	e := newCostEnv(t, "anthropic", "claude-experimental-x", func(w http.ResponseWriter, r *http.Request) {
+		if failing {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"boom"}}`))
+			return
+		}
+		anthropicCacheReply(w, r)
+	})
+	unpriced := func() (month, requests int) {
+		t.Helper()
+		if err := e.st.DB().QueryRow(context.Background(), `SELECT unpriced_requests, requests FROM project_usage
+			WHERE project_id = $1 AND period = 'month'`, e.proj.ID).Scan(&month, &requests); err != nil {
+			t.Fatal(err)
+		}
+		return month, requests
+	}
+	post := func() int {
+		t.Helper()
+		resp := e.post(context.Background(), "/v1/chat/completions", map[string]any{"messages": userMsg}, e.key)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if status := post(); status != http.StatusOK {
+		t.Fatalf("priced-less success: %d", status)
+	}
+	if n, req := unpriced(); n != 1 || req != 1 {
+		t.Fatalf("after a success: unpriced %d of %d requests, want 1 of 1", n, req)
+	}
+	failing = true
+	for range 3 {
+		if status := post(); status < 500 {
+			t.Fatalf("failing upstream answered %d", status)
+		}
+	}
+	if n, req := unpriced(); n != 1 || req != 4 {
+		t.Errorf("after three failures: unpriced %d of %d requests, want 1 of 4 (failures are requests, not unpriced traffic)", n, req)
+	}
+	if rec := e.lastLog(); rec.CostSource != store.CostSourceNone || rec.CostMicros != 0 {
+		t.Errorf("the failed request's log row = %+v", rec)
+	}
+}
+
 // TestNegativeUpstreamUsageIsClamped: a broken or hostile upstream reporting
 // negative token counts must not write a credit into the request log. The row
 // is the input to the cost, the budget counters and the metrics, and a

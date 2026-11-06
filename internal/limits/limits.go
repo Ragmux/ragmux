@@ -184,9 +184,11 @@ func endUserTier(s Subject) Caps {
 
 // Spend is what a finished request spent, as RecordSubject takes it. CostMicros
 // and Unpriced are the request's cost in USD millionths and whether its model
-// had no price; the limiter does not store them yet. CountRequest says whether
-// the project's minute request still has to be counted (Check reserves it when
-// an RPM limit is set).
+// had no price (the cost is then 0); they are added to the project's day and
+// month counters for the money-budget alert, which only warns (ADR-036) --
+// nothing here ever refuses a request on cost. CountRequest says whether the
+// project's minute request still has to be counted (Check reserves it when an
+// RPM limit is set).
 type Spend struct {
 	PromptTokens, CompletionTokens, CostMicros int64
 	Unpriced, CountRequest                     bool
@@ -487,7 +489,7 @@ func (l *Limiter) deny(d Decision, reason, scope string, retryAfter time.Duratio
 // Record adds a finished request's tokens to the project's current windows.
 // Pass countRequest=false when Check already reserved the minute slot.
 func (l *Limiter) Record(ctx context.Context, projectID int64, promptTokens, completionTokens int, countRequest bool) error {
-	return l.Store.RecordUsage(ctx, projectID, Windows(l.now()), promptTokens, completionTokens, countRequest)
+	return l.Store.RecordUsage(ctx, projectID, Windows(l.now()), promptTokens, completionTokens, 0, false, countRequest)
 }
 
 // RecordSubject adds a finished request's tokens to every tier that applies.
@@ -497,7 +499,7 @@ func (l *Limiter) Record(ctx context.Context, projectID int64, promptTokens, com
 // reserved independently.
 func (l *Limiter) RecordSubject(ctx context.Context, s Subject, sp Spend) error {
 	w := Windows(l.now())
-	if err := l.Store.RecordUsage(ctx, s.Project.ID, w, int(sp.PromptTokens), int(sp.CompletionTokens), sp.CountRequest); err != nil {
+	if err := l.Store.RecordUsage(ctx, s.Project.ID, w, int(sp.PromptTokens), int(sp.CompletionTokens), sp.CostMicros, sp.Unpriced, sp.CountRequest); err != nil {
 		return err
 	}
 	if s.KeyID != nil {

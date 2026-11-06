@@ -65,6 +65,12 @@ type Admin struct {
 	// rejected when it is saved rather than on first use.
 	AllowPrivateUpstreams bool
 	PrivateAllowlist      map[string]bool
+	// PrivateWebhookAllowlist is PRIVATE_WEBHOOK_ALLOWLIST: the hosts a webhook
+	// URL may name although they resolve to a private or local address (and
+	// the only ones that may use plain http). It is separate from
+	// PrivateAllowlist on purpose: the provider exemption must not reach a URL
+	// an editor types for a webhook.
+	PrivateWebhookAllowlist map[string]bool
 	// MaxDocumentsPerStore and MaxBytesPerStore are instance-wide ceilings
 	// on a RAG store's contents (0 = unlimited); a store's own max_documents
 	// / max_bytes can only lower them. Checked on upload, not on reprocess.
@@ -188,6 +194,13 @@ func (a *Admin) authenticated(r chi.Router) {
 	editor.Delete("/api/projects/{id}/routes/{routeId}", a.deleteRoute)
 	read.Get("/api/projects/{id}/guardrails", a.getGuardrails)
 	editor.Put("/api/projects/{id}/guardrails", a.putGuardrails)
+	read.Get("/api/projects/{id}/alerts", a.getAlerts)
+	editor.Put("/api/projects/{id}/alerts", a.putAlerts)
+	// A webhook URL often carries a token, so even reading one takes the editor role.
+	editor.Get("/api/projects/{id}/webhooks/{purpose}", a.getWebhook)
+	editor.Put("/api/projects/{id}/webhooks/{purpose}", a.putWebhook)
+	editor.Delete("/api/projects/{id}/webhooks/{purpose}", a.deleteWebhook)
+	editor.Post("/api/projects/{id}/webhooks/{purpose}/rotate-secret", a.rotateWebhookSecret)
 	read.Get("/api/projects/{id}/sessions", a.listSessions)
 	read.Get("/api/projects/{id}/sessions/{sessionId}", a.getSession)
 

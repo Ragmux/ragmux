@@ -907,11 +907,13 @@ func (g *Gateway) record(c *call) {
 	if g.Limiter != nil {
 		// The minute request slot was already reserved by Check when an
 		// RPM limit is set; otherwise count the request here.
-		// The limiter takes the cost along but does not keep it yet; the usage
-		// counters that will are a later change, and the signature is settled
-		// here so it is the only thing that moves (ADR-035).
+		// The limiter adds the cost to the project's usage counters, where the
+		// money-budget alert reads it (ADR-036). A request that did not succeed
+		// is never "unpriced traffic": nothing was billed for it, and the
+		// metric counts the same set (2xx).
+		ok := rec.StatusCode >= 200 && rec.StatusCode < 300
 		spend := limits.Spend{PromptTokens: int64(rec.PromptTokens), CompletionTokens: int64(rec.CompletionTokens),
-			CostMicros: rec.CostMicros, Unpriced: rec.CostSource == store.CostSourceNone && !c.free,
+			CostMicros: rec.CostMicros, Unpriced: ok && rec.CostSource == store.CostSourceNone && !c.free,
 			CountRequest: !c.decision.Reserved}
 		if err := g.Limiter.RecordSubject(context.Background(), c.subject, spend); err != nil {
 			c.log.Error("record usage", "err", err)

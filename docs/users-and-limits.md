@@ -384,10 +384,11 @@ headers describe.
 ### Budgets are counted in tokens, not money
 
 Ragmux 0.4 estimates what each request cost and shows it on the dashboard, but **cost is
-informational: no limit is enforced in money.** A project cannot be given a dollar
-budget, a request is never refused because a spend figure was reached, and the estimate
-never feeds `rate_limit_tpm`, `budget_daily_tokens` or `budget_monthly_tokens` — those
-stay token counters. To cap spend, cap tokens.
+informational: no limit is enforced in money.** A request is never refused because a spend
+figure was reached, and the estimate never feeds `rate_limit_tpm`, `budget_daily_tokens` or
+`budget_monthly_tokens` — those stay token counters. To cap spend, cap tokens. A project can
+be given a monthly dollar budget since 0.8, but only to be *warned* about it; see
+[Limit alerts](#limit-alerts).
 
 A rerank is priced with the connection that ran it: an API reranker (`cohere_rerank`,
 `voyage_rerank`) at its own price row (Cohere per search unit, Voyage per token), and the
@@ -400,6 +401,113 @@ public list prices and is editable per model. It is not a bill: providers round,
 discount and change prices without telling the gateway, and a model with no matching
 price row adds a cost of zero and is logged with `cost_source: "none"` rather than a guess
 (a rerank that ran on another connection with a price row still adds its own cost).
+
+## Limit alerts
+
+A project can ask to be told, by a signed webhook, when a limit is nearly used up, instead of
+finding out from a `429`. The alerts are off until a project turns them on and registers a
+webhook endpoint for them. Nothing in the request path sends or waits for them: once a minute one
+replica reads the usage counters and queues the warnings, and every replica's delivery worker
+sends them. A receiver that is slow or down delays or loses a warning (a delivery is tried up to five
+times, the first send and four retries, over about two and a half hours) and never slows or fails a request.
+
+- **Thresholds.** Fixed: 80 % and 100 %, each sent once per limit and window. There are no custom
+  levels. If a limit jumps over both within a minute, both are sent, 80 first.
+- **What is watched.**
+
+  | Subject | Limits | Sent at |
+  |---|---|---|
+  | The project | `budget_daily_tokens`, `budget_monthly_tokens` | 80 %, 100 % |
+  | A gateway key granted to the project | its `budget_daily_tokens`, `budget_monthly_tokens` | 80 %, 100 % |
+  | An [end user](#end-users-and-tags) of the project | the project's per-end-user daily and monthly token ceilings | 100 % only |
+  | The project's money budget | `budget_monthly_usd` (see below) | 80 %, 100 % |
+
+  Per-minute limits (`rate_limit_rpm`, `rate_limit_tpm`, the end-user and key equivalents) and the
+  session token cap send nothing: they trip and recover within minutes, and
+  [`deploy/prometheus/alerts.yaml`](../deploy/prometheus/alerts.yaml) already covers them. End
+  users warn at the ceiling only because a project can have thousands of them. A key budget is the
+  key's own, counted across every project the key may use; each of the key's projects that has
+  alerts on is told, so the receiver of a project hears about the keys it lets in.
+- **Once per window.** The window is the limit's own: the UTC day or month. The same breach is not
+  sent twice, a new day or month warns again, and **raising a limit and crossing it again is a new
+  alert** (the limit value is part of what makes an alert the same alert).
+- **The monthly money budget** is set per project, in USD millionths (`1000000` is one dollar). It
+  is an estimate and a lower bound: it adds up the [estimated cost](#budgets-are-counted-in-tokens-not-money)
+  of the month's requests, and **a request whose model has no price adds 0** and is counted
+  separately. It **only warns**: no request is ever refused, delayed or answered `429` because the
+  money budget was reached. Token budgets keep refusing as before.
+- **Unpriced traffic.** While alerts are on, the endpoint is registered and a money budget is set, a
+  project with requests of the month that had no price gets one `budget.unpriced_traffic` event a
+  month (in the first minute after the first such request, or after the budget was set), so a
+  receiver knows the money figures are lower than the truth. It carries no threshold.
+- **Setting it up** (editor or admin of the project; `GET /alerts` is open to any member):
+
+  | Method | Path | Purpose |
+  |---|---|---|
+  | `GET`, `PUT` | `/admin/api/projects/{id}/alerts` | `{"enabled": true, "budget_monthly_usd_micros": 25000000}`; `0` is no money budget |
+  | `GET`, `PUT`, `DELETE` | `/admin/api/projects/{id}/webhooks/alerts` | `{"url": "https://…"}`; `PUT` registers (`201`, with the secret) or changes the URL (`200`) |
+  | `POST` | `/admin/api/projects/{id}/webhooks/alerts/rotate-secret` | New secret, shown once; the old one keeps signing for 24 hours |
+
+  The same `webhooks/{purpose}` routes register the `guardrail` endpoint. The secret
+  (`whsec_…`) is in the answer that creates or rotates it and nowhere else, so a lost one is
+  replaced by rotating. The URL must be `https` — `http` only for a host on
+  `PRIVATE_WEBHOOK_ALLOWLIST` — without credentials, at most 2048 bytes, and its host must not
+  resolve only to private or local addresses unless that same allowlist names it
+  ([`PRIVATE_UPSTREAM_ALLOWLIST` does not apply](configuration.md)); a URL that breaks this is a `400`.
+  Reading a webhook takes the editor role because a URL often carries a token.
+- **The payload** is signed like every Ragmux webhook (`webhook-id`, `webhook-timestamp`,
+  `webhook-signature`; the `webhook-id` is the payload's `id`, the same on every retry):
+
+  ```json
+  {"type":"limit.threshold","id":"evt_…","created_at":"2026-11-06T09:14:02Z",
+   "project":{"id":12,"name":"support-bot"},
+   "subject":{"kind":"project","id":"12"},
+   "limit":"budget_monthly_tokens","threshold":80,"used":812345,"limit_value":1000000,"ratio":0.812,
+   "window_start":"2026-11-01T00:00:00Z","window_end":"2026-12-01T00:00:00Z"}
+  ```
+
+  `subject.kind` is `project`, `key` (`id` is the key's id) or `end_user` (`id` is the end user as
+  the client sent it). `limit` is `budget_daily_tokens`, `budget_monthly_tokens` or
+  `budget_monthly_usd`. On a money event `used` and `limit_value` are USD millionths, and two more
+  fields say what the figure is: `"estimate": true` and `"unpriced_requests": 3`, the month's count
+  of requests that added 0. The unpriced notice is:
+
+  ```json
+  {"type":"budget.unpriced_traffic","id":"evt_…","created_at":"…","project":{"id":12,"name":"…"},
+   "subject":{"kind":"project","id":"12"},"limit":"budget_monthly_usd",
+   "window_start":"…","window_end":"…","estimate":true,"unpriced_requests":3}
+  ```
+
+  with no `threshold`, `used`, `limit_value` or `ratio`; `unpriced_requests` is the count when the
+  event was made and is not updated, the current one arrives with the next money event.
+- **A receiver that is gone.** If it answers `410 Gone`, its endpoint is closed, the deliveries
+  still waiting for it fail, and the audit trail gets one `webhook.endpoint_disabled` entry (actor
+  `system`, the project id and the purpose, never the URL), however many deliveries heard the 410
+  at once. Saving a URL again opens it. The alerts that endpoint had not received are forgotten at
+  the same time, and so are they when the endpoint is deleted: once it is open again (or a new one
+  is registered) a limit that is still crossed is sent again, instead of being lost for the rest of
+  its window. An alert the receiver did get is not repeated.
+- **What is audited.** `project.alerts_update`, `project.webhook_register`,
+  `project.webhook_update`, `project.webhook_rotate_secret`, `project.webhook_delete`; none of them
+  writes a URL or a secret, only the host.
+- **Delay.** A warning is queued within a minute of the counters crossing a level, plus the
+  delivery time. With several replicas a round may run more than once a minute, which costs a few
+  small queries and never a second alert. A round that finds the window just closed (the previous
+  UTC day or month, for up to six hours after it ended) still checks it, so a limit crossed in the
+  last minute, while no round ran, is reported after the restart or outage rather than lost;
+  further back than that a missed breach is not reported. A closed window is only checked against
+  a limit that was in force while it was open: if the project (its budgets or end-user ceilings),
+  the key, or the alert settings (alerts switched on, the money budget) were edited after the
+  window ended, that project's or key's closed window is skipped, so a budget set or raised in the
+  small hours never warns about the night before. Any edit counts, which can drop a late warning
+  but never sends a false one. A project whose traffic is mostly
+  unpriced reaches its money budget later than the truth, which is what the unpriced notice is for.
+- **How long the events are kept.** Each warning leaves an `alert_events` row, which is what keeps
+  it once-only. The janitor deletes the rows of windows that are over, never the current one or the
+  one before it: an end user's after 2 days (day windows) or 2 months, the current and the previous
+  calendar month kept (month windows), the same as that end user's counters, because the row holds
+  the identifier as the client sent it; every other row after `LOG_RETENTION_DAYS`
+  (`0` keeps them). The delivery rows follow `LOG_RETENTION_DAYS` as well.
 
 ## Sessions
 

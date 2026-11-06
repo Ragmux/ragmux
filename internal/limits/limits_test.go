@@ -1013,3 +1013,49 @@ func TestEndUserRPMHoldsUnderConcurrentRequests(t *testing.T) {
 		t.Errorf("project minute counter = %d (%v), want %d: a denied request kept its project slot", pu.Minute.Requests, err, rpm)
 	}
 }
+
+// RecordSubject takes the request's cost along: the day and month counters of
+// the project add it up and count the requests that had no price. The price
+// is only an estimate and never a limit -- nothing here refuses a request for
+// what it cost (ADR-036), which the last check pins.
+func TestRecordSubjectCountsCostAndUnpriced(t *testing.T) {
+	l, p, c := setup(t, store.Project{})
+	ctx := context.Background()
+	s := Subject{Project: p}
+	for _, sp := range []Spend{
+		{PromptTokens: 100, CompletionTokens: 50, CostMicros: 1500, CountRequest: true},
+		{PromptTokens: 10, CompletionTokens: 5, CostMicros: 250, CountRequest: true},
+		// A model without a price: it costs 0 and is counted apart.
+		{PromptTokens: 20, CompletionTokens: 10, CostMicros: 0, Unpriced: true, CountRequest: true},
+		{PromptTokens: 1, CompletionTokens: 1, CostMicros: -7, CountRequest: true}, // never subtracts
+	} {
+		if err := l.RecordSubject(ctx, s, sp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := Windows(c.t)
+	for _, row := range []struct {
+		period string
+		start  time.Time
+		cost   int64
+		unpr   int
+	}{
+		{"day", w.Day, 1750, 1},
+		{"month", w.Month, 1750, 1},
+		{"minute", w.Minute, 0, 0}, // the rate limiter's rows carry no money
+	} {
+		var cost int64
+		var unpriced int
+		if err := l.Store.DB().QueryRow(ctx, `SELECT cost_micros, unpriced_requests FROM project_usage
+			WHERE project_id = $1 AND period = $2 AND period_start = $3`, p.ID, row.period, row.start).Scan(&cost, &unpriced); err != nil {
+			t.Fatalf("%s row: %v", row.period, err)
+		}
+		if cost != row.cost || unpriced != row.unpr {
+			t.Errorf("%s row: cost_micros=%d unpriced_requests=%d, want %d and %d", row.period, cost, unpriced, row.cost, row.unpr)
+		}
+	}
+	d := mustCheck(t, l, p, 10)
+	if !d.Allowed {
+		t.Errorf("spend must not deny a request: %+v", d)
+	}
+}

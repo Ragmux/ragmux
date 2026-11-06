@@ -26,6 +26,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ragmux/ragmux/internal/admin"
+	"github.com/ragmux/ragmux/internal/alerts"
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/config"
 	"github.com/ragmux/ragmux/internal/gateway"
@@ -296,9 +297,9 @@ func run(cfg config.Config) error {
 		TrustProxy: cfg.TrustProxyHeaders}
 	usage := &limits.Limiter{Store: st}
 	// One outbound webhook client for the process: the guardrail webhook
-	// (synchronous) uses it through the gateway, and the alert worker will
-	// share it. WithMetrics is applied here because the helper takes only the
-	// config; the option is a plain function over the client.
+	// (synchronous) uses it through the gateway, and the delivery worker
+	// below shares it. WithMetrics is applied here because the helper takes
+	// only the config; the option is a plain function over the client.
 	webhookClient := newWebhookClient(cfg)
 	webhook.WithMetrics(met)(webhookClient)
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
@@ -314,7 +315,8 @@ func run(cfg config.Config) error {
 	adm := &admin.Admin{FTSRebuild: ftsRebuilder, Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
 		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage, Prices: prices,
 		ProviderConfig: provCfg, AllowPrivateUpstreams: cfg.AllowPrivateUpstreams, PrivateAllowlist: cfg.PrivateUpstreamAllowlist,
-		MaxDocumentsPerStore: cfg.MaxDocumentsPerStore, MaxBytesPerStore: cfg.MaxBytesPerStore}
+		MaxDocumentsPerStore: cfg.MaxDocumentsPerStore, MaxBytesPerStore: cfg.MaxBytesPerStore,
+		PrivateWebhookAllowlist: cfg.PrivateWebhookAllowlist}
 
 	scriptHash, err := dashboardScriptHash(web.FS)
 	if err != nil {
@@ -380,6 +382,26 @@ func run(cfg config.Config) error {
 	}()
 	log.Info("retention job scheduled", "log_retention_days", cfg.LogRetentionDays,
 		"audit_retention_days", cfg.AuditRetentionDays, "interval", maintenance.DefaultInterval)
+
+	// Limit alerts (ADR-036). The job turns crossed thresholds into outbox
+	// rows once a minute on one replica; the worker, on every replica, signs
+	// and sends them. Neither is on the request path, so a slow or dead
+	// receiver costs a delayed warning and nothing else. The worker is given
+	// the store through the audited wrapper so a receiver's 410 Gone, which
+	// closes its endpoint, is written to the audit trail.
+	deliveryWorker := webhook.NewWorker(alerts.NewAuditedDeliveries(st, log), webhookClient,
+		webhook.WithLogger(log), webhook.WithWorkerMetrics(met))
+	alertJob := alerts.NewJob(st, alerts.WithLogger(log))
+	deliveryWorkerDone := make(chan struct{})
+	go func() {
+		defer close(deliveryWorkerDone)
+		deliveryWorker.Run(bgCtx)
+	}()
+	alertJobDone := make(chan struct{})
+	go func() {
+		defer close(alertJobDone)
+		alertJob.Run(bgCtx)
+	}()
 
 	// The rebuild of the per-store-language full-text column (ADR-027). It
 	// resumes whatever a previous process left half done and is kicked by the
@@ -477,6 +499,8 @@ func run(cfg config.Config) error {
 	stopBackground()
 	<-janitorDone
 	<-ftsRebuildDone
+	<-deliveryWorkerDone
+	<-alertJobDone
 	log.Info("shutdown complete")
 	return shutErr
 }

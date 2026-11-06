@@ -274,7 +274,7 @@ before another replica claims them. Nothing is lost; a document is only ever
   using that table, and every request that wants the table queues behind it. The gateway
   writes a `request_logs` row at the end of every request, so a long read of that table (a
   CSV export, a summary over a wide window) running at the wrong moment would stall requests
-  on all replicas. Two migrations are guarded against that, `0032` and `0033`: they alter
+  on all replicas. Three migrations are guarded against that, `0032`, `0033` and `0035`: `0032` and `0033` alter
   `request_logs` first and set `lock_timeout` (2 seconds). They run back to back when a
   v0.7 database is upgraded. If the lock is not granted in time the migration fails, rolls
   back whole and is not recorded, and the new replica exits with `canceling statement due
@@ -284,8 +284,13 @@ before another replica claims them. Nothing is lost; a document is only ever
   `projects` step then waits as well (only a long read of `projects` does that). Nothing
   is half applied and the runner does not retry, so the replica is started again by the
   process manager (`restart: unless-stopped`, a Kubernetes `Deployment`) and the migration
-  runs from the start. If it keeps failing,
-  something is still holding `request_logs`. Earlier migrations that touch `request_logs`
+  runs from the start. `0035` follows the same rule for `project_usage`, the table every
+  request upserts into: it creates its own two tables first and alters `project_usage` last,
+  with the same 2 second `lock_timeout`, so while it waits it holds nothing on the request
+  path. If it keeps failing,
+  something is still holding `request_logs` (or, for `0035`, `project_usage`: run the query
+  below with `'project_usage'::regclass`; the usual holder is a long-running read of the
+  usage counters or a session left idle in a transaction). Earlier migrations that touch `request_logs`
   (`0029` among them, which is in v0.7.0 but not in v0.6.1) carry no `lock_timeout`: when
   upgrading from v0.6 or older straight to v0.8, finish long reads of `request_logs`
   (exports, summaries over a wide window) before starting the new replica. Find the holder:

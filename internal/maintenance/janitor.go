@@ -84,6 +84,10 @@ type Report struct {
 	SessionUsage int64
 	// WebhookDeliveries counts outbox rows removed in the pass (ADR-033).
 	WebhookDeliveries int64
+	// AlertEvents counts limit-alert events (ADR-036) removed in the pass: the
+	// ones of windows that are over, an end user's after two days or two
+	// months, the rest after the request log window.
+	AlertEvents int64
 	// WebhookSecretsCleared counts endpoints whose retired signing secret
 	// (past its 24 hour rotation window) was dropped in the pass. It is an
 	// update, not a deletion, and is not counted in Deleted.
@@ -97,7 +101,14 @@ type Report struct {
 // Deleted is the number of rows the pass removed across every table.
 // DocumentsFailed is an update, not a deletion, and is not counted.
 func (r Report) Deleted() int64 {
-	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys + r.SessionUsage + r.WebhookDeliveries
+	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.APIKeys + r.SessionUsage + r.WebhookDeliveries + r.AlertEvents
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }
 
 func (j *Janitor) now() time.Time {
@@ -126,6 +137,19 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 	var errs []error
 	now := j.now()
 
+	// Alert events keep the once-only key of the window they belong to, so a
+	// window that is still open, or was open until a moment ago (the alert job
+	// looks back at the previous one), is never deleted, whatever the window
+	// of days says. An end user's events go with the end-user counters:
+	// two days for a day window, the current and the previous month for a month
+	// window. The ones of anybody else follow LOG_RETENTION_DAYS, held back to
+	// the previous window.
+	win := limits.Windows(now)
+	alertDay := minTime(now.AddDate(0, 0, -j.RequestLogDays), win.Day.AddDate(0, 0, -1))
+	alertMonth := minTime(now.AddDate(0, 0, -j.RequestLogDays), win.Month.AddDate(0, -1, 0))
+	endUserDay := now.Add(-limits.EndUserKeepDayRows)
+	endUserMonth := win.Month.AddDate(0, -(limits.EndUserKeepMonths - 1), 0)
+
 	steps := []struct {
 		table  store.RetentionTable
 		label  string
@@ -140,6 +164,10 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 		// Webhook deliveries (alert bodies and delivery outcomes) follow the
 		// request log window, LOG_RETENTION_DAYS (ADR-033).
 		{store.RetainWebhookDeliveries, "webhook deliveries", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.WebhookDeliveries},
+		{store.RetainAlertEventsEndUserDay, "alert events (end user, day)", endUserDay, false, &rep.AlertEvents},
+		{store.RetainAlertEventsEndUserMonth, "alert events (end user, month)", endUserMonth, false, &rep.AlertEvents},
+		{store.RetainAlertEventsDay, "alert events (day)", alertDay, j.RequestLogDays <= 0, &rep.AlertEvents},
+		{store.RetainAlertEventsMonth, "alert events (month)", alertMonth, j.RequestLogDays <= 0, &rep.AlertEvents},
 		{store.RetainAuditLogs, "audit logs", now.AddDate(0, 0, -j.AuditDays), j.AuditDays <= 0, &rep.AuditLogs},
 		{store.RetainLoginAttempts, "login attempts", now.Add(-LoginAttemptRetention), false, &rep.LoginAttempts},
 		{store.RetainSessions, "sessions", now, false, &rep.Sessions},
@@ -150,7 +178,7 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 			continue
 		}
 		n, _, err := j.deleteBatched(ctx, st.table, st.cutoff)
-		*st.into = n
+		*st.into += n
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", st.label, err))
 		}
@@ -325,5 +353,5 @@ func (j *Janitor) runLogged(ctx context.Context) {
 		"interrupted", ctx.Err() != nil,
 		"request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
 		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "api_keys", rep.APIKeys,
-		"session_usage", rep.SessionUsage, "webhook_deliveries", rep.WebhookDeliveries, "webhook_secrets_cleared", rep.WebhookSecretsCleared, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
+		"session_usage", rep.SessionUsage, "webhook_deliveries", rep.WebhookDeliveries, "alert_events", rep.AlertEvents, "webhook_secrets_cleared", rep.WebhookSecretsCleared, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
 }
