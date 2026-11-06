@@ -766,11 +766,13 @@ cannot change a project setting.
 | `filter` | a [metadata filter](#metadata-and-filters) | retrieve only from matching documents |
 | `sources` | `"inline"` | put the sources in the response body, streamed or not |
 | `include_context` | `true` | `sources` plus the exact context block |
+| `tags` | up to 8 strings | label the request in the request log; has nothing to do with retrieval ([End users and tags](api.md#end-users-and-tags)) |
 
 What is refused and what is ignored:
 
 - A `ragmux` that is not a JSON object (`null`, a string, an array), or a `filter` outside
-  the grammar, is refused with `400` and `code: "invalid_ragmux"`. Ignoring a broken
+  the grammar, is refused with `400` and `code: "invalid_ragmux"` (`tags` that are not a list
+  of valid tags are refused too, with `code: "invalid_tags"`). Ignoring a broken
   filter would widen the answer, so the request fails instead. Before 0.6 a
   malformed `ragmux` was silently ignored.
 - Any other value for `retrieval` (`"always"`, `"auto"`) or `sources`, a mistyped

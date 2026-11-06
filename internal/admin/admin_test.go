@@ -98,11 +98,13 @@ func TestCSVRecordEscapesFormulas(t *testing.T) {
 	keyID := int64(7)
 	row.APIKeyID = &keyID
 	row.SessionID, row.ToolNames, row.ToolsDenied = "run-1", []string{"=cmd", "get_weather"}, 2
+	// An end user may start with + or @, both valid in one: it is defused too.
+	row.EndUser, row.Tags = "+905551234567", []string{"eu", "support"}
 	got := csvRecord(row)
 	// user_id stays empty: a request made with a project's default key has no
 	// owner, and an empty cell says that where a 0 would read as user zero.
 	want := []string{"2026-09-18T10:00:00Z", "3", "'=HYPERLINK(\"x\")", "m", "200", "10", "2", "false", "45", "true", "true", "2", "'-DDE",
-		"6", "4", "0.001234", "builtin", "7", "", "run-1", "'=cmd;get_weather", "2"}
+		"6", "4", "0.001234", "builtin", "7", "", "run-1", "'=cmd;get_weather", "2", "'+905551234567", "eu;support"}
 	if len(got) != len(csvHeader) || strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("record = %q\nwant     %q", got, want)
 	}
@@ -290,5 +292,70 @@ func TestProjectGuardrailsWarnAboutAPlaceholderABlockRuleMatches(t *testing.T) {
 	body["rules"].([]any)[1].(map[string]any)["keywords"] = []string{"secret"}
 	if _, out = e.do(http.MethodPut, path, body, editor.token); len(out["warnings"].([]any)) != 0 {
 		t.Errorf("no overlap, no warning: %v", out["warnings"])
+	}
+}
+
+// The per-end-user ceilings (ADR-035) follow the other ADR-032 settings: a body
+// that leaves them out keeps them, 0 lifts one, and a negative value is a 400.
+func TestProjectEndUserLimits(t *testing.T) {
+	e := newAdminEnv(t)
+	editor := e.user("editor", "editor")
+	base := func(extra map[string]any) map[string]any {
+		body := map[string]any{"name": "per-user", "model_connection_id": e.conn.ID}
+		for k, v := range extra {
+			body[k] = v
+		}
+		return body
+	}
+	fields := []string{"end_user_rpm", "end_user_tpm", "end_user_daily_tokens", "end_user_monthly_tokens"}
+
+	status, out := e.do(http.MethodPost, "/api/projects", base(nil), editor.token)
+	if status != http.StatusCreated {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	proj, _ := out["project"].(map[string]any)
+	for _, f := range fields {
+		if proj[f] != float64(0) {
+			t.Errorf("default %s = %v, want 0 (unlimited)", f, proj[f])
+		}
+	}
+	id := itoa(int64(proj["id"].(float64)))
+
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{
+		"end_user_rpm": 5, "end_user_tpm": 600, "end_user_daily_tokens": 7000, "end_user_monthly_tokens": 80000}), editor.token)
+	if status != http.StatusOK || out["end_user_rpm"] != float64(5) || out["end_user_tpm"] != float64(600) ||
+		out["end_user_daily_tokens"] != float64(7000) || out["end_user_monthly_tokens"] != float64(80000) {
+		t.Fatalf("set: %d %v", status, out)
+	}
+	// Left out: kept, whatever the rest of the body changes.
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{"system_prompt": "hi", "rate_limit_rpm": 3}), editor.token)
+	if status != http.StatusOK || out["end_user_rpm"] != float64(5) || out["end_user_monthly_tokens"] != float64(80000) {
+		t.Errorf("left out: %d %v, want the ceilings kept", status, out)
+	}
+	// One field changes alone.
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{"end_user_rpm": 0}), editor.token)
+	if status != http.StatusOK || out["end_user_rpm"] != float64(0) || out["end_user_tpm"] != float64(600) {
+		t.Errorf("clear one: %d %v", status, out)
+	}
+	for _, f := range fields {
+		if status, out := e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{f: -1}), editor.token); status != http.StatusBadRequest {
+			t.Errorf("%s = -1: %d %v, want 400", f, status, out)
+		}
+		if status, _ := e.do(http.MethodPost, "/api/projects", base(map[string]any{f: -1}), editor.token); status != http.StatusBadRequest {
+			t.Errorf("%s = -1 on create: %d, want 400", f, status)
+		}
+	}
+	// The change is on the audit trail with the other limits.
+	logs, _, err := e.st.ListAuditLogs(context.Background(), store.AuditFilter{Action: "project.update", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, l := range logs {
+		raw, _ := json.Marshal(l.Details)
+		seen = seen || strings.Contains(string(raw), "end_user_daily_tokens")
+	}
+	if !seen {
+		t.Error("the audit trail does not mention the end-user ceilings")
 	}
 }

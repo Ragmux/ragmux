@@ -894,8 +894,21 @@ func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, ragmuxRequest, bool
 	opts, err := parseRagmux(req.Extra)
 	delete(req.Extra, "ragmux")
 	if err != nil {
-		writeErrorCode(c.w, http.StatusBadRequest, "invalid_request_error", errInvalidRagmux, err.Error())
+		writeRagmuxError(c.w, err)
 		return req, opts, false
+	}
+	// The end user and the tags (ADR-035). safety_identifier is read ahead of
+	// user; the field is the client's and goes to an OpenAI-compatible
+	// upstream as it is, whatever it holds.
+	safety, filled := extraString(req.Extra, "safety_identifier")
+	if w := c.applyBodyEndUser(
+		bodyEndUserField{name: "safety_identifier", value: safety, filled: filled},
+		bodyEndUserField{name: "user", value: req.User, filled: req.User != ""}); w != "" {
+		opts.Warnings = append(opts.Warnings, w)
+	}
+	req.EndUser = c.providerEndUser
+	if w := c.applyTags(opts.Tags, opts.TagsSet); w != "" {
+		opts.Warnings = append(opts.Warnings, w)
 	}
 	return req, opts, true
 }
@@ -1146,6 +1159,10 @@ type ragmuxRequest struct {
 	// Filter is ragmux.filter (ADR-025): retrieval is limited to the documents
 	// whose metadata matches. Nil when absent. It only narrows.
 	Filter *store.MetadataFilter
+	// Tags is ragmux.tags (ADR-035), sorted and without duplicates, and TagsSet
+	// says the object carried the field -- an empty list is an answer too.
+	Tags    []string
+	TagsSet bool
 	// Warnings are the texts of the Warning headers the object earns.
 	Warnings []string
 	// ToolTurn is set by the Messages endpoint, never read from a body: the
@@ -1214,6 +1231,21 @@ func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 		}
 	}
 
+	// Tags are refused when malformed, like the filter: a tag set that was
+	// quietly dropped would leave the request unlabelled where the client
+	// believes it is labelled (ADR-035).
+	if v, ok := fields["tags"]; ok {
+		var list []string
+		if json.Unmarshal(v, &list) != nil || list == nil {
+			return o, &tagsError{"ragmux.tags must be an array of strings"}
+		}
+		tags, err := checkTags(list)
+		if err != nil {
+			return o, &tagsError{"ragmux.tags: " + err.Error()}
+		}
+		o.Tags, o.TagsSet = tags, true
+	}
+
 	// A filter outside the grammar is refused like a malformed object, not
 	// ignored: dropping it would answer from documents the caller meant to
 	// exclude (ADR-024, ADR-025).
@@ -1228,7 +1260,7 @@ func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 	// Map order is random; the headers must not be.
 	var rest []string
 	for k := range fields {
-		if k != "include_context" && k != "retrieval" && k != "sources" && k != "filter" {
+		if k != "include_context" && k != "retrieval" && k != "sources" && k != "filter" && k != "tags" {
 			rest = append(rest, k)
 		}
 	}
@@ -1244,6 +1276,16 @@ func parseRagmux(extra map[string]json.RawMessage) (ragmuxRequest, error) {
 		}
 	}
 	return o, nil
+}
+
+// writeRagmuxError answers an unusable ragmux object: invalid_tags when the
+// tags are what is wrong, invalid_ragmux otherwise.
+func writeRagmuxError(w http.ResponseWriter, err error) {
+	code, msg, ok := asTagsError(err)
+	if !ok {
+		code, msg = errInvalidRagmux, err.Error()
+	}
+	writeErrorCode(w, http.StatusBadRequest, "invalid_request_error", code, msg)
 }
 
 // addRagmuxWarnings adds one `Warning: 299 ragmux "<text>"` header per text, at
@@ -1723,8 +1765,11 @@ func ceilSeconds(d time.Duration) int {
 // messages are unchanged for the tier that always existed.
 func writeLimitError(w http.ResponseWriter, d limits.Decision) {
 	subject := "this project"
-	if d.Scope == limits.ScopeKey {
+	switch d.Scope {
+	case limits.ScopeKey:
 		subject = "this api key"
+	case limits.ScopeEndUser:
+		subject = "this end user"
 	}
 	typ, msg := "rate_limit_exceeded", ""
 	switch d.Reason {

@@ -3,6 +3,8 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -57,6 +59,26 @@ type AnthropicRequest struct {
 	// Thinking and OutputConfig carry reasoning_effort (effort.go).
 	Thinking     *AnthropicThinking     `json:"thinking,omitempty"`
 	OutputConfig *AnthropicOutputConfig `json:"output_config,omitempty"`
+	// Metadata carries the end user's hashed identifier (ADR-035), the only
+	// field of Anthropic's metadata object the adapter sets.
+	Metadata *AnthropicMetadata `json:"metadata,omitempty"`
+}
+
+// AnthropicMetadata is the request's metadata object.
+type AnthropicMetadata struct {
+	UserID string `json:"user_id"`
+}
+
+// endUserHash is the identifier a translated request sends a provider for an
+// end user (ADR-035): "h-" and the first 61 hex digits of the SHA-256 of the
+// value, 63 characters of lowercase letters, digits and a hyphen. The raw
+// value never leaves: Anthropic asks that metadata.user_id carry no personal
+// information, and the value may be an e-mail address. The hash is unsalted, so
+// it keeps one end user's requests together at the provider and does nothing
+// more -- it is not anonymisation.
+func endUserHash(v string) string {
+	sum := sha256.Sum256([]byte(v))
+	return "h-" + hex.EncodeToString(sum[:])[:61]
 }
 
 // AnthropicMessage is one turn of a Messages request or response.
@@ -293,6 +315,13 @@ func translateAnthropic(ctx context.Context, cfg Config, req ChatRequest) (Anthr
 	su, err := setupAnthropicThinking(cfg.Model, req)
 	if err != nil {
 		return out, err
+	}
+	// Only the end user the gateway validated and set aside for the provider
+	// (ChatRequest.EndUser) goes out, hashed. ChatRequest.User is not read: the
+	// translated path never forwarded it, and a client's free text must not
+	// start to.
+	if ValidEndUser(req.EndUser) {
+		out.Metadata = &AnthropicMetadata{UserID: endUserHash(req.EndUser)}
 	}
 	images := cfg.imageBudget(ctx)
 	out.MaxTokens = su.plan.MaxTokens

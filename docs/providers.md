@@ -379,7 +379,8 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   array of blocks instead — see [Prompt caching](#prompt-caching).
 - `max_tokens` is required by Anthropic; when the client sends neither `max_tokens` nor
   `max_completion_tokens` the gateway uses **4096**.
-- `temperature`, `top_p` and `stop` are mapped; `n`, `user` and unknown fields are dropped.
+- `temperature`, `top_p` and `stop` are mapped; `n` and unknown fields are dropped. `user` is
+  not read; the end user travels as `metadata.user_id`, below.
 - `response_format` is applied; see [Structured output](#structured-output).
 - Consecutive messages with the same role are merged, as the Messages API requires.
 - `reasoning_effort` becomes `thinking` and `output_config.effort`, or `thinking` with
@@ -415,6 +416,39 @@ Requests are translated to the Messages API and responses back to the OpenAI sch
   value Anthropic adds later) → `stop`, logged at warn level with the value. Usage is mapped to `prompt_tokens`/`completion_tokens`,
   including on streams; see [Prompt caching](#prompt-caching) for how the cache
   counters are folded in.
+
+### End user
+
+A request can name its end user ([End users and tags](api.md#end-users-and-tags)). When the
+*body* of a chat completions request, which is translated for an Anthropic connection, carries a
+usable one, the gateway sends
+`metadata.user_id` set to `h-` followed by the first 61 hex digits of the SHA-256 of the value:
+63 characters, the same for the same end user every time. Anthropic uses the field to tell
+one user's traffic from another's when it investigates abuse.
+
+**This is a behaviour change.** Earlier releases dropped `user` on this path, so nothing
+identifying an end user left the gateway. Now a stable identifier does, and the points below
+are why it is a hash and what the hash is not:
+
+- The raw value never leaves. An end user is often an e-mail address, and Anthropic asks that
+  `metadata.user_id` carry no personal information.
+- **The hash is not anonymisation.** It is unsalted, so anyone who can guess the values (an
+  e-mail address, a numeric id) can compute the same hash and recognise the user. It keeps one
+  end user's requests together at the provider and nothing more.
+- **What went to the provider cannot be taken back.** Deleting or anonymising the end user in
+  Ragmux does not reach Anthropic.
+- **To send nothing, do not put the id in the body.** `X-Ragmux-End-User` is Ragmux's own and is
+  never forwarded to any provider, so an application that wants the end user in the request log
+  and in the per-end-user ceilings but not at the provider sends it in that header and leaves
+  `user`, `safety_identifier` and `metadata.user_id` out of the body. A body value that is not
+  a valid end user id is dropped, not hashed.
+
+The native `/v1/messages` path to Anthropic forwards the client's `metadata` as it was sent,
+and an OpenAI-compatible connection gets the client's `user` and `safety_identifier` as they
+were sent, both as before. **Gemini** and **Ollama** get no end user, as before: whether
+Gemini's `generateContent` accepts the `labels` field this would travel in has not been
+confirmed against the real API, and a request it rejected would break every chat that carries
+a `user`, so it stays off until it is.
 
 ### Structured output
 
@@ -488,6 +522,8 @@ Requests are translated to `generateContent` / `streamGenerateContent`:
   `reasoning_content` or `ragmux_thinking` on a request message is dropped (the first with a
   `Warning`); Gemini's own thought signatures keep travelling in `ragmux_signature`.
 - Embeddings use `batchEmbedContents`; the model name gets a `models/` prefix if missing.
+- `user` is dropped, and so is the end user ([End user](#end-user)): nothing identifying the
+  request's user is sent to Gemini.
 
 ### Tool calling
 
@@ -627,6 +663,7 @@ gives access to Ollama-only options:
   assistant message's unsigned `ragmux_thinking` goes back to Ollama as `message.thinking`,
   so a thinking model keeps its reasoning across a tool round; signed blocks (Anthropic's)
   are not sent. A `reasoning_content` is dropped with a `Warning`.
+- `user` and the end user are not sent: the native API has no field for them.
 - Tools use OpenAI's `{type:"function", function:{…}}` shape natively, so `tools` are
   forwarded; assistant `tool_calls` and `tool` messages (with `tool_name`) are translated
   both ways. Ollama sends no call ids, so the gateway generates them (`call_…`).

@@ -510,7 +510,8 @@ Project body:
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
- "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0}
+ "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
+ "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0}
 ```
 
 `rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
@@ -533,7 +534,7 @@ value is `400`, and so is a `query_model_connection_id` that is not an existing 
 connection. A connection a project names there cannot be deleted (`409`). A change is
 written to the audit log on the `project.update` entry, under `details.rag_settings_changed`
 (`from` and `to` for each field that changed).
-The last three fields of the body govern tools and sessions
+The next three govern tools and sessions
 ([Users, roles and limits](users-and-limits.md#tool-governance)):
 
 | Field | Values | Default |
@@ -549,6 +550,24 @@ the default on create; `[]` clears a list. A pattern that is not of that shape, 
 more than 64 and a negative cap are `400`. A change is written to the audit log on the
 `project.update` entry, under `details.tool_settings_changed`.
 
+The last four fields are the project's **per-end-user ceilings**
+([Users, roles and limits](users-and-limits.md#end-users-and-tags)): what one end user, named
+by `X-Ragmux-End-User` or by the request body's own field, may make in a UTC minute and spend
+in a UTC day and month.
+
+| Field | Values | Default |
+|---|---|---|
+| `end_user_rpm` | requests per minute for one end user | `0` (unlimited) |
+| `end_user_tpm` | prompt tokens per minute for one end user | `0` |
+| `end_user_daily_tokens` | prompt plus completion tokens per UTC day | `0` |
+| `end_user_monthly_tokens` | prompt plus completion tokens per UTC month | `0` |
+
+These four left out keep their current value on update and take `0` on create, like the
+fields above; a negative value is `400`. A change is written to the audit log on the
+`project.update` entry, under `details.limits_changed` with the other limits. They bind only a
+request that names an end user: a request without one is not held to them (they are a
+guardrail, not a security check).
+
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
 full key is never returned again. The project object:
 
@@ -559,6 +578,7 @@ full key is never returned again. The project object:
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
  "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
+ "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0,
  "member_ids": [4], "created_at": "…", "updated_at": "…"}
 ```
 
@@ -849,6 +869,7 @@ The summary response (also used by `/projects/{id}/metrics`):
              "request_id": "3f2a9c1e", "endpoint": "chat.completions", "requested_model": "smart",
              "route": "smart", "attempt": 2, "fallback_from": 1,
              "session_id": "agent-run-42", "tool_names": ["get_weather"], "tools_denied": 1,
+             "end_user": "ali@firma.com", "tags": ["support", "v2"],
              "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
@@ -868,7 +889,9 @@ target when the request moved to another one, and `route` is absent for the impl
 route. `session_id` (the request's `X-Ragmux-Session`), `tool_names` (the tools the model
 called in its answer: sorted, without duplicates, at most 32 names of at most 64 bytes;
 names only, never arguments) and `tools_denied` (how many tools the project's lists removed)
-are left out when empty or `0`. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
+are left out when empty or `0`. `end_user` (the request's [end user](users-and-limits.md#end-users-and-tags))
+and `tags` (its tags, sorted, without duplicates) are left out when the request named none.
+Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
 `502`, `503`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
@@ -897,7 +920,7 @@ request logs, oldest first and at most 50 000 rows, as `text/csv` with a
 created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
 estimated, latency_ms, streamed, rag_used, rag_hits, error,
 cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id,
-session_id, tool_names, tools_denied
+session_id, tool_names, tools_denied, end_user, tags
 ```
 
 New columns are appended at the end and existing ones never move, so an importer that
@@ -910,7 +933,9 @@ Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
 
-`tool_names` is the names joined with `;`; `session_id` is empty for a request that carried none.
+`tool_names` and `tags` are the names joined with `;`; `session_id`, `end_user` and `tags` are
+empty for a request that carried none. An end user can legitimately begin with `+` or `@`, so
+it is prefixed with a quote like any other cell that could be read as a formula.
 
 The CSV carries the columns above only: `request_id`, `endpoint`, `requested_model`,
 `route`, `attempt` and `fallback_from` are in the JSON log and the database, not in the
@@ -1099,7 +1124,8 @@ Anthropic SDKs and Claude Code use `http://<host>:8765` as their base URL (they 
 Accepts the OpenAI Chat Completions payload: `model`, `messages` (text or
 `text` / `image_url` content parts), `stream`, `temperature`, `top_p`, `max_tokens` /
 `max_completion_tokens`, `stop`, `n`, `tools`, `tool_choice`, `response_format`,
-`stream_options`, `user`. Unknown fields are forwarded to OpenAI-compatible upstreams
+`stream_options`, `user` (also `safety_identifier`; both name the request's
+[end user](#end-users-and-tags)). Unknown fields are forwarded to OpenAI-compatible upstreams
 unchanged (see [Providers](providers.md)), with one exception: an optional `ragmux`
 object is consumed by the gateway and never sent upstream. A `tool` message may carry
 `"ragmux_is_error": true` to mark a failed tool call (see
@@ -1304,6 +1330,41 @@ loop, not an access control. An id outside that set is `400` with `code:
 "invalid_session_id"` and is never ignored, because ignoring it would let a malformed
 header past the cap. The session is not a metric label or a span attribute.
 
+<a id="end-users-and-tags"></a>
+
+**End users and tags.** A request can say who it is for and how to
+classify it; both go to the request log row, the CSV export and (for the end user) the
+per-end-user ceilings, and to nothing else: they are not a metric label, a span attribute or
+a log field.
+
+| | Header (every `/v1` endpoint, and the MCP search) | Body |
+|---|---|---|
+| End user | `X-Ragmux-End-User: <id>` | chat and embeddings: `safety_identifier`, else `user`; messages: `metadata.user_id` |
+| Tags | `X-Ragmux-Tags: a,b,c` | chat and messages: `ragmux.tags` |
+
+- **Which one wins.** The header beats the body for the end user: the header is Ragmux's, the
+  body field is the provider's. The body's first filled field is the one used
+  (`safety_identifier` before `user`); if it is unusable the next is **not** tried. For tags the
+  request's own `ragmux.tags` beats the header (a proxy may add one); with both, the extension is
+  used and a `Warning` says the header was not.
+- **The end user.** 1 to 128 bytes of `A-Z a-z 0-9 . _ : @ + = / -` (an e-mail address fits).
+  A header that is not of that shape, or is sent twice, is `400` with `code: "invalid_end_user"`
+  and is never ignored, because ignoring it would let a malformed header past the per-end-user
+  ceilings. A **body** value that is not of that shape is not an end user: the request is served,
+  the row has none and a `Warning` says so, so a client that has always sent free text in `user`
+  keeps working.
+- **Tags.** At most 8, each 1 to 64 bytes of `A-Z a-z 0-9 . _ : / -`; repeated ones count once
+  and the set is stored sorted. Anything else, an empty item (`a,,b`) and an empty header
+  included, is `400` with `code: "invalid_tags"`. Tags classify; they take no part in limits or access.
+- **What reaches the provider.** Only the value the *body* carried, never the header's. An
+  OpenAI-compatible upstream and the native `/v1/messages` path to Anthropic get the body as
+  it was sent. On the translated path an Anthropic connection gets `metadata.user_id` set to
+  `h-` and the first 61 hex digits of the SHA-256 of the end user, 63 characters, only when the
+  body's value is usable; anything else is dropped, as before. This is a change from earlier
+  releases, which dropped the field; see [Anthropic](providers.md#anthropic) for what the hash
+  is and is not. Gemini and Ollama get nothing. The embeddings endpoint reads the body's fields
+  for the row only and sends them nowhere.
+
 **Tool lists.** When the project sets `tool_allow` or `tool_deny`, the gateway applies them
 to `tools` before the request goes upstream. A tool is matched by `function.name` (or
 `custom.name`); a tool that matches `tool_deny`, or matches no `tool_allow` pattern while that
@@ -1340,11 +1401,12 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
 | `x-ragmux-guardrail` | `blocked` on a JSON answer a `post_response` block rule emptied (see [Guardrails](#guardrails)) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
-| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` `json_object` on an Anthropic model that cannot be forced to call a tool, where an instruction in the system prompt stands in for it (see [Structured output](providers.md#structured-output)), or a `tool_choice` the model cannot take (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), or a match a `redact` guardrail rule replaced (see [Guardrails](#guardrails)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
+| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored (a body `user` / `safety_identifier` / `metadata.user_id` that is not a usable [end user](#end-users-and-tags), or an `X-Ragmux-Tags` that `ragmux.tags` overrode, are two of them): `response_format` `json_object` on an Anthropic model that cannot be forced to call a tool, where an instruction in the system prompt stands in for it (see [Structured output](providers.md#structured-output)), or a `tool_choice` the model cannot take (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), or a match a `redact` guardrail rule replaced (see [Guardrails](#guardrails)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
 `Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and
-accepts `X-Ragmux-Project` in `Access-Control-Allow-Headers`, but a cross-origin page
+accepts `X-Ragmux-Project`, `X-Ragmux-Session`, `X-Ragmux-End-User` and `X-Ragmux-Tags` in
+`Access-Control-Allow-Headers`, but a cross-origin page
 sees no response header outside the CORS safelist unless the request went through CORS
 at all.
 
@@ -1352,12 +1414,12 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`), or a request a [guardrail](#guardrails) `block` rule refused (`code: "guardrail_blocked"`, the message names the stage, never the rule or the match) |
+| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), an invalid `X-Ragmux-End-User` (`code: "invalid_end_user"`), invalid tags in `X-Ragmux-Tags` or `ragmux.tags` (`code: "invalid_tags"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`), or a request a [guardrail](#guardrails) `block` rule refused (`code: "guardrail_blocked"`, the message names the stage, never the rule or the match) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
 | `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
 | `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
 | `413` | body larger than 4 MiB |
-| `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
+| `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"|"end_user"}}` — `scope` says which tier denied; `end_user` is the project's [per-end-user ceiling](users-and-limits.md#end-users-and-tags) |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
 | `429` | the session spent `session_token_cap` tokens; no `Retry-After`, because a session does not reset; body `{"error":{"message":"Session token cap reached (N of M tokens used).","type":"insufficient_quota","code":"session_token_cap","scope":"session"}}`. A request may run a session past the cap by its own size, and concurrent requests of one session can each pass the check before any of them is counted |
 | `4xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted). A `Retry-After` the provider sent (seconds or an HTTP date) is passed through unchanged; a malformed one is dropped |
@@ -1451,6 +1513,12 @@ calls, so the known limit stated for [chat completions](#post-v1chatcompletions)
 and number of blocks do not survive the round trip, which can invalidate a replay on Claude 5.1
 and later) applies to this path. The native path has no such limit.
 
+**End user and tags.** `X-Ragmux-End-User` and `X-Ragmux-Tags` work as on
+[chat](#end-users-and-tags); the body's sources are `metadata.user_id` for the end user and
+`ragmux.tags` for tags. On the native path `metadata` goes to Anthropic as the client sent it
+(an over-long `user_id` is Anthropic's `400`, as it has always been); a translated request to
+an OpenAI-compatible upstream sends it as `user`.
+
 **Sessions and retrieval.** `X-Ragmux-Session` names the session; when it is absent, the
 `x-claude-code-session-id` header Claude Code sends stands in, under the same rules (an
 unusable value is `400`, `code: "invalid_session_id"`). A turn whose last user message holds a
@@ -1490,6 +1558,8 @@ gateway. Needs the key's `embeddings` scope (`403` otherwise).
 - `encoding_format` is `float` (default) or `base64`, the little-endian `float32` bytes
   base64-encoded, as OpenAI's SDKs expect.
 - `dimensions` is not supported and answers `400`: the adapters cannot shorten a vector.
+- `safety_identifier` and `user` name the request's [end user](#end-users-and-tags) for the log
+  row and the per-end-user ceilings, as on chat. They are not sent to the provider.
 
 ```json
 {"object": "list", "model": "text-embedding-3-small",

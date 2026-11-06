@@ -143,6 +143,29 @@ func TextContent(s string) json.RawMessage {
 	return b
 }
 
+// MaxEndUserBytes is the longest end user identifier ValidEndUser accepts.
+const MaxEndUserBytes = 128
+
+// ValidEndUser reports whether v is usable as an end user identifier
+// (ADR-035): 1 to 128 bytes of ASCII letters, digits and . _ : @ + = / -.
+// There is no space, control character or quote in the set, so the value is
+// safe in a header, a log line and a SQL text column.
+func ValidEndUser(v string) bool {
+	if len(v) == 0 || len(v) > MaxEndUserBytes {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("._:@+=/-", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // ChatRequest is the OpenAI /v1/chat/completions payload. Unknown fields are
 // retained in Extra so OpenAI-compatible upstreams receive them unchanged.
 type ChatRequest struct {
@@ -160,6 +183,14 @@ type ChatRequest struct {
 	ResponseFormat   json.RawMessage `json:"response_format,omitempty"`
 	StreamOptions    json.RawMessage `json:"stream_options,omitempty"`
 	User             string          `json:"user,omitempty"`
+	// EndUser is the end user identifier the gateway validated (ValidEndUser)
+	// and set aside for the providers that get a translated request
+	// (ADR-035). It is not User: the translations never read User, so a
+	// client's free text and the value of X-Ragmux-End-User cannot reach a
+	// provider by accident. Only the gateway sets it, from the request body's
+	// own field, and only the Anthropic adapter reads it, hashed. It never goes
+	// on the wire as it is nor into a client payload.
+	EndUser string `json:"-"`
 	// RAGActive is set by the gateway when retrieval may have changed the
 	// prompt of this conversation: the project has a store and its
 	// retrieval policy is not off, whatever the client sent for this request

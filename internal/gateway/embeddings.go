@@ -39,6 +39,12 @@ type embeddingsRequest struct {
 	// Dimensions is rejected when set: the embedders have no way to shorten a
 	// vector, and ignoring it would hand back a width the client did not ask for.
 	Dimensions *int `json:"dimensions"`
+	// SafetyIdentifier and User are read only to name the end user of the
+	// request (ADR-035). They are raw so a value of the wrong type is judged
+	// as an end user and not as a malformed body, which is how the endpoint has
+	// always treated them: ignored. Neither goes upstream.
+	SafetyIdentifier json.RawMessage `json:"safety_identifier"`
+	User             json.RawMessage `json:"user"`
 }
 
 // embeddings is POST /v1/embeddings: the pipeline steps in order with the
@@ -102,6 +108,13 @@ func (g *Gateway) decodeEmbeddings(c *call) (embeddingsRequest, []string, bool) 
 	inputs, msg := parseEmbeddingInput(req.Input)
 	if msg != "" {
 		return bad(msg)
+	}
+	safety, safetyFilled := rawString(req.SafetyIdentifier)
+	user, userFilled := rawString(req.User)
+	if w := c.applyBodyEndUser(
+		bodyEndUserField{name: "safety_identifier", value: safety, filled: safetyFilled},
+		bodyEndUserField{name: "user", value: user, filled: userFilled}); w != "" {
+		addWarnings(c.w.Header(), []string{w})
 	}
 	return req, inputs, true
 }

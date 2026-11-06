@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -74,6 +75,14 @@ type RequestLog struct {
 	// project's allow/deny lists stripped from the request.
 	ToolNames   []string `json:"tool_names,omitempty"`
 	ToolsDenied int      `json:"tools_denied,omitempty"`
+	// EndUser is the end user the request was made for (ADR-035): the
+	// X-Ragmux-End-User header, else the body's own field; empty when the
+	// request named none. Tags are the request's tags, sorted and without
+	// duplicates (at most MaxTags of at most MaxTagBytes bytes); empty for none.
+	// Both are row columns only: never a metric label or a span attribute (PRD
+	// rule 10).
+	EndUser string   `json:"end_user,omitempty"`
+	Tags    []string `json:"tags,omitempty"`
 	// The guardrail columns (ADR-034). GuardrailBlockedStage is the stage a rule
 	// blocked the request at, empty when none did; GuardrailRedactions and
 	// GuardrailFlags count matches; GuardrailRules lists the ids of the rules
@@ -88,6 +97,53 @@ type RequestLog struct {
 	GuardrailRules        []string `json:"-"`
 	GuardrailWebhook      string   `json:"-"`
 	CreatedAt             string   `json:"created_at"`
+}
+
+// Bounds of the end-user columns (ADR-035). The gateway only lets a valid value
+// through; the store applies them again to a writer other than the gateway.
+const (
+	MaxEndUserBytes = 128
+	MaxTags         = 8
+	MaxTagBytes     = 64
+)
+
+// clampEndUser is the end user as the row keeps it: no NUL byte, at most
+// MaxEndUserBytes bytes.
+func clampEndUser(s string) string {
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	return cutBytes(s, MaxEndUserBytes)
+}
+
+// clampTags makes the tags fit their column: NUL bytes dropped, each cut to
+// MaxTagBytes on a character boundary, then de-duplicated, sorted and cut to
+// MaxTags. It returns nil for no tags, which the column stores as NULL.
+func clampTags(tags []string) []string {
+	seen := make(map[string]struct{}, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		if strings.IndexByte(t, 0) >= 0 {
+			t = strings.ReplaceAll(t, "\x00", "")
+		}
+		t = cutBytes(t, MaxTagBytes)
+		if t == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	if len(out) > MaxTags {
+		out = out[:MaxTags]
+	}
+	return out
 }
 
 // MaxGuardrailRules bounds request_logs.guardrail_rules.
@@ -154,18 +210,21 @@ func (s *Store) InsertRequestLog(ctx context.Context, l *RequestLog) error {
 		 rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens, cost_micros, cost_source,
 		 api_key_id, user_id, request_id, endpoint, requested_model, route, attempt, fallback_from, rag_skip_reason,
 		 session_id, tool_names, tools_denied,
-		 guardrail_blocked_stage, guardrail_redactions, guardrail_flags, guardrail_rules, guardrail_webhook)
+		 guardrail_blocked_stage, guardrail_redactions, guardrail_flags, guardrail_rules, guardrail_webhook,
+		 end_user, tags)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
 		 NULLIF($18, ''), NULLIF($19, ''), NULLIF($20, ''), NULLIF($21, ''), NULLIF($22::int, 0)::smallint, $23,
 		 NULLIF($24, ''), NULLIF($25, ''), $26::text[], $27,
-		 NULLIF($28, ''), $29, $30, $31::text[], NULLIF($32, ''))`,
+		 NULLIF($28, ''), $29, $30, $31::text[], NULLIF($32, ''),
+		 NULLIF($33, ''), $34::text[])`,
 		l.ProjectID, l.ModelName, l.StatusCode, l.PromptTokens, l.CompletionTokens, l.Estimated,
 		l.LatencyMs, l.Streamed, l.RAGUsed, l.RAGHits, l.Error,
 		l.CachedPromptTokens, l.CacheWriteTokens, l.CostMicros, source, l.APIKeyID, l.UserID,
 		l.RequestID, l.Endpoint, clampRequestedModel(l.RequestedModel), l.Route, l.Attempt, l.FallbackFrom, l.RAGSkipReason,
 		clampSessionID(l.SessionID), clampToolNames(l.ToolNames), nonNegative(l.ToolsDenied),
 		l.GuardrailBlockedStage, nonNegative(l.GuardrailRedactions), nonNegative(l.GuardrailFlags),
-		clampGuardrailRules(l.GuardrailRules), l.GuardrailWebhook)
+		clampGuardrailRules(l.GuardrailRules), l.GuardrailWebhook,
+		clampEndUser(l.EndUser), clampTags(l.Tags))
 	return err
 }
 
@@ -321,7 +380,8 @@ const requestLogCols = `id, project_id, model_name, status_code, prompt_tokens, 
 	latency_ms, streamed, rag_used, rag_hits, error, cached_prompt_tokens, cache_write_tokens,
 	cost_micros, cost_source, api_key_id, user_id,
 	COALESCE(request_id, ''), COALESCE(endpoint, ''), COALESCE(requested_model, ''), COALESCE(route, ''),
-	COALESCE(attempt, 0), fallback_from, COALESCE(session_id, ''), tool_names, tools_denied, created_at`
+	COALESCE(attempt, 0), fallback_from, COALESCE(session_id, ''), tool_names, tools_denied,
+	COALESCE(end_user, ''), tags, created_at`
 
 // collectRequestLogs reads every row of a query that selected requestLogCols.
 // surface names the caller in the log line a floored row earns.
@@ -335,7 +395,7 @@ func (s *Store) collectRequestLogs(rows pgx.Rows, surface string) ([]*RequestLog
 			&l.Estimated, &l.LatencyMs, &l.Streamed, &l.RAGUsed, &l.RAGHits, &l.Error,
 			&l.CachedPromptTokens, &l.CacheWriteTokens, &l.CostMicros, &l.CostSource,
 			&l.APIKeyID, &l.UserID, &l.RequestID, &l.Endpoint, &l.RequestedModel, &l.Route,
-			&l.Attempt, &l.FallbackFrom, &l.SessionID, &l.ToolNames, &l.ToolsDenied, &created); err != nil {
+			&l.Attempt, &l.FallbackFrom, &l.SessionID, &l.ToolNames, &l.ToolsDenied, &l.EndUser, &l.Tags, &created); err != nil {
 			return nil, err
 		}
 		l.CreatedAt = ts(created)
@@ -461,7 +521,8 @@ func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.
 	q := `SELECT l.id, l.project_id, COALESCE(p.name, ''), l.model_name, l.status_code, l.prompt_tokens, l.completion_tokens,
 		l.estimated, l.latency_ms, l.streamed, l.rag_used, l.rag_hits, l.error,
 		l.cached_prompt_tokens, l.cache_write_tokens, l.cost_micros, l.cost_source,
-		l.api_key_id, l.user_id, COALESCE(l.session_id, ''), l.tool_names, l.tools_denied, l.created_at
+		l.api_key_id, l.user_id, COALESCE(l.session_id, ''), l.tool_names, l.tools_denied,
+		COALESCE(l.end_user, ''), l.tags, l.created_at
 		FROM request_logs l LEFT JOIN projects p ON p.id = l.project_id WHERE l.created_at >= $1`
 	cond, args := f.whereCol("l.project_id", []any{since.UTC()})
 	args = append(args, MaxExportRows)
@@ -478,7 +539,7 @@ func (s *Store) ExportRequests(ctx context.Context, f MetricsFilter, since time.
 		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.ModelName, &r.StatusCode, &r.PromptTokens, &r.CompletionTokens,
 			&r.Estimated, &r.LatencyMs, &r.Streamed, &r.RAGUsed, &r.RAGHits, &r.Error,
 			&r.CachedPromptTokens, &r.CacheWriteTokens, &r.CostMicros, &r.CostSource,
-			&r.APIKeyID, &r.UserID, &r.SessionID, &r.ToolNames, &r.ToolsDenied, &created); err != nil {
+			&r.APIKeyID, &r.UserID, &r.SessionID, &r.ToolNames, &r.ToolsDenied, &r.EndUser, &r.Tags, &created); err != nil {
 			return err
 		}
 		r.CreatedAt = ts(created)

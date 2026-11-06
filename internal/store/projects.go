@@ -52,6 +52,14 @@ type Project struct {
 	// (X-Ragmux-Session) may spend before its requests are answered 429; zero
 	// is unlimited (ADR-032).
 	SessionTokenCap int64 `json:"session_token_cap"`
+	// The per-end-user ceilings (ADR-035): what one end user (X-Ragmux-End-User
+	// or the body's own field) may make in a UTC minute (requests, tokens) and
+	// spend in a UTC day and month; zero is unlimited. They bind only a request
+	// that names an end user: they are a guardrail, not a security check.
+	EndUserRPM           int   `json:"end_user_rpm"`
+	EndUserTPM           int   `json:"end_user_tpm"`
+	EndUserDailyTokens   int64 `json:"end_user_daily_tokens"`
+	EndUserMonthlyTokens int64 `json:"end_user_monthly_tokens"`
 	// Guardrails is the project's guardrail configuration as stored: a JSON
 	// object of rules and settings (ADR-034), nil when the project has none.
 	// The gateway reads it on every request through internal/guardrail, which
@@ -151,6 +159,7 @@ const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, s
 	rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens, created_at, updated_at,
 	context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
 	tool_allow, tool_deny, session_token_cap, guardrails,
+	end_user_rpm, end_user_tpm, end_user_daily_tokens, end_user_monthly_tokens,
 	ARRAY(SELECT user_id FROM project_members pm WHERE pm.project_id = projects.id ORDER BY user_id)`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
@@ -159,7 +168,8 @@ func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	err := row.Scan(&p.ID, &p.Name, &p.ModelConnectionID, &p.RAGStoreID, &p.APIKeyPrefix, &p.SystemPrompt,
 		&p.RateLimitRPM, &p.RateLimitTPM, &p.BudgetDailyTokens, &p.BudgetMonthlyTokens,
 		&created, &updated, &p.ContextPlacement, &p.RetrievalPolicy, &p.QueryStrategy,
-		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.Guardrails, &p.MemberIDs)
+		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.Guardrails,
+		&p.EndUserRPM, &p.EndUserTPM, &p.EndUserDailyTokens, &p.EndUserMonthlyTokens, &p.MemberIDs)
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -234,12 +244,14 @@ func (s *Store) CreateProjectWithMembers(ctx context.Context, p *Project, member
 		(name, model_connection_id, rag_store_id, api_key_hash, api_key_prefix, system_prompt,
 		rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens,
 		context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
-		tool_allow, tool_deny, session_token_cap)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING id`,
+		tool_allow, tool_deny, session_token_cap,
+		end_user_rpm, end_user_tpm, end_user_daily_tokens, end_user_monthly_tokens)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) RETURNING id`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
 		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
-		nonNilStrings(p.ToolAllow), nonNilStrings(p.ToolDeny), p.SessionTokenCap).Scan(&id)
+		nonNilStrings(p.ToolAllow), nonNilStrings(p.ToolDeny), p.SessionTokenCap,
+		p.EndUserRPM, p.EndUserTPM, p.EndUserDailyTokens, p.EndUserMonthlyTokens).Scan(&id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -276,11 +288,13 @@ func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error)
 		history_turns_for_query=COALESCE(NULLIF($12::int, 0), history_turns_for_query),
 		query_model_connection_id=$13, tool_allow=COALESCE($14::text[], tool_allow), tool_deny=COALESCE($15::text[], tool_deny),
 		session_token_cap=$16,
-		updated_at=now() WHERE id=$17`,
+		end_user_rpm=$17, end_user_tpm=$18, end_user_daily_tokens=$19, end_user_monthly_tokens=$20,
+		updated_at=now() WHERE id=$21`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
 		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
-		p.ToolAllow, p.ToolDeny, p.SessionTokenCap, p.ID)
+		p.ToolAllow, p.ToolDeny, p.SessionTokenCap,
+		p.EndUserRPM, p.EndUserTPM, p.EndUserDailyTokens, p.EndUserMonthlyTokens, p.ID)
 	if err != nil {
 		return nil, err
 	}

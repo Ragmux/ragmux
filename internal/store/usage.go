@@ -148,3 +148,86 @@ func (s *Store) BudgetUsedRatios(ctx context.Context, w UsageWindows) (map[strin
 	}
 	return out, rows.Err()
 }
+
+// The end-user counters (ADR-035). end_user_usage has the shape of
+// project_usage with the end user in the key, so the limiter reads a tier the
+// same way it reads the other two. Only a request that names an end user, to a
+// project that sets an end-user ceiling, reads or writes it.
+
+// ReserveEndUserMinuteRequest atomically increments an end user's minute
+// request counter and returns the new value.
+func (s *Store) ReserveEndUserMinuteRequest(ctx context.Context, projectID int64, endUser string, minute time.Time) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `INSERT INTO end_user_usage (project_id, end_user, period, period_start, requests)
+		VALUES ($1, $2, 'minute', $3, 1)
+		ON CONFLICT (project_id, end_user, period, period_start) DO UPDATE SET requests = end_user_usage.requests + 1
+		RETURNING requests`, projectID, clampEndUser(endUser), minute).Scan(&n)
+	return n, err
+}
+
+// ReleaseEndUserMinuteRequest undoes a reservation that was rejected.
+func (s *Store) ReleaseEndUserMinuteRequest(ctx context.Context, projectID int64, endUser string, minute time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE end_user_usage SET requests = GREATEST(requests - 1, 0)
+		WHERE project_id = $1 AND end_user = $2 AND period = 'minute' AND period_start = $3`,
+		projectID, clampEndUser(endUser), minute)
+	return err
+}
+
+// GetEndUserUsage reads an end user's minute, day and month rows in one
+// query. Missing rows come back zeroed with the requested period start.
+func (s *Store) GetEndUserUsage(ctx context.Context, projectID int64, endUser string, w UsageWindows) (minute, day, month UsageRow, err error) {
+	minute = UsageRow{Period: PeriodMinute, PeriodStart: w.Minute}
+	day = UsageRow{Period: PeriodDay, PeriodStart: w.Day}
+	month = UsageRow{Period: PeriodMonth, PeriodStart: w.Month}
+	rows, err := s.pool.Query(ctx, `SELECT period, requests, prompt_tokens, completion_tokens FROM end_user_usage
+		WHERE project_id = $1 AND end_user = $2 AND ((period = 'minute' AND period_start = $3)
+			OR (period = 'day' AND period_start = $4) OR (period = 'month' AND period_start = $5))`,
+		projectID, clampEndUser(endUser), w.Minute, w.Day, w.Month)
+	if err != nil {
+		return minute, day, month, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r UsageRow
+		if err := rows.Scan(&r.Period, &r.Requests, &r.PromptTokens, &r.CompletionTokens); err != nil {
+			return minute, day, month, err
+		}
+		switch r.Period {
+		case PeriodMinute:
+			minute.Requests, minute.PromptTokens, minute.CompletionTokens = r.Requests, r.PromptTokens, r.CompletionTokens
+		case PeriodDay:
+			day.Requests, day.PromptTokens, day.CompletionTokens = r.Requests, r.PromptTokens, r.CompletionTokens
+		case PeriodMonth:
+			month.Requests, month.PromptTokens, month.CompletionTokens = r.Requests, r.PromptTokens, r.CompletionTokens
+		}
+	}
+	return minute, day, month, rows.Err()
+}
+
+// RecordEndUserUsage adds a finished request's tokens to an end user's three
+// period rows; the minute request counter is only bumped when the slot was not
+// already reserved.
+func (s *Store) RecordEndUserUsage(ctx context.Context, projectID int64, endUser string, w UsageWindows, promptTokens, completionTokens int64, countMinuteRequest bool) error {
+	minuteReq := 0
+	if countMinuteRequest {
+		minuteReq = 1
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO end_user_usage (project_id, end_user, period, period_start, requests, prompt_tokens, completion_tokens)
+		VALUES ($1, $2, 'minute', $3, $6, $7, $8), ($1, $2, 'day', $4, 1, $7, $8), ($1, $2, 'month', $5, 1, $7, $8)
+		ON CONFLICT (project_id, end_user, period, period_start) DO UPDATE SET
+			requests = end_user_usage.requests + EXCLUDED.requests,
+			prompt_tokens = end_user_usage.prompt_tokens + EXCLUDED.prompt_tokens,
+			completion_tokens = end_user_usage.completion_tokens + EXCLUDED.completion_tokens`,
+		projectID, clampEndUser(endUser), w.Minute, w.Day, w.Month, minuteReq,
+		max(promptTokens, 0), max(completionTokens, 0))
+	return err
+}
+
+// DeleteEndUserUsageBefore removes rows of one period that started before cutoff.
+func (s *Store) DeleteEndUserUsageBefore(ctx context.Context, period string, cutoff time.Time) (int64, error) {
+	res, err := s.pool.Exec(ctx, "DELETE FROM end_user_usage WHERE period = $1 AND period_start < $2", period, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected(), nil
+}

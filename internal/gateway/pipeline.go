@@ -301,6 +301,20 @@ type call struct {
 	// stripped from the request. Both end up on every request log row.
 	sessionID   string
 	toolsDenied int
+	// endUser is the end user of record (ADR-035): X-Ragmux-End-User, else the
+	// body's own field once the endpoint has read the body; empty when the
+	// request named none. tags are the request's tags, sorted, from
+	// X-Ragmux-Tags until the body's ragmux.tags replaces them;
+	// headerTagsSet says the header carried some. All of them end up on every
+	// request log row, and on nothing else: not a metric label, not a span
+	// attribute, not a log field.
+	endUser       string
+	tags          []string
+	headerTagsSet bool
+	// providerEndUser is the end user the request body itself carried, if it
+	// was usable: the one value that may go to a provider, hashed, when the
+	// request is translated. The header's value is never it.
+	providerEndUser string
 	// routeName is the route that resolved the call; empty for the implicit
 	// route (the project's own connection), which logs NULL.
 	routeName string
@@ -372,6 +386,18 @@ func (g *Gateway) authenticate(w http.ResponseWriter, r *http.Request, op operat
 			"X-Ragmux-Session must be 1 to 128 characters of letters, digits and . _ : -, sent once.")
 		return nil, false
 	}
+	endUser, _, ok := endUserFrom(r)
+	if !ok {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_request_error", errInvalidEndUser,
+			"X-Ragmux-End-User must be "+endUserValueRule+", and sent once.")
+		return nil, false
+	}
+	tags, tagsSet, err := tagsFromHeader(r)
+	if err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_request_error", errInvalidTags,
+			"X-Ragmux-Tags: "+err.Error()+".")
+		return nil, false
+	}
 	start := time.Now()
 	// Every span below -- rag.retrieve, rag.embed_query, rag.rerank and the
 	// provider client spans -- hangs beneath this one, so the traced context
@@ -392,6 +418,9 @@ func (g *Gateway) authenticate(w http.ResponseWriter, r *http.Request, op operat
 	// is the client's own string (PRD rule 10). It reaches the request log row
 	// and the session totals.
 	c.sessionID, c.subject.SessionID = session, session
+	// The same holds for the end user and the tags (ADR-035).
+	c.setEndUser(endUser, true)
+	c.tags, c.headerTagsSet = tags, tagsSet
 	return c, true
 }
 
@@ -604,6 +633,7 @@ func (c *call) stamp(rec *store.RequestLog, attempt int) {
 	rec.Attempt = attempt
 	rec.SessionID = c.sessionID
 	rec.ToolsDenied = c.toolsDenied
+	c.stampIdentity(rec)
 }
 
 // upstreamCall is the endpoint-specific half of invoke: one attempt at one
@@ -877,7 +907,13 @@ func (g *Gateway) record(c *call) {
 	if g.Limiter != nil {
 		// The minute request slot was already reserved by Check when an
 		// RPM limit is set; otherwise count the request here.
-		if err := g.Limiter.RecordSubject(context.Background(), c.subject, rec.PromptTokens, rec.CompletionTokens, !c.decision.Reserved); err != nil {
+		// The limiter takes the cost along but does not keep it yet; the usage
+		// counters that will are a later change, and the signature is settled
+		// here so it is the only thing that moves (ADR-035).
+		spend := limits.Spend{PromptTokens: int64(rec.PromptTokens), CompletionTokens: int64(rec.CompletionTokens),
+			CostMicros: rec.CostMicros, Unpriced: rec.CostSource == store.CostSourceNone && !c.free,
+			CountRequest: !c.decision.Reserved}
+		if err := g.Limiter.RecordSubject(context.Background(), c.subject, spend); err != nil {
 			c.log.Error("record usage", "err", err)
 		}
 	}

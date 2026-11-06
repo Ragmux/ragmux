@@ -334,7 +334,8 @@ HTTP 429  Retry-After: 42
 `type` is `rate_limit_exceeded` for the per-minute limits and `insufficient_quota` for
 budgets; `code` is one of `rate_limit_rpm`, `rate_limit_tpm`, `budget_daily`,
 `budget_monthly`; a session over its [token cap](#sessions) gets `session_token_cap`, the
-one denial without a `Retry-After`. `Retry-After` is the number of seconds until the violated window resets
+one denial without a `Retry-After`. The body's `scope` says which tier denied: `project`, `key`,
+`session` or, for a project's [per-end-user ceiling](#end-users-and-tags), `end_user`. `Retry-After` is the number of seconds until the violated window resets
 (next minute, next UTC day or next month). Rejected requests are recorded in the request
 log with status 429 (visible as `rate_limited` in the metrics summaries and the
 dashboard) and do not consume tokens.
@@ -438,6 +439,68 @@ so two projects can use the same id without meeting.
   header and the cap during a rolling update.
 - **Retention.** A session's total is deleted when its last request is older than the
   request log retention window (`LOG_RETENTION_DAYS`), in the same pass.
+
+## End users and tags
+
+An application that serves many people through one project cannot tell from the request log
+which of them spent what. A request can say who it is for and how to classify it:
+
+- **`X-Ragmux-End-User: <id>`** on any `/v1` endpoint and on the MCP search, or, when the
+  header is absent, the body's own field: `safety_identifier` (else `user`) on chat and
+  embeddings, `metadata.user_id` on messages. 1 to 128 bytes of `A-Z a-z 0-9 . _ : @ + = / -`,
+  so an e-mail address or a user id fits. A header that is not of that shape is `400` with
+  `code: "invalid_end_user"`; a body value that is not is simply not recorded, with a `Warning`,
+  so a client that has always put free text in `user` keeps working.
+- **`X-Ragmux-Tags: a,b`** or **`ragmux.tags`** in a chat or messages body: up to 8 tags of
+  1 to 64 bytes of `A-Z a-z 0-9 . _ : / -`. When both are sent, `ragmux.tags` is used and a
+  `Warning` says so. Anything malformed is `400` with `code: "invalid_tags"`.
+
+The details of the sources, the order and the errors are in
+[the API reference](api.md#end-users-and-tags).
+
+- **Recorded.** Both go into the request log row (`request_logs.end_user`, `request_logs.tags`),
+  the CSV export and the admin API's request rows, and are deleted with the row by the
+  retention job. They are never a metric label, a span attribute or a log field: they are text
+  the client chose, and an unbounded set.
+- **Capped.** The project has four optional ceilings for **one end user**, set with
+  `PUT /admin/api/projects/{id}` like the others (`0` = unlimited):
+
+  | Field | Meaning |
+  |---|---|
+  | `end_user_rpm` | Requests per UTC minute, per end user |
+  | `end_user_tpm` | Prompt tokens per UTC minute, per end user (the estimate, as for the project) |
+  | `end_user_daily_tokens` | Prompt + completion tokens per UTC day, per end user |
+  | `end_user_monthly_tokens` | Prompt + completion tokens per UTC calendar month, per end user |
+
+  Counters live in `end_user_usage`, one row per project, end user and window, and are purged
+  with the other usage counters, but under a shorter retention of their own: minute rows after
+  2 hours, day rows after 2 days, month rows for the current and the previous calendar month only
+  (the project and key
+  counters keep theirs much longer). The limiter reads only the current window, and the row
+  holds the end user's id as it was sent, an e-mail address included, so that id is not kept
+  longer than the ceilings need it. They are read and written only for a
+  request that names an end user, under a project that sets at least one ceiling; a project without one pays nothing.
+  The tiers are checked project, then key, then end user, and the first violation answers.
+  A denial is the same `429` as the other tiers, with `"scope": "end_user"`:
+
+  ```json
+  HTTP 429  Retry-After: 3120
+  {"error":{"message":"Daily token budget exhausted (52000 of 50000 tokens used). Retry after 3120 seconds.",
+            "type":"insufficient_quota","code":"budget_daily","scope":"end_user"}}
+  ```
+
+  When an end user's ceiling is the tightest one, the `x-ratelimit-*` and
+  `x-ragmux-budget-*` response headers describe it.
+- **A guard, not a lock.** A request that names no end user is not held to these ceilings, and
+  one that names a different id gets a fresh allowance. They protect a project from one
+  heavy user among many whose id the application controls; use the key and project
+  [limits](#rate-limits-and-budgets) for anything the client must not be able to avoid.
+  Like the session cap, they compare tokens already spent, so the request that crosses a
+  ceiling is served in full, and a binary older than this feature ignores the headers and the
+  ceilings during a rolling update.
+- **What the provider sees.** Only a value the request *body* carried, and, on a translated
+  Anthropic request, only as a hash. The header is never sent. See
+  [Providers](providers.md#anthropic).
 
 ## Tool governance
 

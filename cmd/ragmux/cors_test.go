@@ -20,7 +20,7 @@ func TestCORSExposesGatewayHeaders(t *testing.T) {
 	for _, name := range strings.Split(w.Header().Get("Access-Control-Expose-Headers"), ",") {
 		exposed[strings.ToLower(strings.TrimSpace(name))] = true
 	}
-	for _, name := range []string{"Retry-After", "Warning", "X-Request-Id", "x-ragmux-projects"} {
+	for _, name := range []string{"Retry-After", "Warning", "X-Request-Id", "x-ragmux-projects", "x-ragmux-guardrail"} {
 		if !exposed[strings.ToLower(name)] {
 			t.Errorf("%s is not exposed: %q", name, w.Header().Get("Access-Control-Expose-Headers"))
 		}
@@ -80,5 +80,30 @@ func TestCORSAllowsAnthropicHeaders(t *testing.T) {
 	}
 	if !exposed["request-id"] {
 		t.Errorf("request-id is not exposed: %q", w.Header().Get("Access-Control-Expose-Headers"))
+	}
+}
+
+// The end user and the tags travel in headers a browser client sets itself
+// (ADR-035), so its preflight must be told it may send them.
+func TestCORSAllowsEndUserAndTagsHeaders(t *testing.T) {
+	h := cors([]string{"https://app.example"})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	r := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	r.Header.Set("Origin", "https://app.example")
+	r.Header.Set("Access-Control-Request-Method", "POST")
+	r.Header.Set("Access-Control-Request-Headers", "X-Ragmux-End-User, X-Ragmux-Tags")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", w.Code)
+	}
+	allowed := map[string]bool{}
+	for _, name := range strings.Split(w.Header().Get("Access-Control-Allow-Headers"), ",") {
+		allowed[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	for _, name := range []string{"X-Ragmux-End-User", "X-Ragmux-Tags"} {
+		if !allowed[strings.ToLower(name)] {
+			t.Errorf("%s is not allowed: %q", name, w.Header().Get("Access-Control-Allow-Headers"))
+		}
 	}
 }

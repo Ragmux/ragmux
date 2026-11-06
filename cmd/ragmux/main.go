@@ -818,7 +818,8 @@ func cors(origins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Vary", "Origin")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers",
-					"Authorization, Content-Type, X-Ragmux-Project, X-Ragmux-Session, MCP-Protocol-Version, Mcp-Method, Mcp-Name, "+
+					"Authorization, Content-Type, X-Ragmux-Project, X-Ragmux-Session, X-Ragmux-End-User, X-Ragmux-Tags, "+
+						"MCP-Protocol-Version, Mcp-Method, Mcp-Name, "+
 						"x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access")
 				// Without this, browser JS cannot read a single one of the
 				// headers the gateway sets: the fetch API hides every
@@ -826,7 +827,7 @@ func cors(origins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Expose-Headers",
 					"Retry-After, X-Request-Id, request-id, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, "+
 						"x-ratelimit-reset-requests, x-ragmux-budget-daily-remaining, x-ragmux-budget-monthly-remaining, "+
-						"x-ragmux-rag-hits, x-ragmux-rag-sources, x-ragmux-projects, Warning")
+						"x-ragmux-rag-hits, x-ragmux-rag-sources, x-ragmux-projects, x-ragmux-guardrail, Warning")
 				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 			if r.Method == http.MethodOptions {

@@ -270,6 +270,39 @@ before another replica claims them. Nothing is lost; a document is only ever
   a new replica starting against a database an old one is still using is safe as
   long as the schema change is backwards compatible - which is the rule these
   migrations follow (`ADD COLUMN IF NOT EXISTS`, new tables, no drops).
+- A migration that alters a busy table asks for a lock that waits behind any query still
+  using that table, and every request that wants the table queues behind it. The gateway
+  writes a `request_logs` row at the end of every request, so a long read of that table (a
+  CSV export, a summary over a wide window) running at the wrong moment would stall requests
+  on all replicas. Two migrations are guarded against that, `0032` and `0033`: they alter
+  `request_logs` first and set `lock_timeout` (2 seconds). They run back to back when a
+  v0.7 database is upgraded. If the lock is not granted in time the migration fails, rolls
+  back whole and is not recorded, and the new replica exits with `canceling statement due
+  to lock timeout`. Old replicas keep serving. The limit is per lock request, 2 seconds
+  each: a request that queued behind the migration waits at most 2 seconds, and about 4
+  seconds in the worst case, when the `request_logs` lock is granted late and the
+  `projects` step then waits as well (only a long read of `projects` does that). Nothing
+  is half applied and the runner does not retry, so the replica is started again by the
+  process manager (`restart: unless-stopped`, a Kubernetes `Deployment`) and the migration
+  runs from the start. If it keeps failing,
+  something is still holding `request_logs`. Earlier migrations that touch `request_logs`
+  (`0029` among them, which is in v0.7.0 but not in v0.6.1) carry no `lock_timeout`: when
+  upgrading from v0.6 or older straight to v0.8, finish long reads of `request_logs`
+  (exports, summaries over a wide window) before starting the new replica. Find the holder:
+
+  ```sql
+  SELECT a.pid, a.state, now() - a.xact_start AS open_for, a.query
+  FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+  WHERE l.relation = 'request_logs'::regclass AND l.granted AND a.pid <> pg_backend_pid();
+  ```
+
+  (Run it in the schema Ragmux uses.) A session that is `active` finishes by itself, or
+  `SELECT pg_cancel_backend(<pid>)` stops its query. A session that is `idle in transaction`
+  is a transaction someone left open: it still holds the lock after its query is cancelled,
+  so `pg_cancel_backend` changes nothing and `SELECT pg_terminate_backend(<pid>)` is what
+  releases it. If long reads keep starting (an export job, a dashboard that polls a wide
+  window), stop that source first; cancelling one query only lets the next one in. Once the
+  table is free the next start goes through.
 
 ### `/readyz` during a rolling upgrade
 

@@ -1819,6 +1819,13 @@ type projectInput struct {
 	ToolAllow       *[]string `json:"tool_allow"`
 	ToolDeny        *[]string `json:"tool_deny"`
 	SessionTokenCap *int64    `json:"session_token_cap"`
+
+	// The per-end-user ceilings (ADR-035). A field left out keeps the project's
+	// current value on update and takes 0 (unlimited) on create.
+	EndUserRPM           *int   `json:"end_user_rpm"`
+	EndUserTPM           *int   `json:"end_user_tpm"`
+	EndUserDailyTokens   *int64 `json:"end_user_daily_tokens"`
+	EndUserMonthlyTokens *int64 `json:"end_user_monthly_tokens"`
 }
 
 // project builds the store record from validated input (id and key aside).
@@ -1836,6 +1843,20 @@ func (in *projectInput) project(base *store.Project) *store.Project {
 	if base != nil {
 		p.HistoryTurnsForQuery, p.QueryModelConnectionID = base.HistoryTurnsForQuery, base.QueryModelConnectionID
 		p.SessionTokenCap = base.SessionTokenCap
+		p.EndUserRPM, p.EndUserTPM = base.EndUserRPM, base.EndUserTPM
+		p.EndUserDailyTokens, p.EndUserMonthlyTokens = base.EndUserDailyTokens, base.EndUserMonthlyTokens
+	}
+	if in.EndUserRPM != nil {
+		p.EndUserRPM = *in.EndUserRPM
+	}
+	if in.EndUserTPM != nil {
+		p.EndUserTPM = *in.EndUserTPM
+	}
+	if in.EndUserDailyTokens != nil {
+		p.EndUserDailyTokens = *in.EndUserDailyTokens
+	}
+	if in.EndUserMonthlyTokens != nil {
+		p.EndUserMonthlyTokens = *in.EndUserMonthlyTokens
 	}
 	// A list left nil stays as it is: the store keeps the column on update and
 	// writes an empty list on create.
@@ -1945,7 +1966,9 @@ func validateToolSettings(in *projectInput) error {
 // limitFields lists the limit columns with their current values.
 func limitFields(p *store.Project) map[string]int64 {
 	return map[string]int64{"rate_limit_rpm": int64(p.RateLimitRPM), "rate_limit_tpm": int64(p.RateLimitTPM),
-		"budget_daily_tokens": p.BudgetDailyTokens, "budget_monthly_tokens": p.BudgetMonthlyTokens}
+		"budget_daily_tokens": p.BudgetDailyTokens, "budget_monthly_tokens": p.BudgetMonthlyTokens,
+		"end_user_rpm": int64(p.EndUserRPM), "end_user_tpm": int64(p.EndUserTPM),
+		"end_user_daily_tokens": p.EndUserDailyTokens, "end_user_monthly_tokens": p.EndUserMonthlyTokens}
 }
 
 // loadProject fetches a project the caller may see; non-members get 404.
@@ -1991,6 +2014,10 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	}
 	if in.RateLimitRPM < 0 || in.RateLimitTPM < 0 || in.BudgetDailyTokens < 0 || in.BudgetMonthlyTokens < 0 {
 		return errors.New("rate limits and budgets must be 0 (unlimited) or positive")
+	}
+	if in.EndUserRPM != nil && *in.EndUserRPM < 0 || in.EndUserTPM != nil && *in.EndUserTPM < 0 ||
+		in.EndUserDailyTokens != nil && *in.EndUserDailyTokens < 0 || in.EndUserMonthlyTokens != nil && *in.EndUserMonthlyTokens < 0 {
+		return errors.New("end-user limits must be 0 (unlimited) or positive")
 	}
 	if err := validateToolSettings(in); err != nil {
 		return err
@@ -2403,7 +2430,7 @@ func (a *Admin) requestsCSV(w http.ResponseWriter, r *http.Request) {
 var csvHeader = []string{"created_at", "project_id", "project_name", "model_name", "status_code", "prompt_tokens",
 	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error",
 	"cached_prompt_tokens", "cache_write_tokens", "cost_usd", "cost_source", "api_key_id", "user_id",
-	"session_id", "tool_names", "tools_denied"}
+	"session_id", "tool_names", "tools_denied", "end_user", "tags"}
 
 // exportCSV streams the window's request logs (oldest first, at most
 // store.MaxExportRows) as a CSV download. Errors after the first row can
@@ -2446,7 +2473,10 @@ func csvRecord(row *store.RequestExportRow) []string {
 		optInt64(row.APIKeyID), optInt64(row.UserID),
 		// Tool names are the model's own output, so they pass csvCell like
 		// every other cell a third party could shape.
-		row.SessionID, strings.Join(row.ToolNames, ";"), strconv.Itoa(row.ToolsDenied)}
+		row.SessionID, strings.Join(row.ToolNames, ";"), strconv.Itoa(row.ToolsDenied),
+		// The end user and the tags are the client's own strings, so they pass
+		// csvCell too (the end user may start with + or @, both valid there).
+		row.EndUser, strings.Join(row.Tags, ";")}
 	for i, c := range rec {
 		rec[i] = csvCell(c)
 	}

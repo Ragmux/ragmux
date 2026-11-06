@@ -1351,7 +1351,7 @@ func TestMetricsExportAndSummaryOptions(t *testing.T) {
 		t.Fatalf("csv: %d %v", code, h)
 	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error,cached_prompt_tokens,cache_write_tokens,cost_usd,cost_source,api_key_id,user_id,session_id,tool_names,tools_denied" {
+	if len(lines) != 4 || lines[0] != "created_at,project_id,project_name,model_name,status_code,prompt_tokens,completion_tokens,estimated,latency_ms,streamed,rag_used,rag_hits,error,cached_prompt_tokens,cache_write_tokens,cost_usd,cost_source,api_key_id,user_id,session_id,tool_names,tools_denied,end_user,tags" {
 		t.Fatalf("csv lines: %q", lines)
 	}
 	if !strings.Contains(lines[1], fmt.Sprintf(",%d,alpha,x,200,10,3,false,40,true,true,2,", idA)) {
@@ -2256,7 +2256,7 @@ func TestToolGovernanceAndSessionsEndToEnd(t *testing.T) {
 
 	// The CSV carries the new columns at the end.
 	status2, raw, _ := e.fetch(fmt.Sprintf("/admin/api/projects/%d/metrics.csv", pid), e.session)
-	if status2 != 200 || !strings.Contains(strings.SplitN(string(raw), "\n", 2)[0], ",session_id,tool_names,tools_denied") {
+	if status2 != 200 || !strings.Contains(strings.SplitN(string(raw), "\n", 2)[0], ",session_id,tool_names,tools_denied,end_user,tags") {
 		t.Errorf("csv header: %d %q", status2, strings.SplitN(string(raw), "\n", 2)[0])
 	}
 }

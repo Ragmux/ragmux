@@ -180,6 +180,13 @@ func (g *Gateway) readMessages(c *call) (messagesRead, bool) {
 		return messagesRead{}, false
 	}
 	opts.ToolTurn = tr.ToolTurn
+	// The translation reads metadata.user_id into User, for an OpenAI-compatible
+	// upstream; the end user for a translated provider request is the one the
+	// gateway validated (ADR-035). Only the Anthropic adapter reads EndUser, and
+	// it takes /v1/messages natively, so today no translated Messages request
+	// reaches it: this is the wiring that keeps a future one from forwarding
+	// the client's raw value.
+	tr.Request.EndUser = c.providerEndUser
 	return messagesRead{body: body, req: tr.Request, opts: opts, warnings: tr.Warnings}, true
 }
 
@@ -240,6 +247,8 @@ func (g *Gateway) messages(w http.ResponseWriter, r *http.Request) {
 			model := req.Model
 			req, m.warnings = tr.Request, tr.Warnings
 			req.Model = model
+			// Not read on any path today; see readMessages.
+			req.EndUser = c.providerEndUser
 			if warning != "" {
 				opts.Warnings = append([]string{warning}, opts.Warnings...)
 			}
@@ -318,10 +327,28 @@ func (g *Gateway) decodeMessages(c *call) (*provider.MessagesBody, string, ragmu
 	if v, ok := body.Get("ragmux"); ok {
 		opts, err = parseRagmux(map[string]json.RawMessage{"ragmux": v})
 		if err != nil {
-			writeErrorCode(c.w, http.StatusBadRequest, "invalid_request_error", errInvalidRagmux, err.Error())
+			writeRagmuxError(c.w, err)
 			return nil, "", opts, false
 		}
 		body.Delete("ragmux")
+	}
+	// The end user and the tags (ADR-035). A metadata that is not an object is
+	// refused by the translation that follows; here it only has no user_id.
+	var userID string
+	var filled bool
+	if v, ok := body.Get("metadata"); ok {
+		var md struct {
+			UserID json.RawMessage `json:"user_id"`
+		}
+		if json.Unmarshal(v, &md) == nil {
+			userID, filled = rawString(md.UserID)
+		}
+	}
+	if w := c.applyBodyEndUser(bodyEndUserField{name: "metadata.user_id", value: userID, filled: filled}); w != "" {
+		opts.Warnings = append(opts.Warnings, w)
+	}
+	if w := c.applyTags(opts.Tags, opts.TagsSet); w != "" {
+		opts.Warnings = append(opts.Warnings, w)
 	}
 	return body, model, opts, true
 }
