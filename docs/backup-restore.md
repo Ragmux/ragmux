@@ -10,7 +10,7 @@ and how to rehearse a disaster.
 | Where | What |
 |---|---|
 | PostgreSQL (`ragmux-data` volume, `/data/pg`, with the default all-in-one file; `pgdata` volume with `docker-compose.split.yml`) | users and sessions, model connections (provider API keys, AES-256-GCM encrypted), RAG stores, documents (the uploaded files as `bytea`), chunks, one `chunk_embeddings_<dims>` table per embedding width (HNSW vector indexes), projects and their hashed `sk-proj-…` keys, request logs, usage counters, login attempts, audit log, `schema_migrations` |
-| `SECRET_KEY` | the 32-byte key (64 hex characters) that decrypts the provider API keys stored in the database. The database records which key that is (`instance_settings`), and a restore with the wrong one fails at start rather than silently |
+| `SECRET_KEY` | the 32-byte key (64 hex characters) that decrypts the provider API keys stored in the database. With `SECRET_KEY_SOURCE=vault_transit` or `aws_kms` the key is not a file you hold: back up `SECRET_KEY_WRAPPED` and keep the Vault / KMS key it was wrapped with (a restore needs both). The database records which key that is (`instance_settings`), and a restore with the wrong one fails at start rather than silently |
 | `/data/ragmux/secret.key` (all-in-one, only when `SECRET_KEY` is unset) | the generated fallback key; it lives in the same volume as the database, so a volume backup covers it, a `pg_dump` does not |
 
 With the split layout the gateway container itself is stateless: it can be deleted and
@@ -444,13 +444,15 @@ copy `/data/ragmux/secret.key` out of the volume first
 Rotate the key when it may have leaked, when someone who knew it leaves, or on a
 schedule. `ragmux rotate-key` re-encrypts every stored provider API key in one
 transaction, verifies each row decrypts with the new key before committing and prints
-the number of rows changed. It needs the **current** key in the environment
-(`SECRET_KEY`, `SECRET_KEY_FILE` or the `secret.key` fallback) and `DATABASE_URL`.
+the number of rows changed. It also re-encrypts the webhook secrets and TOTP secrets and
+re-seals the canary, in the same transaction. It needs the **current** key in the
+environment (`SECRET_KEY`, `SECRET_KEY_FILE` or the `secret.key` fallback, or the Vault /
+KMS variables when `SECRET_KEY_SOURCE` is set) and `DATABASE_URL`.
 
 1. Take a backup (`scripts/backup.sh`) and keep the old key with it.
 2. Stop the gateway so nothing writes a credential with the old key meanwhile:
    `docker compose stop ragmux`.
-3. Generate the new key and run the rotation with the old one still configured:
+3. With `SECRET_KEY`, `SECRET_KEY_FILE` or the fallback (not Vault / KMS, see below), generate the new key and run the rotation with the old one still configured:
 
    ```bash
    NEW_KEY=$(openssl rand -hex 32)
@@ -465,6 +467,15 @@ the number of rows changed. It needs the **current** key in the environment
    With the binary: `SECRET_KEY=<old> DATABASE_URL=… ragmux rotate-key --new "$NEW_KEY"`.
 4. Put the new key into `.env` (or the secret file) and start the gateway:
    `docker compose up -d ragmux`.
+
+   With `SECRET_KEY_SOURCE=vault_transit` or `aws_kms` the key lives wrapped in
+   `SECRET_KEY_WRAPPED`. **Wrap the new data key with the same Vault key / KMS key first,
+   then** run `rotate-key --new-wrapped "$NEW_WRAPPED"` (it is opened with the same source
+   and credentials as the current one) and put the new blob into `SECRET_KEY_WRAPPED`
+   instead of `SECRET_KEY`. Under these sources `--new <hex>` is refused before the
+   database is touched, since a key given as hex is stored nowhere. The commands are
+   in [Secret key sources](configuration.md#moving-to-a-key-source-and-rotating). Moving from `SECRET_KEY` to a key source
+   needs no rotation; see [Secret key sources](configuration.md#secret-key-sources).
 5. Verify: **Test chat** on a model connection succeeds. If the gateway was started with
    the wrong key it refuses to start at all (`SECRET_KEY does not match the one this
    database was written with`); put the right key back, nothing was lost.

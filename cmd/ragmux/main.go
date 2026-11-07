@@ -30,6 +30,7 @@ import (
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/config"
 	"github.com/ragmux/ragmux/internal/gateway"
+	"github.com/ragmux/ragmux/internal/keysource"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/maintenance"
 	"github.com/ragmux/ragmux/internal/mcp"
@@ -96,6 +97,27 @@ func probe(port int) int {
 	return 0
 }
 
+// resolveSecretKey is the one place the instance key is obtained. The gateway,
+// reset-password and rotate-key all open the store through it: a command that
+// skipped it would reach the store with an empty key, take the secret.key
+// fallback and mint a new key in the data directory, then stop at the canary.
+//
+// With SECRET_KEY_SOURCE=env it returns cfg.SecretKeyHex and an empty source,
+// and the store decides between "env" and the secret.key fallback as it
+// always has. With vault_transit or aws_kms it opens SECRET_KEY_WRAPPED
+// (fail-closed, see internal/keysource) and returns the key with the source's
+// name; the store never falls back to a key file for those.
+func resolveSecretKey(ctx context.Context, cfg config.Config, log *slog.Logger) (keyHex, source string, err error) {
+	if !cfg.KeySource.Remote() {
+		return cfg.SecretKeyHex, "", nil
+	}
+	keyHex, err = keysource.Unwrap(ctx, cfg.KeySource, log)
+	if err != nil {
+		return "", "", err
+	}
+	return keyHex, cfg.KeySource.Source, nil
+}
+
 func run(cfg config.Config) error {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
@@ -112,11 +134,17 @@ func run(cfg config.Config) error {
 	bgCtx, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
 
+	// Before the database: a key that cannot be opened stops the process.
+	keyHex, keySource, err := resolveSecretKey(ctx, cfg, log)
+	if err != nil {
+		return fmt.Errorf("secret key: %w", err)
+	}
 	st, err := store.Open(ctx, store.OpenConfig{
-		DatabaseURL:  cfg.DatabaseURL,
-		MaxConns:     cfg.DBMaxConns,
-		SecretKeyHex: cfg.SecretKeyHex,
-		DataDir:      cfg.DataDir,
+		DatabaseURL:     cfg.DatabaseURL,
+		MaxConns:        cfg.DBMaxConns,
+		SecretKeyHex:    keyHex,
+		SecretKeySource: keySource,
+		DataDir:         cfg.DataDir,
 
 		PgSearchTokenizer: cfg.PgSearchTokenizer,
 	}, log)

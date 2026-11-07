@@ -72,10 +72,15 @@ func (s *Store) verifySecretKey(ctx context.Context) error {
 }
 
 // canaryPrecondition decides whether this key may seal a database that has
-// no canary yet. A database with no stored credential cannot contradict any
-// key, so the first one to arrive is adopted. Otherwise the key has to open
-// one of them, and a key that cannot is reported as the mismatch it is
-// rather than written down as the truth.
+// no canary yet. A database with no stored secret cannot contradict any key,
+// so the first one to arrive is adopted. Otherwise the key has to open a
+// sample of what is stored -- a provider credential and one value of every
+// registered sealed column (sealedColumns) -- and a key that cannot is
+// reported as the mismatch it is rather than written down as the truth.
+//
+// Reading the registry matters for the same reason the connection check does:
+// a database whose only sealed secrets are webhook or TOTP secrets has no
+// connection to contradict a wrong key, and would otherwise adopt it.
 func (s *Store) canaryPrecondition(ctx context.Context) error {
 	var exists bool
 	if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM instance_settings WHERE key = $1)",
@@ -91,19 +96,64 @@ func (s *Store) canaryPrecondition(ctx context.Context) error {
 	err := s.pool.QueryRow(ctx,
 		"SELECT id, api_key_enc, key_version FROM model_connections ORDER BY id LIMIT 1").
 		Scan(&id, &enc, &version)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// no provider credential yet; the sealed columns may still have one.
+	case err != nil:
+		return fmt.Errorf("read a stored credential to check the key: %w", err)
+	default:
+		if _, err := s.decryptKey(id, version, enc); err != nil {
+			return s.noCanaryMismatch("provider credentials")
+		}
+	}
+	for _, col := range sealedColumns {
+		ok, err := s.sealedSampleOpens(ctx, col)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return s.noCanaryMismatch("sealed secrets (" + col.table + "." + col.blobCol + ")")
+		}
+	}
+	return nil // nothing encrypted yet, or all of it opens; this key becomes the database's.
+}
+
+// noCanaryMismatch is the error for a key that cannot open what a database
+// without a canary already holds.
+func (s *Store) noCanaryMismatch(what string) error {
+	return fmt.Errorf("%w (key source: %s): this database already holds %s "+
+		"this key cannot open, and it has no canary yet, so the key is not being recorded. "+
+		"Start with the key those secrets were written with. See docs/scaling.md#secret-key",
+		ErrSecretKeyMismatch, s.SecretKeySource, what)
+}
+
+// sealedSampleOpens reads the first non-empty value of a registered column
+// and reports whether the current key opens it. A column with no value, or
+// one sealed at a version this check does not know, proves nothing and
+// passes: the point is to refuse a key that is demonstrably wrong.
+func (s *Store) sealedSampleOpens(ctx context.Context, col sealedColumn) (bool, error) {
+	version := "1::smallint"
+	if col.versionCol != "" {
+		version = col.versionCol
+	}
+	var id int64
+	var blob []byte
+	var v int16
+	// Table and column names come from the fixed registry, not from input.
+	err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		"SELECT %[2]s, %[3]s, %[4]s FROM %[1]s WHERE %[3]s IS NOT NULL AND octet_length(%[3]s) > 0 ORDER BY %[2]s LIMIT 1",
+		col.table, col.idCol, col.blobCol, version)).Scan(&id, &blob, &v)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil // nothing encrypted yet; this key becomes the database's.
+		return true, nil
 	}
 	if err != nil {
-		return fmt.Errorf("read a stored credential to check the key: %w", err)
+		return false, fmt.Errorf("read a sealed value to check the key (%s.%s): %w", col.table, col.blobCol, err)
 	}
-	if _, err := s.decryptKey(id, version, enc); err != nil {
-		return fmt.Errorf("%w (key source: %s): this database already holds provider credentials "+
-			"this key cannot open, and it has no canary yet, so the key is not being recorded. "+
-			"Start with the key those credentials were written with. See docs/scaling.md#secret-key",
-			ErrSecretKeyMismatch, s.SecretKeySource)
+	if v != keyVersionBound {
+		return true, nil
 	}
-	return nil
+	_, err = s.cipher.decrypt(blob, sealedAAD(col.aadPrefix, id))
+	return err == nil, nil
 }
 
 // resealCanaryTx rewrites the canary with cipher inside an ongoing

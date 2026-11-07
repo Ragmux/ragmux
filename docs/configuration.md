@@ -12,6 +12,17 @@ startup (`internal/config/config.go`); an invalid value makes the binary print
 | `DATABASE_URL_FILE` | *(none)* | Path of a file whose trimmed content is used when `DATABASE_URL` is unset (Docker/Compose secrets). |
 | `SECRET_KEY` | *(file fallback)* | 32-byte AES-256-GCM key as 64 hex characters that encrypts provider API keys at rest. Generate once with `openssl rand -hex 32` and keep it with your backups. Any other length or non-hex value is rejected. When unset, the gateway generates and reads `DATA_DIR/secret.key` and logs a warning; that fallback is meant for local development only. Rotate with `ragmux rotate-key` (see [Backup and restore](backup-restore.md#rotating-secret_key)). |
 | `SECRET_KEY_FILE` | *(none)* | Path of a file holding the key, used when `SECRET_KEY` is unset. |
+| `SECRET_KEY_SOURCE` | `env` | Where the key comes from: `env` (`SECRET_KEY`, `SECRET_KEY_FILE` or the `secret.key` fallback, as above), `vault_transit` or `aws_kms`. The last two open a wrapped data key once at startup; see [Secret key sources](#secret-key-sources). With either of them `SECRET_KEY` and `SECRET_KEY_FILE` must be unset. |
+| `SECRET_KEY_WRAPPED` | *(none)* | The data key wrapped by Vault Transit (`vault:v1:…`) or AWS KMS (the base64 `CiphertextBlob`). Required for `vault_transit` and `aws_kms`. |
+| `SECRET_KEY_WRAPPED_FILE` | *(none)* | Path of a file holding the wrapped key, used when `SECRET_KEY_WRAPPED` is unset. |
+| `VAULT_ADDR` | *(none)* | `vault_transit`: Vault base URL, `https` only, e.g. `https://vault.example.com:8200`. |
+| `VAULT_TRANSIT_KEY` | *(none)* | `vault_transit`: name of the Transit key that wrapped the data key. |
+| `VAULT_TRANSIT_MOUNT` | `transit` | `vault_transit`: mount path of the Transit engine. |
+| `VAULT_TOKEN` | *(none)* | `vault_transit`: token with permission to decrypt with that key. Never logged. |
+| `VAULT_TOKEN_FILE` | *(none)* | Path of a file holding the token (a Vault Agent sink), used when `VAULT_TOKEN` is unset. |
+| `VAULT_NAMESPACE` | *(none)* | `vault_transit`: sent as `X-Vault-Namespace` (Vault Enterprise / HCP). |
+| `VAULT_CACERT` | *(none)* | `vault_transit`: PEM file of an extra CA to trust for `VAULT_ADDR`. TLS verification itself cannot be turned off. |
+| `AWS_REGION` | *(none)* | `aws_kms`: region of the KMS key (`AWS_DEFAULT_REGION` is read when it is unset). The credentials come from the standard AWS variables described in [Secret key sources](#secret-key-sources). |
 | `DB_MAX_CONNS` | `10` | Connection pool size (must be `>= 1`). |
 | `DATA_DIR` | `/app/data` | Only used for the `secret.key` fallback when `SECRET_KEY` is unset. The all-in-one image sets it to `/data/ragmux` inside its volume. |
 | `PORT` | `8765` | HTTP listen port (`1`-`65535`). Also read by `-healthcheck`. |
@@ -131,6 +142,164 @@ Local model servers therefore need to be allowed explicitly:
 
 The same policy applies to the `POST /admin/api/models/{id}/test` ping.
 
+## Secret key sources
+
+By default the key that encrypts provider API keys, webhook secrets and TOTP secrets
+is `SECRET_KEY` (or its file, or the `secret.key` fallback). `SECRET_KEY_SOURCE` lets
+it live in HashiCorp Vault or AWS KMS instead, so the plain key never sits in `.env`,
+in the Compose file or on disk.
+
+The model is envelope encryption. You keep a **data key** (the same 32 random bytes
+`SECRET_KEY` would hold) *wrapped* by a key that never leaves Vault or KMS, and give
+the gateway the wrapped blob as `SECRET_KEY_WRAPPED`. At startup the gateway asks the
+service to open it **once**; the plain key then stays in process memory exactly as
+`SECRET_KEY` does today. Nothing on the request path calls Vault or KMS, the stored
+ciphertext format is unchanged and the key check against the database (the canary) runs
+as before. Rotating the Vault key version or the KMS key does not touch the data: the
+wrapped blob keeps opening, and you may re-wrap it at your leisure.
+
+**Startup is fail-closed.** If the key cannot be opened the gateway does not start, and
+it never falls back to a `secret.key` file for these sources. Opening is tried three
+times (five seconds each, with one and three seconds between attempts). A network
+failure, a throttling or server error, and an `auth` or `denied` answer are all retried,
+since a token that is not projected yet or a role that is still propagating looks like a
+refusal; a `malformed` request or reply (a ciphertext the service cannot open, an unparsable
+reply, a key that is not 32 bytes) stops at the first attempt. The error names a class -
+`auth`, `denied`, `network` or `malformed` - and an HTTP status; tokens, credentials,
+the wrapped blob and response bodies are never put in an error message or a log line.
+The opened key must be exactly 32 bytes.
+
+`/admin/api/system` and the setup status report the source in `secret_key_source`
+(`env`, `file`, `vault_transit` or `aws_kms`).
+
+### Vault Transit
+
+```bash
+# once: a Transit key, and a token whose policy allows `update` on transit/decrypt/ragmux
+vault secrets enable transit
+vault write -f transit/keys/ragmux
+
+# wrap a fresh 32-byte data key (the base64 of the RAW bytes, not of their hex text)
+openssl rand 32 | base64 | vault write -field=ciphertext transit/encrypt/ragmux plaintext=-
+# vault:v1:8SDd3WHDOjf7mq69CyCqYjBXAiQQAVZRkFM13ok481zoCmHnSeDX9vyf7w==
+```
+
+```bash
+SECRET_KEY_SOURCE=vault_transit
+SECRET_KEY_WRAPPED=vault:v1:8SDd3WHDOjf7mq69CyCqYjBXAiQQAVZRkFM13ok481zoCmHnSeDX9vyf7w==
+VAULT_ADDR=https://vault.example.com:8200
+VAULT_TRANSIT_KEY=ragmux
+VAULT_TOKEN_FILE=/vault/secrets/token
+```
+
+The gateway sends `POST /v1/<mount>/decrypt/<key>` with the token. Authentication is a
+token only (read from `VAULT_TOKEN_FILE` once at startup); for AppRole, Kubernetes auth
+or similar, run Vault Agent next to the gateway and point `VAULT_TOKEN_FILE` at its sink.
+`VAULT_ADDR` must be `https`; add a private CA with `VAULT_CACERT`. Redirects are not
+followed. Because the address is set by the operator, not by a tenant, it is not subject
+to the private-address filter that protects tenant-supplied URLs.
+
+### AWS KMS
+
+```bash
+# once: a symmetric KMS key; wrap a fresh data key with the fixed encryption context
+aws kms encrypt --key-id alias/ragmux \
+  --encryption-context ragmux:purpose=secret_key \
+  --plaintext fileb://<(openssl rand 32) \
+  --query CiphertextBlob --output text
+```
+
+```bash
+SECRET_KEY_SOURCE=aws_kms
+SECRET_KEY_WRAPPED=AQICAHh...            # the CiphertextBlob printed above
+AWS_REGION=eu-west-1
+```
+
+The encryption context is fixed at `{"ragmux:purpose": "secret_key"}`; a blob wrapped
+with another context (or none) does not open. The role needs `kms:Decrypt` on the key.
+No AWS SDK is linked: the gateway signs the KMS call itself (Signature Version 4).
+Credentials are looked up in this order, and the first source that is configured is used:
+
+1. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`).
+2. Web identity: `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` (EKS IAM roles for
+   service accounts), exchanged with STS `AssumeRoleWithWebIdentity`
+   (`AWS_ROLE_SESSION_NAME` optional).
+3. Container credentials: `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or
+   `AWS_CONTAINER_CREDENTIALS_FULL_URI` (ECS, EKS Pod Identity), with
+   `AWS_CONTAINER_AUTHORIZATION_TOKEN` or `_FILE` when the agent wants it. A plain-HTTP
+   full URI is accepted only on loopback or the agent addresses.
+4. EC2 instance metadata (IMDSv2), unless `AWS_EC2_METADATA_DISABLED=true`. From a
+   container on EC2 the instance's metadata option `HttpPutResponseHopLimit` must be at
+   least `2`; with `1` the token response never reaches the container and the lookup ends
+   in a `network` error (`timed out`) after the three attempts, with nothing pointing at
+   the hop limit.
+
+**Not supported:** the shared credentials/config file (`AWS_PROFILE`, `~/.aws`) and AWS
+SSO. `AWS_ENDPOINT_URL_KMS` / `AWS_ENDPOINT_URL_STS` (or `AWS_ENDPOINT_URL`) override the
+endpoints, for VPC endpoints; they must be `https`.
+
+### Moving to a key source, and rotating
+
+- **From `SECRET_KEY` to Vault or KMS needs no rotation.** The data key stays the same;
+  you only wrap the key you already have and change the configuration:
+
+  ```bash
+  # Vault: wrap the existing key (hex -> raw bytes -> base64)
+  printf '%s' "$SECRET_KEY" | xxd -r -p | base64 | vault write -field=ciphertext transit/encrypt/ragmux plaintext=-
+  # KMS
+  printf '%s' "$SECRET_KEY" | xxd -r -p > key.bin
+  aws kms encrypt --key-id alias/ragmux --encryption-context ragmux:purpose=secret_key \
+    --plaintext fileb://key.bin --query CiphertextBlob --output text; shred -u key.bin
+  ```
+
+  Then set `SECRET_KEY_SOURCE` and `SECRET_KEY_WRAPPED`, **remove `SECRET_KEY`** and
+  restart. The canary confirms it is the same key. Going back is the reverse: open the
+  key with `vault write transit/decrypt/ragmux ciphertext=…` (or `aws kms decrypt`),
+  convert it back to hex and set `SECRET_KEY`.
+- **Rotating the key-encryption key** (a new Transit key version, KMS automatic
+  rotation) needs nothing from Ragmux. To re-wrap the blob, use `vault write
+  transit/rewrap/ragmux ciphertext=…` and put the result in `SECRET_KEY_WRAPPED`.
+- **Rotating the data key** is `ragmux rotate-key`, which always reads the *current* key
+  from the configured source. **Wrap the new key before you rotate and use
+  `--new-wrapped`.** Once the rotation commits, only the new key opens the data; a key
+  that exists only in your shell cannot be wrapped afterwards, and the gateway would never
+  start again (the only way back is a backup).
+
+  ```bash
+  # 1. Back up first (scripts/backup.sh) and keep the current SECRET_KEY_WRAPPED.
+  # 2. Generate the new data key into a file and wrap it. Nothing is rotated yet.
+  (umask 077; openssl rand 32 > new.key)
+  #    Vault:
+  NEW_WRAPPED=$(base64 < new.key | vault write -field=ciphertext transit/encrypt/ragmux plaintext=-)
+  #    KMS:
+  NEW_WRAPPED=$(aws kms encrypt --key-id alias/ragmux --encryption-context ragmux:purpose=secret_key \
+    --plaintext fileb://new.key --query CiphertextBlob --output text)
+  # 3. Store $NEW_WRAPPED where you keep configuration, then destroy the plain key.
+  #    The wrapped copy is enough: Vault / KMS opens it again.
+  shred -u new.key
+  # 4. Stop the gateway and rotate. The blob is opened with the same source and
+  #    credentials as the current key.
+  ragmux rotate-key --new-wrapped "$NEW_WRAPPED"
+  ```
+
+  Afterwards set `SECRET_KEY_WRAPPED` to the new blob before starting the gateway. See
+  [Rotating SECRET_KEY](backup-restore.md#rotating-secret_key).
+
+  Under `vault_transit` and `aws_kms` the command accepts **only** `--new-wrapped`.
+  `--new <hex>` exits with status `2` before the current key is opened or the database is
+  touched, because a key given as hex is stored nowhere and the gateway could not start
+  from it afterwards. `--new <hex>` remains the form for the `env` source.
+- **Subcommands** (`reset-password`, `rotate-key`) use the same source and the same
+  variables, so run them with the Vault/AWS settings in the environment.
+
+### Compose files
+
+`SECRET_KEY_SOURCE=vault_transit` and `aws_kms` do not work out of the box with `docker-compose.split.yml` and `docker-compose.paradedb.yml`: both require `SECRET_KEY`. Remove that line from your copy of the compose file. `docker-compose.yml` does not require it, and the variables in `.env` reach the container through `env_file`.
+
+In the all-in-one image a gateway that cannot reach Vault or KMS exits, and the entrypoint
+then stops the container (it restarts under the restart policy), so the container never
+comes up without its key. The plain key is held in the gateway process's memory only.
+
 ## Command-line flags
 
 | Flag | Effect |
@@ -146,12 +315,14 @@ the document ingestion queue and starts listening.
 
 ## Subcommands
 
-Both open the database directly and need `DATABASE_URL` plus the current `SECRET_KEY`
-(or `SECRET_KEY_FILE` / the `secret.key` fallback); neither needs a running gateway.
+Both open the database directly and need `DATABASE_URL` plus the current key: `SECRET_KEY`
+(or `SECRET_KEY_FILE` / the `secret.key` fallback), or the Vault / KMS variables when
+`SECRET_KEY_SOURCE` is set (see [Secret key sources](#secret-key-sources)); neither needs a
+running gateway.
 
 | Subcommand | Purpose |
 |---|---|
-| `ragmux rotate-key --new <hex>` | Re-encrypt the stored provider credentials with a new `SECRET_KEY`. Stop the gateway first; see [Rotating SECRET_KEY](backup-restore.md#rotating-secret_key). |
+| `ragmux rotate-key --new <hex>` (env source) or `--new-wrapped <blob>` (Vault / KMS source) | Re-encrypt the stored provider credentials, webhook secrets and TOTP secrets with a new key (`--new-wrapped`: a key wrapped for the configured Vault / KMS source; the only form accepted there). Stop the gateway first; see [Rotating SECRET_KEY](backup-restore.md#rotating-secret_key). |
 | `ragmux reset-password <username> …` | Set a dashboard password from the command line, for when every administrator is locked out. |
 
 ### reset-password
@@ -318,7 +489,7 @@ Both Compose files read `.env` (copy `.env.example`) and pass these through:
 
 | Variable | Default | Used by |
 |---|---|---|
-| `SECRET_KEY` | *(recommended)* | gateway. The split file refuses to start without it; the default file falls back to `/data/ragmux/secret.key` in the volume and logs a warning |
+| `SECRET_KEY` | *(recommended)* | gateway. The split file refuses to start without it; the default file falls back to `/data/ragmux/secret.key` in the volume and logs a warning. For Vault or KMS (`SECRET_KEY_SOURCE`) leave it empty; see [Secret key sources](#secret-key-sources) |
 | `DATABASE_URL` | *(none)* | default file only: your own PostgreSQL instead of the embedded one (see [Deployment layouts](#deployment-layouts)) |
 | `EMBEDDED_POSTGRES`, `PG_SHARED_BUFFERS`, `DB_MAX_CONNS` | *(auto)*, `128MB`, `10` | default file: the embedded server (above) |
 | `POSTGRES_PASSWORD` | *(required, split)* | superuser password of the split file's `postgres` service. Only the first-start init script, the `backup` profile and `scripts/backup.sh` / `restore.sh` use it; the gateway never sees it. Compose refuses to start without it (`openssl rand -hex 16`) |

@@ -100,8 +100,13 @@ func resetPassword(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	keyHex, keySource, err := resolveSecretKey(ctx, cfg, log)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "reset-password: secret key:", err)
+		return 1
+	}
 	st, err := store.Open(ctx, store.OpenConfig{DatabaseURL: cfg.DatabaseURL, MaxConns: 2,
-		SecretKeyHex: cfg.SecretKeyHex, DataDir: cfg.DataDir}, log)
+		SecretKeyHex: keyHex, SecretKeySource: keySource, DataDir: cfg.DataDir}, log)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "reset-password:", err)
 		return 1
