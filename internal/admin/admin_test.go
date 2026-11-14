@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -357,5 +358,126 @@ func TestProjectEndUserLimits(t *testing.T) {
 	}
 	if !seen {
 		t.Error("the audit trail does not mention the end-user ceilings")
+	}
+}
+
+// The lists for request fields (ADR-041) are validated like the tool lists and
+// mapped onto the project; no database is needed for that.
+func TestExtraSettingsValidationAndMapping(t *testing.T) {
+	list := func(v ...string) *[]string { return &v }
+	tooMany := make([]string, 65)
+	for i := range tooMany {
+		tooMany[i] = "f" + string(rune('a'+i/26)) + string(rune('a'+i%26))
+	}
+	bad := map[string]projectInput{
+		"regexp":        {ExtraDeny: list("a.+")},
+		"space":         {ExtraAllow: list("a b")},
+		"empty pattern": {ExtraDeny: list("")},
+		"too long":      {ExtraDeny: list(strings.Repeat("a", 129))},
+		"too many":      {ExtraAllow: &tooMany},
+		"slash":         {ExtraDeny: list("a/b")},
+		"non ASCII":     {ExtraDeny: list("ara\u00e7")},
+	}
+	for name, in := range bad {
+		if err := validateExtraSettings(&in); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	for name, in := range map[string]projectInput{
+		"nothing":      {},
+		"glob":         {ExtraDeny: list("web_search_*", "store", "service_tier")},
+		"64 patterns":  {ExtraAllow: list(tooMany[:64]...)},
+		"duplicates":   {ExtraAllow: list(append(append([]string{}, tooMany[:64]...), tooMany[:10]...)...)},
+		"both lists":   {ExtraAllow: list("*"), ExtraDeny: list("mcp_servers")},
+		"empty clears": {ExtraAllow: list(), ExtraDeny: list()},
+	} {
+		if err := validateExtraSettings(&in); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	// A list left out stays nil, so the store keeps the column; a list sent
+	// is de-duplicated, and an empty one is a non-nil empty list that clears.
+	in := projectInput{Name: "p", ExtraDeny: list("store", "store", "container"), ExtraAllow: list()}
+	p := in.project(&store.Project{ExtraAllow: []string{"x"}, ExtraDeny: []string{"y"}})
+	if !reflect.DeepEqual(p.ExtraDeny, []string{"store", "container"}) || p.ExtraAllow == nil || len(p.ExtraAllow) != 0 {
+		t.Errorf("sent: allow %v, deny %v", p.ExtraAllow, p.ExtraDeny)
+	}
+	p = (&projectInput{Name: "p"}).project(&store.Project{ExtraAllow: []string{"x"}, ExtraDeny: []string{"y"}})
+	if p.ExtraAllow != nil || p.ExtraDeny != nil {
+		t.Errorf("left out: allow %v, deny %v, want nil (the store keeps the columns)", p.ExtraAllow, p.ExtraDeny)
+	}
+}
+
+func TestProjectExtraSettings(t *testing.T) {
+	e := newAdminEnv(t)
+	editor := e.user("editor", "editor")
+	base := func(extra map[string]any) map[string]any {
+		body := map[string]any{"name": "passthrough", "model_connection_id": e.conn.ID}
+		for k, v := range extra {
+			body[k] = v
+		}
+		return body
+	}
+
+	status, out := e.do(http.MethodPost, "/api/projects", base(nil), editor.token)
+	if status != http.StatusCreated {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	proj, _ := out["project"].(map[string]any)
+	if allow, ok := proj["extra_allow"].([]any); !ok || len(allow) != 0 {
+		t.Errorf("default extra_allow = %v, want [] (not null)", proj["extra_allow"])
+	}
+	if deny, ok := proj["extra_deny"].([]any); !ok || len(deny) != 0 {
+		t.Errorf("default extra_deny = %v, want [] (not null)", proj["extra_deny"])
+	}
+	id := itoa(int64(proj["id"].(float64)))
+
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{
+		"extra_allow": []string{"seed", "guided_*"}, "extra_deny": []string{"store", "store", "mcp_servers"}}), editor.token)
+	if status != http.StatusOK || !reflect.DeepEqual(out["extra_allow"], []any{"seed", "guided_*"}) ||
+		!reflect.DeepEqual(out["extra_deny"], []any{"store", "mcp_servers"}) {
+		t.Fatalf("set: %d %v", status, out)
+	}
+	// Left out: kept, whatever the rest of the body changes.
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{"system_prompt": "hi"}), editor.token)
+	if status != http.StatusOK || len(out["extra_allow"].([]any)) != 2 || len(out["extra_deny"].([]any)) != 2 {
+		t.Errorf("left out: %d %v, want the lists kept", status, out)
+	}
+	// One list clears alone.
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{"extra_allow": []string{}}), editor.token)
+	if status != http.StatusOK || len(out["extra_allow"].([]any)) != 0 || len(out["extra_deny"].([]any)) != 2 {
+		t.Errorf("clear one: %d %v", status, out)
+	}
+	// The gateway reads them back from the store.
+	got, err := e.st.GetProject(context.Background(), int64(proj["id"].(float64)))
+	if err != nil || !reflect.DeepEqual(got.ExtraDeny, []string{"store", "mcp_servers"}) || got.ExtraAllow == nil || len(got.ExtraAllow) != 0 {
+		t.Errorf("stored project = %+v, %v", got, err)
+	}
+
+	for name, extra := range map[string]map[string]any{
+		"regexp": {"extra_deny": []string{"a.+"}}, "space": {"extra_allow": []string{"a b"}}, "empty": {"extra_deny": []string{""}},
+		"too long": {"extra_deny": []string{strings.Repeat("a", 129)}}, "slash": {"extra_deny": []string{"a/b"}},
+	} {
+		if status, out := e.do(http.MethodPut, "/api/projects/"+id, base(extra), editor.token); status != http.StatusBadRequest {
+			t.Errorf("%s: status %d %v, want 400", name, status, out)
+		}
+		if status, _ := e.do(http.MethodPost, "/api/projects", base(extra), editor.token); status != http.StatusBadRequest {
+			t.Errorf("%s on create: status %d, want 400", name, status)
+		}
+	}
+
+	// The change is on the audit trail.
+	logs, _, err := e.st.ListAuditLogs(context.Background(), store.AuditFilter{Action: "project.update", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, l := range logs {
+		raw, _ := json.Marshal(l.Details)
+		seen = seen || strings.Contains(string(raw), "extra_settings_changed")
+	}
+	if !seen {
+		t.Error("the audit trail does not mention the extra lists")
 	}
 }

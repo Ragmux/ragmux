@@ -536,6 +536,7 @@ Project body:
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
  "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
+ "extra_allow": [], "extra_deny": ["store", "service_tier"],
  "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0}
 ```
 
@@ -575,6 +576,21 @@ the default on create; `[]` clears a list. A pattern that is not of that shape, 
 more than 64 and a negative cap are `400`. A change is written to the audit log on the
 `project.update` entry, under `details.tool_settings_changed`.
 
+The next two govern the **request fields the gateway does not read itself**
+([`POST /v1/chat/completions`](#post-v1chatcompletions), [`POST /v1/messages`](#post-v1messages)):
+
+| Field | Values | Default |
+|---|---|---|
+| `extra_allow` | up to 64 patterns; when not empty, only an unknown request field whose name matches one is forwarded upstream | `[]` (every field) |
+| `extra_deny` | up to 64 patterns; an unknown request field whose name matches one is removed from the request, and deny wins over allow | `[]` |
+
+A pattern has the same shape and the same matching as a tool pattern above, and these two left
+out keep their current value on update and take `[]` on create. A pattern of another shape and a
+list of more than 64 distinct patterns are `400`. A change is written to
+the audit log on the `project.update` entry, under `details.extra_settings_changed`. With both
+lists empty, which is what every project has until an operator sets them, nothing changes:
+the protection exists only where the operator's lists say so.
+
 The last four fields are the project's **per-end-user ceilings**
 ([Users, roles and limits](users-and-limits.md#end-users-and-tags)): what one end user, named
 by `X-Ragmux-End-User` or by the request body's own field, may make in a UTC minute and spend
@@ -603,6 +619,7 @@ full key is never returned again. The project object:
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
  "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
+ "extra_allow": [], "extra_deny": ["store", "service_tier"],
  "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0,
  "member_ids": [4], "created_at": "…", "updated_at": "…"}
 ```
@@ -1152,8 +1169,9 @@ Accepts the OpenAI Chat Completions payload: `model`, `messages` (text or
 `max_completion_tokens`, `stop`, `n`, `tools`, `tool_choice`, `response_format`,
 `stream_options`, `user` (also `safety_identifier`; both name the request's
 [end user](#end-users-and-tags)). Unknown fields are forwarded to OpenAI-compatible upstreams
-unchanged (see [Providers](providers.md)), with one exception: an optional `ragmux`
-object is consumed by the gateway and never sent upstream. A `tool` message may carry
+unchanged (see [Providers](providers.md)), unless the project's `extra_allow` / `extra_deny`
+lists remove them ([below](#request-fields-the-gateway-does-not-read)), with one exception: an
+optional `ragmux` object is consumed by the gateway and never sent upstream. A `tool` message may carry
 `"ragmux_is_error": true` to mark a failed tool call (see
 [Anthropic](providers.md#anthropic)). `messages` is required; the
 body may not exceed 4 MiB.
@@ -1406,6 +1424,23 @@ they are. `tool_choice` is then reconciled with what is left:
 | `allowed_tools` | its `tools` list loses the entries the project does not allow, with a `Warning`; a `"required"` list that ends up empty is `400`, `code: "tool_not_allowed"`, and an emptied `"auto"` list becomes `"none"`, so the model does not gain the tools the client left out (with no tool left, or none in the request, `tool_choice` is dropped) |
 | anything else | unchanged |
 
+<a id="request-fields-the-gateway-does-not-read"></a>
+**Request fields the gateway does not read.** Every top-level field outside the ones listed at the
+start of this section (`model` … `user`) is kept as it came and sent to an OpenAI-compatible upstream unchanged
+([Request field passthrough](providers.md#request-field-passthrough-extra)), and some of those
+fields change what a request costs or what the provider keeps: `store`, `service_tier`,
+`web_search_options`, `modalities`, `audio`, `prediction`. When the project sets `extra_allow` or
+`extra_deny`, the gateway applies them to those fields right after the body is decoded, before the
+tool lists. A field that matches `extra_deny`, or matches no `extra_allow` pattern while that list
+is not empty, is removed from the request and the response carries `Warning: 299 ragmux "field
+<name> removed by project policy"` (one per field for up to five fields, then one more that counts
+the rest); the request is still served, never refused. What Ollama reads (`keep_alive`, `num_ctx`,
+`options`) is such a field too. The fields the gateway reads (the list at the start of this
+section, and the `ragmux` object) are not affected, and neither is the `user` or
+`safety_identifier` as the [end user](#end-users-and-tags) of record; a `safety_identifier` the
+policy removed is, like any removed field, not sent to the provider on a translated request either;
+the `user` the request also carries is what the provider gets then, as if the other field had not been sent.
+
 The request log row records `tools_denied` (how many were removed) and `tool_names` (the
 tools the model *called*, names only). An upstream may refuse a request whose history holds
 tool calls but whose `tools` came out empty; that refusal is relayed as the upstream's own
@@ -1488,7 +1523,8 @@ first target is Anthropic and whose fallback is Gemini serves one client with bo
 | `model` in the answer | the `model` the client sent (written over the one the upstream reports, in the message and in `message_start`) | the `model` the client sent |
 | Upstream `4xx` | the upstream's body, unchanged, with its status | n/a |
 
-**Native path.** The gateway changes only these parts of the body: `model` (the connection's
+**Native path.** The gateway changes only these parts of the body (and, when the project sets
+`extra_allow` or `extra_deny`, the unhandled top-level fields they remove, below): `model` (the connection's
 model is written in, and the client's own `model` string is written back into the answer, so
 a route alias such as `fast` reads the same whichever target served the call, as on
 [chat completions](#post-v1chatcompletions)), `system`, `ragmux` (removed), the tools the project denies, the thinking
@@ -1514,7 +1550,17 @@ features are billed by use, not by token: server tools such as `web_search_*`, `
 code execution, and `mcp_servers`. That spend does not reach Ragmux's cost figures or token
 budgets. A project can switch the server tools off with a `tool_deny` pattern (they are matched by
 `name`, `web_search*` for example). `mcp_servers` and `container` are not in `tools`, so the
-lists do not reach them.
+tool lists do not reach them; the project's `extra_deny` does, for them and for every other
+top-level field the gateway has no name for (`context_management`, `top_k`, …).
+
+**Field policy.** `extra_allow` and `extra_deny` (see the [project body](#projects)) apply to the
+top-level fields of the body that are not `model`, `messages`, `system`, `max_tokens`,
+`temperature`, `top_p`, `stop_sequences`, `stream`, `tools`, `tool_choice`, `thinking`,
+`metadata`, `output_config` and `ragmux`. A field the policy removes is left out of the body on
+both paths, so a route that falls back from an Anthropic target to another provider sees the same
+fields, and the response carries `Warning: 299 ragmux "field <name> removed by project policy"`;
+the request is served, not refused. Empty lists leave the body as it came. The values of the
+`anthropic-beta` header are not part of this policy.
 
 **Translated path.** The request becomes a chat request: `system` (one system message per
 block, with its cache breakpoint), text and image blocks, `tool_use` and `tool_result` (a user

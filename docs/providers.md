@@ -311,6 +311,19 @@ mapped (below). `anthropic`, `gemini` and `ollama` translate `reasoning_effort` 
 field. On the request side, an assistant message's `reasoning_content` is forwarded to the
 OpenAI-compatible and Azure connections as sent, and its `ragmux_thinking` is removed.
 
+Passing every unknown field on is the default and stays so: nothing is removed unless the
+operator says so. A project's `extra_allow` and `extra_deny` lists
+([Projects](api.md#projects)) narrow it. A field that matches `extra_deny`, or matches no
+`extra_allow` pattern while that list is not empty, is removed from the request before it is
+sent to any provider (`keep_alive`, `num_ctx` and `options`, which `ollama` reads, included), and
+the response carries `Warning: 299 ragmux "field <name> removed by project policy"`; the
+request is not refused. The fields in the list above are the gateway's own and no list reaches
+them. The protection is the operator's: no field is blocked by default, so a client that sends
+`store`, `service_tier` or `seed` today keeps working after an upgrade. The fields that change
+cost or what the provider keeps are the ones worth listing:
+`store`, `service_tier`, `web_search_options`, `modalities`, `audio`, `prediction`, and on the
+native `/v1/messages` path `mcp_servers` and `container`.
+
 ## Azure OpenAI
 
 `azure_openai` talks to an Azure OpenAI resource. It uses the Chat Completions body and

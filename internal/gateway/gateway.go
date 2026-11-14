@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -842,6 +843,48 @@ func (in *chatInvocation) attempt(c *call, conn *store.ModelConnection) error {
 	return nil
 }
 
+// extraPolicyOf is the project's policy for request fields (ADR-041).
+func extraPolicyOf(p *store.Project) provider.ExtraPolicy {
+	return provider.ExtraPolicy{Allow: p.ExtraAllow, Deny: p.ExtraDeny}
+}
+
+// maxWarnedExtra bounds the field names one request's Warnings list.
+const maxWarnedExtra = 5
+
+// extraWarnings is the Warning texts for removed request fields: one per
+// field, naming it, for up to maxWarnedExtra fields whose names are safe to
+// echo; the rest, and any name that is not safe, are counted in one more.
+func extraWarnings(removed []string) []string {
+	var out []string
+	for _, name := range removed {
+		if len(out) == maxWarnedExtra {
+			break
+		}
+		if safeToolName.MatchString(name) {
+			out = append(out, "field "+name+" removed by project policy")
+		}
+	}
+	if rest := len(removed) - len(out); rest > 0 {
+		more := "more "
+		if len(out) == 0 {
+			more = ""
+		}
+		out = append(out, strconv.Itoa(rest)+" "+more+"field(s) removed by project policy")
+	}
+	return out
+}
+
+// noteExtraStripped logs the request fields the project's policy removed and
+// returns their Warning texts, nil when none was removed.
+func (c *call) noteExtraStripped(removed []string) []string {
+	if len(removed) == 0 {
+		return nil
+	}
+	// The names are the client's; the log field is bounded and quoted by slog.
+	c.log.Info("request fields stripped by project policy", "removed", len(removed), "fields", boundedNames(removed))
+	return extraWarnings(removed)
+}
+
 // applyToolPolicy applies the project's tool allow/deny lists to the request
 // (ADR-032). It runs right after the body is decoded, so a refused request
 // costs no route lookup and no limit slot. It answers the client itself and
@@ -897,14 +940,30 @@ func (g *Gateway) decodeChat(c *call) (provider.ChatRequest, ragmuxRequest, bool
 		writeRagmuxError(c.w, err)
 		return req, opts, false
 	}
+	// The project's policy for the fields the gateway does not read itself
+	// (ADR-041), right after the body is decoded and ahead of the tool policy.
+	// safety_identifier is read first: the end user is Ragmux's own record,
+	// and a policy that keeps the field from the upstream does not take the
+	// attribution away.
+	safety, filled := extraString(req.Extra, "safety_identifier")
+	removed := extraPolicyOf(c.project).StripExtra(req.Extra)
+	opts.Warnings = append(opts.Warnings, c.noteExtraStripped(removed)...)
 	// The end user and the tags (ADR-035). safety_identifier is read ahead of
 	// user; the field is the client's and goes to an OpenAI-compatible
-	// upstream as it is, whatever it holds.
-	safety, filled := extraString(req.Extra, "safety_identifier")
+	// upstream as it is, whatever it holds, unless the policy stripped it.
 	if w := c.applyBodyEndUser(
 		bodyEndUserField{name: "safety_identifier", value: safety, filled: filled},
 		bodyEndUserField{name: "user", value: req.User, filled: req.User != ""}); w != "" {
 		opts.Warnings = append(opts.Warnings, w)
+	}
+	if filled && slices.Contains(removed, "safety_identifier") {
+		// A field the policy removed is not set aside for a translated
+		// provider request (ADR-035 reads the validated body value only, and
+		// this one is not forwarded). The request is then what it would have
+		// been without the field: user, which is a known field the policy does
+		// not reach, is the value the provider gets. The end user of record
+		// keeps the choice made above.
+		c.providerEndUser, _ = pickBodyEndUser(bodyEndUserField{name: "user", value: req.User, filled: req.User != ""})
 	}
 	req.EndUser = c.providerEndUser
 	if w := c.applyTags(opts.Tags, opts.TagsSet); w != "" {

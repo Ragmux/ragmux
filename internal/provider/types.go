@@ -7,8 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/ragmux/ragmux/internal/glob"
 )
 
 // Message is one OpenAI chat message. Content is kept raw because it may be
@@ -228,6 +231,82 @@ func (r *ChatRequest) UnmarshalJSON(b []byte) error {
 	}
 	*r = ChatRequest(a)
 	return nil
+}
+
+// ExtraPolicy is a project's allow and deny lists for the request fields the
+// gateway does not read itself (ADR-041): a chat request's Extra, and the
+// top-level fields of a native Messages body that the translation has no name
+// for. The lists mean what the tool lists mean (ADR-032): glob patterns, "*"
+// the only wildcard, case sensitive; a field matching Deny is removed, and so
+// is one matching nothing in Allow when Allow is not empty. Both empty is the
+// behaviour every project had before the lists existed.
+type ExtraPolicy struct {
+	Allow, Deny []string
+}
+
+// Empty reports whether the policy has no list at all.
+func (p ExtraPolicy) Empty() bool { return len(p.Allow) == 0 && len(p.Deny) == 0 }
+
+// Permits reports whether a field of this name may be forwarded. Deny always
+// wins; an empty Allow permits everything else, and a non-empty one only what
+// it matches. glob.Match cannot be made to backtrack.
+func (p ExtraPolicy) Permits(field string) bool {
+	for _, pat := range p.Deny {
+		if glob.Match(pat, field) {
+			return false
+		}
+	}
+	if len(p.Allow) == 0 {
+		return true
+	}
+	for _, pat := range p.Allow {
+		if glob.Match(pat, field) {
+			return true
+		}
+	}
+	return false
+}
+
+// StripExtra removes the fields the policy does not permit from extra and
+// returns their names, sorted. The fields the gateway reads itself are not in
+// Extra, so they are never touched.
+func (p ExtraPolicy) StripExtra(extra map[string]json.RawMessage) []string {
+	if p.Empty() {
+		return nil
+	}
+	var removed []string
+	for name := range extra {
+		if !p.Permits(name) {
+			removed = append(removed, name)
+		}
+	}
+	for _, name := range removed {
+		delete(extra, name)
+	}
+	sort.Strings(removed)
+	return removed
+}
+
+// StripMessagesFields removes from a native Messages body the top-level fields
+// the policy does not permit, among those the translation has no name for
+// (not handledMessagesFields), and returns their names, sorted. It runs on
+// the client's body, so the native path and the translated one both see the
+// result.
+func (p ExtraPolicy) StripMessagesFields(b *MessagesBody) []string {
+	if p.Empty() {
+		return nil
+	}
+	var removed []string
+	for _, name := range b.Keys() {
+		if !handledMessagesFields[name] && !p.Permits(name) {
+			removed = append(removed, name)
+		}
+	}
+	for _, name := range removed {
+		b.Delete(name)
+	}
+	sort.Strings(removed)
+	return removed
 }
 
 // MarshalJSON flattens Extra back into the object.

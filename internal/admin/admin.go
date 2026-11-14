@@ -1863,6 +1863,13 @@ type projectInput struct {
 	ToolDeny        *[]string `json:"tool_deny"`
 	SessionTokenCap *int64    `json:"session_token_cap"`
 
+	// The policy for the request fields the gateway does not read itself
+	// (ADR-041). Same rules as the tool lists: a field left out keeps the
+	// project's current value on update and takes an empty list on create; an
+	// empty list clears a list.
+	ExtraAllow *[]string `json:"extra_allow"`
+	ExtraDeny  *[]string `json:"extra_deny"`
+
 	// The per-end-user ceilings (ADR-035). A field left out keeps the project's
 	// current value on update and takes 0 (unlimited) on create.
 	EndUserRPM           *int   `json:"end_user_rpm"`
@@ -1912,6 +1919,12 @@ func (in *projectInput) project(base *store.Project) *store.Project {
 	if in.SessionTokenCap != nil {
 		p.SessionTokenCap = *in.SessionTokenCap
 	}
+	if in.ExtraAllow != nil {
+		p.ExtraAllow = uniqueStrings(*in.ExtraAllow)
+	}
+	if in.ExtraDeny != nil {
+		p.ExtraDeny = uniqueStrings(*in.ExtraDeny)
+	}
 	if in.ContextPlacement != nil {
 		p.ContextPlacement = *in.ContextPlacement
 	}
@@ -1954,6 +1967,12 @@ func toolSettingFields(p *store.Project) map[string]any {
 	return map[string]any{"tool_allow": p.ToolAllow, "tool_deny": p.ToolDeny, "session_token_cap": p.SessionTokenCap}
 }
 
+// extraSettingFields lists the ADR-041 settings with their current values, for
+// the audit trail's "changed" view.
+func extraSettingFields(p *store.Project) map[string]any {
+	return map[string]any{"extra_allow": p.ExtraAllow, "extra_deny": p.ExtraDeny}
+}
+
 // uniqueStrings is v without repeated entries, in order, and never nil.
 func uniqueStrings(v []string) []string {
 	out := make([]string, 0, len(v))
@@ -1978,6 +1997,14 @@ var toolPattern = regexp.MustCompile(`^[A-Za-z0-9_.*:-]{1,128}$`)
 
 // validateToolList checks one tool list; field names it in the error.
 func validateToolList(field string, list *[]string) error {
+	return validatePatternList(field, "tool", list)
+}
+
+// validatePatternList checks one list of glob patterns (the tool lists of
+// ADR-032 and the extra field lists of ADR-041 share the shape and the
+// bounds); field names the list in the error and kind says what a pattern
+// matches.
+func validatePatternList(field, kind string, list *[]string) error {
 	if list == nil {
 		return nil
 	}
@@ -1986,10 +2013,19 @@ func validateToolList(field string, list *[]string) error {
 	}
 	for _, pat := range *list {
 		if !toolPattern.MatchString(pat) {
-			return fmt.Errorf("%s: %q is not a tool pattern; use 1 to 128 of letters, digits and . _ : - *", field, pat)
+			return fmt.Errorf("%s: %q is not a %s pattern; use 1 to 128 of letters, digits and . _ : - *", field, pat, kind)
 		}
 	}
 	return nil
+}
+
+// validateExtraSettings checks the ADR-041 lists the body carries. A field
+// pattern has the shape of a tool pattern and the same bounds.
+func validateExtraSettings(in *projectInput) error {
+	if err := validatePatternList("extra_allow", "field", in.ExtraAllow); err != nil {
+		return err
+	}
+	return validatePatternList("extra_deny", "field", in.ExtraDeny)
 }
 
 // validateToolSettings checks the ADR-032 settings the body carries.
@@ -2061,6 +2097,9 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	if in.EndUserRPM != nil && *in.EndUserRPM < 0 || in.EndUserTPM != nil && *in.EndUserTPM < 0 ||
 		in.EndUserDailyTokens != nil && *in.EndUserDailyTokens < 0 || in.EndUserMonthlyTokens != nil && *in.EndUserMonthlyTokens < 0 {
 		return errors.New("end-user limits must be 0 (unlimited) or positive")
+	}
+	if err := validateExtraSettings(in); err != nil {
+		return err
 	}
 	if err := validateToolSettings(in); err != nil {
 		return err
@@ -2145,7 +2184,7 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p), "rag_settings": ragSettingFields(p),
-		"tool_settings": toolSettingFields(p)})
+		"tool_settings": toolSettingFields(p), "extra_settings": extraSettingFields(p)})
 	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
 }
 
@@ -2209,6 +2248,16 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(toolChanged) > 0 {
 		details["tool_settings_changed"] = toolChanged
+	}
+	oldExtra, curExtra := extraSettingFields(before), extraSettingFields(p)
+	extraChanged := map[string]any{}
+	for k, v := range curExtra {
+		if !reflect.DeepEqual(oldExtra[k], v) {
+			extraChanged[k] = map[string]any{"from": oldExtra[k], "to": v}
+		}
+	}
+	if len(extraChanged) > 0 {
+		details["extra_settings_changed"] = extraChanged
 	}
 	a.audit(r, "project.update", "project", ptr(p.ID), details)
 	writeJSON(w, http.StatusOK, p)

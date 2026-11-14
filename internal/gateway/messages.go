@@ -332,6 +332,11 @@ func (g *Gateway) decodeMessages(c *call) (*provider.MessagesBody, string, ragmu
 		}
 		body.Delete("ragmux")
 	}
+	// The project's policy for the top-level fields the gateway has no name
+	// for (ADR-041), on the body itself: the native path sends it as it stands
+	// and the translated one reads it, so neither can be used to get a field
+	// past the lists. Ahead of the tool policy.
+	opts.Warnings = append(opts.Warnings, c.noteExtraStripped(extraPolicyOf(c.project).StripMessagesFields(body))...)
 	// The end user and the tags (ADR-035). A metadata that is not an object is
 	// refused by the translation that follows; here it only has no user_id.
 	var userID string
