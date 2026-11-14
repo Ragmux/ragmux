@@ -6,6 +6,12 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Go 1.27.4.** The minimum Go version moves from 1.27.3 to 1.27.4, picking up the fix for a
+  reachable header race in `net/http`'s `MaxBytesReader` (GO-2026-6859, reported by
+  `govulncheck`).
+
 ## [0.7.0] - 2026-11-01
 
 ### Added
