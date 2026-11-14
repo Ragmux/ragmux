@@ -267,6 +267,59 @@ logs still attribute usage to; that is what keeps billing history intact.
 Prefer **revoke** over **delete**: `DELETE /admin/api/keys/{id}` is admin-only and
 answers `409 key_in_use` while any request log references the key.
 
+### Network allowlists
+
+A gateway key, and a project's own `sk-proj-…` key, can be restricted to the networks and the
+browser origins it may be used from. A key that leaks is then useless from anywhere else, and
+a key embedded in a web page cannot be used from another site. Each key carries its own two
+lists (there is no project-wide ceiling and no intersection of lists):
+
+| List | On a user key | On a project key | Entry |
+|---|---|---|---|
+| CIDR | `allowed_cidrs` | `key_allowed_cidrs` | an IPv4 or IPv6 network, or one address (`203.0.113.7` is stored as `203.0.113.7/32`); an IPv4-mapped IPv6 address counts as IPv4 |
+| Origin | `allowed_origins` | `key_allowed_origins` | `https://app.example.com`, `http://localhost:3000`, or `https://*.example.com` |
+
+**The CIDR list is only as trustworthy as the client address.** The gateway checks the TCP peer
+address, or, when `TRUST_PROXY_HEADERS=true`, the address the proxy reported in
+`X-Forwarded-For` / `X-Real-IP` (see [Behind a reverse
+proxy](configuration.md#behind-a-reverse-proxy)). With `TRUST_PROXY_HEADERS=true` and an empty
+`TRUSTED_PROXY_CIDRS` those headers are accepted from every connection, so a client can send
+any address it likes and walk around the list. Set `TRUSTED_PROXY_CIDRS` to the network of your
+reverse proxy before relying on a CIDR list. The gateway does not stop for this: it logs a `warn`
+at start-up when any key or project key holds a CIDR list in that configuration, and an admin
+API save of such a list answers with a `warnings` entry. Behind a reverse proxy without
+`TRUST_PROXY_HEADERS` the peer is the proxy itself, so a list of client networks would admit
+nothing; enable the setting or do not use CIDR lists.
+
+Both lists hold at most 32 entries and are empty by default, which is today's behaviour: no
+restriction. A wildcard origin matches a subdomain at any depth and never the apex itself
+(`https://*.example.com` admits `https://a.example.com` and `https://a.b.example.com`, not
+`https://example.com`); a lone `*` is refused. Origins are compared in lower case without a
+trailing `/`, and the default port (`:443` for `https`, `:80` for `http`) is dropped on both
+sides, as a browser leaves it out of the `Origin` header.
+
+A request that a list does not admit is answered `403` with `type: "permission_error"` and
+`code: "ip_not_allowed"` or `"origin_not_allowed"` before anything else runs: no project is
+selected, no limit is spent and no request log row is written. The refusal is counted in
+`ragmux_gateway_key_denied_total{reason}` and logged at `warn` with the key's id. A key that
+does not resolve keeps its `401`, so the lists never tell a real key from a made-up one. The
+same check guards `/v1`, `POST /v1/messages` with `x-api-key` and `/mcp`; the `CORS_ORIGINS`
+check of `/mcp` still applies as well, and a browser also needs the page's origin in
+`CORS_ORIGINS` for the response to be readable.
+
+**An origin list makes the key a browser key.** When the list is not empty, a request without an
+`Origin` header is refused, as is one whose `Origin` is `null` or matches no entry. A server-side
+caller sends no `Origin`, so give it a separate key with a CIDR list instead. The header is sent by
+browsers; any other client can set it to whatever it likes, so an origin list stops other web
+pages from using a leaked key and nothing else. It is a browser signal, not a security boundary,
+and is best combined with a CIDR list.
+
+The lists are set through the admin API ([API keys](api.md#api-keys), [Projects](api.md#projects)).
+They are read by the binary that serves the request: a replica running an older version, or a
+rollback to one, does not know the columns and applies no allowlist at all. Mutual TLS is not
+done by the gateway; terminate it at the reverse proxy, as in
+[Mutual TLS at the proxy](scaling.md#mutual-tls-at-the-proxy).
+
 ### Key sub-limits
 
 A gateway key carries the same four limits as a project (`rate_limit_rpm`,

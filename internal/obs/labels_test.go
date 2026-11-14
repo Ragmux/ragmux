@@ -233,3 +233,33 @@ func TestGuardrailLabelsAreBounded(t *testing.T) {
 	nilMetrics.RecordGuardrailEvents("7", GuardrailStagePreRequest, GuardrailFlag, 1) // must not panic
 	nilMetrics.RecordGuardrailWebhook("7", GuardrailWebhookOK)
 }
+
+// TestKeyDeniedLabelIsBounded: ragmux_gateway_key_denied_total{reason} takes
+// the two reasons of ADR-039 and nothing else; any other string collapses into
+// "other" instead of becoming a label.
+func TestKeyDeniedLabelIsBounded(t *testing.T) {
+	reg := metrics.New(metrics.Options{})
+	m := New(reg)
+	m.RecordKeyDenied(KeyDeniedIP)
+	m.RecordKeyDenied(KeyDeniedIP)
+	m.RecordKeyDenied(KeyDeniedOrigin)
+	m.RecordKeyDenied("203.0.113.9")
+	m.RecordKeyDenied("https://evil.example")
+	text := reg.Text()
+	for _, want := range []string{
+		`ragmux_gateway_key_denied_total{reason="ip_not_allowed"} 2`,
+		`ragmux_gateway_key_denied_total{reason="origin_not_allowed"} 1`,
+		`ragmux_gateway_key_denied_total{reason="other"} 2`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %s in:\n%s", want, text)
+		}
+	}
+	for _, leak := range []string{"203.0.113.9", "evil.example"} {
+		if strings.Contains(text, leak) {
+			t.Errorf("%q reached a label", leak)
+		}
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordKeyDenied(KeyDeniedIP) // must not panic
+}

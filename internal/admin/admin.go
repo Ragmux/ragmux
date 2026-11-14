@@ -80,6 +80,12 @@ type Admin struct {
 	// model returns; a RAG store save uses it to refuse a model pgvector
 	// cannot index. nil embeds one word through ProviderConfig.
 	EmbeddingWidth func(ctx context.Context, conn *store.ModelConnection) (int, error)
+	// ProxyHeadersUnverified is set when TRUST_PROXY_HEADERS is on and
+	// TRUSTED_PROXY_CIDRS is empty: X-Forwarded-For is then accepted from any
+	// connection, and a CIDR allowlist on a key (ADR-039) can be walked around
+	// with a forged header. A save that stores such a list answers with a
+	// warning; it is never refused for it.
+	ProxyHeadersUnverified bool
 }
 
 // Body read budgets. JSON handlers get a short one; login shorter still so a
@@ -1873,6 +1879,12 @@ type projectInput struct {
 	ExtraAllow *[]string `json:"extra_allow"`
 	ExtraDeny  *[]string `json:"extra_deny"`
 
+	// The network allowlists of the project's own "sk-proj-" key (ADR-039).
+	// Same rules as the lists above: a field left out keeps the current value
+	// on update and takes an empty list (no restriction) on create.
+	KeyAllowedCIDRs   *[]string `json:"key_allowed_cidrs"`
+	KeyAllowedOrigins *[]string `json:"key_allowed_origins"`
+
 	// The per-end-user ceilings (ADR-035). A field left out keeps the project's
 	// current value on update and takes 0 (unlimited) on create.
 	EndUserRPM           *int   `json:"end_user_rpm"`
@@ -1928,6 +1940,13 @@ func (in *projectInput) project(base *store.Project) *store.Project {
 	if in.ExtraDeny != nil {
 		p.ExtraDeny = uniqueStrings(*in.ExtraDeny)
 	}
+	// validateProject has normalised both lists in place.
+	if in.KeyAllowedCIDRs != nil {
+		p.KeyAllowedCIDRs = *in.KeyAllowedCIDRs
+	}
+	if in.KeyAllowedOrigins != nil {
+		p.KeyAllowedOrigins = *in.KeyAllowedOrigins
+	}
 	if in.ContextPlacement != nil {
 		p.ContextPlacement = *in.ContextPlacement
 	}
@@ -1974,6 +1993,12 @@ func toolSettingFields(p *store.Project) map[string]any {
 // the audit trail's "changed" view.
 func extraSettingFields(p *store.Project) map[string]any {
 	return map[string]any{"extra_allow": p.ExtraAllow, "extra_deny": p.ExtraDeny}
+}
+
+// keyNetworkFields lists the ADR-039 settings with their current values, for
+// the audit trail's "changed" view.
+func keyNetworkFields(p *store.Project) map[string]any {
+	return map[string]any{"key_allowed_cidrs": p.KeyAllowedCIDRs, "key_allowed_origins": p.KeyAllowedOrigins}
 }
 
 // uniqueStrings is v without repeated entries, in order, and never nil.
@@ -2029,6 +2054,33 @@ func validateExtraSettings(in *projectInput) error {
 		return err
 	}
 	return validatePatternList("extra_deny", "field", in.ExtraDeny)
+}
+
+// validateKeyNetwork checks the key allowlists of a project body (ADR-039)
+// and rewrites them in the canonical form the store keeps.
+func validateKeyNetwork(in *projectInput) error {
+	if in.KeyAllowedCIDRs != nil {
+		cidrs, err := store.NormalizeCIDRs(*in.KeyAllowedCIDRs)
+		if err != nil {
+			return errors.New("key_allowed_cidrs: " + err.Error())
+		}
+		in.KeyAllowedCIDRs = &cidrs
+	}
+	if in.KeyAllowedOrigins != nil {
+		origins, err := store.NormalizeOrigins(*in.KeyAllowedOrigins)
+		if err != nil {
+			return errors.New("key_allowed_origins: " + err.Error())
+		}
+		in.KeyAllowedOrigins = &origins
+	}
+	return nil
+}
+
+// projectResponse is a saved project with the warnings the save produced,
+// flattened into one JSON object.
+type projectResponse struct {
+	*store.Project
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // validateToolSettings checks the ADR-032 settings the body carries.
@@ -2102,6 +2154,9 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 		return errors.New("end-user limits must be 0 (unlimited) or positive")
 	}
 	if err := validateExtraSettings(in); err != nil {
+		return err
+	}
+	if err := validateKeyNetwork(in); err != nil {
 		return err
 	}
 	if err := validateToolSettings(in); err != nil {
@@ -2187,8 +2242,12 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p), "rag_settings": ragSettingFields(p),
-		"tool_settings": toolSettingFields(p), "extra_settings": extraSettingFields(p)})
-	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
+		"tool_settings": toolSettingFields(p), "extra_settings": extraSettingFields(p), "key_network": keyNetworkFields(p)})
+	resp := map[string]any{"project": p, "api_key": key}
+	if warn := a.networkWarnings(p.KeyAllowedCIDRs); warn != nil {
+		resp["warnings"] = warn
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (a *Admin) getProject(w http.ResponseWriter, r *http.Request) {
@@ -2262,8 +2321,18 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 	if len(extraChanged) > 0 {
 		details["extra_settings_changed"] = extraChanged
 	}
+	oldNet, curNet := keyNetworkFields(before), keyNetworkFields(p)
+	netChanged := map[string]any{}
+	for k, v := range curNet {
+		if !reflect.DeepEqual(oldNet[k], v) {
+			netChanged[k] = map[string]any{"from": oldNet[k], "to": v}
+		}
+	}
+	if len(netChanged) > 0 {
+		details["key_network_changed"] = netChanged
+	}
 	a.audit(r, "project.update", "project", ptr(p.ID), details)
-	writeJSON(w, http.StatusOK, p)
+	writeJSON(w, http.StatusOK, projectResponse{Project: p, Warnings: a.networkWarnings(p.KeyAllowedCIDRs)})
 }
 
 func (a *Admin) deleteProject(w http.ResponseWriter, r *http.Request) {

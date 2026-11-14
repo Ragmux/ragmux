@@ -166,6 +166,16 @@ var (
 		GuardrailWebhookTimeout: true, GuardrailWebhookSkippedFailOpen: true}
 )
 
+// Reasons a key's network allowlist refused a request (ADR-039), the values of
+// ragmux_gateway_key_denied_total{reason}: a closed set, and neither the key,
+// the address nor the origin is ever a label.
+const (
+	KeyDeniedIP     = "ip_not_allowed"
+	KeyDeniedOrigin = "origin_not_allowed"
+)
+
+var keyDeniedReasons = map[string]bool{KeyDeniedIP: true, KeyDeniedOrigin: true}
+
 var (
 	webhookPurposes = map[string]bool{WebhookPurposeGuardrail: true, WebhookPurposeAlerts: true}
 	webhookOutcomes = map[string]bool{WebhookDelivered: true, WebhookRetry: true, WebhookFailed: true, WebhookDisabled: true}
@@ -219,6 +229,8 @@ type Metrics struct {
 
 	guardrailEvents  *metrics.CounterVec
 	guardrailWebhook *metrics.CounterVec
+
+	keyDenied *metrics.CounterVec
 
 	retentionLastSuccess *metrics.GaugeVec
 }
@@ -332,6 +344,11 @@ func New(reg *metrics.Registry) *Metrics {
 	m.guardrailWebhook = reg.Counter("ragmux_guardrail_webhook_total",
 		"Guardrail webhook calls by project and outcome: ok, error, timeout or skipped_fail_open "+
 			"(failed, and the project lets the request through).", "project", "outcome")
+
+	m.keyDenied = reg.Counter("ragmux_gateway_key_denied_total",
+		"Requests refused with 403 because the key's IP or Origin allowlist did not admit them, by "+
+			"reason: ip_not_allowed or origin_not_allowed. The key, the address and the origin are "+
+			"not labels.", "reason")
 
 	m.retentionLastSuccess = reg.Gauge("ragmux_retention_last_success_timestamp_seconds",
 		"Unix time of the last retention pass this replica completed without error; 0 until one has. "+
@@ -613,6 +630,18 @@ func (m *Metrics) RecordWebhookDelivery(purpose, outcome string) {
 		outcome = otherLabel
 	}
 	m.webhookDeliveries.With(purpose, outcome).Inc()
+}
+
+// RecordKeyDenied counts one request a key's network allowlist refused. A
+// reason outside the closed KeyDenied* set is counted as "other".
+func (m *Metrics) RecordKeyDenied(reason string) {
+	if m == nil {
+		return
+	}
+	if !keyDeniedReasons[reason] {
+		reason = otherLabel
+	}
+	m.keyDenied.With(reason).Inc()
 }
 
 // RecordGuardrailEvents counts n guardrail matches. A stage or action outside

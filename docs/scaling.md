@@ -290,7 +290,9 @@ before another replica claims them. Nothing is lost; a document is only ever
   path. If it keeps failing,
   something is still holding `request_logs` (or, for `0035`, `project_usage`: run the query
   below with `'project_usage'::regclass`; the usual holder is a long-running read of the
-  usage counters or a session left idle in a transaction). Earlier migrations that touch `request_logs`
+  usage counters or a session left idle in a transaction). `0039` (the per-key allowlist columns) alters `projects` first and `api_keys` second, with the same
+2 second `lock_timeout`; if it times out, find the holder with the query below using
+`'projects'::regclass` (the usual holder is a long dashboard query joining it). Earlier migrations that touch `request_logs`
   (`0029` among them, which is in v0.7.0 but not in v0.6.1) carry no `lock_timeout`: when
   upgrading from v0.6 or older straight to v0.8, finish long reads of `request_logs`
   (exports, summaries over a wide window) before starting the new replica. Find the holder:
@@ -352,6 +354,35 @@ is not enough on its own and the upgrade needs a maintenance window.
 The `degraded` entry is informational and `/readyz` still returns `200`, so
 nothing pages on it by itself. It is expected for the length of a deploy;
 alert on it *persisting*, which means a replica was left behind.
+
+## Mutual TLS at the proxy
+
+The gateway terminates no TLS and checks no client certificate. If clients must present one, do
+it at the reverse proxy and let only the proxy reach the gateway. With nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name gateway.example.com;
+    ssl_certificate         /etc/ssl/gateway.crt;
+    ssl_certificate_key     /etc/ssl/gateway.key;
+    ssl_client_certificate  /etc/ssl/clients-ca.crt;   # the CA that signs your clients' certificates
+    ssl_verify_client       on;                        # a client without a valid certificate gets 400
+
+    location / {
+        proxy_pass http://ragmux:8765;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Run the gateway with `TRUST_PROXY_HEADERS=true` and `TRUSTED_PROXY_CIDRS` set to the proxy's
+network, so the per-key [network allowlists](users-and-limits.md#network-allowlists) see the
+client's address and not the proxy's. Without `TRUSTED_PROXY_CIDRS` the headers are accepted
+from any connection, and a client that reaches the gateway directly can claim any address.
+Make sure it cannot reach it directly.
 
 ## The Compose example
 

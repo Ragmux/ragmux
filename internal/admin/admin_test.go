@@ -706,3 +706,101 @@ func TestAnonymizeEndUserEndpoint(t *testing.T) {
 		t.Errorf("audit trail:\n%s", dump)
 	}
 }
+
+// ---- the project key's network allowlists (ADR-039) ----
+
+func TestProjectKeyNetworkSettings(t *testing.T) {
+	e := newAdminEnv(t)
+	editor := e.user("editor", "editor")
+	base := func(extra map[string]any) map[string]any {
+		body := map[string]any{"name": "netted", "model_connection_id": e.conn.ID}
+		for k, v := range extra {
+			body[k] = v
+		}
+		return body
+	}
+	status, out := e.do(http.MethodPost, "/api/projects", base(nil), editor.token)
+	if status != http.StatusCreated {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	proj, _ := out["project"].(map[string]any)
+	for _, f := range []string{"key_allowed_cidrs", "key_allowed_origins"} {
+		if l, ok := proj[f].([]any); !ok || len(l) != 0 {
+			t.Errorf("default %s = %v, want [] (not null)", f, proj[f])
+		}
+	}
+	if out["warnings"] != nil {
+		t.Errorf("warnings on a project without a CIDR list: %v", out["warnings"])
+	}
+	id := itoa(int64(proj["id"].(float64)))
+
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{
+		"key_allowed_cidrs": []string{"198.51.100.4", "10.1.0.0/16"}, "key_allowed_origins": []string{"https://Site.example.com/"}}), editor.token)
+	if status != http.StatusOK || !reflect.DeepEqual(out["key_allowed_cidrs"], []any{"198.51.100.4/32", "10.1.0.0/16"}) ||
+		!reflect.DeepEqual(out["key_allowed_origins"], []any{"https://site.example.com"}) || out["name"] != "netted" {
+		t.Fatalf("set: %d %v", status, out)
+	}
+	// Left out: kept. One list clears alone.
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{"system_prompt": "hi"}), editor.token)
+	if status != http.StatusOK || len(out["key_allowed_cidrs"].([]any)) != 2 || len(out["key_allowed_origins"].([]any)) != 1 {
+		t.Errorf("left out: %d %v, want the lists kept", status, out)
+	}
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, base(map[string]any{"key_allowed_origins": []string{}}), editor.token)
+	if status != http.StatusOK || len(out["key_allowed_cidrs"].([]any)) != 2 || len(out["key_allowed_origins"].([]any)) != 0 {
+		t.Errorf("clear one: %d %v", status, out)
+	}
+	got, err := e.st.GetProject(context.Background(), int64(proj["id"].(float64)))
+	if err != nil || !reflect.DeepEqual(got.KeyAllowedCIDRs, []string{"198.51.100.4/32", "10.1.0.0/16"}) || got.KeyAllowedOrigins == nil {
+		t.Errorf("stored project = %+v, %v", got, err)
+	}
+	// Rotating the key leaves its lists alone.
+	if status, _ := e.do(http.MethodPost, "/api/projects/"+id+"/rotate-key", nil, editor.token); status != http.StatusOK {
+		t.Fatalf("rotate: %d", status)
+	}
+	if got, _ := e.st.GetProject(context.Background(), got.ID); len(got.KeyAllowedCIDRs) != 2 {
+		t.Errorf("rotation dropped the lists: %v", got.KeyAllowedCIDRs)
+	}
+
+	for name, extra := range map[string]map[string]any{
+		"junk cidr": {"key_allowed_cidrs": []string{"nope"}}, "host bits": {"key_allowed_cidrs": []string{"10.0.0.1/8"}},
+		"star": {"key_allowed_origins": []string{"*"}}, "path": {"key_allowed_origins": []string{"https://a.example.com/p"}},
+	} {
+		if status, out := e.do(http.MethodPut, "/api/projects/"+id, base(extra), editor.token); status != http.StatusBadRequest {
+			t.Errorf("%s: status %d %v, want 400", name, status, out)
+		}
+		if status, _ := e.do(http.MethodPost, "/api/projects", base(extra), editor.token); status != http.StatusBadRequest {
+			t.Errorf("%s on create: status %d, want 400", name, status)
+		}
+	}
+}
+
+func TestProjectCIDRWarningFollowsProxyHeaderSetting(t *testing.T) {
+	e := newAdminEnv(t)
+	editor := e.user("editor", "editor")
+	body := map[string]any{"name": "warned", "model_connection_id": e.conn.ID, "key_allowed_cidrs": []string{"10.0.0.0/8"}}
+
+	status, out := e.do(http.MethodPost, "/api/projects", body, editor.token)
+	if status != http.StatusCreated || out["warnings"] != nil {
+		t.Fatalf("flag off: %d %v", status, out)
+	}
+	e.adm.ProxyHeadersUnverified = true
+	body["name"] = "warned2"
+	status, out = e.do(http.MethodPost, "/api/projects", body, editor.token)
+	if w, _ := out["warnings"].([]any); status != http.StatusCreated || len(w) != 1 {
+		t.Fatalf("flag on, create: %d %v", status, out)
+	}
+	id := itoa(int64(out["project"].(map[string]any)["id"].(float64)))
+	status, out = e.do(http.MethodPut, "/api/projects/"+id, body, editor.token)
+	if w, _ := out["warnings"].([]any); status != http.StatusOK || len(w) != 1 || out["name"] != "warned2" {
+		t.Fatalf("flag on, update: %d %v", status, out)
+	}
+	// The warning does not stop the save.
+	if got, err := e.st.GetProject(context.Background(), int64(out["id"].(float64))); err != nil || len(got.KeyAllowedCIDRs) != 1 {
+		t.Errorf("stored: %+v %v", got, err)
+	}
+	// No CIDR list, no warning.
+	body["key_allowed_cidrs"] = []string{}
+	if _, out = e.do(http.MethodPut, "/api/projects/"+id, body, editor.token); out["warnings"] != nil {
+		t.Errorf("warnings without a list: %v", out["warnings"])
+	}
+}

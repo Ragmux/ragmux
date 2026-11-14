@@ -141,6 +141,14 @@ whatever its shape. A key that *is* known but no longer resolves carries a `code
 — `key_revoked`, `key_expired` or `key_owner_inactive` — so the extra detail only ever
 reaches a caller who already holds the key bytes.
 
+A key with a [network allowlist](users-and-limits.md#network-allowlists) that the request does
+not satisfy answers `403 {"error":{"type":"permission_error","code":"ip_not_allowed"}}` (the
+client address is in no listed network) or `code: "origin_not_allowed"` (the key lists origins
+and the request has no `Origin` header, or one no entry matches). The check runs once the key
+has resolved, so an unknown, revoked or expired key keeps its `401`; it runs before a project is
+chosen, writes no request log row and counts in `ragmux_gateway_key_denied_total`. It applies
+to every `/v1` route, to `POST /v1/messages` with `x-api-key` and to `/mcp` alike.
+
 #### Choosing a project
 
 A `sk-user-…` key may grant several projects, so each request resolves one, in this
@@ -537,6 +545,7 @@ Project body:
  "history_turns_for_query": 3, "query_model_connection_id": null,
  "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
  "extra_allow": [], "extra_deny": ["store", "service_tier"],
+ "key_allowed_cidrs": [], "key_allowed_origins": [],
  "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0}
 ```
 
@@ -591,6 +600,24 @@ the audit log on the `project.update` entry, under `details.extra_settings_chang
 lists empty, which is what every project has until an operator sets them, nothing changes:
 the protection exists only where the operator's lists say so.
 
+The next two restrict **where the project's own `sk-proj-…` key may be used from**
+([Users, roles and limits](users-and-limits.md#network-allowlists)):
+
+| Field | Values | Default |
+|---|---|---|
+| `key_allowed_cidrs` | up to 32 networks, IPv4 or IPv6; a bare address is stored as `/32` or `/128` | `[]` (any address) |
+| `key_allowed_origins` | up to 32 browser origins: `https://app.example.com` or `https://*.example.com` | `[]` (any origin, none needed) |
+
+They are the same lists a user key carries (`allowed_cidrs`, `allowed_origins`, see
+[API keys](#api-keys)), with the same validation (`400` for anything that is not a network
+or an origin, for a network with bits set to the right of its mask, for a lone `*` and for
+more than 32 entries), and the same rule for a field left out: it keeps its current value on
+update and takes `[]` on create. Rotating the key leaves them alone. The response of a save
+that leaves a CIDR list in place carries `"warnings": [...]` when the instance runs
+`TRUST_PROXY_HEADERS=true` with an empty `TRUSTED_PROXY_CIDRS`, because the list can then be
+walked around with a forged `X-Forwarded-For`; the save is not refused. A change is written to
+the audit log on the `project.update` entry, under `details.key_network_changed`.
+
 The last four fields are the project's **per-end-user ceilings**
 ([Users, roles and limits](users-and-limits.md#end-users-and-tags)): what one end user, named
 by `X-Ragmux-End-User` or by the request body's own field, may make in a UTC minute and spend
@@ -620,6 +647,7 @@ full key is never returned again. The project object:
  "history_turns_for_query": 3, "query_model_connection_id": null,
  "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
  "extra_allow": [], "extra_deny": ["store", "service_tier"],
+ "key_allowed_cidrs": [], "key_allowed_origins": [],
  "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0,
  "member_ids": [4], "created_at": "…", "updated_at": "…"}
 ```
@@ -843,7 +871,8 @@ Request body:
 {"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models", "retrieve"],
  "project_ids": [1, 2], "default_project_id": 1, "expires_at": "2027-01-01T00:00:00Z",
  "user_id": 4,
- "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
+ "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "allowed_cidrs": ["203.0.113.0/24"], "allowed_origins": ["https://app.example.com"]}
 ```
 
 `kind` is `gateway` (default) or `management`. `name` is required, at most 64 characters
@@ -861,6 +890,23 @@ projects and limits are refused with a `400`: it has neither. Creating a `manage
 additionally needs at least the `editor` role and a dashboard session
 (`403 session_required` for an api key); the `admin` scope needs the `admin` role.
 
+`allowed_cidrs` and `allowed_origins` restrict where a gateway key may be used from
+([Network allowlists](users-and-limits.md#network-allowlists)): up to 32 entries each, empty
+(the default) meaning no restriction. A CIDR entry is an IPv4 or IPv6 network, or a bare
+address, which is stored as `/32` or `/128`; an IPv4-mapped IPv6 network (`::ffff:10.0.0.0/104`)
+is stored as the IPv4 one. An origin entry is `scheme://host[:port]` (`http` or `https`, lower
+case, no path, no trailing `/`, the scheme's default port left out) or `https://*.example.com`
+for any subdomain but not the apex itself; a lone `*` is refused. Entries are stored in that
+canonical form and repeats collapse. A malformed entry, a network with bits set to the right
+of its mask (`10.0.0.5/24`) and more than 32 entries are `400`; so is any entry on a
+`management` key, which never passes through this check. **On update a field left out keeps its
+current list** (unlike the limits above, which a save resets), and `[]` clears it, so a script
+that does not know the fields never lifts a restriction by saving the rest of the key. When
+the instance runs `TRUST_PROXY_HEADERS=true` with an empty `TRUSTED_PROXY_CIDRS`, a save that
+leaves a CIDR list in place answers with `"warnings": ["…"]` next to the key (on update, beside
+the key's own fields), because the list can be walked around with a forged `X-Forwarded-For`;
+the save is not refused.
+
 The key object never contains the credential:
 
 ```json
@@ -868,6 +914,7 @@ The key object never contains the credential:
  "user_id": 1, "created_by": 1, "scopes": ["chat", "models", "retrieve"], "project_ids": [1, 2],
  "default_project_id": null, "rate_limit_rpm": 0, "rate_limit_tpm": 0,
  "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "allowed_cidrs": ["203.0.113.0/24"], "allowed_origins": ["https://app.example.com"],
  "expires_at": null, "revoked_at": null, "last_used_at": "2026-09-19T03:41:00Z",
  "created_at": "…", "updated_at": "…"}
 ```
@@ -1486,7 +1533,7 @@ Status codes:
 |---|---|
 | `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), an invalid `X-Ragmux-End-User` (`code: "invalid_end_user"`), invalid tags in `X-Ragmux-Tags` or `ragmux.tags` (`code: "invalid_tags"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`), or a request a [guardrail](#guardrails) `block` rule refused (`code: "guardrail_blocked"`, the message names the stage, never the rule or the match) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
-| `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
+| `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`), or the key's [network allowlist](users-and-limits.md#network-allowlists) refuses the request (`type: "permission_error"`, `code: "ip_not_allowed"` or `"origin_not_allowed"`) |
 | `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
 | `413` | body larger than 4 MiB |
 | `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"|"end_user"}}` — `scope` says which tier denied; `end_user` is the project's [per-end-user ceiling](users-and-limits.md#end-users-and-tags) |
@@ -1877,12 +1924,13 @@ project, Origin) have no `id`; a limit refusal of a `tools/call` carries the cal
 ```
 
 `data.code` is the Ragmux code (`invalid_api_key`, `key_revoked`, `insufficient_scope`,
-`project_required`, `rate_limited`, …). An unknown key's message is fixed, as for `/v1`.
+`project_required`, `ip_not_allowed`, `origin_not_allowed`, `rate_limited`, …). An unknown key's message is fixed, as for `/v1`.
 
 **Origin.** A request that carries an `Origin` header is checked against `CORS_ORIGINS`: one that
 is not listed answers `403`, an empty list refuses every request with an `Origin`, and `*` lets
 every one through. A request without `Origin`, which is what non-browser MCP clients send, always
-passes. For browser clients the preflight allows `MCP-Protocol-Version`, `Mcp-Method` and
+passes. The key's own [network allowlist](users-and-limits.md#network-allowlists) is checked on top
+of this, and a key that lists origins needs an `Origin` that matches one. For browser clients the preflight allows `MCP-Protocol-Version`, `Mcp-Method` and
 `Mcp-Name`.
 
 The endpoint and the supported protocol versions are part of the public contract frozen at v1.0.

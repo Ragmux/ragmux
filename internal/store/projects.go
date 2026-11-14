@@ -54,6 +54,12 @@ type Project struct {
 	// the tool lists' rules and are never nil on a Project read from the store.
 	ExtraAllow []string `json:"extra_allow"`
 	ExtraDeny  []string `json:"extra_deny"`
+	// KeyAllowedCIDRs and KeyAllowedOrigins are the network allowlists of the
+	// project's own "sk-proj-" key (ADR-039), the same lists a user key carries
+	// in api_keys. Empty means no restriction; never nil on a Project read from
+	// the store.
+	KeyAllowedCIDRs   []string `json:"key_allowed_cidrs"`
+	KeyAllowedOrigins []string `json:"key_allowed_origins"`
 	// SessionTokenCap is the prompt+completion tokens one session
 	// (X-Ragmux-Session) may spend before its requests are answered 429; zero
 	// is unlimited (ADR-032).
@@ -166,7 +172,7 @@ const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, s
 	context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
 	tool_allow, tool_deny, session_token_cap, guardrails,
 	end_user_rpm, end_user_tpm, end_user_daily_tokens, end_user_monthly_tokens,
-	extra_allow, extra_deny,
+	extra_allow, extra_deny, key_allowed_cidrs::text[], key_allowed_origins,
 	ARRAY(SELECT user_id FROM project_members pm WHERE pm.project_id = projects.id ORDER BY user_id)`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
@@ -177,7 +183,7 @@ func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 		&created, &updated, &p.ContextPlacement, &p.RetrievalPolicy, &p.QueryStrategy,
 		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.Guardrails,
 		&p.EndUserRPM, &p.EndUserTPM, &p.EndUserDailyTokens, &p.EndUserMonthlyTokens,
-		&p.ExtraAllow, &p.ExtraDeny, &p.MemberIDs)
+		&p.ExtraAllow, &p.ExtraDeny, &p.KeyAllowedCIDRs, &p.KeyAllowedOrigins, &p.MemberIDs)
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -193,6 +199,12 @@ func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	}
 	if p.ExtraDeny == nil {
 		p.ExtraDeny = []string{}
+	}
+	if p.KeyAllowedCIDRs == nil {
+		p.KeyAllowedCIDRs = []string{}
+	}
+	if p.KeyAllowedOrigins == nil {
+		p.KeyAllowedOrigins = []string{}
 	}
 	if p.MemberIDs == nil {
 		p.MemberIDs = []int64{}
@@ -260,14 +272,16 @@ func (s *Store) CreateProjectWithMembers(ctx context.Context, p *Project, member
 		context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
 		tool_allow, tool_deny, session_token_cap,
 		end_user_rpm, end_user_tpm, end_user_daily_tokens, end_user_monthly_tokens,
-		extra_allow, extra_deny)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) RETURNING id`,
+		extra_allow, extra_deny, key_allowed_cidrs, key_allowed_origins)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+		$25::text[]::cidr[], $26) RETURNING id`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
 		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
 		nonNilStrings(p.ToolAllow), nonNilStrings(p.ToolDeny), p.SessionTokenCap,
 		p.EndUserRPM, p.EndUserTPM, p.EndUserDailyTokens, p.EndUserMonthlyTokens,
-		nonNilStrings(p.ExtraAllow), nonNilStrings(p.ExtraDeny)).Scan(&id)
+		nonNilStrings(p.ExtraAllow), nonNilStrings(p.ExtraDeny),
+		nonNilStrings(p.KeyAllowedCIDRs), nonNilStrings(p.KeyAllowedOrigins)).Scan(&id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -293,7 +307,7 @@ func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error)
 	// than writing the default: a value this build does not know -- written by
 	// a newer release -- reads as the default, and writing that read value
 	// back would overwrite it. The nullif/coalesce pairs are the only place
-	// that distinction survives. The tool lists and the extra lists follow the same rule with nil
+	// that distinction survives. The tool lists, the extra lists and the key allowlists follow the same rule with nil
 	// as "unset": a Project built by hand keeps them, an empty non-nil slice
 	// clears them.
 	_, err := s.pool.Exec(ctx, `UPDATE projects SET name=$1, model_connection_id=$2, rag_store_id=$3,
@@ -306,13 +320,15 @@ func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error)
 		session_token_cap=$16,
 		end_user_rpm=$17, end_user_tpm=$18, end_user_daily_tokens=$19, end_user_monthly_tokens=$20,
 		extra_allow=COALESCE($21::text[], extra_allow), extra_deny=COALESCE($22::text[], extra_deny),
-		updated_at=now() WHERE id=$23`,
+		key_allowed_cidrs=COALESCE($23::text[]::cidr[], key_allowed_cidrs),
+		key_allowed_origins=COALESCE($24::text[], key_allowed_origins),
+		updated_at=now() WHERE id=$25`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
 		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
 		p.ToolAllow, p.ToolDeny, p.SessionTokenCap,
 		p.EndUserRPM, p.EndUserTPM, p.EndUserDailyTokens, p.EndUserMonthlyTokens,
-		p.ExtraAllow, p.ExtraDeny, p.ID)
+		p.ExtraAllow, p.ExtraDeny, p.KeyAllowedCIDRs, p.KeyAllowedOrigins, p.ID)
 	if err != nil {
 		return nil, err
 	}

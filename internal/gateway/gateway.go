@@ -423,6 +423,9 @@ func (g *Gateway) identify(next http.Handler) http.Handler {
 			writeError(w, http.StatusInternalServerError, "server_error", "project lookup failed")
 			return
 		}
+		if !g.checkKeyNetwork(w, r, gk) {
+			return
+		}
 		pr := &principal{project: gk.Project, key: gk.Key, user: gk.Owner}
 		if pr.key != nil {
 			grants, err := g.Store.ListProjectsByIDs(ctx, pr.key.ProjectIDs)
@@ -440,6 +443,47 @@ func (g *Gateway) identify(next http.Handler) http.Handler {
 		ctx = provider.WithImageTenant(ctx, pr.imageTenant())
 		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, ctxKey{}, pr.project)))
 	})
+}
+
+// checkKeyNetwork applies the key's IP and Origin allowlists (ADR-039). It
+// runs once the key has resolved, so an unknown or retired key keeps its 401
+// and the allowlist is never a way to tell a real key from a made-up one, and
+// before the project is selected, so a refused request does no further work.
+// /v1, /v1/messages and /mcp all reach it through identify.
+//
+// The client address is r.RemoteAddr: the connection's peer, or, when
+// TRUST_PROXY_HEADERS is set, what the realIP middleware replaced it with.
+// Nothing here reads X-Forwarded-For. It answers the client itself and reports
+// whether the request may proceed. A refusal writes no request_logs row
+// (identify refusals never do); it is counted and logged with the key's id.
+func (g *Gateway) checkKeyNetwork(w http.ResponseWriter, r *http.Request, gk *store.GatewayKey) bool {
+	var cidrs, origins []string
+	var subject []any
+	if gk.Key != nil {
+		cidrs, origins = gk.Key.AllowedCIDRs, gk.Key.AllowedOrigins
+		subject = []any{"key", gk.Key.ID}
+	} else if gk.Project != nil {
+		cidrs, origins = gk.Project.KeyAllowedCIDRs, gk.Project.KeyAllowedOrigins
+		subject = []any{"project", gk.Project.ID}
+	}
+	if len(cidrs) == 0 && len(origins) == 0 {
+		return true
+	}
+	reason := store.CheckKeyNetwork(cidrs, origins, r.RemoteAddr, r.Header.Values("Origin"))
+	if reason == "" {
+		return true
+	}
+	g.Metrics.RecordKeyDenied(reason)
+	g.Log.Warn("api key refused by its network allowlist", append(subject, "reason", reason)...)
+	switch reason {
+	case store.DenyOriginNotAllowed:
+		writeErrorCode(w, http.StatusForbidden, "permission_error", reason,
+			"this api key cannot be used from this origin")
+	default:
+		writeErrorCode(w, http.StatusForbidden, "permission_error", reason,
+			"this api key cannot be used from this network address")
+	}
+	return false
 }
 
 // explainMiss answers a credential that did not resolve. The extra lookup

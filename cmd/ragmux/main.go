@@ -351,6 +351,9 @@ func run(cfg config.Config) error {
 		return err
 	}
 
+	adm.ProxyHeadersUnverified = proxyHeadersUnverified(cfg)
+	warnUnverifiedProxyKeys(bgCtx, st, log, adm.ProxyHeadersUnverified)
+
 	r := chi.NewRouter()
 	// obs.RequestID, not middleware.RequestID: chi's starts from the
 	// client's X-Request-Id header, which would put attacker-chosen bytes on
