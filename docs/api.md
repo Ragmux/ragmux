@@ -531,6 +531,7 @@ log as `rag_store.reindex`. See [Embedding width](rag.md#embedding-width).
 | GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
 | GET | `/projects/{id}/sessions?limit=50&offset=0` | member | The project's [sessions](users-and-limits.md#sessions), most recently active first (`limit` defaults to 50, larger values are cut to 500) |
 | GET | `/projects/{id}/sessions/{sessionId}?limit=100` | member | One session's totals and its request log rows, newest first (`limit` defaults to 100, larger values are cut to 1000); `404` for an unknown session |
+| GET | `/projects/{id}/feedback/summary?days=30` | member | The project's [feedback](#post-v1feedback) over the last `days` days (default 30, at most 365): `positive`, `negative`, `total`, `ratio` (positive / total, `null` with no feedback), the labelled breakdown and the daily series; counts only (see below) |
 | GET | `/projects/{id}/guardrails` | member | The project's [guardrails](#guardrails): rules, stream window and webhook settings, every default filled in |
 | PUT | `/projects/{id}/guardrails` | member + editor | Replace the guardrails as a whole; a rule that cannot work is a `400` naming it |
 
@@ -684,6 +685,20 @@ nothing was consumed in the last hour, or the projection lands after the window 
 with. `GET /projects/{id}/sessions/{sessionId}` returns `{"session": {…}, "requests": […]}`:
 the same object, and the session's request log rows in the shape of
 [`recent` below](#metrics). The roles are those of the request logs: any member can read them.
+
+`GET /projects/{id}/feedback/summary` counts the scores clients sent through
+[`POST /v1/feedback`](#post-v1feedback), by the day each was first received (UTC):
+
+```json
+{"days": 30, "positive": 41, "negative": 9, "total": 50, "ratio": 0.82,
+ "labels": [{"label": "helpful", "positive": 30, "negative": 0},
+            {"label": "wrong_answer", "positive": 0, "negative": 6}],
+ "daily": [{"day": "2026-11-03", "positive": 12, "negative": 2}]}
+```
+
+`labels` covers the labelled feedback only, the busiest 50 labels first; feedback sent without
+a label is in the totals. `daily` lists the days that have feedback. There is no content to
+show: the endpoint never receives any. The roles are those of the request logs.
 
 ### Guardrails
 
@@ -1829,6 +1844,43 @@ answers as in chat (`503` `guardrail_unavailable` under `fail_closed`).
 
 A project without `pre_request` rules answers `flagged: false` with empty `categories`. An SDK that
 reads `categories` as OpenAI's fixed category set sees the project's rule ids instead.
+
+### `POST /v1/feedback`
+
+A score, and optionally a label, for a request the project already made. It collects a quality
+signal without collecting content: the admin API shows the share of positive scores per project
+(`GET /projects/{id}/feedback/summary`, under [Projects](#projects)), so a model, a route or a RAG setting can be
+judged by what users said about it.
+
+```json
+{"request_id": "3f2a9c1e", "score": 1, "label": "helpful"}
+```
+
+`request_id` is the `X-Request-Id` of the response being rated. `score` is `1` or `-1`.
+`label` is optional: 1 to 64 characters of `a-z 0-9 . _ : -`. Any other field, free-text
+`comment` included, is a `400` (`invalid_feedback`). The answer is `200` with
+`{"request_id": "3f2a9c1e", "score": 1, "label": "helpful"}`.
+
+- **One feedback per request.** Feedback is kept per `(project, request_id)`. Sending it again
+  replaces the score and the label (the last one wins) and answers `200`. A `request_id` a
+  client chose itself is not unique, so two requests that share one share their feedback too.
+- **Which requests.** The id must belong to a request log row of the key's project. Any key of
+  the project may send it: the back end makes the call, a front end with a key of its own can
+  rate it. An id the project has no row for, and an id that belongs to another project, get the
+  same answer: `404` `{"error": {"type": "not_found_error", "code": "request_not_found", …}}`.
+  A call refused before its request log row is opened (`401`, a scope or project-selection
+  `403`/`400`, a malformed body) has no row to rate; a `429` from a limit and a guardrail
+  block do leave a row, so they can be rated.
+- **Retry once on `404`.** The request log row is written after the response, for a JSON answer
+  and for the end of a stream alike, so feedback sent the instant a response ends can arrive
+  before the row exists. Retry it once after a short pause (a few hundred milliseconds). If the
+  row could not be written at all, which the gateway only logs, the `404` stays.
+- **Scope and limits.** The key needs the `chat` or the `retrieve` scope (`403`
+  `insufficient_scope` otherwise); there is no scope of its own. Feedback does not count
+  against the project's request or token limits, leaves no request log row and has no metric.
+  The body is at most 4 KiB.
+- **Retention.** Feedback is deleted with the request logs, after `LOG_RETENTION_DAYS`, counted
+  from the day it was first received.
 
 ### `GET /v1/models` and `GET /v1/models/{id}`
 

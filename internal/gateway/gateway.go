@@ -250,6 +250,7 @@ func (g *Gateway) Routes(r chi.Router) {
 	r.Post("/retrieve", g.retrieve)
 	r.Post("/rerank", g.rerank)
 	r.Post("/moderations", g.moderations)
+	r.Post("/feedback", g.feedback)
 	models := r.With(g.requireScope(store.ScopeModels, "model listings"))
 	models.Get("/models", g.listModels)
 	models.Get("/models/{id}", g.getModel)

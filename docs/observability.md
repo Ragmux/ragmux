@@ -368,6 +368,8 @@ cost columns, a row identifies the request:
 
 `session_id`, `tool_names` and `tools_denied` are added by migration `0029` (the session index by `0030`, built `CONCURRENTLY` like the request id index); the rows of sessions are summarised in `session_usage`, which retention trims with the request logs.
 
+[`POST /v1/feedback`](api.md#post-v1feedback) scores are kept in `request_feedback` (migration `0040`), one row per `(project_id, request_id)`: `score` (`1` or `-1`), an optional `label`, the sending key's `api_key_id` (`NULL` once the key is deleted) and `created_at` / `updated_at`. There is no content and no free text in it. Retention deletes the rows with the request logs (`LOG_RETENTION_DAYS`, by `created_at`). Feedback has no Prometheus metric in this release; read it through `GET /projects/{id}/feedback/summary` in the admin API.
+
 `request_id` is a column, never a metric label (see the
 [cardinality checklist](#cardinality-checklist)). The identifying columns are added by
 migrations `0016` and `0017` (`rag_skip_reason` by `0022`); the index is built `CONCURRENTLY`, so upgrading does not lock a large

@@ -466,6 +466,50 @@ func TestRunOnceTrimsWebhookDeliveries(t *testing.T) {
 	}
 }
 
+func TestReportDeletedCountsRequestFeedback(t *testing.T) {
+	if got := (Report{RequestFeedback: 4}).Deleted(); got != 4 {
+		t.Errorf("Deleted() = %d, want 4", got)
+	}
+}
+
+// Feedback follows the request log window (ADR-042): rows older than it go,
+// newer ones stay, and the count is in the report and in the total.
+func TestRunOnceTrimsRequestFeedback(t *testing.T) {
+	f := seed(t)
+	for _, id := range []string{"old", "fresh"} {
+		if err := f.st.InsertRequestLog(f.ctx, &store.RequestLog{ProjectID: f.proj, ModelName: "m", StatusCode: 200, RequestID: id}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.st.UpsertFeedback(f.ctx, f.proj, id, 1, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for id, age := range map[string]int{"old": 100, "fresh": 10} {
+		if _, err := f.st.DB().Exec(f.ctx, "UPDATE request_feedback SET created_at = $2 WHERE request_id = $1", id, f.now.AddDate(0, 0, -age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j := &Janitor{Store: f.st, Now: func() time.Time { return f.now }, RequestLogDays: 90, AuditDays: 365}
+	rep, err := j.RunOnce(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RequestFeedback != 1 || f.count("request_feedback") != 1 {
+		t.Errorf("report = %+v, %d rows left; want one feedback row removed", rep, f.count("request_feedback"))
+	}
+	if rep.Deleted() != rep.RequestLogs+rep.AuditLogs+rep.LoginAttempts+rep.Sessions+rep.SessionUsage+rep.RequestFeedback {
+		t.Errorf("Deleted() = %d does not include the feedback rows: %+v", rep.Deleted(), rep)
+	}
+	// With the window off the table is kept forever, like request logs.
+	if _, err := f.st.DB().Exec(f.ctx, "UPDATE request_feedback SET created_at = $1", f.now.AddDate(0, 0, -400)); err != nil {
+		t.Fatal(err)
+	}
+	j.RequestLogDays = 0
+	if rep, err = j.RunOnce(f.ctx); err != nil || rep.RequestFeedback != 0 || f.count("request_feedback") != 1 {
+		t.Errorf("RequestLogDays=0: report %+v err %v, rows %d; want the row kept", rep, err, f.count("request_feedback"))
+	}
+}
+
 // The pass drops a retired webhook secret once its 24 hour window is over.
 func TestRunOnceClearsExpiredWebhookSecrets(t *testing.T) {
 	f := seed(t)

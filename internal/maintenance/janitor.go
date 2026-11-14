@@ -91,6 +91,9 @@ type Report struct {
 	// ones of windows that are over, an end user's after two days or two
 	// months, the rest after the request log window.
 	AlertEvents int64
+	// RequestFeedback counts feedback rows (ADR-042) removed in the pass: the
+	// ones older than the request log window.
+	RequestFeedback int64
 	// WebhookSecretsCleared counts endpoints whose retired signing secret
 	// (past its 24 hour rotation window) was dropped in the pass. It is an
 	// update, not a deletion, and is not counted in Deleted.
@@ -104,7 +107,7 @@ type Report struct {
 // Deleted is the number of rows the pass removed across every table.
 // DocumentsFailed is an update, not a deletion, and is not counted.
 func (r Report) Deleted() int64 {
-	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.LoginChallenges + r.APIKeys + r.SessionUsage + r.WebhookDeliveries + r.AlertEvents
+	return r.RequestLogs + r.AuditLogs + r.LoginAttempts + r.Sessions + r.LoginChallenges + r.APIKeys + r.SessionUsage + r.WebhookDeliveries + r.AlertEvents + r.RequestFeedback
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -167,6 +170,8 @@ func (j *Janitor) RunOnce(ctx context.Context) (Report, error) {
 		// Webhook deliveries (alert bodies and delivery outcomes) follow the
 		// request log window, LOG_RETENTION_DAYS (ADR-033).
 		{store.RetainWebhookDeliveries, "webhook deliveries", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.WebhookDeliveries},
+		// Feedback follows the request log window too (ADR-042).
+		{store.RetainRequestFeedback, "request feedback", now.AddDate(0, 0, -j.RequestLogDays), j.RequestLogDays <= 0, &rep.RequestFeedback},
 		{store.RetainAlertEventsEndUserDay, "alert events (end user, day)", endUserDay, false, &rep.AlertEvents},
 		{store.RetainAlertEventsEndUserMonth, "alert events (end user, month)", endUserMonth, false, &rep.AlertEvents},
 		{store.RetainAlertEventsDay, "alert events (day)", alertDay, j.RequestLogDays <= 0, &rep.AlertEvents},
@@ -357,5 +362,5 @@ func (j *Janitor) runLogged(ctx context.Context) {
 		"interrupted", ctx.Err() != nil,
 		"request_logs", rep.RequestLogs, "audit_logs", rep.AuditLogs,
 		"login_attempts", rep.LoginAttempts, "sessions", rep.Sessions, "login_challenges", rep.LoginChallenges, "api_keys", rep.APIKeys,
-		"session_usage", rep.SessionUsage, "webhook_deliveries", rep.WebhookDeliveries, "alert_events", rep.AlertEvents, "webhook_secrets_cleared", rep.WebhookSecretsCleared, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
+		"session_usage", rep.SessionUsage, "webhook_deliveries", rep.WebhookDeliveries, "alert_events", rep.AlertEvents, "request_feedback", rep.RequestFeedback, "webhook_secrets_cleared", rep.WebhookSecretsCleared, "usage_purged", rep.UsagePurged, "documents_failed", rep.DocumentsFailed)
 }

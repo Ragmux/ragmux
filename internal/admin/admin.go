@@ -218,6 +218,7 @@ func (a *Admin) authenticated(r chi.Router) {
 	editor.Post("/api/projects/{id}/webhooks/{purpose}/rotate-secret", a.rotateWebhookSecret)
 	read.Get("/api/projects/{id}/sessions", a.listSessions)
 	read.Get("/api/projects/{id}/sessions/{sessionId}", a.getSession)
+	read.Get("/api/projects/{id}/feedback/summary", a.feedbackSummary)
 
 	// API keys: ownership is checked inside the handlers (404 for someone
 	// else's key). Deleting one is admin-only; everyone else revokes.
