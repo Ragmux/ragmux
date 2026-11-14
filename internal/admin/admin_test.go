@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -479,5 +480,229 @@ func TestProjectExtraSettings(t *testing.T) {
 	}
 	if !seen {
 		t.Error("the audit trail does not mention the extra lists")
+	}
+}
+
+// ---- KVKK anonymisation (ADR-040) ----
+
+// auditDump is every audit row as one lower-cased string.
+func (e *adminEnv) auditDump() string {
+	e.t.Helper()
+	entries, _, err := e.st.ListAuditLogs(context.Background(), store.AuditFilter{Limit: 1000})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, l := range entries {
+		raw, _ := json.Marshal(l)
+		b.Write(raw)
+		b.WriteByte('\n')
+	}
+	return strings.ToLower(b.String())
+}
+
+// Both endpoints are for a signed-in session: a management key with the admin
+// scope is refused with session_required, a non-admin session is refused by
+// the role gate, and an admin session goes through.
+func TestAnonymizeEndpointsAreSessionOnly(t *testing.T) {
+	e := newAdminEnv(t)
+	root := e.user("root", "admin")
+	editor := e.user("editor", "editor", e.proj.ID)
+	viewer := e.user("viewer", "viewer", e.proj.ID)
+	victim := e.user("Victim", "viewer")
+
+	_, raw, err := e.st.CreateAPIKey(context.Background(), &store.APIKey{Kind: store.KindManagement, Name: "all", UserID: root.ID,
+		Scopes: store.ManagementScopes()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userPath := "/api/users/" + itoa(victim.ID) + "/anonymize"
+	userBody := map[string]any{"confirm": "Victim"}
+	endBody := map[string]any{"end_user": "u-1"}
+	endPath := "/api/end-users/anonymize"
+
+	if st, out := e.do(http.MethodPost, userPath, userBody, raw); st != http.StatusForbidden || errCode(out) != "session_required" {
+		t.Errorf("admin-scope key, user: %d %v", st, out)
+	}
+	if st, out := e.do(http.MethodPost, endPath, endBody, raw); st != http.StatusForbidden || errCode(out) != "session_required" {
+		t.Errorf("admin-scope key, end user: %d %v", st, out)
+	}
+	for _, who := range []*actor{editor, viewer} {
+		if st, _ := e.do(http.MethodPost, userPath, userBody, who.token); st != http.StatusForbidden {
+			t.Errorf("%s session, user: %d", who.Role, st)
+		}
+		if st, _ := e.do(http.MethodPost, endPath, endBody, who.token); st != http.StatusForbidden {
+			t.Errorf("%s session, end user: %d", who.Role, st)
+		}
+	}
+	// Nothing happened to the account.
+	if u, err := e.st.GetUser(context.Background(), victim.ID); err != nil || u.Username != "Victim" || !u.IsActive {
+		t.Fatalf("a refused call changed the account: %v %+v", err, u)
+	}
+	// The admin session passes both.
+	if st, out := e.do(http.MethodPost, endPath, endBody, root.token); st != http.StatusOK {
+		t.Errorf("admin session, end user: %d %v", st, out)
+	}
+	if st, out := e.do(http.MethodPost, userPath, userBody, root.token); st != http.StatusOK {
+		t.Errorf("admin session, user: %d %v", st, out)
+	}
+}
+
+func TestAnonymizeUserEndpoint(t *testing.T) {
+	e := newAdminEnv(t)
+	root := e.user("root", "admin")
+	victim := e.user("Dave Brown", "editor", e.proj.ID)
+	ctx := context.Background()
+	path := "/api/users/" + itoa(victim.ID) + "/anonymize"
+
+	// A key and a login failure under the name, to see the sweep end to end.
+	k, _, err := e.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "dave's key", UserID: victim.ID,
+		Scopes: store.DefaultGatewayScopes(), ProjectIDs: []int64{e.proj.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.adm.auditAs(httptest.NewRequest(http.MethodPost, "/", nil), nil, "login.failure", "user", nil, map[string]any{"username": "DAVE BROWN"})
+
+	if st, out := e.do(http.MethodPost, path, map[string]any{"confirm": "dave brown"}, root.token); st != http.StatusBadRequest {
+		t.Errorf("wrong confirm: %d %v", st, out)
+	}
+	if st, out := e.do(http.MethodPost, path, map[string]any{}, root.token); st != http.StatusBadRequest {
+		t.Errorf("no confirm: %d %v", st, out)
+	}
+	if st, _ := e.do(http.MethodPost, "/api/users/987654/anonymize", map[string]any{"confirm": "x"}, root.token); st != http.StatusNotFound {
+		t.Errorf("unknown account: %d", st)
+	}
+
+	st, out := e.do(http.MethodPost, path, map[string]any{"confirm": "Dave Brown"}, root.token)
+	if st != http.StatusOK {
+		t.Fatalf("anonymize: %d %v", st, out)
+	}
+	pseudonym, _ := out["pseudonym"].(string)
+	if !strings.HasPrefix(pseudonym, "anon-") || len(pseudonym) != len("anon-")+16 {
+		t.Fatalf("pseudonym %q", pseudonym)
+	}
+	if n, _ := out["revoked_keys"].(float64); n != 1 {
+		t.Errorf("revoked_keys = %v", out["revoked_keys"])
+	}
+	u, err := e.st.GetUser(ctx, victim.ID)
+	if err != nil || u.Username != pseudonym || u.IsActive {
+		t.Errorf("account after: %v %+v", err, u)
+	}
+	// The old session is dead and the old name does not log in.
+	if st, _ := e.do(http.MethodGet, "/api/me", nil, victim.token); st != http.StatusUnauthorized {
+		t.Errorf("old session still works: %d", st)
+	}
+	if got, err := e.st.GetAPIKey(ctx, k.ID); err != nil || got.RevokedAt == nil || got.Name != "key-"+itoa(k.ID) {
+		t.Errorf("key after: %v %+v", err, got)
+	}
+
+	// The second call is a 409 with a code, whatever it confirms.
+	for _, c := range []string{"Dave Brown", pseudonym} {
+		if st, out := e.do(http.MethodPost, path, map[string]any{"confirm": c}, root.token); st != http.StatusConflict || errCode(out) != "already_anonymized" {
+			t.Errorf("second call (%q): %d %v", c, st, out)
+		}
+	}
+
+	// The audit entry carries the pseudonym; the original is in no row.
+	dump := e.auditDump()
+	if !strings.Contains(dump, `"action":"user.anonymize"`) || !strings.Contains(dump, pseudonym) {
+		t.Errorf("no user.anonymize entry with the pseudonym:\n%s", dump)
+	}
+	if strings.Contains(dump, "dave") {
+		t.Errorf("the original name is still in the audit trail:\n%s", dump)
+	}
+	// The name can be registered again.
+	if st, out := e.do(http.MethodPost, "/api/users", map[string]any{"username": "Dave Brown", "password": "correct horse battery", "role": "viewer"}, root.token); st != http.StatusCreated {
+		t.Errorf("re-register: %d %v", st, out)
+	}
+}
+
+// Nobody anonymizes their own account (400), as nobody deactivates or deletes
+// it. The last-active-admin guard behind it is a backstop, covered in the store
+// tests.
+func TestAnonymizeRefusesOwnAccount(t *testing.T) {
+	e := newAdminEnv(t)
+	ctx := context.Background()
+	me := e.user("Solo Admin", "admin")
+	e.user("Other Admin", "admin")
+	path := "/api/users/" + itoa(me.ID) + "/anonymize"
+	if st, out := e.do(http.MethodPost, path, map[string]any{"confirm": "Solo Admin"}, me.token); st != http.StatusBadRequest {
+		t.Fatalf("own account: %d %v", st, out)
+	}
+	if u, err := e.st.GetUser(ctx, me.ID); err != nil || u.Username != "Solo Admin" || !u.IsActive {
+		t.Fatalf("a refused call changed the account: %v %+v", err, u)
+	}
+	if n, err := e.st.CountAuditLogs(ctx, store.AuditFilter{Action: "user.anonymize"}); err != nil || n != 0 {
+		t.Errorf("a refused call was audited: %d %v", n, err)
+	}
+}
+
+// An anonymized account stays closed: it cannot be switched back on and its
+// password cannot be set, so no new personal data can gather under it.
+func TestAnonymizedAccountStaysClosed(t *testing.T) {
+	e := newAdminEnv(t)
+	ctx := context.Background()
+	root := e.user("root", "admin")
+	victim := e.user("Frank Moore", "editor")
+	if st, out := e.do(http.MethodPost, "/api/users/"+itoa(victim.ID)+"/anonymize", map[string]any{"confirm": "Frank Moore"}, root.token); st != http.StatusOK {
+		t.Fatalf("anonymize: %d %v", st, out)
+	}
+	before, err := e.st.GetUser(ctx, victim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/users/" + itoa(victim.ID)
+	if st, out := e.do(http.MethodPut, path, map[string]any{"is_active": true}, root.token); st != http.StatusConflict || errCode(out) != "already_anonymized" {
+		t.Errorf("activate: %d %v", st, out)
+	}
+	if st, out := e.do(http.MethodPut, path, map[string]any{"role": "viewer", "is_active": true}, root.token); st != http.StatusConflict || errCode(out) != "already_anonymized" {
+		t.Errorf("activate with a role: %d %v", st, out)
+	}
+	if st, out := e.do(http.MethodPost, path+"/reset-password", map[string]any{"new_password": "correct horse battery"}, root.token); st != http.StatusConflict || errCode(out) != "already_anonymized" {
+		t.Errorf("reset password: %d %v", st, out)
+	}
+	after, err := e.st.GetUser(ctx, victim.ID)
+	if err != nil || after.IsActive || after.PasswordHash != before.PasswordHash {
+		t.Errorf("a refused call changed the account: %v %+v", err, after)
+	}
+	// Leaving it deactivated is not an activation.
+	if st, out := e.do(http.MethodPut, path, map[string]any{"is_active": false}, root.token); st != http.StatusOK {
+		t.Errorf("keep deactivated: %d %v", st, out)
+	}
+}
+
+func TestAnonymizeEndUserEndpoint(t *testing.T) {
+	e := newAdminEnv(t)
+	root := e.user("root", "admin")
+	ctx := context.Background()
+	for _, pid := range []int64{e.proj.ID, e.other.ID} {
+		if err := e.st.InsertRequestLog(ctx, &store.RequestLog{ProjectID: pid, ModelName: "m", StatusCode: 200, PromptTokens: 4, EndUser: "customer@example.com"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, body := range []map[string]any{{}, {"end_user": ""}, {"end_user": strings.Repeat("x", 129)}} {
+		if st, out := e.do(http.MethodPost, "/api/end-users/anonymize", body, root.token); st != http.StatusBadRequest {
+			t.Errorf("bad body %v: %d %v", body, st, out)
+		}
+	}
+	if st, _ := e.do(http.MethodPost, "/api/end-users/anonymize", map[string]any{"end_user": "customer@example.com", "project_id": 987654}, root.token); st != http.StatusNotFound {
+		t.Errorf("unknown project: %d", st)
+	}
+
+	st, out := e.do(http.MethodPost, "/api/end-users/anonymize", map[string]any{"end_user": "customer@example.com", "project_id": e.proj.ID}, root.token)
+	if st != http.StatusOK || out["request_logs"] != float64(1) {
+		t.Fatalf("one project: %d %v", st, out)
+	}
+	st, out = e.do(http.MethodPost, "/api/end-users/anonymize", map[string]any{"end_user": "customer@example.com"}, root.token)
+	if st != http.StatusOK || out["request_logs"] != float64(1) {
+		t.Fatalf("all projects: %d %v", st, out)
+	}
+	for _, k := range []string{"pseudonym", "end_user_usage", "alert_events", "webhook_deliveries"} {
+		if _, ok := out[k]; !ok {
+			t.Errorf("response has no %q: %v", k, out)
+		}
+	}
+	if dump := e.auditDump(); strings.Contains(dump, "customer@example.com") || !strings.Contains(dump, `"action":"end_user.anonymize"`) {
+		t.Errorf("audit trail:\n%s", dump)
 	}
 }

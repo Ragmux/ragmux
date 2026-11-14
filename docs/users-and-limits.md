@@ -81,7 +81,7 @@ replace the member set freely.
 - `PUT /admin/api/users/{id}` changes `role` and `is_active`. Deactivated users cannot sign
   in and their existing sessions stop working immediately.
 - The last active admin cannot be demoted, deactivated or deleted (`409`), and nobody can
-  deactivate or delete their own account (`400`).
+  deactivate, delete or [anonymise](#anonymisation-kvkk) their own account (`400`).
 - `POST /admin/api/users/{id}/reset-password` sets a new password and revokes the user's
   sessions; `POST /admin/api/users/{id}/sessions/revoke` only signs the user out everywhere.
   It cannot be used on your own account (`400`): you change your own password with
@@ -101,6 +101,79 @@ replace the member set freely.
 - `GET /admin/api/users` reports `project_count` and `active_sessions` per user;
   `GET /admin/api/me` reports `session_expires_at` and whether the session is a bearer
   token (`session_bearer`).
+
+## Anonymisation (KVKK)
+
+A data-subject request to erase a person's data must not wipe the usage history that
+accounting and abuse reviews rely on, so Ragmux anonymises instead of deleting: the
+personal fields are replaced and the rows stay. Use anonymisation, not
+`DELETE /admin/api/users/{id}`, for such a request.
+
+Both operations replace the value with **one random pseudonym** (`anon-` and 16 hex digits)
+generated per operation and written to every row the operation touches. The pseudonym is
+not a hash of the original: nothing derived from the original is kept, so it cannot be
+reversed, and the original value is not written to the audit log either. Two operations
+never share a pseudonym. Both endpoints are for a signed-in admin **session**; a
+management key, even one with the `admin` scope, gets `403` with `code: "session_required"`.
+A deliberate trade-off: an application cannot automate these requests with a key, and a
+leaked key cannot make a change that cannot be undone.
+
+**A user.** `POST /admin/api/users/{id}/anonymize` with `{"confirm": "<the account's current
+username>"}` (exactly as stored; a mismatch is `400`). In one transaction:
+
+- the username becomes the pseudonym, the password becomes a random one nobody knows, the
+  account is deactivated, `users.anonymized_at` is set and the second factor (secret,
+  recovery codes, open challenges) is removed;
+- sessions and project memberships are deleted; every key of the account is revoked and
+  renamed `key-<id>` (a key name is free text and can be a person's name);
+- in the audit log, the `actor_username` of the account's own entries, `details.username` of
+  the entries about it, `details.name` of the `apikey.*` entries for its keys (also entries
+  the account made on someone else's key; the key id stays in `target_id`), and the
+  `login.failure`, `login.rate_limited` and `login.locked` entries that named the account
+  but had no actor, matched on the name case-insensitively and with no lower time bound;
+- the account's rows in the login-attempt counters are deleted.
+
+`request_logs` is not touched: it points at the account by id, carries no name and keeps
+its usage and cost figures, so totals do not move. You cannot anonymise your own account
+(`400`), as you cannot deactivate or delete it; another admin does it. The last active
+admin is refused too (`409`), and a second call on an account is `409` with `code:
+"already_anonymized"`. The old username can be registered again.
+
+An anonymized account is closed for good: `PUT /admin/api/users/{id}` with `is_active: true`
+and `POST /admin/api/users/{id}/reset-password` are refused with `409` and `code:
+"already_anonymized"` (`ragmux reset-password` fails for it too), because anything created under
+it afterwards, a key name for instance, could not be anonymized again. Create a new account
+instead. The operation is audited as
+`user.anonymize` with the pseudonym only.
+
+**An end user.** `POST /admin/api/end-users/anonymize` with `{"end_user": "<id>",
+"project_id": 3}` replaces the identifier in `request_logs.end_user` (in batches of 5000
+rows), `end_user_usage`, `alert_events` and the subject of alert webhook deliveries.
+Without `project_id` every project is covered. The response is the pseudonym and the number
+of rows changed per table. If a call fails partway, call it again: rows already changed keep
+their pseudonym and the rest get a second one. Audited as `end_user.anonymize` (project,
+counts and pseudonym; not the identifier).
+
+**What it does not reach.** State these to whoever files the request:
+
+- It looks backwards. An end user who shows up again, or a login that types the old name,
+  writes new rows with the original value, and there is no second pass for them.
+- An end user's current rate and token windows start again from zero if the same identifier
+  keeps sending: the counters in `end_user_usage` are keyed by the identifier, so the next
+  request opens a new row under the original value and the ceilings count from nothing.
+  Anonymise after the person has stopped using the application.
+- A failed-login entry names no account, only a typed name. If the name belonged to someone
+  else earlier (an account deleted, the name registered again), those entries are attached
+  to this pseudonym too. They prove no identity.
+- The name of an account deleted **before** this feature stays in the audit log; the
+  endpoint works on an existing account only.
+- A key deleted before v0.8, whose `apikey.create` entry has already been removed by
+  retention, leaves a name in its `apikey.revoke` / `apikey.delete` entry until retention
+  removes that too. Newer entries carry the owner's id, so the gap closes over time.
+- `audit_logs.ip` is kept, as a security record with a legitimate interest, for
+  `AUDIT_RETENTION_DAYS` (default 365; `0` keeps entries forever).
+- Application logs (stdout) and backups are outside it: keeping and expiring them is the
+  operator's job.
 
 ## API keys
 
@@ -372,7 +445,7 @@ small JSON `details` object that never contains credentials. Action names are
 `document.upload`, `document.delete`, `document.reprocess`, `project.create`,
 `project.update`, `project.delete`, `project.rotate_key`, `project.members_update`,
 `user.create`, `user.update`, `user.delete`, `user.reset_password`,
-`user.revoke_sessions`, `apikey.create`, `apikey.update`, `apikey.revoke`,
+`user.revoke_sessions`, `user.anonymize`, `end_user.anonymize`, `apikey.create`, `apikey.update`, `apikey.revoke`,
 `apikey.delete`, `password.change`, `totp.setup`, `totp.enable`, `totp.disable`,
 `totp.recovery_regenerate`, `user.totp_reset`, `login.mfa_failure`, `login.mfa_locked`,
 `login.recovery_code_used`, `logout`, `setup.complete` for the first

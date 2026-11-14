@@ -1075,6 +1075,8 @@ already knows.
 | POST | `/users/{id}/reset-password` | admin | `{new_password}` (at least 12 characters, at most 72 bytes); revokes the user's sessions and clears the account's wrong second-factor codes and open challenges; `400` for the caller's own account (use `POST /me/password`). Session-only |
 | POST | `/users/{id}/totp/reset` | admin | Removes the user's two-factor authentication (secret, recovery codes), its wrong-code history and its sessions → `{"ok": true}`; `400` for the caller's own account (use `/me/totp/disable`). Audited as `user.totp_reset`. Session-only |
 | POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
+| POST | `/users/{id}/anonymize` | admin | `{confirm}` (the account's current username, exactly) → `{"ok": true, "pseudonym", "revoked_keys"}`; replaces the personal fields with one random pseudonym and keeps usage history; `400` on a wrong `confirm` or for the caller's own account, `409` for the last active admin or `code: "already_anonymized"`. Audited as `user.anonymize`. Session-only |
+| POST | `/end-users/anonymize` | admin | `{end_user, project_id?}` → `{"pseudonym", "request_logs", "end_user_usage", "alert_events", "webhook_deliveries"}` (rows changed); without `project_id` every project; `404` for an unknown project. Audited as `end_user.anonymize`. Session-only |
 | GET | `/audit` | admin | Audit entries, newest first, with the total for the filter |
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
 | GET | `/security/logins` | admin | Failed-login counters and active lockouts |
@@ -1087,8 +1089,15 @@ already knows.
   "project_count": 2, "active_sessions": 1}]
 ```
 
+`POST /users/{id}/anonymize` and `POST /end-users/anonymize` are for a signed-in session:
+a management key, even one with the `admin` scope, gets `403` with
+`code: "session_required"`. What they change, and what they cannot reach, is in
+[Users, roles and limits](users-and-limits.md#anonymisation-kvkk).
+
 `PUT`/`DELETE` on users refuse to demote, deactivate or delete the last active admin
-(`409`) and to deactivate or delete the caller's own account (`400`).
+(`409`) and to deactivate or delete the caller's own account (`400`). On an
+[anonymized](users-and-limits.md#anonymisation-kvkk) account, `PUT` with `is_active: true` and
+`POST /users/{id}/reset-password` are `409` with `code: "already_anonymized"`: it stays closed.
 
 `GET /audit?limit=100&action=project.&actor_user_id=1&since=2026-09-01T00:00:00Z&until=2026-09-18T00:00:00Z&before=2026-09-17T10:00:00Z`:
 `action` is a prefix match, `since` (inclusive) and `until` (exclusive) bound

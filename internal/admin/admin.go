@@ -248,6 +248,9 @@ func (a *Admin) authenticated(r chi.Router) {
 	adminOnly.Post("/api/users/{id}/reset-password", a.resetPassword)
 	adminOnly.Post("/api/users/{id}/totp/reset", a.resetUserTOTP)
 	adminOnly.Post("/api/users/{id}/sessions/revoke", a.revokeSessions)
+	// KVKK anonymisation; both handlers are session-only (ADR-040).
+	adminOnly.Post("/api/users/{id}/anonymize", a.anonymizeUser)
+	adminOnly.Post("/api/end-users/anonymize", a.anonymizeEndUser)
 	adminOnly.Get("/api/audit", a.listAudit)
 	adminOnly.Get("/api/audit/export", a.exportAudit)
 	adminOnly.Get("/api/security/logins", a.loginSecurity)

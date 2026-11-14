@@ -169,6 +169,9 @@ func (a *Admin) updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := a.Store.UpdateUser(r.Context(), id, role, active)
 	if err != nil {
+		if anonymizedRefusal(w, err) {
+			return
+		}
 		a.fail(w, err)
 		return
 	}
@@ -261,6 +264,9 @@ func (a *Admin) resetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Store.UpdateUserPassword(r.Context(), id, hash); err != nil {
+		if anonymizedRefusal(w, err) {
+			return
+		}
 		a.fail(w, err)
 		return
 	}

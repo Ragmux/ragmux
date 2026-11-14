@@ -205,6 +205,18 @@ const lockAdminChange int64 = 0x7261676d75780002
 func (s *Store) UpdateUser(ctx context.Context, id int64, role string, isActive bool) (*User, error) {
 	var out *User
 	err := s.adminGuardedTx(ctx, id, func(tx pgx.Tx) error {
+		// An anonymized account stays closed (ADR-040): switching it back on
+		// would let new personal data accumulate under an account that can no
+		// longer be anonymized again.
+		if isActive {
+			var anonymized bool
+			if err := tx.QueryRow(ctx, "SELECT anonymized_at IS NOT NULL FROM users WHERE id = $1", id).Scan(&anonymized); err != nil {
+				return scanErr(err)
+			}
+			if anonymized {
+				return ErrAlreadyAnonymized
+			}
+		}
 		u, err := scanUser(tx.QueryRow(ctx,
 			"UPDATE users SET role = $1, is_active = $2 WHERE id = $3 RETURNING "+userCols, role, isActive, id))
 		out = u
@@ -276,10 +288,29 @@ func (s *Store) adminGuardedTx(ctx context.Context, id int64, fn func(tx pgx.Tx)
 	return tx.Commit(ctx)
 }
 
-// UpdateUserPassword replaces the stored hash.
+// UpdateUserPassword replaces the stored hash. An anonymized account keeps the
+// unusable hash anonymization gave it: the call fails with ErrAlreadyAnonymized
+// and changes nothing (ADR-040).
 func (s *Store) UpdateUserPassword(ctx context.Context, id int64, passwordHash string) error {
-	_, err := s.pool.Exec(ctx, "UPDATE users SET password_hash = $1 WHERE id = $2", passwordHash, id)
-	return err
+	res, err := s.pool.Exec(ctx, "UPDATE users SET password_hash = $1 WHERE id = $2 AND anonymized_at IS NULL", passwordHash, id)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() > 0 {
+		return nil
+	}
+	var anonymized bool
+	err = s.pool.QueryRow(ctx, "SELECT anonymized_at IS NOT NULL FROM users WHERE id = $1", id).Scan(&anonymized)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // unknown id: nothing to change, as before
+	}
+	if err != nil {
+		return err
+	}
+	if anonymized {
+		return ErrAlreadyAnonymized
+	}
+	return nil
 }
 
 // TouchLastLogin records a successful login time.
