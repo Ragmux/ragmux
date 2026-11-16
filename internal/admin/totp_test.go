@@ -621,6 +621,10 @@ func TestTOTPParallelLoginsYieldOneSession(t *testing.T) {
 	}); n != 1 {
 		t.Errorf("one TOTP code opened %d sessions, want 1", n)
 	}
+	// A request that waited for the winner sees its code spent and counts as a
+	// wrong code, so up to five of them can lock the gate; that lock is not
+	// what this test is about.
+	e.exec("DELETE FROM login_attempts WHERE stage = 'mfa'")
 	for i := range tokens {
 		tokens[i] = e.challenge("ed")
 	}
@@ -630,6 +634,10 @@ func TestTOTPParallelLoginsYieldOneSession(t *testing.T) {
 	}); n != 1 {
 		t.Errorf("one recovery code opened %d sessions, want 1", n)
 	}
+	// A request that waited for the winner sees its code spent and counts as a
+	// wrong code, so up to five of them can lock the gate; that lock is not
+	// what this test is about.
+	e.exec("DELETE FROM login_attempts WHERE stage = 'mfa'")
 	// One challenge, two different valid proofs.
 	e.forget(ed)
 	one := e.challenge("ed")
