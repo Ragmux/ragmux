@@ -251,26 +251,7 @@ func TestMigration0033LeavesProjectsReadableWhileItWaits(t *testing.T) {
 	}()
 
 	// Wait until the migration is really queued behind the reader.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var waiting int
-		if err := s.DB().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting > 0 {
-			break
-		}
-		select {
-		case err := <-done:
-			t.Fatalf("the migration finished (%v) without waiting for the reader", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the migration never queued behind the reader")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForTableLockWaiter(t, s, done)
 
 	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -330,7 +311,6 @@ func TestMigration0033TimesOutInsteadOfStallingRequests(t *testing.T) {
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	started := time.Now()
 	opened := make(chan error, 1)
 	go func() {
 		s2, err := store.Open(ctx, cfg, log)
@@ -340,22 +320,9 @@ func TestMigration0033TimesOutInsteadOfStallingRequests(t *testing.T) {
 		opened <- err
 	}()
 
-	// Wait until the migration's lock request is queued behind the reader.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var waiting int
-		if err := s.DB().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the migration never queued behind the reader")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Wait until the migration's lock request is queued behind the reader;
+	// the timeouts below count from here.
+	started := waitForTableLockWaiter(t, s, nil)
 
 	// A request finishing now writes its row. It queues behind the migration's
 	// lock request and must be let through when that gives up.
@@ -409,19 +376,33 @@ func TestMigration0033TimesOutInsteadOfStallingRequests(t *testing.T) {
 	}
 }
 
-// waitForLockWaiter waits until some backend is queued on a lock, which is how
-// a test knows the migration has reached the table the reader holds.
-func waitForLockWaiter(t *testing.T, s *store.Store) {
+// waitForTableLockWaiter waits until a backend is queued on a table lock in
+// the test's own schema, and returns the moment it saw that. Only such a lock
+// counts: the packages of one `go test ./...` run share the database, and their
+// migration runs queue on the database-wide migration advisory lock, so a Lock
+// wait in pg_stat_activity may well be theirs. For the same reason store.Open
+// can spend a while queued on that advisory lock before it reaches the table;
+// the deadline allows for it, and a test counts its timeouts from the returned
+// moment. If done is not nil and receives first, the waiter never queued.
+func waitForTableLockWaiter(t *testing.T, s *store.Store, done <-chan error) time.Time {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for {
 		var waiting int
-		if err := s.DB().QueryRow(context.Background(), `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`).Scan(&waiting); err != nil {
+		if err := s.DB().QueryRow(context.Background(), `SELECT count(*)
+			FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_class c ON c.oid = l.relation
+			WHERE l.locktype = 'relation' AND NOT l.granted
+			  AND l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+			  AND c.relnamespace = pg_catalog.current_schema()::regnamespace`).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
 		if waiting > 0 {
-			return
+			return time.Now()
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("the migration finished (%v) without waiting for the lock holder", err)
+		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the migration never queued behind the lock holder")
@@ -465,7 +446,6 @@ func TestUpgradeFromV07DoesNotStallRequests(t *testing.T) {
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	started := time.Now()
 	opened := make(chan error, 1)
 	go func() {
 		s2, err := store.Open(ctx, cfg, log)
@@ -474,7 +454,7 @@ func TestUpgradeFromV07DoesNotStallRequests(t *testing.T) {
 		}
 		opened <- err
 	}()
-	waitForLockWaiter(t, s)
+	started := waitForTableLockWaiter(t, s, nil)
 
 	// The project read of a request does not wait for the migration.
 	readCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
@@ -567,7 +547,7 @@ func TestMigration0033RollsBackWhenItsSecondStepTimesOut(t *testing.T) {
 		}
 		opened <- err
 	}()
-	waitForLockWaiter(t, s)
+	waitForTableLockWaiter(t, s, nil)
 	select {
 	case err := <-opened:
 		var pgErr *pgconn.PgError
