@@ -311,6 +311,29 @@ before another replica claims them. Nothing is lost; a document is only ever
   window), stop that source first; cancelling one query only lets the next one in. Once the
   table is free the next start goes through.
 
+### Rolling back after v0.8 security features are on
+
+**Do not go back to an older binary after you have turned the v0.8 security features on.** The
+v0.8 migrations only add columns and tables, so an older binary still starts and `/readyz` stays
+`200` (see below), but it does not know what the new columns mean and reads none of them:
+
+- it applies no [guardrail](api.md#guardrails): the rules stay in the database and requests go
+  through unchecked, with no error and no `Warning`;
+- it applies no `Extra` field policy (`extra_allow`, `extra_deny`), so the fields you removed
+  reach the provider again;
+- it applies no [network allowlist](users-and-limits.md#network-allowlists): a key with a CIDR or
+  `Origin` list works from anywhere, which is what the list was there to stop;
+- it applies no per-end-user limit and sends no limit or budget alert;
+- an account with [two-factor authentication](users-and-limits.md#two-factor-authentication-totp)
+  signs in with the password alone, because that binary knows no second step;
+- its `ragmux rotate-key` does not re-encrypt the webhook and TOTP secrets, which this release
+  seals with the same key.
+
+The same holds for a replica left on the old version during a rolling update: until the last one
+is replaced, requests it serves are not checked by these features. If you must roll back, turn
+the features off first (empty the guardrail rules and the allowlists, switch the second factor off
+for every account) and keep the database backup you took before the upgrade.
+
 ### `/readyz` during a rolling upgrade
 
 There is one shared database and one schema, so the moment the first new replica

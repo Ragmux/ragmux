@@ -69,14 +69,17 @@ Released in 0.7.0.
 
 ## v0.8 — security, cost visibility and feedback
 
+Done and waiting for its release tag.
+
 - Guardrails before the request, before retrieval and on the response, including PII
   detection with Turkish national ID and IBAN validators, and webhook guardrails.
 - Two-factor login with TOTP.
 - Tags and end-user identifiers on requests, with per-end-user limits.
 - Signed webhooks when a project nears or passes a limit.
 - A feedback endpoint tied to the request ID.
-- Key management through Vault or a cloud KMS, per-key IP and origin allowlists, and
-  anonymisation of a user's personal data that keeps their usage history.
+- The secret key held in HashiCorp Vault (Transit) or AWS KMS, per-key IP and origin
+  allowlists, and anonymisation of a user's personal data that keeps their usage history.
+- Allow and deny lists per project for the request fields the gateway passes through unread.
 
 ## v0.9 — ingest, evaluation and scale
 
@@ -109,8 +112,8 @@ and deprecations follow a published policy.
 These have no release because they need a decision first, and some may stay out of scope.
 Reasons to want one of them are welcome in an issue.
 
-- OCR for scanned PDFs, SSO and OIDC login, budgets denominated in money, and an import
-  tool for 0.1 databases.
+- OCR for scanned PDFs, SSO and OIDC login, refusing requests over a budget denominated in
+  money (a monthly dollar budget only warns since 0.8), and an import tool for 0.1 databases.
 - Object storage for uploaded files, optional prompt and response logging, response
   caching, and an organisation and team hierarchy.
 - Batch, audio, image and realtime endpoints.

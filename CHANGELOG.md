@@ -6,11 +6,123 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Guardrails, per project.** Rules read what a client sends and what the model answers, and
+  `block`, `redact` or `flag` a match: Turkish citizen ids (`tckn`, checksum-validated), IBANs
+  (mod-97), a regular expression or a word list. They run at three stages: `pre_request`,
+  `pre_retrieval` (the search query, after a `condense` rewrite) and `post_response`, streams
+  included (the last `stream_window_chars - 1` characters are held back so a match split across
+  chunks is still caught). A block is `400` with `code: "guardrail_blocked"`, a redaction a
+  `Warning`, and a project can add a signed guardrail webhook that decides for requests the local
+  rules let through (`fail_closed` answers `503` with `code: "guardrail_unavailable"`). Chat,
+  `/v1/messages`, `/v1/retrieve` and the MCP search are all covered. The request log records which
+  rule ids matched and how many matches there were, never the text, a hash or a position. See
+  [Guardrails](docs/api.md#guardrails) and [Guardrails and retrieval](docs/rag.md#guardrails-and-retrieval).
+- **`POST /v1/moderations`.** The OpenAI moderation shape, answered with the project's
+  `pre_request` guardrail rules; the `categories` keys are rule ids. See
+  [`POST /v1/moderations`](docs/api.md#post-v1moderations).
+- **Two-factor login with TOTP.** Any dashboard account can turn on a time-based one-time
+  password (RFC 6238) with ten single-use recovery codes. Sign-in becomes two steps
+  (`POST /admin/api/login`, then `POST /admin/api/login/mfa`), `GET /admin/api/me` and
+  `GET /admin/api/users` report `totp_enabled`, an admin can switch another user's second
+  factor off, and `ragmux reset-password --disable-totp` does the same from the server. See
+  [Two-factor authentication](docs/users-and-limits.md#two-factor-authentication-totp).
+- **End users and tags on requests.** `X-Ragmux-End-User` (or the body's `safety_identifier`,
+  `user` or `metadata.user_id`) names who a request is for, and `X-Ragmux-Tags` or
+  `ragmux.tags` classifies it. Both go into the request log and its CSV export, never into a
+  metric label. A project can cap one end user with `end_user_rpm`, `end_user_tpm`,
+  `end_user_daily_tokens` and `end_user_monthly_tokens`; a request over a ceiling is `429` with
+  `scope: "end_user"`. See [End users and tags](docs/users-and-limits.md#end-users-and-tags).
+- **Limit and budget alerts.** A project that turns them on and registers a webhook endpoint
+  is told at 80 % and 100 % of its daily and monthly token budgets, of a key's budgets and, at
+  100 %, of an end user's ceilings. A project can also be given a monthly budget in dollars;
+  that budget only warns, it never refuses a request. The webhook is signed with the Standard
+  Webhooks scheme and delivered from a Postgres outbox, so a warning survives a restart. See
+  [Limit alerts](docs/users-and-limits.md#limit-alerts).
+- **`POST /v1/feedback`.** A score (`1` or `-1`) and an optional label for a request the project
+  already made, with no content and no free text. `GET /admin/api/projects/{id}/feedback/summary`
+  reports the share of positive scores. See [`POST /v1/feedback`](docs/api.md#post-v1feedback).
+- **The secret key can live in Vault or AWS KMS.** `SECRET_KEY_SOURCE=vault_transit` or
+  `aws_kms` opens a wrapped data key (`SECRET_KEY_WRAPPED`) once at startup, so the plain key
+  never sits in `.env` or on disk. Startup fails closed if the key cannot be opened.
+  `ragmux rotate-key --new-wrapped` rotates the data key under these sources. See
+  [Secret key sources](docs/configuration.md#secret-key-sources).
+- **Allowed networks and origins per key.** A gateway key, and a project's own `sk-proj-` key,
+  can carry a CIDR list and a browser `Origin` list; a request they do not admit is `403` with
+  `code: "ip_not_allowed"` or `"origin_not_allowed"` before anything else runs, and is counted
+  in `ragmux_gateway_key_denied_total{reason}`. See
+  [Network allowlists](docs/users-and-limits.md#network-allowlists).
+- **Anonymisation for data-subject requests (KVKK).** `POST /admin/api/users/{id}/anonymize` and
+  `POST /admin/api/end-users/anonymize` replace a person's identifiers with one random pseudonym
+  and keep the usage history, so cost totals do not move. You cannot anonymise your own account
+  (`400`), and an anonymised account stays closed (`409` with `code: "already_anonymized"`). See
+  [Anonymisation (KVKK)](docs/users-and-limits.md#anonymisation-kvkk).
+- **Allow and deny lists for pass-through request fields.** `extra_allow` and `extra_deny` on a
+  project remove fields the gateway does not handle itself (`store`, `service_tier`,
+  `web_search_options`, and on `/v1/messages` `mcp_servers` and `container` among them) before
+  the request is sent, with a `Warning`. Both lists are empty by default, which is the old
+  behaviour. See [Projects](docs/api.md#projects).
+- **Dashboard.** Two-factor setup and the second sign-in step, *Reset 2FA* and *Anonymize* on
+  the user list, the end-user anonymisation form, allowed networks and origins on keys and
+  project keys, and project cards for guardrails, alerts and the money budget, and feedback.
+  See [Dashboard](docs/dashboard.md).
+- **Outbound webhooks.** Guardrail calls and alerts share one signed delivery path. A receiver
+  that answers `410 Gone` closes its endpoint, and a private address is reachable only through
+  the new `PRIVATE_WEBHOOK_ALLOWLIST`, separate from `PRIVATE_UPSTREAM_ALLOWLIST`. Deliveries are
+  counted in `ragmux_webhook_deliveries_total{purpose,outcome}`. See
+  [Limit alerts](docs/users-and-limits.md#limit-alerts).
+- New metrics `ragmux_guardrail_events_total`, `ragmux_guardrail_webhook_total`,
+  `ragmux_gateway_key_denied_total` and `ragmux_webhook_deliveries_total`, and the value
+  `guardrail` for the `reason` label of `ragmux_rag_skipped_total`. See
+  [Observability](docs/observability.md).
+- Migrations `0031` to `0040`. They only add columns, tables and indexes (the one large-table
+  index, on `request_logs` in `0034`, is built `CONCURRENTLY`), so a rolling update with older replicas keeps working.
+  Read [Rolling back](docs/scaling.md#rolling-back-after-v08-security-features-are-on) before
+  you turn the new features on.
+
+### Changed
+
+- **Behaviour change: an end user in the body now reaches Anthropic.** When a chat completions
+  request that Ragmux translates for an Anthropic connection carries a valid `safety_identifier`
+  or `user` in its body, the value goes to Anthropic as
+  `metadata.user_id`, in the form `h-` followed by the first 61 hex digits of its SHA-256. Earlier
+  releases dropped it. **The hash is not anonymisation:** it is unsalted and stable, so anyone who
+  can guess the value can compute it, and what was sent cannot be taken back. To send nothing,
+  leave the id out of the body and send it only in `X-Ragmux-End-User`, which is never
+  forwarded; a body value is sent whatever the header says. Gemini and Ollama get no end
+  user. See [End user](docs/providers.md#end-user).
+- **Behaviour change: the fifth wrong password in one session ends the session.** This holds for
+  `POST /admin/api/me/password` (`changePassword`), which now counts wrong passwords per session,
+  and for the password asked by the two-factor calls (`setup`, `enable`, `disable`,
+  `recovery-codes`), which spend the same five; a right password gives the five back.
+- **Behaviour change: `POST /admin/api/users/{id}/reset-password` on your own account is `400`.**
+  Change your own password with `POST /admin/api/me/password`, which asks for the current one.
+- **Behaviour change: the login counters ignore the case of the username.** `ali`, `ALI` and `Ali`
+  share one budget of failed logins, as they already shared one account.
+- `X-Ragmux-End-User` and `X-Ragmux-Tags` are allowed request headers for origins in
+  `CORS_ORIGINS`, and `x-ragmux-guardrail` is exposed.
+- `secret_key_source` in `GET /admin/api/system` and the setup status can now also be `vault_transit` or `aws_kms`.
+- On a project with guardrails, a `/v1/messages` request that goes to Anthropic unchanged can
+  have its body (`redact` at `pre_request`) and its answer (`post_response`) rewritten, and its
+  stream is no longer a byte copy. A project without rules is served as before.
+
 ### Security
 
 - **Go 1.27.4.** The minimum Go version moves from 1.27.3 to 1.27.4, picking up the fix for a
   reachable header race in `net/http`'s `MaxBytesReader` (GO-2026-6859, reported by
   `govulncheck`).
+- **One lock for the second factor.** Every endpoint that checks a code or a recovery code
+  (`login/mfa`, `enable`, `disable`, `recovery-codes`) shares one limit: five wrong codes in
+  15 minutes lock the account's second factor, parallel requests included. The lock also stops
+  a right code, so a person who knows the password can keep it closed; the way out is another
+  admin or `ragmux reset-password --disable-totp`.
+- **Anonymisation works only in a signed-in session.** A management key, even one with the
+  `admin` scope, gets `403` with `code: "session_required"`, so a leaked key cannot make a change
+  that cannot be undone and data-subject requests cannot be automated with a key.
+- **Outbound webhooks are held to the same private-network rule as upstreams.** `https` is
+  required, a redirect is not followed, and a loopback, private or link-local target is reachable
+  only for a host on `PRIVATE_WEBHOOK_ALLOWLIST`.
 
 ## [0.7.0] - 2026-11-01
 

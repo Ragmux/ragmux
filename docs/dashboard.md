@@ -76,13 +76,13 @@ Users) or `ragmux reset-password --disable-totp` on the server. Screens:
   On a user row, *Reset 2FA* (shown only while the user has two-factor authentication on, from
   the list's `totp_enabled`) removes it and ends their sessions, and *Anonymize* (shown only
   until `anonymized_at` is set) replaces the account's personal data for good (the dialog lists
-  what changes and asks you to type the username). An anonymized account is marked with an
+  what changes and asks you to type the username). An anonymised account is marked with an
   *anonymized* badge and the date, and offers neither *Reset password*, *Reset 2FA*,
   *Anonymize* nor the *Active* switch: it stays closed and the API answers `409` to those.
   Your own row shows none of the reset buttons nor *Anonymize*, which the API refuses for the
   caller: use the sidebar's **Password** and **Two-factor** buttons. Below the table, a form
-  anonymizes an end user for a data-subject request, for one project or all of them, and shows
-  how many rows it changed. Both anonymizations work only in a signed-in session; they are
+  anonymises an end user for a data-subject request, for one project or all of them, and shows
+  how many rows it changed. Both anonymisations work only in a signed-in session; they are
   irreversible. See [Anonymisation (KVKK)](users-and-limits.md#anonymisation-kvkk).
 
 What a user sees follows their role: viewers get read-only screens, editors the forms,

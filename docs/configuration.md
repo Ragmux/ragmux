@@ -613,7 +613,9 @@ anything you deploy. From v0.3.1 on all of them are signed with cosign; see
 - **CORS.** If browsers call the API from another origin, set `CORS_ORIGINS`; the
   gateway answers preflight `OPTIONS` requests itself with
   `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS` and
-  `Access-Control-Allow-Headers: Authorization, Content-Type, X-Ragmux-Project`. The
+  `Access-Control-Allow-Headers` naming `Authorization`, `Content-Type`, `X-Ragmux-Project`,
+  `X-Ragmux-Session`, `X-Ragmux-End-User`, `X-Ragmux-Tags`, `x-api-key`, the `anthropic-*`
+  headers Anthropic's SDKs send and the `MCP-*` headers. The
   rate-limit, budget, RAG, `Retry-After` and `Warning` headers are listed in
   `Access-Control-Expose-Headers`, without which browser JavaScript cannot read any of
   them. With `CORS_ORIGINS` empty (the default) no preflight is ever answered, which is

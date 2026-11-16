@@ -211,6 +211,33 @@ The client API uses the OpenAI shape with a `code` field:
 [`POST /v1/messages`](#post-v1messages) answers in Anthropic's shape instead, with the same
 `code` carried inside `error`.
 
+### Error codes added in 0.8
+
+These `code` values are new in 0.8. Each is also described where the endpoint is; this list is
+where to look one up by name. `type` is as in the envelope above; on the management API it is
+the HTTP status text. 
+| `code` | Status, `type` | Where | Meaning |
+|---|---|---|---|
+| `guardrail_blocked` | `400`, `invalid_request_error` | `/v1/chat/completions`, `/v1/messages`, `/v1/retrieve`, the MCP tool (as a tool error) | A `block` [guardrail](#guardrails) rule matched at `pre_request`, or at `pre_retrieval` on an endpoint with no request to continue. The message names the stage, never the rule |
+| `guardrail_unavailable` | `503`, `server_error` | the same endpoints and `/v1/moderations` | The project's guardrail webhook failed under `fail_closed`, or the stored guardrail configuration cannot be used. No `Retry-After` |
+| `invalid_end_user` | `400`, `invalid_request_error` | every `/v1` endpoint and the MCP search | An `X-Ragmux-End-User` header that is not 1 to 128 bytes of `A-Z a-z 0-9 . _ : @ + = / -`, or is sent twice. A bad body value is not an error; it is dropped with a `Warning` |
+| `invalid_tags` | `400`, `invalid_request_error` | chat and messages | `X-Ragmux-Tags` or `ragmux.tags` with more than 8 tags, or a tag outside 1 to 64 bytes of `A-Z a-z 0-9 . _ : / -` |
+| `ip_not_allowed` | `403`, `permission_error` | `/v1` and `/mcp` | The key's CIDR list does not admit the client address (see [Network allowlists](users-and-limits.md#network-allowlists)) |
+| `origin_not_allowed` | `403`, `permission_error` | `/v1` and `/mcp` | The key lists origins and the request has none, a `null` one, or one that matches no entry |
+| `request_not_found` | `404`, `not_found_error` | `POST /v1/feedback` | The key's project has no request log row with that `request_id`; another project's id answers the same. Retry once after a short pause if the answer was only just sent |
+| `session_required` | `403`, `Forbidden` | management API | The action needs a signed-in session and the caller used an API key: anonymisation, two-factor management, password changes, minting a management key |
+| `totp_already_enabled` | `409`, `Conflict` | `POST /me/totp/setup`, `/me/totp/enable` | Two-factor authentication is already on; `disable` first to change device |
+| `totp_not_set_up` | `409`, `Conflict` | `POST /me/totp/enable` | No secret is pending; call `setup` first |
+| `totp_not_enabled` | `409`, `Conflict` | `POST /me/totp/disable`, `/me/totp/recovery-codes` | Two-factor authentication is not on for the account |
+| `mfa_invalid_code` | `401`, `Unauthorized` on sign-in, `403` where the caller has a session | `POST /login/mfa`, `/me/totp/*` | A wrong code or recovery code. On sign-in the body also has `attempts_left` |
+| `mfa_challenge_invalid` | `401` | `POST /login/mfa` | The sign-in step expired, was used, or was closed by five wrong codes; sign in again |
+| `mfa_locked` | `429` | `POST /login`, `/login/mfa`, `/me/totp/*` | Five wrong codes in 15 minutes locked the account's second factor; `Retry-After` says how long. A right code is refused too |
+| `mfa_busy` | `429` | the same | Another code check of the account is running; `Retry-After: 1`, not counted as a failure |
+| `wrong_password` | `403` | `/me/totp/*`, `POST /me/password` | The password asked for with the action is wrong; it spends one of the session's five tries |
+| `password_attempts_exhausted` | `401` | `/me/totp/*`, `POST /me/password` | The session already used its five wrong passwords and is ended; sign in again |
+| `invalid_feedback` | `400`, `invalid_request_error` | `POST /v1/feedback` | A missing or malformed `request_id`, `score` or `label`, an unknown field, or a body over 4 KiB |
+| `already_anonymized` | `409`, `Conflict` | `POST /users/{id}/anonymize`, `PUT /users/{id}` with `is_active: true`, `POST /users/{id}/reset-password` | The account was [anonymised](users-and-limits.md#anonymisation-kvkk) and stays closed |
+
 ## Management endpoints
 
 All paths are relative to `/admin/api`.
@@ -221,7 +248,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
+| GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env`, `file`, `vault_transit` or `aws_kms`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: at least 12 characters and at most 72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
@@ -781,6 +808,8 @@ The counters are [`ragmux_guardrail_events_total` and `ragmux_guardrail_webhook_
 The matched text, its hash and its position are stored and logged nowhere. A blocked request is a
 request: it takes a slot of the request limit.
 
+<a id="webhook-endpoints"></a>
+
 **Webhook endpoints.** With `webhook.enabled`, the gateway posts the request to the project's
 guardrail webhook endpoint after the local rules ran, signed as every Ragmux webhook is:
 
@@ -1129,7 +1158,7 @@ already knows.
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | GET | `/users/lite` | editor | Active users as `[{id, username, role}]` (for member pickers) |
-| GET | `/users` | admin | All users, each with `project_count` (memberships), `active_sessions` (unexpired sessions), `totp_enabled` (two-factor authentication is on) and `anonymized_at` (when the account was [anonymized](users-and-limits.md#anonymisation-kvkk), else `null`) |
+| GET | `/users` | admin | All users, each with `project_count` (memberships), `active_sessions` (unexpired sessions), `totp_enabled` (two-factor authentication is on) and `anonymized_at` (when the account was [anonymised](users-and-limits.md#anonymisation-kvkk), else `null`) |
 | POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password at least 12 characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
@@ -1143,7 +1172,7 @@ already knows.
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
 | GET | `/security/logins` | admin | Failed-login counters and active lockouts |
 
-`GET /users` answers an array of user objects with the two counters, the second-factor flag and the anonymization time:
+`GET /users` answers an array of user objects with the two counters, the second-factor flag and the anonymisation time:
 
 ```json
 [{"id": 1, "username": "admin", "role": "admin", "is_active": true,
@@ -1158,7 +1187,7 @@ a management key, even one with the `admin` scope, gets `403` with
 
 `PUT`/`DELETE` on users refuse to demote, deactivate or delete the last active admin
 (`409`) and to deactivate or delete the caller's own account (`400`). On an
-[anonymized](users-and-limits.md#anonymisation-kvkk) account, `PUT` with `is_active: true` and
+[anonymised](users-and-limits.md#anonymisation-kvkk) account, `PUT` with `is_active: true` and
 `POST /users/{id}/reset-password` are `409` with `code: "already_anonymized"`: it stays closed.
 
 `GET /audit?limit=100&action=project.&actor_user_id=1&since=2026-09-01T00:00:00Z&until=2026-09-18T00:00:00Z&before=2026-09-17T10:00:00Z`:
@@ -1208,7 +1237,8 @@ whatever the running build reports:
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
-bytes of uploaded files stored in the database, `secret_key_source` is `env` or `file`.
+bytes of uploaded files stored in the database, `secret_key_source` is `env`, `file`,
+`vault_transit` or `aws_kms` (see [Secret key sources](configuration.md#secret-key-sources)).
 `database.pg_search_version` is the installed ParadeDB `pg_search` extension, empty when it
 is absent (see [Search backends](rag.md#search-backends)). `database.postgres_version`,
 `database.pgvector_version` and `database.pg_search_version` are only returned to admins;

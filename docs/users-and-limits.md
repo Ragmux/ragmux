@@ -140,10 +140,10 @@ its usage and cost figures, so totals do not move. You cannot anonymise your own
 admin is refused too (`409`), and a second call on an account is `409` with `code:
 "already_anonymized"`. The old username can be registered again.
 
-An anonymized account is closed for good: `PUT /admin/api/users/{id}` with `is_active: true`
+An anonymised account is closed for good: `PUT /admin/api/users/{id}` with `is_active: true`
 and `POST /admin/api/users/{id}/reset-password` are refused with `409` and `code:
 "already_anonymized"` (`ragmux reset-password` fails for it too), because anything created under
-it afterwards, a key name for instance, could not be anonymized again. Create a new account
+it afterwards, a key name for instance, could not be anonymised again. Create a new account
 instead. The operation is audited as
 `user.anonymize` with the pseudonym only.
 
@@ -316,8 +316,8 @@ pages from using a leaked key and nothing else. It is a browser signal, not a se
 and is best combined with a CIDR list.
 
 The lists are set through the admin API ([API keys](api.md#api-keys), [Projects](api.md#projects)).
-They are read by the binary that serves the request: a replica running an older version, or a
-rollback to one, does not know the columns and applies no allowlist at all. Mutual TLS is not
+Do not roll back once lists are in use: see [Rolling
+back](scaling.md#rolling-back-after-v08-security-features-are-on). Mutual TLS is not
 done by the gateway; terminate it at the reverse proxy, as in
 [Mutual TLS at the proxy](scaling.md#mutual-tls-at-the-proxy).
 
@@ -482,9 +482,8 @@ the username, and `details.via` is one of `login`, `enable`, `disable`, `recover
 
 - The secret is stored sealed with `SECRET_KEY` (AAD bound to the account), so
   `ragmux rotate-key` re-encrypts it with the provider keys and a lost key loses it.
-- **Do not go back to a binary older than v0.8 after an account has turned two-factor
-  authentication on.** That binary does not know the second factor and lets the password
-  in alone.
+- Do not go back to an older binary while accounts use two-factor authentication: see
+  [Rolling back](scaling.md#rolling-back-after-v08-security-features-are-on).
 - An abandoned setup (a secret, never enabled) does not make the login two-step.
 - Expired challenges are removed by the hourly retention pass.
 
@@ -823,8 +822,9 @@ The details of the sources, the order and the errors are in
   heavy user among many whose id the application controls; use the key and project
   [limits](#rate-limits-and-budgets) for anything the client must not be able to avoid.
   Like the session cap, they compare tokens already spent, so the request that crosses a
-  ceiling is served in full, and a binary older than this feature ignores the headers and the
-  ceilings during a rolling update.
+  ceiling is served in full. See [Rolling
+  back](scaling.md#rolling-back-after-v08-security-features-are-on) for what an older binary
+  does not enforce.
 - **What the provider sees.** Only a value the request *body* carried, and, on a translated
   Anthropic request, only as a hash. The header is never sent. See
   [Providers](providers.md#anthropic).
@@ -886,8 +886,9 @@ the [API reference](api.md#guardrails); this section is about who can do what an
   `post_response` therefore only flags a match inside thinking, and a `block` rule still
   blocks. `pre_request` does not read the thinking blocks of earlier turns.
 - **Streams are delayed by the window.** With a `post_response` rule a stream holds back its last
-  `stream_window_chars - 1` characters (128 by default), which delays the first text by roughly 0.3
-  to 0.6 s. A project without a `post_response` rule streams as before. A window smaller than a
+  `stream_window_chars - 1` characters (the window is 128 by default), which delays the first text by the time
+  the model needs to write them (about 0.3 to 0.6 s at the speed of a typical model; an
+  estimate, not a measurement). A project without a `post_response` rule streams as before. A window smaller than a
   match cannot catch it; the API answers with a warning for a window too small for `tckn` or `iban`.
 - **No logprobs on a guarded answer.** `logprobs` and `top_logprobs` are dropped from requests to a project whose `post_response` rules block or redact (with a `Warning`; a project whose rules only flag keeps them), because token probabilities would spell out a match that was redacted or blocked.
 - **Content is not kept.** The request log records how many matches there were and which rule ids
