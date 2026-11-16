@@ -65,6 +65,12 @@ type Admin struct {
 	// rejected when it is saved rather than on first use.
 	AllowPrivateUpstreams bool
 	PrivateAllowlist      map[string]bool
+	// PrivateWebhookAllowlist is PRIVATE_WEBHOOK_ALLOWLIST: the hosts a webhook
+	// URL may name although they resolve to a private or local address (and
+	// the only ones that may use plain http). It is separate from
+	// PrivateAllowlist on purpose: the provider exemption must not reach a URL
+	// an editor types for a webhook.
+	PrivateWebhookAllowlist map[string]bool
 	// MaxDocumentsPerStore and MaxBytesPerStore are instance-wide ceilings
 	// on a RAG store's contents (0 = unlimited); a store's own max_documents
 	// / max_bytes can only lower them. Checked on upload, not on reprocess.
@@ -74,6 +80,12 @@ type Admin struct {
 	// model returns; a RAG store save uses it to refuse a model pgvector
 	// cannot index. nil embeds one word through ProviderConfig.
 	EmbeddingWidth func(ctx context.Context, conn *store.ModelConnection) (int, error)
+	// ProxyHeadersUnverified is set when TRUST_PROXY_HEADERS is on and
+	// TRUSTED_PROXY_CIDRS is empty: X-Forwarded-For is then accepted from any
+	// connection, and a CIDR allowlist on a key (ADR-039) can be walked around
+	// with a forged header. A save that stores such a list answers with a
+	// warning; it is never refused for it.
+	ProxyHeadersUnverified bool
 }
 
 // Body read budgets. JSON handlers get a short one; login shorter still so a
@@ -89,6 +101,9 @@ func (a *Admin) Routes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(requestIDHeader, httpx.NoStore, httpx.ReadDeadline(jsonReadDeadline))
 		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/login", a.login)
+		// Second step of an account with TOTP: unauthenticated like login, its
+		// credential is the challenge the first step handed out.
+		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/login/mfa", a.loginMFA)
 		// First-run setup: unauthenticated by design, refuses once any user exists.
 		r.Get("/api/setup", a.setupStatus)
 		r.With(httpx.ReadDeadline(loginReadDeadline)).Post("/api/setup", a.setup)
@@ -137,6 +152,12 @@ func (a *Admin) authenticated(r chi.Router) {
 	r.Post("/api/logout", a.logout)
 	r.Get("/api/me", a.me)
 	r.Post("/api/me/password", a.changePassword)
+	// Two-factor authentication: no scope, like the password change; each
+	// handler refuses an api-key principal itself (sessionOnly).
+	r.Post("/api/me/totp/setup", a.totpSetup)
+	r.Post("/api/me/totp/enable", a.totpEnable)
+	r.Post("/api/me/totp/disable", a.totpDisable)
+	r.Post("/api/me/totp/recovery-codes", a.totpRecoveryCodes)
 
 	read.Get("/api/provider-types", a.providerTypes)
 	read.Get("/api/provider-presets", a.providerPresets)
@@ -186,8 +207,18 @@ func (a *Admin) authenticated(r chi.Router) {
 	read.Get("/api/projects/{id}/routes/{routeId}", a.getRoute)
 	editor.Put("/api/projects/{id}/routes/{routeId}", a.updateRoute)
 	editor.Delete("/api/projects/{id}/routes/{routeId}", a.deleteRoute)
+	read.Get("/api/projects/{id}/guardrails", a.getGuardrails)
+	editor.Put("/api/projects/{id}/guardrails", a.putGuardrails)
+	read.Get("/api/projects/{id}/alerts", a.getAlerts)
+	editor.Put("/api/projects/{id}/alerts", a.putAlerts)
+	// A webhook URL often carries a token, so even reading one takes the editor role.
+	editor.Get("/api/projects/{id}/webhooks/{purpose}", a.getWebhook)
+	editor.Put("/api/projects/{id}/webhooks/{purpose}", a.putWebhook)
+	editor.Delete("/api/projects/{id}/webhooks/{purpose}", a.deleteWebhook)
+	editor.Post("/api/projects/{id}/webhooks/{purpose}/rotate-secret", a.rotateWebhookSecret)
 	read.Get("/api/projects/{id}/sessions", a.listSessions)
 	read.Get("/api/projects/{id}/sessions/{sessionId}", a.getSession)
+	read.Get("/api/projects/{id}/feedback/summary", a.feedbackSummary)
 
 	// API keys: ownership is checked inside the handlers (404 for someone
 	// else's key). Deleting one is admin-only; everyone else revokes.
@@ -222,16 +253,20 @@ func (a *Admin) authenticated(r chi.Router) {
 	adminOnly.Put("/api/users/{id}", a.updateUser)
 	adminOnly.Delete("/api/users/{id}", a.deleteUser)
 	adminOnly.Post("/api/users/{id}/reset-password", a.resetPassword)
+	adminOnly.Post("/api/users/{id}/totp/reset", a.resetUserTOTP)
 	adminOnly.Post("/api/users/{id}/sessions/revoke", a.revokeSessions)
+	// KVKK anonymisation; both handlers are session-only (ADR-040).
+	adminOnly.Post("/api/users/{id}/anonymize", a.anonymizeUser)
+	adminOnly.Post("/api/end-users/anonymize", a.anonymizeEndUser)
 	adminOnly.Get("/api/audit", a.listAudit)
 	adminOnly.Get("/api/audit/export", a.exportAudit)
 	adminOnly.Get("/api/security/logins", a.loginSecurity)
 }
 
-// sessionOnly refuses an api-key principal. It guards the three actions that
-// could take an account over — changing a password, resetting one and minting
-// a management key — so a leaked key cannot lock its owner out or extend its
-// own reach beyond the key that leaked.
+// sessionOnly refuses an api-key principal. It guards the actions that could
+// take an account over — changing a password, resetting one, minting a
+// management key and every two-factor action — so a leaked key cannot lock its
+// owner out or extend its own reach beyond the key that leaked.
 func sessionOnly(w http.ResponseWriter, r *http.Request) bool {
 	if auth.SessionFrom(r.Context()).IsKey() {
 		writeErrCode(w, http.StatusForbidden, "session_required",
@@ -344,7 +379,7 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 	if !a.allowAttempt(w, r, in.Username, ip) {
 		return
 	}
-	u, tok, err := a.Auth.Login(ctx, in.Username, in.Password)
+	u, err := a.Auth.Authenticate(ctx, in.Username, in.Password)
 	if a.Limiter != nil {
 		if rerr := a.Limiter.Record(ctx, in.Username, ip, err == nil); rerr != nil {
 			a.Log.Error("record login attempt", "err", rerr)
@@ -359,16 +394,19 @@ func (a *Admin) login(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.Store.TouchLastLogin(ctx, u.ID); err != nil {
-		a.Log.Error("touch last login", "err", err)
+	// The password was right. An account with a second factor gets a
+	// challenge, never a session, from this endpoint (ADR-037); an account
+	// with an abandoned setup (a secret, never enabled) logs in as before.
+	st, err := a.Store.GetTOTPStatus(ctx, u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
 	}
-	a.auditAs(r, u, "login.success", "user", &u.ID, nil)
-	a.Auth.SetCookie(w, r, tok)
-	out := map[string]any{"user": u}
-	if in.Bearer {
-		out["token"] = tok
+	if st.Enabled {
+		a.startMFA(w, r, u, in.Bearer, ip)
+		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	a.finishLogin(w, r, u, in.Bearer, true)
 }
 
 // invalidCredentials answers a failed login. The body carries the number of
@@ -476,7 +514,16 @@ func (a *Admin) me(w http.ResponseWriter, r *http.Request) {
 		SessionBearer    bool     `json:"session_bearer"`
 		SessionKind      string   `json:"session_kind"`
 		Scopes           []string `json:"scopes,omitempty"`
+		// TOTPEnabled tells a client which of enable and disable to offer
+		// (ADR-037); a pending secret that was never enabled reads false.
+		TOTPEnabled bool `json:"totp_enabled"`
 	}{User: auth.UserFrom(r.Context()), SessionKind: "session"}
+	st, err := a.Store.GetTOTPStatus(r.Context(), out.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	out.TOTPEnabled = st.Enabled
 	if se := auth.SessionFrom(r.Context()); se != nil {
 		if !se.ExpiresAt.IsZero() {
 			out.SessionExpiresAt = se.ExpiresAt.UTC().Format(time.RFC3339)
@@ -503,8 +550,9 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := auth.UserFrom(r.Context())
-	if len(in.Current) > maxLoginPasswordLen || !auth.CheckPassword(u.PasswordHash, in.Current) {
-		writeErr(w, http.StatusForbidden, "current password is wrong")
+	// A session tries at most five wrong passwords, here as in the TOTP
+	// endpoints; the fifth ends the session (T10).
+	if !a.checkSessionPassword(w, r, u, in.Current, "current password is wrong") {
 		return
 	}
 	h, err := auth.HashPassword(in.New)
@@ -513,6 +561,13 @@ func (a *Admin) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Store.UpdateUserPassword(r.Context(), u.ID, h); err != nil {
+		a.fail(w, err)
+		return
+	}
+	// A second-factor challenge opened with the old password is not answerable
+	// with the new one. The failed-code rows stay: rotating the password must
+	// not reset the MFA counter.
+	if err := a.Store.DeleteUserLoginChallenges(r.Context(), u.ID); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -1817,6 +1872,26 @@ type projectInput struct {
 	ToolAllow       *[]string `json:"tool_allow"`
 	ToolDeny        *[]string `json:"tool_deny"`
 	SessionTokenCap *int64    `json:"session_token_cap"`
+
+	// The policy for the request fields the gateway does not read itself
+	// (ADR-041). Same rules as the tool lists: a field left out keeps the
+	// project's current value on update and takes an empty list on create; an
+	// empty list clears a list.
+	ExtraAllow *[]string `json:"extra_allow"`
+	ExtraDeny  *[]string `json:"extra_deny"`
+
+	// The network allowlists of the project's own "sk-proj-" key (ADR-039).
+	// Same rules as the lists above: a field left out keeps the current value
+	// on update and takes an empty list (no restriction) on create.
+	KeyAllowedCIDRs   *[]string `json:"key_allowed_cidrs"`
+	KeyAllowedOrigins *[]string `json:"key_allowed_origins"`
+
+	// The per-end-user ceilings (ADR-035). A field left out keeps the project's
+	// current value on update and takes 0 (unlimited) on create.
+	EndUserRPM           *int   `json:"end_user_rpm"`
+	EndUserTPM           *int   `json:"end_user_tpm"`
+	EndUserDailyTokens   *int64 `json:"end_user_daily_tokens"`
+	EndUserMonthlyTokens *int64 `json:"end_user_monthly_tokens"`
 }
 
 // project builds the store record from validated input (id and key aside).
@@ -1834,6 +1909,20 @@ func (in *projectInput) project(base *store.Project) *store.Project {
 	if base != nil {
 		p.HistoryTurnsForQuery, p.QueryModelConnectionID = base.HistoryTurnsForQuery, base.QueryModelConnectionID
 		p.SessionTokenCap = base.SessionTokenCap
+		p.EndUserRPM, p.EndUserTPM = base.EndUserRPM, base.EndUserTPM
+		p.EndUserDailyTokens, p.EndUserMonthlyTokens = base.EndUserDailyTokens, base.EndUserMonthlyTokens
+	}
+	if in.EndUserRPM != nil {
+		p.EndUserRPM = *in.EndUserRPM
+	}
+	if in.EndUserTPM != nil {
+		p.EndUserTPM = *in.EndUserTPM
+	}
+	if in.EndUserDailyTokens != nil {
+		p.EndUserDailyTokens = *in.EndUserDailyTokens
+	}
+	if in.EndUserMonthlyTokens != nil {
+		p.EndUserMonthlyTokens = *in.EndUserMonthlyTokens
 	}
 	// A list left nil stays as it is: the store keeps the column on update and
 	// writes an empty list on create.
@@ -1845,6 +1934,19 @@ func (in *projectInput) project(base *store.Project) *store.Project {
 	}
 	if in.SessionTokenCap != nil {
 		p.SessionTokenCap = *in.SessionTokenCap
+	}
+	if in.ExtraAllow != nil {
+		p.ExtraAllow = uniqueStrings(*in.ExtraAllow)
+	}
+	if in.ExtraDeny != nil {
+		p.ExtraDeny = uniqueStrings(*in.ExtraDeny)
+	}
+	// validateProject has normalised both lists in place.
+	if in.KeyAllowedCIDRs != nil {
+		p.KeyAllowedCIDRs = *in.KeyAllowedCIDRs
+	}
+	if in.KeyAllowedOrigins != nil {
+		p.KeyAllowedOrigins = *in.KeyAllowedOrigins
 	}
 	if in.ContextPlacement != nil {
 		p.ContextPlacement = *in.ContextPlacement
@@ -1888,6 +1990,18 @@ func toolSettingFields(p *store.Project) map[string]any {
 	return map[string]any{"tool_allow": p.ToolAllow, "tool_deny": p.ToolDeny, "session_token_cap": p.SessionTokenCap}
 }
 
+// extraSettingFields lists the ADR-041 settings with their current values, for
+// the audit trail's "changed" view.
+func extraSettingFields(p *store.Project) map[string]any {
+	return map[string]any{"extra_allow": p.ExtraAllow, "extra_deny": p.ExtraDeny}
+}
+
+// keyNetworkFields lists the ADR-039 settings with their current values, for
+// the audit trail's "changed" view.
+func keyNetworkFields(p *store.Project) map[string]any {
+	return map[string]any{"key_allowed_cidrs": p.KeyAllowedCIDRs, "key_allowed_origins": p.KeyAllowedOrigins}
+}
+
 // uniqueStrings is v without repeated entries, in order, and never nil.
 func uniqueStrings(v []string) []string {
 	out := make([]string, 0, len(v))
@@ -1912,6 +2026,14 @@ var toolPattern = regexp.MustCompile(`^[A-Za-z0-9_.*:-]{1,128}$`)
 
 // validateToolList checks one tool list; field names it in the error.
 func validateToolList(field string, list *[]string) error {
+	return validatePatternList(field, "tool", list)
+}
+
+// validatePatternList checks one list of glob patterns (the tool lists of
+// ADR-032 and the extra field lists of ADR-041 share the shape and the
+// bounds); field names the list in the error and kind says what a pattern
+// matches.
+func validatePatternList(field, kind string, list *[]string) error {
 	if list == nil {
 		return nil
 	}
@@ -1920,10 +2042,46 @@ func validateToolList(field string, list *[]string) error {
 	}
 	for _, pat := range *list {
 		if !toolPattern.MatchString(pat) {
-			return fmt.Errorf("%s: %q is not a tool pattern; use 1 to 128 of letters, digits and . _ : - *", field, pat)
+			return fmt.Errorf("%s: %q is not a %s pattern; use 1 to 128 of letters, digits and . _ : - *", field, pat, kind)
 		}
 	}
 	return nil
+}
+
+// validateExtraSettings checks the ADR-041 lists the body carries. A field
+// pattern has the shape of a tool pattern and the same bounds.
+func validateExtraSettings(in *projectInput) error {
+	if err := validatePatternList("extra_allow", "field", in.ExtraAllow); err != nil {
+		return err
+	}
+	return validatePatternList("extra_deny", "field", in.ExtraDeny)
+}
+
+// validateKeyNetwork checks the key allowlists of a project body (ADR-039)
+// and rewrites them in the canonical form the store keeps.
+func validateKeyNetwork(in *projectInput) error {
+	if in.KeyAllowedCIDRs != nil {
+		cidrs, err := store.NormalizeCIDRs(*in.KeyAllowedCIDRs)
+		if err != nil {
+			return errors.New("key_allowed_cidrs: " + err.Error())
+		}
+		in.KeyAllowedCIDRs = &cidrs
+	}
+	if in.KeyAllowedOrigins != nil {
+		origins, err := store.NormalizeOrigins(*in.KeyAllowedOrigins)
+		if err != nil {
+			return errors.New("key_allowed_origins: " + err.Error())
+		}
+		in.KeyAllowedOrigins = &origins
+	}
+	return nil
+}
+
+// projectResponse is a saved project with the warnings the save produced,
+// flattened into one JSON object.
+type projectResponse struct {
+	*store.Project
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // validateToolSettings checks the ADR-032 settings the body carries.
@@ -1943,7 +2101,9 @@ func validateToolSettings(in *projectInput) error {
 // limitFields lists the limit columns with their current values.
 func limitFields(p *store.Project) map[string]int64 {
 	return map[string]int64{"rate_limit_rpm": int64(p.RateLimitRPM), "rate_limit_tpm": int64(p.RateLimitTPM),
-		"budget_daily_tokens": p.BudgetDailyTokens, "budget_monthly_tokens": p.BudgetMonthlyTokens}
+		"budget_daily_tokens": p.BudgetDailyTokens, "budget_monthly_tokens": p.BudgetMonthlyTokens,
+		"end_user_rpm": int64(p.EndUserRPM), "end_user_tpm": int64(p.EndUserTPM),
+		"end_user_daily_tokens": p.EndUserDailyTokens, "end_user_monthly_tokens": p.EndUserMonthlyTokens}
 }
 
 // loadProject fetches a project the caller may see; non-members get 404.
@@ -1989,6 +2149,16 @@ func (a *Admin) validateProject(r *http.Request, in *projectInput) error {
 	}
 	if in.RateLimitRPM < 0 || in.RateLimitTPM < 0 || in.BudgetDailyTokens < 0 || in.BudgetMonthlyTokens < 0 {
 		return errors.New("rate limits and budgets must be 0 (unlimited) or positive")
+	}
+	if in.EndUserRPM != nil && *in.EndUserRPM < 0 || in.EndUserTPM != nil && *in.EndUserTPM < 0 ||
+		in.EndUserDailyTokens != nil && *in.EndUserDailyTokens < 0 || in.EndUserMonthlyTokens != nil && *in.EndUserMonthlyTokens < 0 {
+		return errors.New("end-user limits must be 0 (unlimited) or positive")
+	}
+	if err := validateExtraSettings(in); err != nil {
+		return err
+	}
+	if err := validateKeyNetwork(in); err != nil {
+		return err
 	}
 	if err := validateToolSettings(in); err != nil {
 		return err
@@ -2073,8 +2243,12 @@ func (a *Admin) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "project.create", "project", ptr(p.ID), map[string]any{"name": p.Name, "member_ids": p.MemberIDs, "limits": limitFields(p), "rag_settings": ragSettingFields(p),
-		"tool_settings": toolSettingFields(p)})
-	writeJSON(w, http.StatusCreated, map[string]any{"project": p, "api_key": key})
+		"tool_settings": toolSettingFields(p), "extra_settings": extraSettingFields(p), "key_network": keyNetworkFields(p)})
+	resp := map[string]any{"project": p, "api_key": key}
+	if warn := a.networkWarnings(p.KeyAllowedCIDRs); warn != nil {
+		resp["warnings"] = warn
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (a *Admin) getProject(w http.ResponseWriter, r *http.Request) {
@@ -2138,8 +2312,28 @@ func (a *Admin) updateProject(w http.ResponseWriter, r *http.Request) {
 	if len(toolChanged) > 0 {
 		details["tool_settings_changed"] = toolChanged
 	}
+	oldExtra, curExtra := extraSettingFields(before), extraSettingFields(p)
+	extraChanged := map[string]any{}
+	for k, v := range curExtra {
+		if !reflect.DeepEqual(oldExtra[k], v) {
+			extraChanged[k] = map[string]any{"from": oldExtra[k], "to": v}
+		}
+	}
+	if len(extraChanged) > 0 {
+		details["extra_settings_changed"] = extraChanged
+	}
+	oldNet, curNet := keyNetworkFields(before), keyNetworkFields(p)
+	netChanged := map[string]any{}
+	for k, v := range curNet {
+		if !reflect.DeepEqual(oldNet[k], v) {
+			netChanged[k] = map[string]any{"from": oldNet[k], "to": v}
+		}
+	}
+	if len(netChanged) > 0 {
+		details["key_network_changed"] = netChanged
+	}
 	a.audit(r, "project.update", "project", ptr(p.ID), details)
-	writeJSON(w, http.StatusOK, p)
+	writeJSON(w, http.StatusOK, projectResponse{Project: p, Warnings: a.networkWarnings(p.KeyAllowedCIDRs)})
 }
 
 func (a *Admin) deleteProject(w http.ResponseWriter, r *http.Request) {
@@ -2401,7 +2595,7 @@ func (a *Admin) requestsCSV(w http.ResponseWriter, r *http.Request) {
 var csvHeader = []string{"created_at", "project_id", "project_name", "model_name", "status_code", "prompt_tokens",
 	"completion_tokens", "estimated", "latency_ms", "streamed", "rag_used", "rag_hits", "error",
 	"cached_prompt_tokens", "cache_write_tokens", "cost_usd", "cost_source", "api_key_id", "user_id",
-	"session_id", "tool_names", "tools_denied"}
+	"session_id", "tool_names", "tools_denied", "end_user", "tags"}
 
 // exportCSV streams the window's request logs (oldest first, at most
 // store.MaxExportRows) as a CSV download. Errors after the first row can
@@ -2444,7 +2638,10 @@ func csvRecord(row *store.RequestExportRow) []string {
 		optInt64(row.APIKeyID), optInt64(row.UserID),
 		// Tool names are the model's own output, so they pass csvCell like
 		// every other cell a third party could shape.
-		row.SessionID, strings.Join(row.ToolNames, ";"), strconv.Itoa(row.ToolsDenied)}
+		row.SessionID, strings.Join(row.ToolNames, ";"), strconv.Itoa(row.ToolsDenied),
+		// The end user and the tags are the client's own strings, so they pass
+		// csvCell too (the end user may start with + or @, both valid there).
+		row.EndUser, strings.Join(row.Tags, ";")}
 	for i, c := range rec {
 		rec[i] = csvCell(c)
 	}

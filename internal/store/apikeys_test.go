@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -514,4 +515,206 @@ func extraVals(extra string) string {
 		return ", now() - interval '1 day'"
 	}
 	return ""
+}
+
+// ---- network allowlists (ADR-039) ----
+
+func TestNormalizeCIDRs(t *testing.T) {
+	got, err := store.NormalizeCIDRs([]string{" 203.0.113.7 ", "10.0.0.0/8", "::ffff:192.168.0.0/112", "192.168.0.0/16",
+		"2001:db8::1", "2001:DB8::/32", "::ffff:198.51.100.9", "0.0.0.0/0"})
+	want := []string{"203.0.113.7/32", "10.0.0.0/8", "192.168.0.0/16", "2001:db8::1/128", "2001:db8::/32",
+		"198.51.100.9/32", "0.0.0.0/0"}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("NormalizeCIDRs = %v, %v; want %v", got, err, want)
+	}
+	if got, err := store.NormalizeCIDRs(nil); err != nil || got == nil || len(got) != 0 {
+		t.Errorf("nil list = %v, %v; want a non-nil empty list", got, err)
+	}
+	for _, bad := range []string{"", "nope", "10.0.0.5/24", "10.0.0.0/33", "2001:db8::/129", "::ffff:10.0.0.0/64",
+		"fe80::1%eth0", "10.0.0.0/8/9", "1.2.3"} {
+		if _, err := store.NormalizeCIDRs([]string{bad}); err == nil {
+			t.Errorf("NormalizeCIDRs(%q) accepted it", bad)
+		}
+	}
+	many := make([]string, store.MaxKeyNetworkEntries+1)
+	for i := range many {
+		many[i] = "10.0." + strconv.Itoa(i) + ".0/24"
+	}
+	if _, err := store.NormalizeCIDRs(many); err == nil {
+		t.Error("more than the maximum was accepted")
+	}
+	if got, err := store.NormalizeCIDRs(many[:store.MaxKeyNetworkEntries]); err != nil || len(got) != store.MaxKeyNetworkEntries {
+		t.Errorf("exactly the maximum: %d, %v", len(got), err)
+	}
+}
+
+func TestNormalizeOrigins(t *testing.T) {
+	got, err := store.NormalizeOrigins([]string{"HTTPS://App.Example.com/", "https://app.example.com:443", "http://localhost:3000",
+		"https://*.Example.org", "http://app.example.com:80", "https://[::1]:8443", "https://app.example.com:8443"})
+	want := []string{"https://app.example.com", "http://localhost:3000", "https://*.example.org", "http://app.example.com",
+		"https://[::1]:8443", "https://app.example.com:8443"}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("NormalizeOrigins = %v, %v; want %v", got, err, want)
+	}
+	for _, bad := range []string{"", "*", " * ", "app.example.com", "ftp://a.example.com", "https://", "https://a.example.com/x",
+		"https://a.example.com?x=1", "https://u@a.example.com", "https://*.com", "https://*", "https://a*.example.com",
+		"https://*.*.example.com", "https://a.example.com:0", "https://a.example.com:65536", "https://a.example.com:80a",
+		"https://-a.example.com", "https://a..example.com", "https://bücher.example", "https://a b.example.com",
+		"https://[::1", "https://[zz]", "null"} {
+		if _, err := store.NormalizeOrigins([]string{bad}); err == nil {
+			t.Errorf("NormalizeOrigins(%q) accepted it", bad)
+		}
+	}
+	many := make([]string, store.MaxKeyNetworkEntries+1)
+	for i := range many {
+		many[i] = "https://a" + string(rune('a'+i%26)) + string(rune('a'+i/26)) + ".example.com"
+	}
+	if _, err := store.NormalizeOrigins(many); err == nil {
+		t.Error("more than the maximum was accepted")
+	}
+}
+
+func TestCheckKeyNetwork(t *testing.T) {
+	cidrs := []string{"203.0.113.0/24", "2001:db8::/32", "198.51.100.7/32"}
+	ipCases := []struct {
+		remote string
+		want   string
+	}{
+		{"203.0.113.9:5000", ""}, {"203.0.113.9", ""}, {"198.51.100.7", ""}, {"198.51.100.8", store.DenyIPNotAllowed},
+		{"[2001:db8::5]:443", ""}, {"2001:db8:1::5", ""}, {"2001:dead::1", store.DenyIPNotAllowed},
+		{"::ffff:203.0.113.9", ""}, {"[::ffff:198.51.100.8]:1", store.DenyIPNotAllowed},
+		{"fe80::1%eth0", store.DenyIPNotAllowed}, {"", store.DenyIPNotAllowed}, {"not-an-address", store.DenyIPNotAllowed},
+	}
+	for _, c := range ipCases {
+		if got := store.CheckKeyNetwork(cidrs, nil, c.remote, nil); got != c.want {
+			t.Errorf("ip %q = %q, want %q", c.remote, got, c.want)
+		}
+	}
+	// A list of IPv4 networks is matched by an IPv4-mapped client.
+	if got := store.CheckKeyNetwork([]string{"10.0.0.0/8"}, nil, "[::ffff:10.1.2.3]:80", nil); got != "" {
+		t.Errorf("IPv4-mapped client = %q, want it admitted", got)
+	}
+	// An empty list restricts nothing, whatever the address or Origin.
+	if got := store.CheckKeyNetwork(nil, nil, "garbage", []string{"https://evil.example", "https://x"}); got != "" {
+		t.Errorf("empty lists = %q", got)
+	}
+
+	origins := []string{"https://app.example.com", "https://*.example.org", "http://localhost:3000"}
+	originCases := []struct {
+		origin []string
+		want   string
+	}{
+		{[]string{"https://app.example.com"}, ""}, {[]string{"HTTPS://APP.EXAMPLE.COM"}, ""},
+		{[]string{"https://app.example.com:443"}, ""}, {[]string{"https://app.example.com:8443"}, store.DenyOriginNotAllowed},
+		{[]string{"http://app.example.com"}, store.DenyOriginNotAllowed}, {[]string{"https://www.example.com"}, store.DenyOriginNotAllowed},
+		{[]string{"https://a.example.org"}, ""}, {[]string{"https://a.b.example.org"}, ""},
+		{[]string{"https://example.org"}, store.DenyOriginNotAllowed}, {[]string{"https://evilexample.org"}, store.DenyOriginNotAllowed},
+		{[]string{"https://a.example.org.evil.com"}, store.DenyOriginNotAllowed}, {[]string{"http://a.example.org"}, store.DenyOriginNotAllowed},
+		{[]string{"http://localhost:3000"}, ""}, {[]string{"http://localhost:3001"}, store.DenyOriginNotAllowed},
+		{nil, store.DenyOriginNotAllowed}, {[]string{}, store.DenyOriginNotAllowed},
+		{[]string{"null"}, store.DenyOriginNotAllowed}, {[]string{""}, store.DenyOriginNotAllowed},
+		{[]string{"https://*.example.org"}, store.DenyOriginNotAllowed},
+		{[]string{"https://app.example.com", "https://app.example.com"}, store.DenyOriginNotAllowed},
+		{[]string{"https://app.example.com/path"}, store.DenyOriginNotAllowed},
+	}
+	for _, c := range originCases {
+		if got := store.CheckKeyNetwork(nil, origins, "203.0.113.9", c.origin); got != c.want {
+			t.Errorf("origin %q = %q, want %q", c.origin, got, c.want)
+		}
+	}
+	// Both lists: the address is checked first.
+	if got := store.CheckKeyNetwork(cidrs, origins, "192.0.2.1", []string{"https://evil.example"}); got != store.DenyIPNotAllowed {
+		t.Errorf("both wrong = %q", got)
+	}
+	if got := store.CheckKeyNetwork(cidrs, origins, "203.0.113.9", []string{"https://evil.example"}); got != store.DenyOriginNotAllowed {
+		t.Errorf("origin wrong = %q", got)
+	}
+	if got := store.CheckKeyNetwork(cidrs, origins, "203.0.113.9", []string{"https://app.example.com"}); got != "" {
+		t.Errorf("both right = %q", got)
+	}
+}
+
+func TestKeyNetworkColumnsRoundTrip(t *testing.T) {
+	f := newKeyFixture(t)
+	ctx := f.ctx
+	k, raw, err := f.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "net", UserID: f.user.ID,
+		Scopes: store.DefaultGatewayScopes(), ProjectIDs: []int64{f.prod.ID},
+		AllowedCIDRs: []string{"203.0.113.0/24", "2001:db8::/32", "198.51.100.7/32"}, AllowedOrigins: []string{"https://app.example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(k.AllowedCIDRs, []string{"203.0.113.0/24", "2001:db8::/32", "198.51.100.7/32"}) ||
+		!reflect.DeepEqual(k.AllowedOrigins, []string{"https://app.example.com"}) {
+		t.Fatalf("created key = %v / %v", k.AllowedCIDRs, k.AllowedOrigins)
+	}
+	// The hot-path lookup carries the lists, so the gateway needs no second query.
+	gk, err := f.st.ResolveGatewayKey(ctx, raw)
+	if err != nil || len(gk.Key.AllowedCIDRs) != 3 || len(gk.Key.AllowedOrigins) != 1 {
+		t.Fatalf("ResolveGatewayKey: %+v, %v", gk, err)
+	}
+	// A key written without lists reads [] and not nil.
+	plain, _, err := f.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: "plain", UserID: f.user.ID,
+		Scopes: store.DefaultGatewayScopes(), ProjectIDs: []int64{f.prod.ID}})
+	if err != nil || plain.AllowedCIDRs == nil || len(plain.AllowedCIDRs) != 0 || plain.AllowedOrigins == nil || len(plain.AllowedOrigins) != 0 {
+		t.Fatalf("plain key = %+v, %v", plain, err)
+	}
+	// Update replaces both lists; the database refuses a malformed network.
+	k.AllowedCIDRs, k.AllowedOrigins = []string{"10.0.0.0/8"}, nil
+	up, err := f.st.UpdateAPIKey(ctx, k)
+	if err != nil || !reflect.DeepEqual(up.AllowedCIDRs, []string{"10.0.0.0/8"}) || len(up.AllowedOrigins) != 0 {
+		t.Fatalf("update = %+v, %v", up, err)
+	}
+	k.AllowedCIDRs = []string{"10.0.0.5/24"}
+	if _, err := f.st.UpdateAPIKey(ctx, k); err == nil {
+		t.Error("the CIDR column accepted a network with host bits")
+	}
+
+	// The project key has its own two columns; an update that leaves them nil keeps them.
+	p, _, err := f.st.CreateProject(ctx, &store.Project{Name: "netproj", ModelConnectionID: f.prod.ModelConnectionID,
+		KeyAllowedCIDRs: []string{"192.0.2.0/24"}, KeyAllowedOrigins: []string{"https://site.example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(p.KeyAllowedCIDRs, []string{"192.0.2.0/24"}) || !reflect.DeepEqual(p.KeyAllowedOrigins, []string{"https://site.example.com"}) {
+		t.Fatalf("created project = %v / %v", p.KeyAllowedCIDRs, p.KeyAllowedOrigins)
+	}
+	p.KeyAllowedCIDRs, p.KeyAllowedOrigins = nil, nil
+	p.SystemPrompt = "changed"
+	if p, err = f.st.UpdateProject(ctx, p); err != nil || len(p.KeyAllowedCIDRs) != 1 || len(p.KeyAllowedOrigins) != 1 {
+		t.Fatalf("a nil update must keep the lists: %+v, %v", p, err)
+	}
+	p.KeyAllowedCIDRs = []string{}
+	if p, err = f.st.UpdateProject(ctx, p); err != nil || len(p.KeyAllowedCIDRs) != 0 || len(p.KeyAllowedOrigins) != 1 {
+		t.Fatalf("an empty update must clear one list: %+v, %v", p, err)
+	}
+}
+
+func TestCountCIDRRestricted(t *testing.T) {
+	f := newKeyFixture(t)
+	ctx := f.ctx
+	if k, p, err := f.st.CountCIDRRestricted(ctx); err != nil || k != 0 || p != 0 {
+		t.Fatalf("empty: %d %d %v", k, p, err)
+	}
+	mk := func(name string, cidrs []string) *store.APIKey {
+		k, _, err := f.st.CreateAPIKey(ctx, &store.APIKey{Kind: store.KindGateway, Name: name, UserID: f.user.ID,
+			Scopes: store.DefaultGatewayScopes(), ProjectIDs: []int64{f.prod.ID}, AllowedCIDRs: cidrs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	live := mk("live", []string{"10.0.0.0/8"})
+	revoked := mk("revoked", []string{"10.0.0.0/8"})
+	mk("origins-only", nil)
+	if _, err := f.st.RevokeAPIKey(ctx, revoked.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.st.CreateProject(ctx, &store.Project{Name: "withlist", ModelConnectionID: f.prod.ModelConnectionID,
+		KeyAllowedCIDRs: []string{"192.0.2.0/24"}}); err != nil {
+		t.Fatal(err)
+	}
+	if k, p, err := f.st.CountCIDRRestricted(ctx); err != nil || k != 1 || p != 1 {
+		t.Errorf("counts = %d keys, %d projects, %v; want 1, 1", k, p, err)
+	}
+	_ = live
 }

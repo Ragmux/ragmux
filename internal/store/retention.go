@@ -26,6 +26,27 @@ const (
 	// RetainSessionUsage removes the totals of sessions idle for as long as
 	// request logs are kept (ADR-032).
 	RetainSessionUsage
+	// RetainWebhookDeliveries removes outbox rows (delivered, failed or
+	// still pending) older than the request log window (ADR-033).
+	RetainWebhookDeliveries
+	// The alert_events tables below remove events of windows that are over
+	// (ADR-036); each is told apart by the kind of window and the subject.
+	// RetainAlertEventsEndUserDay and ...Month are the end-user events, whose
+	// subject_id is a person's identifier as the client sent it, so they follow
+	// the end-user counters' short retention (two days, two months) instead of
+	// the request log window. RetainAlertEventsDay and ...Month are the rest.
+	// The cutoff is compared with window_start, which the caller keeps at or
+	// before the previous window so an open window's once-only key stays.
+	RetainAlertEventsEndUserDay
+	RetainAlertEventsEndUserMonth
+	RetainAlertEventsDay
+	RetainAlertEventsMonth
+	// RetainLoginChallenges removes second-factor challenges past their five
+	// minutes (ADR-037), compared with expires_at like sessions.
+	RetainLoginChallenges
+	// RetainRequestFeedback removes feedback (ADR-042) older than the request
+	// log window, by created_at.
+	RetainRequestFeedback
 )
 
 type retentionSpec struct {
@@ -51,6 +72,21 @@ var retentionSpecs = map[RetentionTable]retentionSpec{
 	// just outlives the key it names.
 	RetainAPIKeys: {"api_keys",
 		"(revoked_at < $1 OR expires_at < $1) AND NOT EXISTS (SELECT 1 FROM request_logs WHERE api_key_id = api_keys.id)", ""},
+	// Outbox rows carry an alert body only, never request content (ADR-033).
+	RetainWebhookDeliveries: {"webhook_deliveries", "created_at < $1", "created_at"}, // idx_webhook_deliveries_created
+	// A day event is the one whose limit is a day budget; every other limit
+	// kind (month tokens, month money, the unpriced notice) has a month window.
+	RetainAlertEventsEndUserDay: {"alert_events",
+		"subject_kind = 'end_user' AND limit_kind = 'budget_daily_tokens' AND window_start < $1", "window_start"}, // idx_alert_events_window
+	RetainAlertEventsEndUserMonth: {"alert_events",
+		"subject_kind = 'end_user' AND limit_kind <> 'budget_daily_tokens' AND window_start < $1", "window_start"},
+	RetainAlertEventsDay: {"alert_events",
+		"subject_kind <> 'end_user' AND limit_kind = 'budget_daily_tokens' AND window_start < $1", "window_start"},
+	RetainAlertEventsMonth: {"alert_events",
+		"subject_kind <> 'end_user' AND limit_kind <> 'budget_daily_tokens' AND window_start < $1", "window_start"},
+	// A challenge is useless once expires_at has passed, whatever its attempts.
+	RetainLoginChallenges: {"login_challenges", "expires_at <= $1", "expires_at"}, // idx_login_challenges_expires
+	RetainRequestFeedback: {"request_feedback", "created_at < $1", "created_at"},  // idx_request_feedback_created
 }
 
 func (t RetentionTable) String() string {

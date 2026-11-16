@@ -17,8 +17,9 @@ database. More at <https://ragmux.com>.
   `cohere_rerank` and `voyage_rerank`. Presets cover Mistral, xAI and Groq; see
   [Providers](docs/providers.md).
 - **OpenAI-compatible API:** `/v1/chat/completions` (JSON and SSE streaming), `/v1/models`,
-  `/v1/embeddings`, `/v1/retrieve` and `/v1/rerank`. The official SDKs work after changing
-  `base_url` and `api_key`; Anthropic and Gemini requests are translated, tool calls included.
+  `/v1/embeddings`, `/v1/retrieve`, `/v1/rerank`, `/v1/moderations` and `/v1/feedback`. The
+  official SDKs work after changing `base_url` and `api_key`; Anthropic and Gemini requests
+  are translated, tool calls included.
 - **Anthropic-compatible API:** `/v1/messages`. The Anthropic SDKs and Claude Code work after
   changing the base URL. On an Anthropic connection the request and the answer pass through
   as they are, beta headers included; on any other connection the request is translated, so
@@ -47,9 +48,28 @@ database. More at <https://ragmux.com>.
   system prompt and an optional RAG store; scoped `sk-user-` and `sk-mgmt-` keys with expiry
   and revocation.
 - **Access control:** `admin`, `editor` and `viewer` roles, project membership, login
-  lockout and an audit log of every management action.
+  lockout, optional two-factor login with TOTP and recovery codes, and an audit log of every
+  management action; see
+  [Two-factor authentication](docs/users-and-limits.md#two-factor-authentication-totp).
+- **Guardrails:** per-project rules that block, redact or flag Turkish citizen ids, IBANs,
+  regular expressions and word lists before the request, before retrieval and on the answer
+  (streams included), an optional signed guardrail webhook, and `/v1/moderations`. Matched
+  content is never stored; see [Guardrails](docs/api.md#guardrails).
+- **Key hardening:** a CIDR and a browser `Origin` allowlist per gateway key, and allow and
+  deny lists for the request fields the gateway passes through unread; see
+  [Network allowlists](docs/users-and-limits.md#network-allowlists).
+- **Secrets:** provider credentials, webhook secrets and TOTP secrets are encrypted at rest;
+  the key can be held in HashiCorp Vault (Transit) or AWS KMS instead of the environment; see
+  [Secret key sources](docs/configuration.md#secret-key-sources).
 - **Limits and cost:** per-project rate limits and token budgets shared across replicas,
-  prompt-caching passthrough and an editable price table that estimates request cost.
+  limits per end user (`X-Ragmux-End-User`), signed webhook alerts at 80 % and 100 % of a
+  budget, a monthly dollar budget that only warns, prompt-caching passthrough and an editable
+  price table that estimates request cost; see [End users and tags](docs/users-and-limits.md#end-users-and-tags)
+  and [Limit alerts](docs/users-and-limits.md#limit-alerts).
+- **Feedback and privacy:** a score and a label per request through `/v1/feedback`, without
+  content, and KVKK anonymisation of a user or an end user that keeps the usage history; see
+  [`POST /v1/feedback`](docs/api.md#post-v1feedback) and
+  [Anonymisation (KVKK)](docs/users-and-limits.md#anonymisation-kvkk).
 - **Observability and scale:** request logs, an authenticated Prometheus `/metrics`
   endpoint, OpenTelemetry traces, and several replicas against one PostgreSQL; see
   [Observability](docs/observability.md) and [Scaling](docs/scaling.md).
@@ -251,6 +271,8 @@ Configuration is environment variables. The ones most installations touch:
 | `SECURE_COOKIES` | `false` | Mark the session cookie `Secure` unconditionally |
 | `ALLOW_PRIVATE_UPSTREAMS` | `false` | Let provider URLs point at private networks |
 | `PRIVATE_UPSTREAM_ALLOWLIST` | none | Hostnames allowed to resolve to private addresses |
+| `PRIVATE_WEBHOOK_ALLOWLIST` | none | Hostnames an outbound webhook may reach on a private address |
+| `SECRET_KEY_SOURCE` | `env` | Where the key comes from: `env`, `vault_transit` or `aws_kms` |
 
 Every variable, default and the `-healthcheck` / `-version` flags are in
 [Configuration](docs/configuration.md).
@@ -284,6 +306,10 @@ decrypt stored credentials). See [Backup and restore](docs/backup-restore.md).
 docker exec -u postgres ragmux pg_dump -Fc --no-owner --no-privileges -d ragmux > ragmux.dump
 ```
 
+Before you turn on the guardrails, network allowlists or two-factor login, read
+[Rolling back](docs/scaling.md#rolling-back-after-v08-security-features-are-on): an older
+binary does not enforce them.
+
 Migrations run at gateway start. The PostgreSQL major version inside the all-in-one image
 never changes within a minor series, and pulling a newer image never runs `pg_upgrade`; see
 [Deployment layouts](docs/configuration.md#deployment-layouts). Release notes are in
@@ -296,12 +322,13 @@ Reference pages are on <https://ragmux.com> and in this repository.
 | Page | Contents |
 |---|---|
 | [Configuration](docs/configuration.md) | every environment variable and default, flags, subcommands, Compose variables, reverse-proxy notes |
-| [API reference](docs/api.md) | authentication, roles per endpoint, the `/v1` surface including `/v1/messages`, the MCP endpoint, error envelope, `/healthz` |
+| [API reference](docs/api.md) | authentication, roles per endpoint, the `/v1` surface including `/v1/messages`, `/v1/moderations` and `/v1/feedback`, the MCP endpoint, guardrails, error envelope and error codes, `/healthz` |
 | [Retrieval (RAG)](docs/rag.md) | formats, chunking, hybrid search, store language, metadata filters, reranking, context placement, retrieval policy, context format |
-| [Users, roles and limits](docs/users-and-limits.md) | roles matrix, login protection, audit log, rate limits, budgets, tool governance, sessions, retention |
+| [Users, roles and limits](docs/users-and-limits.md) | roles matrix, login protection, two-factor login, anonymisation, network allowlists, audit log, rate limits, budgets, limit alerts, end users, tool governance, guardrails, sessions, retention |
 | [Providers](docs/providers.md) | provider types and presets, translation details, reasoning effort, structured output, model-level capabilities, routing, retry, fallback |
 | [Backup and restore](docs/backup-restore.md) | what to back up, scripts, scheduled backups, restore runbook |
-| [Scaling](docs/scaling.md) | several replicas, shared state, leased ingestion, rolling restarts |
+| [Scaling](docs/scaling.md) | several replicas, shared state, leased ingestion, rolling restarts, rolling back |
+| [Dashboard](docs/dashboard.md) | every screen of the embedded dashboard |
 | [Observability](docs/observability.md) | `/metrics`, the metric table, `/readyz` vs `/healthz`, tracing |
 | [Changelog](CHANGELOG.md) | release notes |
 
@@ -310,8 +337,8 @@ Reference pages are on <https://ragmux.com> and in this repository.
 **Beta.** Ragmux is pre-1.0: the public API, configuration keys and metric names can still
 change between minor versions, and each change is listed in the
 [CHANGELOG](CHANGELOG.md). The direction after the current release is in
-[ROADMAP.md](ROADMAP.md); OCR for scanned PDFs, SSO / OIDC login, cost-denominated budgets
-and an import tool for 0.1 databases are not scheduled.
+[ROADMAP.md](ROADMAP.md); OCR for scanned PDFs, SSO / OIDC login, refusing requests over a
+budget in money and an import tool for 0.1 databases are not scheduled.
 
 ## Contributing
 

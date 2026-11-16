@@ -691,3 +691,48 @@ func TestGeminiResponseFormatLogsDroppedKeywords(t *testing.T) {
 		t.Errorf("unexpected log: %s", logged.String())
 	}
 }
+
+// Gemini does not get the end user (ADR-035, U8): whether generateContent
+// accepts a labels field is not proven, and a request it rejects would break
+// every Gemini-routed chat that carries a user. This pins the closed state; an
+// httptest fake cannot prove the opposite, because it rejects nothing.
+func TestGeminiGetsNoEndUserOrLabels(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if strings.Contains(r.URL.Path, ":streamGenerateContent") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`))
+	}))
+	defer srv.Close()
+	p, _ := New(Config{ProviderType: "gemini", BaseURL: srv.URL, APIKey: "k", Model: "gemini-2.0-flash"})
+
+	req := parseReq(t, `{"messages":[{"role":"user","content":"hi"}],"user":"ali@firma.com","safety_identifier":"sid-1"}`)
+	req.EndUser = "ali@firma.com"
+	if _, err := p.Chat(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	out := make(chan StreamChunk, 8)
+	if err := p.ChatStream(context.Background(), req, out); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests, want a generateContent and a streamGenerateContent", len(bodies))
+	}
+	for i, b := range bodies {
+		for _, leak := range []string{"labels", "safety_identifier", "ali@firma.com", "sid-1", wantHash("ali@firma.com")} {
+			if strings.Contains(b, leak) {
+				t.Errorf("request %d carries %q: %s", i, leak, b)
+			}
+		}
+	}
+}

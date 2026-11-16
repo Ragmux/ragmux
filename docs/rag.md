@@ -642,6 +642,7 @@ reported:
 3. `tool_turn`: the last message has the `tool` role, under every policy. The model is
    consuming a tool result for a question that was already answered with context.
 4. `greeting` or `ack`: the policy is `auto` and the last user message is small talk.
+5. `guardrail`: a `pre_retrieval` [guardrail](api.md#guardrails) `block` rule matched the query (see [Guardrails and retrieval](#guardrails-and-retrieval)). Only a chat request skips this way; `/v1/retrieve` and the MCP tool answer `400` instead.
 
 `auto` uses a rule-based classifier (Turkish and English), not a model. It only looks at
 the last user message, and only when the whole message is made of known phrases: up to six
@@ -662,8 +663,24 @@ four ways:
 - the counter `ragmux_rag_skipped_total{project,reason}`;
 - `ragmux.sources: []` in the body, if the request asked for sources.
 
-The reason is always one of the five values above, never text a client wrote. A project
+The reason is always one of the six values above, never text a client wrote. A project
 without a store has nothing to skip and carries none of these.
+
+### Guardrails and retrieval
+
+A project's [guardrails](api.md#guardrails) have a stage of their own in front of the search,
+`pre_retrieval`, which reads the **query** the search will embed: the last user message, or
+the rewritten question when the [query strategy](#query-strategy) is `condense` (the rule sees
+what the model wrote, after the condense call). A `redact` rule makes the search run with
+`[REDACTED:<id>]` in place of the match, and sets a `Warning` header; the chat model still
+receives the client's own message, which `pre_request` rules govern. A `block` rule skips the
+retrieval: in chat the request goes on without context (reason `guardrail`, `x-ragmux-rag-hits: 0`),
+and the condense call, if it ran, is still charged. `POST /v1/retrieve` and the MCP tool have no
+request to continue, so a block is a `400` `guardrail_blocked` there (a tool error in MCP).
+
+The retrieved passages are **not** scanned. They are the operator's own corpus, they are not
+part of the client's request, and a rule meant for user input would flag a document the
+operator chose to index. To keep a pattern out of the corpus, redact or drop it at ingestion.
 
 ### Query strategy
 
@@ -749,11 +766,13 @@ cannot change a project setting.
 | `filter` | a [metadata filter](#metadata-and-filters) | retrieve only from matching documents |
 | `sources` | `"inline"` | put the sources in the response body, streamed or not |
 | `include_context` | `true` | `sources` plus the exact context block |
+| `tags` | up to 8 strings | label the request in the request log; has nothing to do with retrieval ([End users and tags](api.md#end-users-and-tags)) |
 
 What is refused and what is ignored:
 
 - A `ragmux` that is not a JSON object (`null`, a string, an array), or a `filter` outside
-  the grammar, is refused with `400` and `code: "invalid_ragmux"`. Ignoring a broken
+  the grammar, is refused with `400` and `code: "invalid_ragmux"` (`tags` that are not a list
+  of valid tags are refused too, with `code: "invalid_tags"`). Ignoring a broken
   filter would widen the answer, so the request fails instead. Before 0.6 a
   malformed `ragmux` was silently ignored.
 - Any other value for `retrieval` (`"always"`, `"auto"`) or `sources`, a mistyped

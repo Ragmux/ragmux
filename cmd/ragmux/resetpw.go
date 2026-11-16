@@ -42,8 +42,9 @@ func resetPassword(args []string) int {
 	force := fs.Bool("force", false, "do not ask for confirmation")
 	noRevoke := fs.Bool("no-revoke", false, "keep the user's dashboard sessions alive")
 	revokeKeys := fs.Bool("revoke-keys", false, "also revoke every api key the user owns")
+	disableTOTP := fs.Bool("disable-totp", false, "also switch the user's two-factor authentication off (secret and recovery codes are deleted)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: ragmux reset-password <username> [--generate|--stdin] [--force] [--no-revoke] [--revoke-keys]\n\nSets a new password for a dashboard account directly in the database, for when every administrator is locked out. Needs DATABASE_URL (and SECRET_KEY); the gateway does not have to be running.")
+		fmt.Fprintln(os.Stderr, "Usage: ragmux reset-password <username> [--generate|--stdin] [--force] [--no-revoke] [--revoke-keys] [--disable-totp]\n\nSets a new password for a dashboard account directly in the database, for when every administrator is locked out. Needs DATABASE_URL (and SECRET_KEY); the gateway does not have to be running.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -99,8 +100,13 @@ func resetPassword(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	keyHex, keySource, err := resolveSecretKey(ctx, cfg, log)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "reset-password: secret key:", err)
+		return 1
+	}
 	st, err := store.Open(ctx, store.OpenConfig{DatabaseURL: cfg.DatabaseURL, MaxConns: 2,
-		SecretKeyHex: cfg.SecretKeyHex, DataDir: cfg.DataDir}, log)
+		SecretKeyHex: keyHex, SecretKeySource: keySource, DataDir: cfg.DataDir}, log)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "reset-password:", err)
 		return 1
@@ -147,6 +153,19 @@ func resetPassword(args []string) int {
 			return 1
 		}
 	}
+	// A reset is the way out of the second factor's lock: the user's wrong
+	// codes are forgotten and open challenges closed, whether or not TOTP itself
+	// is switched off. Without --disable-totp the secret and the codes stay.
+	hadTOTP := false
+	if *disableTOTP {
+		if hadTOTP, err = st.DisableUserTOTP(ctx, u.ID); err != nil {
+			fmt.Fprintln(os.Stderr, "reset-password:", err)
+			return 1
+		}
+	} else if err := st.ClearUserMFAState(ctx, u.ID); err != nil {
+		fmt.Fprintln(os.Stderr, "reset-password:", err)
+		return 1
+	}
 	var keys int64
 	if *revokeKeys {
 		if keys, err = st.RevokeUserAPIKeys(ctx, u.ID); err != nil {
@@ -159,6 +178,9 @@ func resetPassword(args []string) int {
 	// migration to record itself: it is an actor without an account.
 	details := map[string]any{"via": "cli", "host": hostname(), "os_user": osUser(),
 		"revoked_sessions": sessions, "revoked_keys": keys}
+	if *disableTOTP {
+		details["totp_disabled"] = hadTOTP
+	}
 	if err := st.InsertAuditLog(ctx, &store.AuditLog{ActorUsername: "cli", Action: "user.reset_password",
 		TargetType: "user", TargetID: &u.ID, Details: details, IP: "cli"}); err != nil {
 		fmt.Fprintln(os.Stderr, "reset-password: warning: could not write the audit entry:", err)
@@ -170,6 +192,9 @@ func resetPassword(args []string) int {
 	}
 	if *revokeKeys {
 		fmt.Printf("; %d api key(s) revoked", keys)
+	}
+	if *disableTOTP {
+		fmt.Printf("; two-factor authentication switched off (an account secret existed: %v)", hadTOTP)
 	}
 	fmt.Println()
 	if *generate {

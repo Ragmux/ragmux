@@ -33,6 +33,25 @@ bearer header wins when both are present. Sessions expire after `SESSION_TTL` (d
 sessions of the account), a password reset, a session revoke or deactivation of the
 account.
 
+An account that has switched on **two-factor authentication** (TOTP, see
+[Two-factor authentication](users-and-limits.md#two-factor-authentication-totp)) does
+not get a session from that call, with `bearer: true` or without. A right password
+answers
+
+```json
+{"mfa_required": true, "challenge_token": "…", "expires_at": "2026-09-18T10:05:00Z",
+ "methods": ["totp", "recovery_code"]}
+```
+
+with no cookie and no `token`. The challenge lives five minutes, answers once and
+closes after five wrong codes. `POST /admin/api/login/mfa` with
+`{"challenge_token": "…", "code": "123456"}` (or `"recovery_code": "abcde-fghjk"`
+instead of `code`) then answers like the one-step login: `{user}`, the cookie and,
+when the first step asked for `bearer: true`, `token`. A wrong code is
+`401 {"error":{"code":"mfa_invalid_code","attempts_left":3}}`, an expired, spent or
+unknown challenge `401 {"error":{"code":"mfa_challenge_invalid"}}`. Scripts that need
+to run without a second factor use a management key.
+
 ```bash
 TOKEN=$(curl -s localhost:8765/admin/api/login -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"YOUR_PASSWORD","bearer":true}' | jq -r .token)
@@ -57,9 +76,10 @@ origins in `CORS_ORIGINS` (empty by default). The premise behind the existing ex
 therefore holds identically for management keys, and nothing about the cookie path is
 loosened.
 
-Three routes refuse an api-key principal outright with
+These routes refuse an api-key principal outright with
 `403 {"error":{"code":"session_required"}}` — `POST /me/password`,
-`POST /users/{id}/reset-password` and creating a `kind=management` key — so a leaked key
+`POST /users/{id}/reset-password`, `POST /users/{id}/totp/reset`, the four
+`/me/totp/*` routes and creating a `kind=management` key — so a leaked key
 cannot take over the account it belongs to.
 
 **What that guard assumes.** It treats a session as a person at a keyboard and an api
@@ -73,7 +93,7 @@ password reset, a session revoke or a deactivation, and cannot be listed, named 
 scoped — an api key outlives all of that until someone revokes it. Treat a bearer
 session token as a short-lived credential, keep it out of anything durable, and use a
 `sk-mgmt-…` key for automation that is supposed to persist; if a script genuinely needs
-one of the three routes above, it needs a human to sign in for it.
+one of the routes above, it needs a human to sign in for it.
 
 Every `/admin/api` response carries `Cache-Control: no-store` and an `X-Request-Id`;
 unexpected failures answer `500 {"error":{"message":"internal error (request id …)"}}`
@@ -120,6 +140,14 @@ or `invalid_api_key`. An unknown key's body is exactly
 whatever its shape. A key that *is* known but no longer resolves carries a `code` on top
 — `key_revoked`, `key_expired` or `key_owner_inactive` — so the extra detail only ever
 reaches a caller who already holds the key bytes.
+
+A key with a [network allowlist](users-and-limits.md#network-allowlists) that the request does
+not satisfy answers `403 {"error":{"type":"permission_error","code":"ip_not_allowed"}}` (the
+client address is in no listed network) or `code: "origin_not_allowed"` (the key lists origins
+and the request has no `Origin` header, or one no entry matches). The check runs once the key
+has resolved, so an unknown, revoked or expired key keeps its `401`; it runs before a project is
+chosen, writes no request log row and counts in `ragmux_gateway_key_denied_total`. It applies
+to every `/v1` route, to `POST /v1/messages` with `x-api-key` and to `/mcp` alike.
 
 #### Choosing a project
 
@@ -183,6 +211,33 @@ The client API uses the OpenAI shape with a `code` field:
 [`POST /v1/messages`](#post-v1messages) answers in Anthropic's shape instead, with the same
 `code` carried inside `error`.
 
+### Error codes added in 0.8
+
+These `code` values are new in 0.8. Each is also described where the endpoint is; this list is
+where to look one up by name. `type` is as in the envelope above; on the management API it is
+the HTTP status text. 
+| `code` | Status, `type` | Where | Meaning |
+|---|---|---|---|
+| `guardrail_blocked` | `400`, `invalid_request_error` | `/v1/chat/completions`, `/v1/messages`, `/v1/retrieve`, the MCP tool (as a tool error) | A `block` [guardrail](#guardrails) rule matched at `pre_request`, or at `pre_retrieval` on an endpoint with no request to continue. The message names the stage, never the rule |
+| `guardrail_unavailable` | `503`, `server_error` | the same endpoints and `/v1/moderations` | The project's guardrail webhook failed under `fail_closed`, or the stored guardrail configuration cannot be used. No `Retry-After` |
+| `invalid_end_user` | `400`, `invalid_request_error` | every `/v1` endpoint and the MCP search | An `X-Ragmux-End-User` header that is not 1 to 128 bytes of `A-Z a-z 0-9 . _ : @ + = / -`, or is sent twice. A bad body value is not an error; it is dropped with a `Warning` |
+| `invalid_tags` | `400`, `invalid_request_error` | chat and messages | `X-Ragmux-Tags` or `ragmux.tags` with more than 8 tags, or a tag outside 1 to 64 bytes of `A-Z a-z 0-9 . _ : / -` |
+| `ip_not_allowed` | `403`, `permission_error` | `/v1` and `/mcp` | The key's CIDR list does not admit the client address (see [Network allowlists](users-and-limits.md#network-allowlists)) |
+| `origin_not_allowed` | `403`, `permission_error` | `/v1` and `/mcp` | The key lists origins and the request has none, a `null` one, or one that matches no entry |
+| `request_not_found` | `404`, `not_found_error` | `POST /v1/feedback` | The key's project has no request log row with that `request_id`; another project's id answers the same. Retry once after a short pause if the answer was only just sent |
+| `session_required` | `403`, `Forbidden` | management API | The action needs a signed-in session and the caller used an API key: anonymisation, two-factor management, password changes, minting a management key |
+| `totp_already_enabled` | `409`, `Conflict` | `POST /me/totp/setup`, `/me/totp/enable` | Two-factor authentication is already on; `disable` first to change device |
+| `totp_not_set_up` | `409`, `Conflict` | `POST /me/totp/enable` | No secret is pending; call `setup` first |
+| `totp_not_enabled` | `409`, `Conflict` | `POST /me/totp/disable`, `/me/totp/recovery-codes` | Two-factor authentication is not on for the account |
+| `mfa_invalid_code` | `401`, `Unauthorized` on sign-in, `403` where the caller has a session | `POST /login/mfa`, `/me/totp/*` | A wrong code or recovery code. On sign-in the body also has `attempts_left` |
+| `mfa_challenge_invalid` | `401` | `POST /login/mfa` | The sign-in step expired, was used, or was closed by five wrong codes; sign in again |
+| `mfa_locked` | `429` | `POST /login`, `/login/mfa`, `/me/totp/*` | Five wrong codes in 15 minutes locked the account's second factor; `Retry-After` says how long. A right code is refused too |
+| `mfa_busy` | `429` | the same | Another code check of the account is running; `Retry-After: 1`, not counted as a failure |
+| `wrong_password` | `403` | `/me/totp/*`, `POST /me/password` | The password asked for with the action is wrong; it spends one of the session's five tries |
+| `password_attempts_exhausted` | `401` | `/me/totp/*`, `POST /me/password` | The session already used its five wrong passwords and is ended; sign in again |
+| `invalid_feedback` | `400`, `invalid_request_error` | `POST /v1/feedback` | A missing or malformed `request_id`, `score` or `label`, an unknown field, or a body over 4 KiB |
+| `already_anonymized` | `409`, `Conflict` | `POST /users/{id}/anonymize`, `PUT /users/{id}` with `is_active: true`, `POST /users/{id}/reset-password` | The account was [anonymised](users-and-limits.md#anonymisation-kvkk) and stays closed |
+
 ## Management endpoints
 
 All paths are relative to `/admin/api`.
@@ -193,7 +248,7 @@ Unauthenticated by design; both refuse as soon as any user exists.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env` or `file`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
+| GET | `/setup` | — | While the `users` table is empty: `{"needs_setup": true, "migrations_version": N, "secret_key_source": "env", "database_role": "ragmux", "has_connections": false, "has_projects": false}` — the facts after `needs_setup` let the setup page confirm which database and key the gateway runs on (`secret_key_source` is `env`, `file`, `vault_transit` or `aws_kms`, `database_role` the connected PostgreSQL role, `N` the applied migration version, whatever this build has reached) and let the wizard resume at the right step. **Once any user exists the answer is `{"needs_setup": false}` and nothing else**: the endpoint is unauthenticated, and after setup an anonymous request has no business knowing the migration version, the database role or how far the install got |
 | POST | `/setup` | — | `{username, password, bearer?}` creates the first user with the `admin` role and logs it in (session cookie; `token` in the body when `bearer` is true) → `201 {user}`. Username: 3–64 characters of `a-z 0-9 . _ -`; password: at least 12 characters and at most 72 bytes. `409 setup already completed` once a user exists, also for a concurrent request that lost the race. Failed attempts count against the per-address login limit (`429` with `Retry-After`). Audited as `setup.complete`. |
 
 `ADMIN_PASSWORD` pre-creates the account on start for unattended installs, in which
@@ -211,10 +266,15 @@ not from `GET /setup`, which by then answers `needs_setup` alone.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively |
+| POST | `/login` | — | `{username, password, bearer?}` → `{user}` plus `token` when `bearer` is true; `400` when the username (1–64 characters) or password (1–1024) is missing or too long; the username is matched case-insensitively. For an account with two-factor authentication on, a right password answers `200 {mfa_required, challenge_token, expires_at, methods}` instead and issues no session (see [Authentication](#authentication)); `429` while that account's second factor is locked |
+| POST | `/login/mfa` | — | `{challenge_token, code}` or `{challenge_token, recovery_code}` → the same answer as a one-step login; `401` for a wrong code (`mfa_invalid_code`) or a dead challenge (`mfa_challenge_invalid`); `429` (`mfa_locked`, `Retry-After`) while the account's second factor is locked, even for a right code; `429` (`mfa_busy`, `Retry-After: 1`) while another check of the account is running |
 | POST | `/logout` | viewer | Ends the session → `{"ok": true}` |
-| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`) and, for a key, its `scopes` |
-| POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required` |
+| GET | `/me` | viewer | Current user `{id, username, role, is_active, last_login_at, created_at}` plus `session_expires_at` (RFC 3339, empty for a key without an expiry), `session_bearer` (`true` when the request carried an `Authorization` header rather than the cookie), `session_kind` (`"session"` or `"api_key"`), `totp_enabled` (`true` when the account has two-factor authentication on) and, for a key, its `scopes` |
+| POST | `/me/password` | viewer | `{current_password, new_password}` (at least 12 characters, at most 72 bytes) → `{"ok": true}`; `403` when the current password is wrong; every other session of the account is revoked. Session-only: an api key gets `403 session_required`. A session may try five wrong passwords here and on the `/me/totp/*` routes below; the fifth ends it, and a request after that is `401` (`code: password_attempts_exhausted` while the session still resolves, otherwise the plain `unauthorized`) |
+| POST | `/me/totp/setup` | viewer | `{password}` → `{secret, otpauth_uri}`: a new base32 secret and the `otpauth://` URI an authenticator app imports. `403 wrong_password`; `409 totp_already_enabled` when two-factor authentication is on (the secret in place is never replaced). Until `enable` the login stays one-step; another call replaces the pending secret. Session-only |
+| POST | `/me/totp/enable` | viewer | `{password, code}` → `{"ok": true, "recovery_codes": [...]}`: switches two-factor authentication on, returns ten recovery codes **once** and ends the account's other sessions. `409 totp_already_enabled` / `totp_not_set_up`; `403` for a wrong password (`wrong_password`) or code (`mfa_invalid_code`); `429` while locked. Session-only |
+| POST | `/me/totp/disable` | viewer | `{password, code}` or `{password, recovery_code}` → `{"ok": true}`: deletes the secret and the recovery codes. `409 totp_not_enabled`; errors as `enable`. Session-only |
+| POST | `/me/totp/recovery-codes` | viewer | `{password, code}` → `{"ok": true, "recovery_codes": [...]}`: ten new codes, shown once; the old ones stop working. `409 totp_not_enabled`; errors as `enable`. Session-only |
 | GET | `/provider-types` | viewer | Supported provider types with `type`, `label`, `default_base_url`, `supports_embeddings`, `requires_api_key`, `supports_tools`, `supports_streaming`, and a `capabilities` object (`chat`, `streaming`, `embeddings`, `tools`, `tool_streaming`, `vision`, `remote_images`, `prompt_caching`, `cached_token_usage`, `rerank`, plus the model-level `native_json_schema`, `forced_tool_choice`, `thinking`, `thinking_off`, `effort_levels` and `thinking_prefix_bound`, reported for the provider's current generation) — see [Capabilities](providers.md#capabilities) |
 | GET | `/provider-presets` | viewer | Ready-made `custom_openai` setups for hosted OpenAI-compatible providers (Mistral, xAI, Groq), each with `id`, `label`, `provider_type`, `base_url`, suggested `models`, an optional `embedding_model` and `requires_api_key`. A preset is not stored: create the connection with `POST /models` using its `provider_type` and `base_url`. No preset carries a price — see [Presets](providers.md#presets) |
 
@@ -498,6 +558,9 @@ log as `rag_store.reindex`. See [Embedding width](rag.md#embedding-width).
 | GET | `/projects/{id}/usage` | member | Live rate-limit and budget counters with a budget forecast |
 | GET | `/projects/{id}/sessions?limit=50&offset=0` | member | The project's [sessions](users-and-limits.md#sessions), most recently active first (`limit` defaults to 50, larger values are cut to 500) |
 | GET | `/projects/{id}/sessions/{sessionId}?limit=100` | member | One session's totals and its request log rows, newest first (`limit` defaults to 100, larger values are cut to 1000); `404` for an unknown session |
+| GET | `/projects/{id}/feedback/summary?days=30` | member | The project's [feedback](#post-v1feedback) over the last `days` days (default 30, at most 365): `positive`, `negative`, `total`, `ratio` (positive / total, `null` with no feedback), the labelled breakdown and the daily series; counts only (see below) |
+| GET | `/projects/{id}/guardrails` | member | The project's [guardrails](#guardrails): rules, stream window and webhook settings, every default filled in |
+| PUT | `/projects/{id}/guardrails` | member + editor | Replace the guardrails as a whole; a rule that cannot work is a `400` naming it |
 
 Project body:
 
@@ -508,7 +571,10 @@ Project body:
  "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
- "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0}
+ "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
+ "extra_allow": [], "extra_deny": ["store", "service_tier"],
+ "key_allowed_cidrs": [], "key_allowed_origins": [],
+ "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0}
 ```
 
 `rag_store_id` may be `null` or `0` for no store; limits are `0` for unlimited (see
@@ -531,7 +597,7 @@ value is `400`, and so is a `query_model_connection_id` that is not an existing 
 connection. A connection a project names there cannot be deleted (`409`). A change is
 written to the audit log on the `project.update` entry, under `details.rag_settings_changed`
 (`from` and `to` for each field that changed).
-The last three fields of the body govern tools and sessions
+The next three govern tools and sessions
 ([Users, roles and limits](users-and-limits.md#tool-governance)):
 
 | Field | Values | Default |
@@ -547,6 +613,57 @@ the default on create; `[]` clears a list. A pattern that is not of that shape, 
 more than 64 and a negative cap are `400`. A change is written to the audit log on the
 `project.update` entry, under `details.tool_settings_changed`.
 
+The next two govern the **request fields the gateway does not read itself**
+([`POST /v1/chat/completions`](#post-v1chatcompletions), [`POST /v1/messages`](#post-v1messages)):
+
+| Field | Values | Default |
+|---|---|---|
+| `extra_allow` | up to 64 patterns; when not empty, only an unknown request field whose name matches one is forwarded upstream | `[]` (every field) |
+| `extra_deny` | up to 64 patterns; an unknown request field whose name matches one is removed from the request, and deny wins over allow | `[]` |
+
+A pattern has the same shape and the same matching as a tool pattern above, and these two left
+out keep their current value on update and take `[]` on create. A pattern of another shape and a
+list of more than 64 distinct patterns are `400`. A change is written to
+the audit log on the `project.update` entry, under `details.extra_settings_changed`. With both
+lists empty, which is what every project has until an operator sets them, nothing changes:
+the protection exists only where the operator's lists say so.
+
+The next two restrict **where the project's own `sk-proj-…` key may be used from**
+([Users, roles and limits](users-and-limits.md#network-allowlists)):
+
+| Field | Values | Default |
+|---|---|---|
+| `key_allowed_cidrs` | up to 32 networks, IPv4 or IPv6; a bare address is stored as `/32` or `/128` | `[]` (any address) |
+| `key_allowed_origins` | up to 32 browser origins: `https://app.example.com` or `https://*.example.com` | `[]` (any origin, none needed) |
+
+They are the same lists a user key carries (`allowed_cidrs`, `allowed_origins`, see
+[API keys](#api-keys)), with the same validation (`400` for anything that is not a network
+or an origin, for a network with bits set to the right of its mask, for a lone `*` and for
+more than 32 entries), and the same rule for a field left out: it keeps its current value on
+update and takes `[]` on create. Rotating the key leaves them alone. The response of a save
+that leaves a CIDR list in place carries `"warnings": [...]` when the instance runs
+`TRUST_PROXY_HEADERS=true` with an empty `TRUSTED_PROXY_CIDRS`, because the list can then be
+walked around with a forged `X-Forwarded-For`; the save is not refused. A change is written to
+the audit log on the `project.update` entry, under `details.key_network_changed`.
+
+The last four fields are the project's **per-end-user ceilings**
+([Users, roles and limits](users-and-limits.md#end-users-and-tags)): what one end user, named
+by `X-Ragmux-End-User` or by the request body's own field, may make in a UTC minute and spend
+in a UTC day and month.
+
+| Field | Values | Default |
+|---|---|---|
+| `end_user_rpm` | requests per minute for one end user | `0` (unlimited) |
+| `end_user_tpm` | prompt tokens per minute for one end user | `0` |
+| `end_user_daily_tokens` | prompt plus completion tokens per UTC day | `0` |
+| `end_user_monthly_tokens` | prompt plus completion tokens per UTC month | `0` |
+
+These four left out keep their current value on update and take `0` on create, like the
+fields above; a negative value is `400`. A change is written to the audit log on the
+`project.update` entry, under `details.limits_changed` with the other limits. They bind only a
+request that names an end user: a request without one is not held to them (they are a
+guardrail, not a security check).
+
 `member_user_ids` is only read on create (use the members endpoint afterwards). The
 full key is never returned again. The project object:
 
@@ -557,6 +674,9 @@ full key is never returned again. The project object:
  "context_placement": "system", "retrieval_policy": "always", "query_strategy": "last_user",
  "history_turns_for_query": 3, "query_model_connection_id": null,
  "tool_allow": [], "tool_deny": ["mcp__github__*"], "session_token_cap": 0,
+ "extra_allow": [], "extra_deny": ["store", "service_tier"],
+ "key_allowed_cidrs": [], "key_allowed_origins": [],
+ "end_user_rpm": 0, "end_user_tpm": 0, "end_user_daily_tokens": 0, "end_user_monthly_tokens": 0,
  "member_ids": [4], "created_at": "…", "updated_at": "…"}
 ```
 
@@ -592,6 +712,126 @@ nothing was consumed in the last hour, or the projection lands after the window 
 with. `GET /projects/{id}/sessions/{sessionId}` returns `{"session": {…}, "requests": […]}`:
 the same object, and the session's request log rows in the shape of
 [`recent` below](#metrics). The roles are those of the request logs: any member can read them.
+
+`GET /projects/{id}/feedback/summary` counts the scores clients sent through
+[`POST /v1/feedback`](#post-v1feedback), by the day each was first received (UTC):
+
+```json
+{"days": 30, "positive": 41, "negative": 9, "total": 50, "ratio": 0.82,
+ "labels": [{"label": "helpful", "positive": 30, "negative": 0},
+            {"label": "wrong_answer", "positive": 0, "negative": 6}],
+ "daily": [{"day": "2026-11-03", "positive": 12, "negative": 2}]}
+```
+
+`labels` covers the labelled feedback only, the busiest 50 labels first; feedback sent without
+a label is in the totals. `daily` lists the days that have feedback. There is no content to
+show: the endpoint never receives any. The roles are those of the request logs.
+
+### Guardrails
+
+A project can screen what goes into the model and what comes back (ADR-034). The rules
+live on the project; this endpoint reads and replaces them as a whole.
+
+```json
+{"rules": [
+   {"id": "citizen-id", "type": "tckn", "action": "redact", "stages": ["pre_request", "post_response"]},
+   {"id": "card-words", "type": "keywords", "action": "block", "stages": ["pre_request"], "keywords": ["card number", "cvv"]},
+   {"id": "ticket", "type": "regex", "action": "flag", "stages": ["post_response"], "pattern": "TKT-[0-9]{6}"}],
+ "stream_window_chars": 128,
+ "webhook": {"enabled": true, "timeout_ms": 2000, "failure_mode": "fail_closed"},
+ "warnings": []}
+```
+
+`warnings` is only in the answer (a `PUT` body may send it; it is ignored): what is allowed
+but risky, for instance a window too small to hold a whole `tckn` or `iban` match, a
+`regex` that can match more than the window, or a webhook that is enabled while the project
+has no [guardrail webhook endpoint](#webhook-endpoints) yet.
+
+| Field | Meaning |
+|---|---|
+| `rules[].id` | `^[a-z0-9_-]{1,32}$`, unique in the project. It names the rule in the request log, the placeholder and the moderation categories |
+| `rules[].type` | `tckn` (11 digits whose checksum holds), `iban` (mod-97 and the country's length; spaces between groups of four are read), `regex` (RE2, at most 512 bytes, must not match the empty string) or `keywords` (at most 500 words of at most 64 bytes; case-insensitive, whole words, Turkish and other Unicode letters respected) |
+| `rules[].action` | `block`, `redact` (the match becomes `[REDACTED:<id>]`) or `flag` (counted, nothing changes) |
+| `rules[].stages` | one or more of `pre_request`, `pre_retrieval`, `post_response` |
+| `rules[].pattern` / `keywords` | for `regex` / `keywords` only |
+| `stream_window_chars` | 32 to 2048, default 128: how much of a streamed answer is held back to catch a match split across chunks |
+| `webhook.enabled` | consult the project's guardrail webhook at `pre_request` and `pre_retrieval`, after the local rules |
+| `webhook.timeout_ms` | 100 to 10000, default 2000 |
+| `webhook.failure_mode` | `fail_closed` (default) or `fail_open` |
+
+At most 32 rules. A `PUT` is audited as `project.guardrails_update` with the rule ids,
+never the patterns or words.
+
+**What each stage reads.**
+
+| Stage | Reads | A `block` | A `redact` |
+|---|---|---|---|
+| `pre_request` | on `/v1/chat/completions`: every message's content (a string, or every part except an image, audio or a file, whatever the part's type is called), its `name`, the `reasoning_content` of an earlier assistant turn, the name and arguments of tool calls, tool results, and the text of a `prediction`; a content or an argument in a shape the schema does not allow (one object where a list belongs, a list of bare strings, arguments as an object) is read all the same. On `/v1/messages`: `system` and every content block: text, `document`, `search_result`, `tool_result` (and the blocks nested in it), `tool_use` name and input, and any block type the gateway does not know, whose strings are all read, URLs and names included, except ids, signatures, encrypted payloads, settings and base64 data. Not images, not the contents of a base64 document (a PDF is not searched for text), not tool definitions, not the project's own system prompt, not the signed thinking blocks of earlier turns, not `user`, `stop`, `response_format`, `metadata` or any other request field: those are the application's settings, not text a person wrote, and the [tool lists](users-and-limits.md#tool-governance) and the policy for extra request fields (ADR-041) are the operator's instruments for what a request may carry, not a content scan | | `400`, `code: "guardrail_blocked"`; nothing is sent upstream and no retrieval runs | the match is replaced before anything else happens, and the response carries `Warning: 299 ragmux "guardrail redacted N match(es)"` |
+| `pre_retrieval` | the retrieval query, after a `condense` strategy has rewritten it. Applies to chat, [`POST /v1/retrieve`](#post-v1retrieve) and the [MCP tool](#mcp-endpoint). The retrieved passages are not scanned (they are the operator's corpus) | in chat the search is skipped (`x-ragmux-rag-skip: guardrail`) and the request goes on without context; `/v1/retrieve` and MCP answer `400` `guardrail_blocked` | the search runs with the redacted query; the model still sees the client's own text |
+| `post_response` | the answer: content, refusal, tool call arguments, annotations and citations (`cited_text`, `annotations[].url_citation.title`), the results a server tool returned, and thinking. Not the RAG context | the answer is replaced by an empty one with `finish_reason: "content_filter"` (`stop_reason: "refusal"` on `/v1/messages`); the JSON answer carries `x-ragmux-guardrail: blocked`. The tokens were spent and are counted | the match is replaced. Thinking can only be flagged (see below) |
+
+All rules of a stage run, in the order they are listed: a `redact` changes the text the
+rules after it read, and a `block` anywhere wins. (One limit in a stream: a `block` rule written against text that an earlier `redact` rule has already replaced sees the replacement, because the window rewrites as it goes. The text the `redact` rule hid never leaks, but that `block` can fail to fire where it would on the whole answer, and the rest of the text it would have matched is then written. Write such a rule against the text a client would send, not against what the rules leave.) An empty rule list, or one with no rule
+for a stage, leaves that stage out entirely: no scan, no window, no latency, and a native
+`/v1/messages` stream stays a byte-for-byte copy of the upstream's.
+
+**Streams.** `post_response` on a stream holds back the last `stream_window_chars - 1`
+characters until it can tell they are not the start of a match, so the first text reaches the
+client later: about 0.3 to 0.6 s with the default 128 characters, at the speed of a typical
+model (an estimate; it is the time the model needs to write the window). A block stops the
+stream with a final chunk (`content_filter` / `refusal`) and the upstream call is cancelled;
+nothing of the match, or after it, is written. The `Warning` header and `x-ragmux-guardrail`
+cannot be set once a stream has begun. On `/v1/messages` against an Anthropic connection the SSE
+events are rewritten when the project has a `post_response` rule.
+
+**Tool call arguments** are read as JSON when they are JSON: every key, every string and every number in them. A match in a number (`{"id": 10000000146}`) or a key is replaced by a string placeholder, so the arguments stay valid JSON, and a `block` rule sees it. The JSON is also read once as a whole text, for `block` rules only, so a pattern that spans a key and its value (`"password": "…"`) stops the request too; a `redact` or `flag` rule of that shape is matched only in a streamed answer. Arguments that are not JSON are read as text. In a **stream** the arguments arrive in pieces and cannot be parsed as they come, so they are scanned as text: a `block` is caught, a `redact` hides the match, but a redacted number leaves `[REDACTED:<id>]` unquoted in the stream and the client's JSON parse of the finished arguments can fail. Use `block` on a rule meant for tool arguments if that matters.
+
+**What the webhook is sent.** The project's own rules read every key, string and number of tool call arguments. The [guardrail webhook](#webhook-endpoints) is sent the keys and the string values, one `texts` entry each, and never a number, nor the arguments as one text: a numeric value is not text a person wrote, and a receiver that is sent every `7` and `1` of a tool's input gets a body made mostly of noise. A webhook that must see a number in tool arguments cannot; a local rule can.
+
+**Names.** A tool's name and a participant's `name` are letters, digits, `_` and `-`. A `redact` rule writes `REDACTED-<id>` there instead of `[REDACTED:<id>]` (`refresh-token` becomes `refresh-REDACTED-tok`), so the call stays well formed and the request acceptable. A redacted name no longer matches the name in the client's own tool table, so the call is not executed under it: that is the price of hiding it. `block` and `flag` act on names as they do on text.
+
+**Duplicate keys.** A JSON key that appears twice is read as the first value by one parser and as the last by another. Tool arguments and inputs with a repeated key go on with the last value only, so a value the rules did not read does not travel with them.
+
+**Placeholders.** `[REDACTED:<id>]` is let alone by the rules after the one that wrote it only where the gateway wrote it. A client that types one gets no exemption: a rule reads that text like any other.
+
+**Token log-probabilities.** `logprobs` spell the answer out one token at a time and a token cannot be redacted, so a project with a `post_response` rule that blocks or redacts does not return them: `logprobs` and `top_logprobs` are removed from the request before it goes upstream, the answer carries none, and the response has `Warning: 299 ragmux "logprobs was dropped: …"` (set before the first byte, so a stream has it too). A project whose `post_response` rules only flag hides nothing and is not affected, and neither is one without a `post_response` rule.
+
+**Thinking.** A thinking block is signed by its provider, and an edited block would be refused
+when the client sends it back. `post_response` therefore scans thinking text, applies `block`
+and `flag`, and treats `redact` as `flag`; the signature is never touched. `pre_request` does not
+scan the thinking blocks of earlier turns.
+
+**What is recorded.** The request log row gets `guardrail_blocked_stage` (the stage that refused
+something), `guardrail_redactions`, `guardrail_flags`, `guardrail_rules` (the ids of the rules that
+matched, at most 16) and `guardrail_webhook` (`ok`, `error`, `timeout` or `skipped_fail_open`).
+The counters are [`ragmux_guardrail_events_total` and `ragmux_guardrail_webhook_total`](observability.md#the-metric-set).
+The matched text, its hash and its position are stored and logged nowhere. A blocked request is a
+request: it takes a slot of the request limit.
+
+<a id="webhook-endpoints"></a>
+
+**Webhook endpoints.** With `webhook.enabled`, the gateway posts the request to the project's
+guardrail webhook endpoint after the local rules ran, signed as every Ragmux webhook is:
+
+```json
+{"version": "2026-11-01", "stage": "pre_request", "request_id": "req_…", "project_id": 3,
+ "endpoint": "chat.completions",
+ "texts": [{"index": 0, "role": "system", "text": "…"}, {"index": 1, "role": "user", "text": "…"}]}
+```
+
+`stage` is `pre_request` or `pre_retrieval` (then a single text with `role: "query"`); there is no
+call at `post_response`. The receiver answers `200` with
+`{"action": "allow"|"block"|"redact"|"flag", "reason": "<a-z0-9_.-, up to 32>", "texts": […]}`;
+`texts` is only read for `redact` and must have the same length and `index` values as the request.
+The call is synchronous, has no retry, and a request body over 1 MB is not sent. A timeout, a
+transport error, a status outside 2xx, a redirect, a reply that is not this shape, or texts that do
+not line up all count as a failure: `fail_closed` answers `503` with `code: "guardrail_unavailable"` (no
+`Retry-After`; the guardrails are down, not busy), `fail_open` serves the request and counts
+`skipped_fail_open`. The `reason` is recorded as `webhook:<reason>` in `guardrail_rules`.
+
+A stored configuration this version cannot read or compile is treated like a failed closed
+webhook: the project's requests are refused with `guardrail_unavailable` rather than served
+unguarded.
 
 ### Routes
 
@@ -675,7 +915,8 @@ Request body:
 {"kind": "gateway", "name": "ci-pipeline", "scopes": ["chat", "models", "retrieve"],
  "project_ids": [1, 2], "default_project_id": 1, "expires_at": "2027-01-01T00:00:00Z",
  "user_id": 4,
- "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0}
+ "rate_limit_rpm": 0, "rate_limit_tpm": 0, "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "allowed_cidrs": ["203.0.113.0/24"], "allowed_origins": ["https://app.example.com"]}
 ```
 
 `kind` is `gateway` (default) or `management`. `name` is required, at most 64 characters
@@ -693,6 +934,23 @@ projects and limits are refused with a `400`: it has neither. Creating a `manage
 additionally needs at least the `editor` role and a dashboard session
 (`403 session_required` for an api key); the `admin` scope needs the `admin` role.
 
+`allowed_cidrs` and `allowed_origins` restrict where a gateway key may be used from
+([Network allowlists](users-and-limits.md#network-allowlists)): up to 32 entries each, empty
+(the default) meaning no restriction. A CIDR entry is an IPv4 or IPv6 network, or a bare
+address, which is stored as `/32` or `/128`; an IPv4-mapped IPv6 network (`::ffff:10.0.0.0/104`)
+is stored as the IPv4 one. An origin entry is `scheme://host[:port]` (`http` or `https`, lower
+case, no path, no trailing `/`, the scheme's default port left out) or `https://*.example.com`
+for any subdomain but not the apex itself; a lone `*` is refused. Entries are stored in that
+canonical form and repeats collapse. A malformed entry, a network with bits set to the right
+of its mask (`10.0.0.5/24`) and more than 32 entries are `400`; so is any entry on a
+`management` key, which never passes through this check. **On update a field left out keeps its
+current list** (unlike the limits above, which a save resets), and `[]` clears it, so a script
+that does not know the fields never lifts a restriction by saving the rest of the key. When
+the instance runs `TRUST_PROXY_HEADERS=true` with an empty `TRUSTED_PROXY_CIDRS`, a save that
+leaves a CIDR list in place answers with `"warnings": ["…"]` next to the key (on update, beside
+the key's own fields), because the list can be walked around with a forged `X-Forwarded-For`;
+the save is not refused.
+
 The key object never contains the credential:
 
 ```json
@@ -700,6 +958,7 @@ The key object never contains the credential:
  "user_id": 1, "created_by": 1, "scopes": ["chat", "models", "retrieve"], "project_ids": [1, 2],
  "default_project_id": null, "rate_limit_rpm": 0, "rate_limit_tpm": 0,
  "budget_daily_tokens": 0, "budget_monthly_tokens": 0,
+ "allowed_cidrs": ["203.0.113.0/24"], "allowed_origins": ["https://app.example.com"],
  "expires_at": null, "revoked_at": null, "last_used_at": "2026-09-19T03:41:00Z",
  "created_at": "…", "updated_at": "…"}
 ```
@@ -743,6 +1002,7 @@ The summary response (also used by `/projects/{id}/metrics`):
              "request_id": "3f2a9c1e", "endpoint": "chat.completions", "requested_model": "smart",
              "route": "smart", "attempt": 2, "fallback_from": 1,
              "session_id": "agent-run-42", "tool_names": ["get_weather"], "tools_denied": 1,
+             "end_user": "ali@firma.com", "tags": ["support", "v2"],
              "created_at": "…"}],
  "previous": {"…": "only with compare=1"},
  "projects": [{"project_id": 3, "name": "support-bot", "requests": 80, "errors": 2, "prompt_tokens": 30000,
@@ -762,7 +1022,9 @@ target when the request moved to another one, and `route` is absent for the impl
 route. `session_id` (the request's `X-Ragmux-Session`), `tool_names` (the tools the model
 called in its answer: sorted, without duplicates, at most 32 names of at most 64 bytes;
 names only, never arguments) and `tools_denied` (how many tools the project's lists removed)
-are left out when empty or `0`. Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
+are left out when empty or `0`. `end_user` (the request's [end user](users-and-limits.md#end-users-and-tags))
+and `tags` (its tags, sorted, without duplicates) are left out when the request named none.
+Their meaning is in [the request log](observability.md#the-request-log). Status semantics (`429`, `499`,
 `502`, `503`/`504`) are described in
 [Users, roles and limits](users-and-limits.md#metrics-and-retention).
 
@@ -791,7 +1053,7 @@ request logs, oldest first and at most 50 000 rows, as `text/csv` with a
 created_at, project_id, project_name, model_name, status_code, prompt_tokens, completion_tokens,
 estimated, latency_ms, streamed, rag_used, rag_hits, error,
 cached_prompt_tokens, cache_write_tokens, cost_usd, cost_source, api_key_id, user_id,
-session_id, tool_names, tools_denied
+session_id, tool_names, tools_denied, end_user, tags
 ```
 
 New columns are appended at the end and existing ones never move, so an importer that
@@ -804,7 +1066,9 @@ Cells that begin with `=`, `+`, `-` or `@` (also after a leading tab or carriage
 are prefixed with a single quote so a spreadsheet does not evaluate them as formulas;
 model names and error messages can be shaped by an upstream.
 
-`tool_names` is the names joined with `;`; `session_id` is empty for a request that carried none.
+`tool_names` and `tags` are the names joined with `;`; `session_id`, `end_user` and `tags` are
+empty for a request that carried none. An end user can legitimately begin with `+` or `@`, so
+it is prefixed with a quote like any other cell that could be read as a formula.
 
 The CSV carries the columns above only: `request_id`, `endpoint`, `requested_model`,
 `route`, `attempt` and `fallback_from` are in the JSON log and the database, not in the
@@ -894,27 +1158,37 @@ already knows.
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | GET | `/users/lite` | editor | Active users as `[{id, username, role}]` (for member pickers) |
-| GET | `/users` | admin | All users, each with `project_count` (memberships) and `active_sessions` (unexpired sessions) |
+| GET | `/users` | admin | All users, each with `project_count` (memberships), `active_sessions` (unexpired sessions), `totp_enabled` (two-factor authentication is on) and `anonymized_at` (when the account was [anonymised](users-and-limits.md#anonymisation-kvkk), else `null`) |
 | POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password at least 12 characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
 | DELETE | `/users/{id}` | admin | Delete → `{"ok": true}` |
-| POST | `/users/{id}/reset-password` | admin | `{new_password}` (at least 12 characters, at most 72 bytes); revokes the user's sessions |
+| POST | `/users/{id}/reset-password` | admin | `{new_password}` (at least 12 characters, at most 72 bytes); revokes the user's sessions and clears the account's wrong second-factor codes and open challenges; `400` for the caller's own account (use `POST /me/password`). Session-only |
+| POST | `/users/{id}/totp/reset` | admin | Removes the user's two-factor authentication (secret, recovery codes), its wrong-code history and its sessions → `{"ok": true}`; `400` for the caller's own account (use `/me/totp/disable`). Audited as `user.totp_reset`. Session-only |
 | POST | `/users/{id}/sessions/revoke` | admin | Sign the user out everywhere |
+| POST | `/users/{id}/anonymize` | admin | `{confirm}` (the account's current username, exactly) → `{"ok": true, "pseudonym", "revoked_keys"}`; replaces the personal fields with one random pseudonym and keeps usage history; `400` on a wrong `confirm` or for the caller's own account, `409` for the last active admin or `code: "already_anonymized"`. Audited as `user.anonymize`. Session-only |
+| POST | `/end-users/anonymize` | admin | `{end_user, project_id?}` → `{"pseudonym", "request_logs", "end_user_usage", "alert_events", "webhook_deliveries"}` (rows changed); without `project_id` every project; `404` for an unknown project. Audited as `end_user.anonymize`. Session-only |
 | GET | `/audit` | admin | Audit entries, newest first, with the total for the filter |
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
 | GET | `/security/logins` | admin | Failed-login counters and active lockouts |
 
-`GET /users` answers an array of user objects with the two counters:
+`GET /users` answers an array of user objects with the two counters, the second-factor flag and the anonymisation time:
 
 ```json
 [{"id": 1, "username": "admin", "role": "admin", "is_active": true,
   "last_login_at": "2026-09-18T10:00:00Z", "created_at": "…",
-  "project_count": 2, "active_sessions": 1}]
+  "project_count": 2, "active_sessions": 1, "totp_enabled": false, "anonymized_at": null}]
 ```
 
+`POST /users/{id}/anonymize` and `POST /end-users/anonymize` are for a signed-in session:
+a management key, even one with the `admin` scope, gets `403` with
+`code: "session_required"`. What they change, and what they cannot reach, is in
+[Users, roles and limits](users-and-limits.md#anonymisation-kvkk).
+
 `PUT`/`DELETE` on users refuse to demote, deactivate or delete the last active admin
-(`409`) and to deactivate or delete the caller's own account (`400`).
+(`409`) and to deactivate or delete the caller's own account (`400`). On an
+[anonymised](users-and-limits.md#anonymisation-kvkk) account, `PUT` with `is_active: true` and
+`POST /users/{id}/reset-password` are `409` with `code: "already_anonymized"`: it stays closed.
 
 `GET /audit?limit=100&action=project.&actor_user_id=1&since=2026-09-01T00:00:00Z&until=2026-09-18T00:00:00Z&before=2026-09-17T10:00:00Z`:
 `action` is a prefix match, `since` (inclusive) and `until` (exclusive) bound
@@ -945,7 +1219,7 @@ an `audit.exported` entry whose `details` carry the filters that were used.
  "active_lockouts": [{"username": "admin", "ip": "203.0.113.7", "until": "2026-09-18T10:14:00Z"}]}
 ```
 
-The counters are failed attempts in the `login_attempts` table; `active_lockouts` lists
+The counters are failed password attempts in the `login_attempts` table (wrong second-factor codes are recorded there too but not counted); `active_lockouts` lists
 the username/address pairs the login limiter currently refuses, computed with the same
 `LOGIN_LOCKOUT_FAILURES` / `LOGIN_LOCKOUT_MINUTES` rule, with `until` the time the
 lockout ends (empty when the lockout is disabled).
@@ -963,7 +1237,8 @@ whatever the running build reports:
 ```
 
 `backup.tables` is the number of `chunk_embeddings_<dims>` tables, `documents_bytes` the
-bytes of uploaded files stored in the database, `secret_key_source` is `env` or `file`.
+bytes of uploaded files stored in the database, `secret_key_source` is `env`, `file`,
+`vault_transit` or `aws_kms` (see [Secret key sources](configuration.md#secret-key-sources)).
 `database.pg_search_version` is the installed ParadeDB `pg_search` extension, empty when it
 is absent (see [Search backends](rag.md#search-backends)). `database.postgres_version`,
 `database.pgvector_version` and `database.pg_search_version` are only returned to admins;
@@ -993,9 +1268,11 @@ Anthropic SDKs and Claude Code use `http://<host>:8765` as their base URL (they 
 Accepts the OpenAI Chat Completions payload: `model`, `messages` (text or
 `text` / `image_url` content parts), `stream`, `temperature`, `top_p`, `max_tokens` /
 `max_completion_tokens`, `stop`, `n`, `tools`, `tool_choice`, `response_format`,
-`stream_options`, `user`. Unknown fields are forwarded to OpenAI-compatible upstreams
-unchanged (see [Providers](providers.md)), with one exception: an optional `ragmux`
-object is consumed by the gateway and never sent upstream. A `tool` message may carry
+`stream_options`, `user` (also `safety_identifier`; both name the request's
+[end user](#end-users-and-tags)). Unknown fields are forwarded to OpenAI-compatible upstreams
+unchanged (see [Providers](providers.md)), unless the project's `extra_allow` / `extra_deny`
+lists remove them ([below](#request-fields-the-gateway-does-not-read)), with one exception: an
+optional `ragmux` object is consumed by the gateway and never sent upstream. A `tool` message may carry
 `"ragmux_is_error": true` to mark a failed tool call (see
 [Anthropic](providers.md#anthropic)). `messages` is required; the
 body may not exceed 4 MiB.
@@ -1198,6 +1475,41 @@ loop, not an access control. An id outside that set is `400` with `code:
 "invalid_session_id"` and is never ignored, because ignoring it would let a malformed
 header past the cap. The session is not a metric label or a span attribute.
 
+<a id="end-users-and-tags"></a>
+
+**End users and tags.** A request can say who it is for and how to
+classify it; both go to the request log row, the CSV export and (for the end user) the
+per-end-user ceilings, and to nothing else: they are not a metric label, a span attribute or
+a log field.
+
+| | Header (every `/v1` endpoint, and the MCP search) | Body |
+|---|---|---|
+| End user | `X-Ragmux-End-User: <id>` | chat and embeddings: `safety_identifier`, else `user`; messages: `metadata.user_id` |
+| Tags | `X-Ragmux-Tags: a,b,c` | chat and messages: `ragmux.tags` |
+
+- **Which one wins.** The header beats the body for the end user: the header is Ragmux's, the
+  body field is the provider's. The body's first filled field is the one used
+  (`safety_identifier` before `user`); if it is unusable the next is **not** tried. For tags the
+  request's own `ragmux.tags` beats the header (a proxy may add one); with both, the extension is
+  used and a `Warning` says the header was not.
+- **The end user.** 1 to 128 bytes of `A-Z a-z 0-9 . _ : @ + = / -` (an e-mail address fits).
+  A header that is not of that shape, or is sent twice, is `400` with `code: "invalid_end_user"`
+  and is never ignored, because ignoring it would let a malformed header past the per-end-user
+  ceilings. A **body** value that is not of that shape is not an end user: the request is served,
+  the row has none and a `Warning` says so, so a client that has always sent free text in `user`
+  keeps working.
+- **Tags.** At most 8, each 1 to 64 bytes of `A-Z a-z 0-9 . _ : / -`; repeated ones count once
+  and the set is stored sorted. Anything else, an empty item (`a,,b`) and an empty header
+  included, is `400` with `code: "invalid_tags"`. Tags classify; they take no part in limits or access.
+- **What reaches the provider.** Only the value the *body* carried, never the header's. An
+  OpenAI-compatible upstream and the native `/v1/messages` path to Anthropic get the body as
+  it was sent. On the translated path an Anthropic connection gets `metadata.user_id` set to
+  `h-` and the first 61 hex digits of the SHA-256 of the end user, 63 characters, only when the
+  body's value is usable; anything else is dropped, as before. This is a change from earlier
+  releases, which dropped the field; see [Anthropic](providers.md#anthropic) for what the hash
+  is and is not. Gemini and Ollama get nothing. The embeddings endpoint reads the body's fields
+  for the row only and sends them nowhere.
+
 **Tool lists.** When the project sets `tool_allow` or `tool_deny`, the gateway applies them
 to `tools` before the request goes upstream. A tool is matched by `function.name` (or
 `custom.name`); a tool that matches `tool_deny`, or matches no `tool_allow` pattern while that
@@ -1212,6 +1524,23 @@ they are. `tool_choice` is then reconciled with what is left:
 | `"auto"`, absent or `"none"`, and no tool is left | `tools`, `tool_choice` and `parallel_tool_calls` are dropped, with a `Warning`. `"none"` is treated like `"auto"` here: with no tool left it has nothing to forbid, and upstreams refuse `tool_choice` without `tools` |
 | `allowed_tools` | its `tools` list loses the entries the project does not allow, with a `Warning`; a `"required"` list that ends up empty is `400`, `code: "tool_not_allowed"`, and an emptied `"auto"` list becomes `"none"`, so the model does not gain the tools the client left out (with no tool left, or none in the request, `tool_choice` is dropped) |
 | anything else | unchanged |
+
+<a id="request-fields-the-gateway-does-not-read"></a>
+**Request fields the gateway does not read.** Every top-level field outside the ones listed at the
+start of this section (`model` … `user`) is kept as it came and sent to an OpenAI-compatible upstream unchanged
+([Request field passthrough](providers.md#request-field-passthrough-extra)), and some of those
+fields change what a request costs or what the provider keeps: `store`, `service_tier`,
+`web_search_options`, `modalities`, `audio`, `prediction`. When the project sets `extra_allow` or
+`extra_deny`, the gateway applies them to those fields right after the body is decoded, before the
+tool lists. A field that matches `extra_deny`, or matches no `extra_allow` pattern while that list
+is not empty, is removed from the request and the response carries `Warning: 299 ragmux "field
+<name> removed by project policy"` (one per field for up to five fields, then one more that counts
+the rest); the request is still served, never refused. What Ollama reads (`keep_alive`, `num_ctx`,
+`options`) is such a field too. The fields the gateway reads (the list at the start of this
+section, and the `ragmux` object) are not affected, and neither is the `user` or
+`safety_identifier` as the [end user](#end-users-and-tags) of record; a `safety_identifier` the
+policy removed is, like any removed field, not sent to the provider on a translated request either;
+the `user` the request also carries is what the provider gets then, as if the other field had not been sent.
 
 The request log row records `tools_denied` (how many were removed) and `tool_names` (the
 tools the model *called*, names only). An upstream may refuse a request whose history holds
@@ -1230,14 +1559,16 @@ tiers have a limit, the header describes whichever has the smaller remaining all
 | `x-ragmux-budget-monthly-remaining` | tokens left in this month's budget |
 | `x-ragmux-rag-hits` | passages injected (present whenever the project has a store, `0` when none matched) |
 | `x-ragmux-rag-sources` | JSON array of `{document_id, filename, section, page, score}` for the injected passages; present only when `x-ragmux-rag-hits` is above `0`, trimmed to whole entries to stay under 2 KB. `ragmux.sources: "inline"` returns the whole list in the body |
-| `x-ragmux-rag-skip` | present when the project has a store and this request did not retrieve, with the reason: `policy_off`, `client_off`, `tool_turn`, `greeting` or `ack` (then `x-ragmux-rag-hits` is `0`). Absent when retrieval ran. See [Retrieval policy](rag.md#retrieval-policy) |
+| `x-ragmux-rag-skip` | present when the project has a store and this request did not retrieve, with the reason: `policy_off`, `client_off`, `tool_turn`, `greeting`, `ack` or `guardrail` (then `x-ragmux-rag-hits` is `0`). Absent when retrieval ran. See [Retrieval policy](rag.md#retrieval-policy) |
 | `X-Request-Id` | on every `/v1` response, errors included. The client's own `X-Request-Id` when it is 1 to 128 characters of `A-Z a-z 0-9 . _ : -`; anything else (absent, empty, longer, other characters) is replaced by an id the gateway generates — never rejected. The value is stored in `request_logs.request_id` for every call that writes a row: one that went upstream or was denied by a limit. A call answered earlier (`401`, `403`, `400`, `project_required`, an unresolvable route) carries the header but has no row. See [the request log](observability.md#the-request-log) |
+| `x-ragmux-guardrail` | `blocked` on a JSON answer a `post_response` block rule emptied (see [Guardrails](#guardrails)) |
 | `x-ragmux-projects` | on a `400 project_required` only: the project names the key grants, comma separated |
-| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored: `response_format` `json_object` on an Anthropic model that cannot be forced to call a tool, where an instruction in the system prompt stands in for it (see [Structured output](providers.md#structured-output)), or a `tool_choice` the model cannot take (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
+| `Warning` | `299 ragmux "<text>"` when the request was accepted but part of it was ignored (a body `user` / `safety_identifier` / `metadata.user_id` that is not a usable [end user](#end-users-and-tags), or an `X-Ragmux-Tags` that `ragmux.tags` overrode, are two of them): `response_format` `json_object` on an Anthropic model that cannot be forced to call a tool, where an instruction in the system prompt stands in for it (see [Structured output](providers.md#structured-output)), or a `tool_choice` the model cannot take (see [Anthropic](providers.md#anthropic)), or a part of the `ragmux` object (see [The `ragmux` request object](rag.md#the-ragmux-request-object)), or a thinking setting the model could not take (see [Reasoning and thinking](#post-v1chatcompletions)), or a match a `redact` guardrail rule replaced (see [Guardrails](#guardrails)), one header per problem and at most eight. Set before the first byte, so a stream carries it too |
 
 Browser clients need `CORS_ORIGINS` to read any of these: the gateway lists them in
 `Access-Control-Expose-Headers` (together with `Retry-After` and `X-Request-Id`; `Warning` is in the table above) and
-accepts `X-Ragmux-Project` in `Access-Control-Allow-Headers`, but a cross-origin page
+accepts `X-Ragmux-Project`, `X-Ragmux-Session`, `X-Ragmux-End-User` and `X-Ragmux-Tags` in
+`Access-Control-Allow-Headers`, but a cross-origin page
 sees no response header outside the CORS safelist unless the request went through CORS
 at all.
 
@@ -1245,16 +1576,17 @@ Status codes:
 
 | Status | When |
 |---|---|
-| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`) |
+| `400` | malformed JSON, missing `messages`, a `ragmux` that is not an object or has an invalid `filter` (`code: "invalid_ragmux"`; no request log row is written), a translation error such as an image the provider's adapter cannot take (an unsupported type, or a remote URL while `IMAGE_FETCH=false`; see [Images](providers.md#images)), a multi-project key that named none (`code: "project_required"`, with `X-Ragmux-Projects` listing the valid values), an invalid `X-Ragmux-Session` (`code: "invalid_session_id"`), an invalid `X-Ragmux-End-User` (`code: "invalid_end_user"`), invalid tags in `X-Ragmux-Tags` or `ragmux.tags` (`code: "invalid_tags"`), a `reasoning_effort` the gateway cannot translate (`code: "invalid_reasoning_effort"`), a malformed `ragmux_thinking` (`code: "invalid_ragmux_thinking"`), or a `tool_choice` the project's tool lists make impossible (`code: "tool_not_allowed"`), or a request a [guardrail](#guardrails) `block` rule refused (`code: "guardrail_blocked"`, the message names the stage, never the rule or the match) |
 | `401` | missing or invalid key; `code` is `key_revoked`, `key_expired` or `key_owner_inactive` for a key that exists but no longer resolves, and `null` for an unknown one |
-| `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`) |
+| `403` | the key lacks the route's scope (`type: "insufficient_scope"`), or it does not grant the requested project (`code: "project_not_granted"`), or the key's [network allowlist](users-and-limits.md#network-allowlists) refuses the request (`type: "permission_error"`, `code: "ip_not_allowed"` or `"origin_not_allowed"`) |
 | `404` | the project has chat routes and `model` names neither a route nor the default connection's model (`code: "model_not_found"`) |
 | `413` | body larger than 4 MiB |
-| `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"}}` — `scope` says which tier denied |
+| `429` | rate limit or budget exceeded; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded"|"insufficient_quota","code":"rate_limit_rpm"|"rate_limit_tpm"|"budget_daily"|"budget_monthly","scope":"project"|"key"|"end_user"}}` — `scope` says which tier denied; `end_user` is the project's [per-end-user ceiling](users-and-limits.md#end-users-and-tags) |
 | `429` | the gateway is already fetching as many images at once as `IMAGE_FETCH_MAX_CONCURRENT` allows, or the project has taken its half of them; `Retry-After` set, body `{"error":{"message","type":"rate_limit_exceeded","code":"image_fetch_saturated"}}`. It is a resource limit rather than a fault, so it is not a `5xx`, which would report the gateway as unwell when it is merely full; `Retry-After` carries `IMAGE_FETCH_TIMEOUT`, since a slot frees when a download finishes |
 | `429` | the session spent `session_token_cap` tokens; no `Retry-After`, because a session does not reset; body `{"error":{"message":"Session token cap reached (N of M tokens used).","type":"insufficient_quota","code":"session_token_cap","scope":"session"}}`. A request may run a session past the cap by its own size, and concurrent requests of one session can each pass the check before any of them is counted |
 | `4xx` from the provider | relayed with the provider's status and message (API-key-looking strings redacted). A `Retry-After` the provider sent (seconds or an HTTP date) is passed through unchanged; a malformed one is dropped |
 | `503` / `504` | the provider answered `503` or `504` (or, on an Anthropic connection, `529 overloaded`, which becomes `503`): the status is kept, because both say "retry later" rather than "broken", with the provider's message and its `Retry-After`, if any |
+| `503` | the [guardrails](#guardrails) could not be consulted: the project's guardrail webhook failed under `fail_closed`, or its stored configuration cannot be used (`type: "server_error"`, `code: "guardrail_unavailable"`; no `Retry-After`) |
 | `500` | the project's model connection cannot be set up (`model connection unavailable`; the reason is in the gateway log) |
 | `502` | any other `5xx` from the provider (`500`, `501`, `502`, …, with its message), transport failure, a provider error without a status, or a crash inside the provider adapter during a stream; mid-stream failures are logged as `502` |
 | `499` | never sent on the wire: recorded in the request log when the client disconnected before the completion finished. The upstream call is cancelled in both the JSON and the streaming path |
@@ -1274,6 +1606,8 @@ retry and fallback, rate limits and budgets, the request log (`endpoint = messag
 [tool lists](#post-v1chatcompletions) and sessions. A query string such as `?beta=true` is
 ignored. `POST /v1/messages/count_tokens` and Anthropic-shaped model listings are not served.
 
+The project's [guardrails](#guardrails) apply here as on chat. A refusal comes in Anthropic's error shape with the same `code` (`guardrail_blocked`, `guardrail_unavailable`); a `post_response` block ends the message with `stop_reason: "refusal"` and no content.
+
 The optional `ragmux` object has the same grammar as on chat, as a top-level field of the
 body. It is consumed by the gateway and never sent upstream, which matters because the
 Anthropic API refuses an unknown field. `"sources": "inline"` returns the sources as a
@@ -1290,7 +1624,8 @@ first target is Anthropic and whose fallback is Gemini serves one client with bo
 | `model` in the answer | the `model` the client sent (written over the one the upstream reports, in the message and in `message_start`) | the `model` the client sent |
 | Upstream `4xx` | the upstream's body, unchanged, with its status | n/a |
 
-**Native path.** The gateway changes only these parts of the body: `model` (the connection's
+**Native path.** The gateway changes only these parts of the body (and, when the project sets
+`extra_allow` or `extra_deny`, the unhandled top-level fields they remove, below): `model` (the connection's
 model is written in, and the client's own `model` string is written back into the answer, so
 a route alias such as `fast` reads the same whichever target served the call, as on
 [chat completions](#post-v1chatcompletions)), `system`, `ragmux` (removed), the tools the project denies, the thinking
@@ -1316,7 +1651,17 @@ features are billed by use, not by token: server tools such as `web_search_*`, `
 code execution, and `mcp_servers`. That spend does not reach Ragmux's cost figures or token
 budgets. A project can switch the server tools off with a `tool_deny` pattern (they are matched by
 `name`, `web_search*` for example). `mcp_servers` and `container` are not in `tools`, so the
-lists do not reach them.
+tool lists do not reach them; the project's `extra_deny` does, for them and for every other
+top-level field the gateway has no name for (`context_management`, `top_k`, …).
+
+**Field policy.** `extra_allow` and `extra_deny` (see the [project body](#projects)) apply to the
+top-level fields of the body that are not `model`, `messages`, `system`, `max_tokens`,
+`temperature`, `top_p`, `stop_sequences`, `stream`, `tools`, `tool_choice`, `thinking`,
+`metadata`, `output_config` and `ragmux`. A field the policy removes is left out of the body on
+both paths, so a route that falls back from an Anthropic target to another provider sees the same
+fields, and the response carries `Warning: 299 ragmux "field <name> removed by project policy"`;
+the request is served, not refused. Empty lists leave the body as it came. The values of the
+`anthropic-beta` header are not part of this policy.
 
 **Translated path.** The request becomes a chat request: `system` (one system message per
 block, with its cache breakpoint), text and image blocks, `tool_use` and `tool_result` (a user
@@ -1340,6 +1685,12 @@ several text blocks, or thinking between them, is rebuilt as thinking, then text
 calls, so the known limit stated for [chat completions](#post-v1chatcompletions) (the order
 and number of blocks do not survive the round trip, which can invalidate a replay on Claude 5.1
 and later) applies to this path. The native path has no such limit.
+
+**End user and tags.** `X-Ragmux-End-User` and `X-Ragmux-Tags` work as on
+[chat](#end-users-and-tags); the body's sources are `metadata.user_id` for the end user and
+`ragmux.tags` for tags. On the native path `metadata` goes to Anthropic as the client sent it
+(an over-long `user_id` is Anthropic's `400`, as it has always been); a translated request to
+an OpenAI-compatible upstream sends it as `user`.
 
 **Sessions and retrieval.** `X-Ragmux-Session` names the session; when it is absent, the
 `x-claude-code-session-id` header Claude Code sends stands in, under the same rules (an
@@ -1380,6 +1731,8 @@ gateway. Needs the key's `embeddings` scope (`403` otherwise).
 - `encoding_format` is `float` (default) or `base64`, the little-endian `float32` bytes
   base64-encoded, as OpenAI's SDKs expect.
 - `dimensions` is not supported and answers `400`: the adapters cannot shorten a vector.
+- `safety_identifier` and `user` name the request's [end user](#end-users-and-tags) for the log
+  row and the per-end-user ceilings, as on chat. They are not sent to the provider.
 
 ```json
 {"object": "list", "model": "text-embedding-3-small",
@@ -1441,6 +1794,8 @@ unit). A project without a RAG store answers
 `rag_used`, `rag_hits`, and the embedding connection's model, tokens and price. An
 embedding failure at the provider answers with the provider's status as in chat.
 
+A project's `pre_retrieval` [guardrails](#guardrails) read `query`: a `block` rule answers `400` `guardrail_blocked`, a `redact` rule searches with the redacted query and sets a `Warning`.
+
 ### `POST /v1/rerank`
 
 Reorders documents by relevance to a query, in Cohere's request and response shape, so a
@@ -1487,6 +1842,75 @@ search unit (a row with a `per_search_unit` never adds token prices), Voyage by 
 Inside a chat or retrieve request that cost is added to the row's `cost_micros`, priced
 with the rerank connection; the `llm` backend's tokens are priced with the chat connection
 that ran the rerank. A rerank connection with no price row adds 0.
+
+### `POST /v1/moderations`
+
+The OpenAI moderation call, answered by the project's own [guardrails](#guardrails): no model is
+called. Each input is read by the project's `pre_request` rules (and the guardrail webhook, if
+the project has one) and reported, never applied.
+
+```json
+{"input": ["my id is 10000000146", "good morning"], "model": "omni-moderation-latest"}
+```
+
+`input` is a string or an array of at most 32 strings (an entry that is not a string, `null` included, is a `400`); `model` is accepted and ignored.
+
+```json
+{"id": "modr-3f9c0a7d5b1e4c2a8d6f0b13", "model": "ragmux-guardrails",
+ "results": [{"flagged": true, "categories": {"citizen-id": true, "card-words": false},
+              "category_scores": {"citizen-id": 1, "card-words": 0},
+              "ragmux": {"action": "redact"}},
+             {"flagged": false, "categories": {"citizen-id": false, "card-words": false},
+              "category_scores": {"citizen-id": 0, "card-words": 0}, "ragmux": {"action": "none"}}]}
+```
+
+Every `pre_request` rule is a category, its id the key; the score is `1` or `0`. `ragmux.action` is
+the strongest action among the rules that matched (`none`, `flag`, `redact`, `block`) and says what the
+project's rules *would* do; nothing is blocked or changed here. With the webhook on, its verdict is
+one more category, `webhook`, on the inputs it concerns (it answers once for the whole call, so a
+`block` or `flag` marks them all). The key needs the `chat` scope. The call takes a slot of the request
+limit, costs no tokens, and leaves a request log row with `endpoint = moderations`. A webhook failure
+answers as in chat (`503` `guardrail_unavailable` under `fail_closed`).
+
+A project without `pre_request` rules answers `flagged: false` with empty `categories`. An SDK that
+reads `categories` as OpenAI's fixed category set sees the project's rule ids instead.
+
+### `POST /v1/feedback`
+
+A score, and optionally a label, for a request the project already made. It collects a quality
+signal without collecting content: the admin API shows the share of positive scores per project
+(`GET /projects/{id}/feedback/summary`, under [Projects](#projects)), so a model, a route or a RAG setting can be
+judged by what users said about it.
+
+```json
+{"request_id": "3f2a9c1e", "score": 1, "label": "helpful"}
+```
+
+`request_id` is the `X-Request-Id` of the response being rated. `score` is `1` or `-1`.
+`label` is optional: 1 to 64 characters of `a-z 0-9 . _ : -`. Any other field, free-text
+`comment` included, is a `400` (`invalid_feedback`). The answer is `200` with
+`{"request_id": "3f2a9c1e", "score": 1, "label": "helpful"}`.
+
+- **One feedback per request.** Feedback is kept per `(project, request_id)`. Sending it again
+  replaces the score and the label (the last one wins) and answers `200`. A `request_id` a
+  client chose itself is not unique, so two requests that share one share their feedback too.
+- **Which requests.** The id must belong to a request log row of the key's project. Any key of
+  the project may send it: the back end makes the call, a front end with a key of its own can
+  rate it. An id the project has no row for, and an id that belongs to another project, get the
+  same answer: `404` `{"error": {"type": "not_found_error", "code": "request_not_found", …}}`.
+  A call refused before its request log row is opened (`401`, a scope or project-selection
+  `403`/`400`, a malformed body) has no row to rate; a `429` from a limit and a guardrail
+  block do leave a row, so they can be rated.
+- **Retry once on `404`.** The request log row is written after the response, for a JSON answer
+  and for the end of a stream alike, so feedback sent the instant a response ends can arrive
+  before the row exists. Retry it once after a short pause (a few hundred milliseconds). If the
+  row could not be written at all, which the gateway only logs, the `404` stays.
+- **Scope and limits.** The key needs the `chat` or the `retrieve` scope (`403`
+  `insufficient_scope` otherwise); there is no scope of its own. Feedback does not count
+  against the project's request or token limits, leaves no request log row and has no metric.
+  The body is at most 4 KiB.
+- **Retention.** Feedback is deleted with the request logs, after `LOG_RETENTION_DAYS`, counted
+  from the day it was first received.
 
 ### `GET /v1/models` and `GET /v1/models/{id}`
 
@@ -1582,12 +2006,13 @@ project, Origin) have no `id`; a limit refusal of a `tools/call` carries the cal
 ```
 
 `data.code` is the Ragmux code (`invalid_api_key`, `key_revoked`, `insufficient_scope`,
-`project_required`, `rate_limited`, …). An unknown key's message is fixed, as for `/v1`.
+`project_required`, `ip_not_allowed`, `origin_not_allowed`, `rate_limited`, …). An unknown key's message is fixed, as for `/v1`.
 
 **Origin.** A request that carries an `Origin` header is checked against `CORS_ORIGINS`: one that
 is not listed answers `403`, an empty list refuses every request with an `Origin`, and `*` lets
 every one through. A request without `Origin`, which is what non-browser MCP clients send, always
-passes. For browser clients the preflight allows `MCP-Protocol-Version`, `Mcp-Method` and
+passes. The key's own [network allowlist](users-and-limits.md#network-allowlists) is checked on top
+of this, and a key that lists origins needs an `Origin` that matches one. For browser clients the preflight allows `MCP-Protocol-Version`, `Mcp-Method` and
 `Mcp-Name`.
 
 The endpoint and the supported protocol versions are part of the public contract frozen at v1.0.

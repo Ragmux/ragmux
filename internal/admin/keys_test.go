@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -765,5 +766,203 @@ func TestKeyUnknownScopeListsValidValues(t *testing.T) {
 		"name": "ok", "project_ids": []int64{e.proj.ID}, "scopes": []string{"rerank-all"}}, alice.token)
 	if status != http.StatusBadRequest || !strings.Contains(errMessage(out), store.ScopeRerank) {
 		t.Errorf("unknown scope on update: %d %v", status, out)
+	}
+}
+
+// ---- network allowlists (ADR-039) ----
+
+func TestGatewayKeyNetworkAllowlists(t *testing.T) {
+	e := newAdminEnv(t)
+	alice := e.user("alice", "editor", e.proj.ID)
+	n := 0
+	body := func(extra map[string]any) map[string]any {
+		n++
+		b := map[string]any{"kind": "gateway", "name": "k" + strconv.Itoa(n), "project_ids": []int64{e.proj.ID}}
+		for k, v := range extra {
+			b[k] = v
+		}
+		return b
+	}
+
+	// Left out on create: empty lists, shown as [] and not null.
+	status, out := e.do(http.MethodPost, "/api/keys", body(nil), alice.token)
+	if status != http.StatusCreated {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	k := out["key"].(map[string]any)
+	if c, ok := k["allowed_cidrs"].([]any); !ok || len(c) != 0 {
+		t.Errorf("default allowed_cidrs = %v, want []", k["allowed_cidrs"])
+	}
+	if o, ok := k["allowed_origins"].([]any); !ok || len(o) != 0 {
+		t.Errorf("default allowed_origins = %v, want []", k["allowed_origins"])
+	}
+	if _, has := out["warnings"]; has {
+		t.Errorf("warnings on a key without a CIDR list: %v", out["warnings"])
+	}
+
+	// Stored in canonical form: a bare address gets its prefix length, an
+	// IPv4-mapped network is the IPv4 one, a repeat collapses, the origin is
+	// lower-cased and loses its trailing slash and default port.
+	status, out = e.do(http.MethodPost, "/api/keys", body(map[string]any{
+		"allowed_cidrs":   []string{"203.0.113.7", "10.0.0.0/8", "::ffff:192.168.0.0/112", "192.168.0.0/16", "2001:db8::1"},
+		"allowed_origins": []string{"HTTPS://App.Example.com/", "https://*.example.org", "https://app.example.com:443"},
+	}), alice.token)
+	if status != http.StatusCreated {
+		t.Fatalf("create with lists: %d %v", status, out)
+	}
+	k = out["key"].(map[string]any)
+	if !reflect.DeepEqual(k["allowed_cidrs"], []any{"203.0.113.7/32", "10.0.0.0/8", "192.168.0.0/16", "2001:db8::1/128"}) {
+		t.Errorf("allowed_cidrs = %v", k["allowed_cidrs"])
+	}
+	if !reflect.DeepEqual(k["allowed_origins"], []any{"https://app.example.com", "https://*.example.org"}) {
+		t.Errorf("allowed_origins = %v", k["allowed_origins"])
+	}
+	id := keyID(t, out)
+
+	// A save that leaves the fields out keeps them; an empty list clears one.
+	status, out = e.do(http.MethodPut, "/api/keys/"+itoa(id), map[string]any{
+		"name": "renamed", "project_ids": []int64{e.proj.ID}}, alice.token)
+	if status != http.StatusOK || len(out["allowed_cidrs"].([]any)) != 4 || len(out["allowed_origins"].([]any)) != 2 {
+		t.Fatalf("left out: %d %v, want both lists kept", status, out)
+	}
+	status, out = e.do(http.MethodPut, "/api/keys/"+itoa(id), map[string]any{
+		"name": "renamed", "project_ids": []int64{e.proj.ID}, "allowed_origins": []string{}}, alice.token)
+	if status != http.StatusOK || len(out["allowed_cidrs"].([]any)) != 4 || len(out["allowed_origins"].([]any)) != 0 {
+		t.Fatalf("clear one: %d %v", status, out)
+	}
+	stored, err := e.st.GetAPIKey(context.Background(), id)
+	if err != nil || len(stored.AllowedCIDRs) != 4 || stored.AllowedOrigins == nil || len(stored.AllowedOrigins) != 0 {
+		t.Errorf("stored key = %+v, %v", stored, err)
+	}
+
+	// The lists are on the audit trail.
+	entries, _, err := e.st.ListAuditLogs(context.Background(), store.AuditFilter{Action: "apikey.update"})
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("audit: %v %d", err, len(entries))
+	}
+	if raw, _ := json.Marshal(entries[0].Details); !bytes.Contains(raw, []byte("allowed_cidrs")) {
+		t.Errorf("audit details do not carry the CIDR list: %s", raw)
+	}
+
+	tooMany := make([]string, 33)
+	for i := range tooMany {
+		tooMany[i] = "10.0." + strconv.Itoa(i) + ".0/24"
+	}
+	manyOrigins := make([]string, 33)
+	for i := range manyOrigins {
+		manyOrigins[i] = "https://a" + strconv.Itoa(i) + ".example.com"
+	}
+	for name, extra := range map[string]map[string]any{
+		"junk cidr":          {"allowed_cidrs": []string{"not-an-ip"}},
+		"host bits":          {"allowed_cidrs": []string{"10.0.0.5/24"}},
+		"bad prefix length":  {"allowed_cidrs": []string{"10.0.0.0/33"}},
+		"empty cidr":         {"allowed_cidrs": []string{""}},
+		"too many cidrs":     {"allowed_cidrs": tooMany},
+		"star":               {"allowed_origins": []string{"*"}},
+		"no scheme":          {"allowed_origins": []string{"app.example.com"}},
+		"path":               {"allowed_origins": []string{"https://app.example.com/x"}},
+		"bare tld wildcard":  {"allowed_origins": []string{"https://*.com"}},
+		"wildcard mid-label": {"allowed_origins": []string{"https://a*.example.com"}},
+		"bad port":           {"allowed_origins": []string{"https://app.example.com:99999"}},
+		"wrong scheme":       {"allowed_origins": []string{"ftp://app.example.com"}},
+		"too many origins":   {"allowed_origins": manyOrigins},
+	} {
+		if status, out := e.do(http.MethodPost, "/api/keys", body(extra), alice.token); status != http.StatusBadRequest {
+			t.Errorf("%s on create: %d %v, want 400", name, status, out)
+		}
+		upd := map[string]any{"name": "k", "project_ids": []int64{e.proj.ID}}
+		for k, v := range extra {
+			upd[k] = v
+		}
+		if status, _ := e.do(http.MethodPut, "/api/keys/"+itoa(id), upd, alice.token); status != http.StatusBadRequest {
+			t.Errorf("%s on update: %d, want 400", name, status)
+		}
+	}
+}
+
+// A management key never goes through identify, so a list on one would be a
+// restriction nothing applies.
+func TestManagementKeyHasNoNetworkAllowlist(t *testing.T) {
+	e := newAdminEnv(t)
+	editor := e.user("editor", "editor")
+	status, out := e.do(http.MethodPost, "/api/keys", map[string]any{
+		"kind": "management", "name": "m", "scopes": []string{"read"}, "allowed_cidrs": []string{"10.0.0.0/8"}}, editor.token)
+	if status != http.StatusBadRequest || !strings.Contains(errMessage(out), "network allowlist") {
+		t.Errorf("management key with a CIDR list: %d %v", status, out)
+	}
+}
+
+func TestKeyCIDRWarningFollowsProxyHeaderSetting(t *testing.T) {
+	e := newAdminEnv(t)
+	alice := e.user("alice", "editor", e.proj.ID)
+	n := 0
+	create := func(extra map[string]any) map[string]any {
+		n++
+		b := map[string]any{"kind": "gateway", "name": "k" + strconv.Itoa(n), "project_ids": []int64{e.proj.ID}}
+		for k, v := range extra {
+			b[k] = v
+		}
+		status, out := e.do(http.MethodPost, "/api/keys", b, alice.token)
+		if status != http.StatusCreated {
+			t.Fatalf("create: %d %v", status, out)
+		}
+		return out
+	}
+	withCIDR := map[string]any{"allowed_cidrs": []string{"10.0.0.0/8"}}
+
+	// Flag off: no warning.
+	if out := create(withCIDR); out["warnings"] != nil {
+		t.Errorf("warnings with the flag off: %v", out["warnings"])
+	}
+	// Flag on: a CIDR list is saved all the same and the response says so.
+	e.adm.ProxyHeadersUnverified = true
+	out := create(withCIDR)
+	w, _ := out["warnings"].([]any)
+	if len(w) != 1 || !strings.Contains(w[0].(string), "TRUSTED_PROXY_CIDRS") {
+		t.Errorf("warnings = %v", out["warnings"])
+	}
+	if len(out["key"].(map[string]any)["allowed_cidrs"].([]any)) != 1 {
+		t.Errorf("the list was not stored: %v", out["key"])
+	}
+	// Origins alone are not affected by X-Forwarded-For.
+	if out := create(map[string]any{"allowed_origins": []string{"https://app.example.com"}}); out["warnings"] != nil {
+		t.Errorf("warnings for an origin-only key: %v", out["warnings"])
+	}
+	// An update that leaves a CIDR list in place warns too.
+	id := keyID(t, create(withCIDR))
+	status, upd := e.do(http.MethodPut, "/api/keys/"+itoa(id), map[string]any{
+		"name": "renamed-a", "project_ids": []int64{e.proj.ID}}, alice.token)
+	if w, _ := upd["warnings"].([]any); status != http.StatusOK || len(w) != 1 {
+		t.Errorf("update: %d %v", status, upd)
+	}
+	e.adm.ProxyHeadersUnverified = false
+	if _, upd := e.do(http.MethodPut, "/api/keys/"+itoa(id), map[string]any{
+		"name": "renamed-b", "project_ids": []int64{e.proj.ID}}, alice.token); upd["warnings"] != nil {
+		t.Errorf("update with the flag off: %v", upd["warnings"])
+	}
+}
+
+// Anonymisation reads a key's owner from the revoke and delete entries, so it
+// still can once the create entry has aged out (ADR-040).
+func TestRevokeAndDeleteAuditCarryUserID(t *testing.T) {
+	e := newAdminEnv(t)
+	alice := e.user("alice", "editor", e.proj.ID)
+	admin := e.user("admin", "admin")
+	for _, action := range []string{"revoke", "delete"} {
+		_, out := e.do(http.MethodPost, "/api/keys", map[string]any{
+			"kind": "gateway", "name": action, "project_ids": []int64{e.proj.ID}}, alice.token)
+		id := keyID(t, out)
+		if action == "revoke" {
+			e.do(http.MethodPost, "/api/keys/"+itoa(id)+"/revoke", nil, alice.token)
+		} else if status, _ := e.do(http.MethodDelete, "/api/keys/"+itoa(id), nil, admin.token); status != http.StatusOK {
+			t.Fatalf("delete: %d", status)
+		}
+		entries, _, err := e.st.ListAuditLogs(context.Background(), store.AuditFilter{Action: "apikey." + action})
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("apikey.%s entries: %v %d", action, err, len(entries))
+		}
+		if got, _ := entries[0].Details["user_id"].(float64); int64(got) != alice.ID {
+			t.Errorf("apikey.%s details = %v, want user_id %d", action, entries[0].Details, alice.ID)
+		}
 	}
 }

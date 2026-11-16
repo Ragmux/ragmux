@@ -270,6 +270,69 @@ before another replica claims them. Nothing is lost; a document is only ever
   a new replica starting against a database an old one is still using is safe as
   long as the schema change is backwards compatible - which is the rule these
   migrations follow (`ADD COLUMN IF NOT EXISTS`, new tables, no drops).
+- A migration that alters a busy table asks for a lock that waits behind any query still
+  using that table, and every request that wants the table queues behind it. The gateway
+  writes a `request_logs` row at the end of every request, so a long read of that table (a
+  CSV export, a summary over a wide window) running at the wrong moment would stall requests
+  on all replicas. Three migrations are guarded against that, `0032`, `0033` and `0035`: `0032` and `0033` alter
+  `request_logs` first and set `lock_timeout` (2 seconds). They run back to back when a
+  v0.7 database is upgraded. If the lock is not granted in time the migration fails, rolls
+  back whole and is not recorded, and the new replica exits with `canceling statement due
+  to lock timeout`. Old replicas keep serving. The limit is per lock request, 2 seconds
+  each: a request that queued behind the migration waits at most 2 seconds, and about 4
+  seconds in the worst case, when the `request_logs` lock is granted late and the
+  `projects` step then waits as well (only a long read of `projects` does that). Nothing
+  is half applied and the runner does not retry, so the replica is started again by the
+  process manager (`restart: unless-stopped`, a Kubernetes `Deployment`) and the migration
+  runs from the start. `0035` follows the same rule for `project_usage`, the table every
+  request upserts into: it creates its own two tables first and alters `project_usage` last,
+  with the same 2 second `lock_timeout`, so while it waits it holds nothing on the request
+  path. If it keeps failing,
+  something is still holding `request_logs` (or, for `0035`, `project_usage`: run the query
+  below with `'project_usage'::regclass`; the usual holder is a long-running read of the
+  usage counters or a session left idle in a transaction). `0039` (the per-key allowlist columns) alters `projects` first and `api_keys` second, with the same
+2 second `lock_timeout`; if it times out, find the holder with the query below using
+`'projects'::regclass` (the usual holder is a long dashboard query joining it). Earlier migrations that touch `request_logs`
+  (`0029` among them, which is in v0.7.0 but not in v0.6.1) carry no `lock_timeout`: when
+  upgrading from v0.6 or older straight to v0.8, finish long reads of `request_logs`
+  (exports, summaries over a wide window) before starting the new replica. Find the holder:
+
+  ```sql
+  SELECT a.pid, a.state, now() - a.xact_start AS open_for, a.query
+  FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+  WHERE l.relation = 'request_logs'::regclass AND l.granted AND a.pid <> pg_backend_pid();
+  ```
+
+  (Run it in the schema Ragmux uses.) A session that is `active` finishes by itself, or
+  `SELECT pg_cancel_backend(<pid>)` stops its query. A session that is `idle in transaction`
+  is a transaction someone left open: it still holds the lock after its query is cancelled,
+  so `pg_cancel_backend` changes nothing and `SELECT pg_terminate_backend(<pid>)` is what
+  releases it. If long reads keep starting (an export job, a dashboard that polls a wide
+  window), stop that source first; cancelling one query only lets the next one in. Once the
+  table is free the next start goes through.
+
+### Rolling back after v0.8 security features are on
+
+**Do not go back to an older binary after you have turned the v0.8 security features on.** The
+v0.8 migrations only add columns and tables, so an older binary still starts and `/readyz` stays
+`200` (see below), but it does not know what the new columns mean and reads none of them:
+
+- it applies no [guardrail](api.md#guardrails): the rules stay in the database and requests go
+  through unchecked, with no error and no `Warning`;
+- it applies no `Extra` field policy (`extra_allow`, `extra_deny`), so the fields you removed
+  reach the provider again;
+- it applies no [network allowlist](users-and-limits.md#network-allowlists): a key with a CIDR or
+  `Origin` list works from anywhere, which is what the list was there to stop;
+- it applies no per-end-user limit and sends no limit or budget alert;
+- an account with [two-factor authentication](users-and-limits.md#two-factor-authentication-totp)
+  signs in with the password alone, because that binary knows no second step;
+- its `ragmux rotate-key` does not re-encrypt the webhook and TOTP secrets, which this release
+  seals with the same key.
+
+The same holds for a replica left on the old version during a rolling update: until the last one
+is replaced, requests it serves are not checked by these features. If you must roll back, turn
+the features off first (empty the guardrail rules and the allowlists, switch the second factor off
+for every account) and keep the database backup you took before the upgrade.
 
 ### `/readyz` during a rolling upgrade
 
@@ -314,6 +377,35 @@ is not enough on its own and the upgrade needs a maintenance window.
 The `degraded` entry is informational and `/readyz` still returns `200`, so
 nothing pages on it by itself. It is expected for the length of a deploy;
 alert on it *persisting*, which means a replica was left behind.
+
+## Mutual TLS at the proxy
+
+The gateway terminates no TLS and checks no client certificate. If clients must present one, do
+it at the reverse proxy and let only the proxy reach the gateway. With nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name gateway.example.com;
+    ssl_certificate         /etc/ssl/gateway.crt;
+    ssl_certificate_key     /etc/ssl/gateway.key;
+    ssl_client_certificate  /etc/ssl/clients-ca.crt;   # the CA that signs your clients' certificates
+    ssl_verify_client       on;                        # a client without a valid certificate gets 400
+
+    location / {
+        proxy_pass http://ragmux:8765;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Run the gateway with `TRUST_PROXY_HEADERS=true` and `TRUSTED_PROXY_CIDRS` set to the proxy's
+network, so the per-key [network allowlists](users-and-limits.md#network-allowlists) see the
+client's address and not the proxy's. Without `TRUSTED_PROXY_CIDRS` the headers are accepted
+from any connection, and a client that reaches the gateway directly can claim any address.
+Make sure it cannot reach it directly.
 
 ## The Compose example
 

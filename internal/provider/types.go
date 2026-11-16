@@ -7,8 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/ragmux/ragmux/internal/glob"
 )
 
 // Message is one OpenAI chat message. Content is kept raw because it may be
@@ -143,6 +146,29 @@ func TextContent(s string) json.RawMessage {
 	return b
 }
 
+// MaxEndUserBytes is the longest end user identifier ValidEndUser accepts.
+const MaxEndUserBytes = 128
+
+// ValidEndUser reports whether v is usable as an end user identifier
+// (ADR-035): 1 to 128 bytes of ASCII letters, digits and . _ : @ + = / -.
+// There is no space, control character or quote in the set, so the value is
+// safe in a header, a log line and a SQL text column.
+func ValidEndUser(v string) bool {
+	if len(v) == 0 || len(v) > MaxEndUserBytes {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("._:@+=/-", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // ChatRequest is the OpenAI /v1/chat/completions payload. Unknown fields are
 // retained in Extra so OpenAI-compatible upstreams receive them unchanged.
 type ChatRequest struct {
@@ -160,6 +186,14 @@ type ChatRequest struct {
 	ResponseFormat   json.RawMessage `json:"response_format,omitempty"`
 	StreamOptions    json.RawMessage `json:"stream_options,omitempty"`
 	User             string          `json:"user,omitempty"`
+	// EndUser is the end user identifier the gateway validated (ValidEndUser)
+	// and set aside for the providers that get a translated request
+	// (ADR-035). It is not User: the translations never read User, so a
+	// client's free text and the value of X-Ragmux-End-User cannot reach a
+	// provider by accident. Only the gateway sets it, from the request body's
+	// own field, and only the Anthropic adapter reads it, hashed. It never goes
+	// on the wire as it is nor into a client payload.
+	EndUser string `json:"-"`
 	// RAGActive is set by the gateway when retrieval may have changed the
 	// prompt of this conversation: the project has a store and its
 	// retrieval policy is not off, whatever the client sent for this request
@@ -197,6 +231,82 @@ func (r *ChatRequest) UnmarshalJSON(b []byte) error {
 	}
 	*r = ChatRequest(a)
 	return nil
+}
+
+// ExtraPolicy is a project's allow and deny lists for the request fields the
+// gateway does not read itself (ADR-041): a chat request's Extra, and the
+// top-level fields of a native Messages body that the translation has no name
+// for. The lists mean what the tool lists mean (ADR-032): glob patterns, "*"
+// the only wildcard, case sensitive; a field matching Deny is removed, and so
+// is one matching nothing in Allow when Allow is not empty. Both empty is the
+// behaviour every project had before the lists existed.
+type ExtraPolicy struct {
+	Allow, Deny []string
+}
+
+// Empty reports whether the policy has no list at all.
+func (p ExtraPolicy) Empty() bool { return len(p.Allow) == 0 && len(p.Deny) == 0 }
+
+// Permits reports whether a field of this name may be forwarded. Deny always
+// wins; an empty Allow permits everything else, and a non-empty one only what
+// it matches. glob.Match cannot be made to backtrack.
+func (p ExtraPolicy) Permits(field string) bool {
+	for _, pat := range p.Deny {
+		if glob.Match(pat, field) {
+			return false
+		}
+	}
+	if len(p.Allow) == 0 {
+		return true
+	}
+	for _, pat := range p.Allow {
+		if glob.Match(pat, field) {
+			return true
+		}
+	}
+	return false
+}
+
+// StripExtra removes the fields the policy does not permit from extra and
+// returns their names, sorted. The fields the gateway reads itself are not in
+// Extra, so they are never touched.
+func (p ExtraPolicy) StripExtra(extra map[string]json.RawMessage) []string {
+	if p.Empty() {
+		return nil
+	}
+	var removed []string
+	for name := range extra {
+		if !p.Permits(name) {
+			removed = append(removed, name)
+		}
+	}
+	for _, name := range removed {
+		delete(extra, name)
+	}
+	sort.Strings(removed)
+	return removed
+}
+
+// StripMessagesFields removes from a native Messages body the top-level fields
+// the policy does not permit, among those the translation has no name for
+// (not handledMessagesFields), and returns their names, sorted. It runs on
+// the client's body, so the native path and the translated one both see the
+// result.
+func (p ExtraPolicy) StripMessagesFields(b *MessagesBody) []string {
+	if p.Empty() {
+		return nil
+	}
+	var removed []string
+	for _, name := range b.Keys() {
+		if !handledMessagesFields[name] && !p.Permits(name) {
+			removed = append(removed, name)
+		}
+	}
+	for _, name := range removed {
+		b.Delete(name)
+	}
+	sort.Strings(removed)
+	return removed
 }
 
 // MarshalJSON flattens Extra back into the object.

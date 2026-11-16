@@ -502,7 +502,7 @@ func driftCases(t *testing.T) []driftCase {
 			brace: []string{"username", "password", "bearer"}},
 		{name: "me", code: union(user, handlerStructFields(t, "admin.go", "me")), sections: []string{"Session and account"},
 			brace: []string{"id", "username", "role", "is_active"},
-			prose: []string{"session_expires_at", "session_bearer", "session_kind", "scopes"}},
+			prose: []string{"session_expires_at", "session_bearer", "session_kind", "scopes", "totp_enabled"}},
 		{name: "password body", code: handlerStructFields(t, "admin.go", "changePassword"), sections: []string{"Session and account"},
 			brace: []string{"current_password", "new_password"}},
 		{name: "provider type", code: handlerStructFields(t, "admin.go", "providerTypes"), sections: []string{"Session and account"},

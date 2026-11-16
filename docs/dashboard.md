@@ -2,7 +2,13 @@
 
 `/admin/` serves a single-page dashboard (vanilla JavaScript, no build step, embedded in
 the binary) over the same REST API. On a fresh database it shows the first-run setup
-form; afterwards a sign-in screen that reports remaining attempts and lockouts. Screens:
+form; afterwards a sign-in screen that reports remaining attempts and lockouts. An account
+with [two-factor authentication](users-and-limits.md#two-factor-authentication-totp) gets a
+second step after the password: the six-digit code, or a recovery code through *Use a recovery
+code*. A wrong code says how many tries the step has left; once the account's second factor
+is locked the screen shows how long it stays locked and says that even a right code or a
+recovery code is refused until then, and that the way out is another admin (*Reset 2FA* under
+Users) or `ragmux reset-password --disable-totp` on the server. Screens:
 
 - **Overview:** 24h / 7d / 30d window with deltas against the previous period, requests
   per day, traffic by project, budget watch with exhaustion forecasts, recent requests
@@ -57,10 +63,27 @@ form; afterwards a sign-in screen that reports remaining attempts and lockouts. 
     the project's [admin API](api.md#projects) `sessions` endpoints. See
     [Sessions](users-and-limits.md#sessions).
 - **API keys:** mint and revoke your own `sk-user-…` and `sk-mgmt-…` keys with a scope
-  checklist, grants and limits.
+  checklist, grants and limits. A gateway key also takes an *Allowed networks (CIDR)* and an
+  *Allowed browser origins* list (one entry per line, up to 32 each, checked in the browser
+  before the request). The form says that a key with an origin list cannot be used from a
+  server, because server-side callers send no `Origin` header, and that a CIDR list is only
+  as trustworthy as the client address behind a proxy; when a save answers with `warnings`
+  (a CIDR list behind `TRUST_PROXY_HEADERS=true` with no `TRUSTED_PROXY_CIDRS`) they are shown
+  in a dialog. See [Network allowlists](users-and-limits.md#network-allowlists).
 - **Playground:** real `/v1/chat/completions` calls with a project key, streaming or JSON,
   optional extra system prompt, RAG sources as citations and the response headers.
 - **Users** and **Audit log** (admins): role and failed-login tiles, filters, NDJSON export.
+  On a user row, *Reset 2FA* (shown only while the user has two-factor authentication on, from
+  the list's `totp_enabled`) removes it and ends their sessions, and *Anonymize* (shown only
+  until `anonymized_at` is set) replaces the account's personal data for good (the dialog lists
+  what changes and asks you to type the username). An anonymised account is marked with an
+  *anonymized* badge and the date, and offers neither *Reset password*, *Reset 2FA*,
+  *Anonymize* nor the *Active* switch: it stays closed and the API answers `409` to those.
+  Your own row shows none of the reset buttons nor *Anonymize*, which the API refuses for the
+  caller: use the sidebar's **Password** and **Two-factor** buttons. Below the table, a form
+  anonymises an end user for a data-subject request, for one project or all of them, and shows
+  how many rows it changed. Both anonymisations work only in a signed-in session; they are
+  irreversible. See [Anonymisation (KVKK)](users-and-limits.md#anonymisation-kvkk).
 
 What a user sees follows their role: viewers get read-only screens, editors the forms,
 admins the user and audit screens. The page ships its own fonts (Bricolage Grotesque,
@@ -74,3 +97,34 @@ system, light and dark; the choice is kept in this browser's `localStorage` unde
 setting is `system`, the page follows an operating-system change live. If the browser blocks
 `localStorage`, the page still works and the choice lasts until the page is reloaded.
 
+**Two-factor authentication.** The sidebar's **Two-factor** button manages your own account's
+TOTP. Every action asks for your password again (five wrong passwords in a row end the session
+and send you to the sign-in screen). *Set up* shows the secret and the `otpauth://` link as
+text (the dashboard draws no QR code, so it loads nothing from outside); *Turn on* takes the
+password and a code and then shows ten recovery codes **once**, tells you your other sessions
+were signed out, and asks you to confirm you stored them. *New recovery codes* and *Turn off*
+are there while it is on. The server never replaces a secret in use, so *Change device* is
+off, set up, on: the dialog warns that between the first and the last step the account signs
+in with the password alone. A management key (`sk-mgmt-…`) never asks for a code.
+
+**Project settings.** The project form has three more sections: *Extra request fields*
+(allow and deny lists with a button that adds the fields that change cost or retention to the
+deny list), *Where the project key may be used from* (CIDR and origin lists, with the same
+notes as the key form) and *End-user limits* (requests and prompt tokens per minute, tokens
+per day and month; `0` is unlimited, and a request without an end user is not held to them).
+Like the tool lists they are sent only when changed. The project panel gains three cards:
+
+- **Guardrails:** the rules (the table shows a rule's size, never its pattern or words), the
+  stream window and the webhook settings, the server's warnings, and a note that retrieved RAG
+  passages are not scanned. *Edit guardrails* opens a rule editor (type, action, stages, pattern
+  or keywords) and warns that a streamed answer starts later by about the window and that a
+  regex longer than the window can be missed. The guardrail webhook endpoint is registered,
+  re-pointed, rotated and removed here.
+- **Alerts & money budget:** alerts on or off, the monthly budget in dollars, and the alerts
+  webhook endpoint. The money budget is labelled an estimate that only warns and never blocks a
+  request. A webhook secret is shown once, when the endpoint is registered or rotated (a rotated
+  secret's predecessor keeps signing for 24 hours); only editors see the endpoint, since its URL
+  often carries a token.
+- **Feedback:** positive share, counts, a per-day chart, the label breakdown and a table of
+  the daily numbers for the last 7, 30 or 90 days. It counts scores only; the gateway never
+  receives the request or answer.

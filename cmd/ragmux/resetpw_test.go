@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/store"
@@ -161,4 +163,113 @@ func TestResetPasswordCLI(t *testing.T) {
 	if e.Details["via"] != "cli" || e.Details["revoked_sessions"] == nil || e.Details["revoked_keys"] == nil {
 		t.Errorf("audit details = %v", e.Details)
 	}
+}
+
+// T5 exits and T7: a reset forgets the user's wrong second-factor codes and
+// closes the open challenges (the way out of the lock) under the lower-cased
+// name the gate writes; TOTP itself stays unless --disable-totp is given.
+func TestResetPasswordCLITOTP(t *testing.T) {
+	ctx := context.Background()
+	cfg := testdb.Config(t)
+	st := testdb.OpenWith(t, cfg)
+	u, err := st.CreateUser(ctx, "Ops", "old-hash", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bystander, err := st.CreateUser(ctx, "other", "old-hash", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []*store.User{u, bystander} {
+		if ok, err := st.SetTOTPSecret(ctx, x.ID, "JBSWY3DPEHPK3PXP"); err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+		if _, err := st.DB().Exec(ctx, "UPDATE users SET totp_enabled_at = now() WHERE id = $1", x.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB().Exec(ctx, "INSERT INTO user_recovery_codes (user_id, code_hash) VALUES ($1, 'h')", x.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wrong := func() {
+		t.Helper()
+		for i := 0; i < store.MFALockFailures; i++ {
+			_, err := st.VerifySecondFactor(ctx, store.SecondFactor{UserID: u.ID, Via: store.ViaDisable, Code: "000000",
+				Check: func(string, string, int64) (int64, bool) { return 0, false }}, nil)
+			if !errors.Is(err, store.ErrMFAWrongCode) {
+				t.Fatal(err)
+			}
+		}
+		if _, err := st.CreateLoginChallenge(ctx, u.ID, "ch-"+time.Now().String(), false, "1.2.3.4", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := func(name string) (n int) {
+		t.Helper()
+		if err := st.DB().QueryRow(ctx, "SELECT COUNT(*) FROM login_attempts WHERE stage = 'mfa' AND username = $1", name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	challenges := func(id int64) (n int) {
+		t.Helper()
+		if err := st.DB().QueryRow(ctx, "SELECT COUNT(*) FROM login_challenges WHERE user_id = $1", id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if _, err := st.CreateLoginChallenge(ctx, bystander.ID, "ch-other", false, "1.2.3.4", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	wrong()
+	if l, _ := st.MFALocked(ctx, u.ID); l == nil || rows("ops") != 5 {
+		t.Fatalf("setup: locked=%v rows=%d", l, rows("ops"))
+	}
+	// Default: the lock goes, TOTP stays.
+	if got := runReset(t, cfg, "a-good-long-password\n", "OPS", "--stdin"); got != 0 {
+		t.Fatalf("reset: exit %d", got)
+	}
+	if rows("ops") != 0 || challenges(u.ID) != 0 {
+		t.Errorf("reset left %d rows and %d challenges", rows("ops"), challenges(u.ID))
+	}
+	if l, _ := st.MFALocked(ctx, u.ID); l != nil {
+		t.Error("the account is still locked after the reset")
+	}
+	if s, _ := st.GetTOTPStatus(ctx, u.ID); !s.Enabled {
+		t.Error("a plain reset switched TOTP off")
+	}
+	if challenges(bystander.ID) != 1 {
+		t.Error("another account's challenge was closed")
+	}
+
+	// --disable-totp: the secret, the codes and the rows go, the audit says so.
+	wrong()
+	if got := runReset(t, cfg, "another-long-password\n", "ops", "--stdin", "--disable-totp"); got != 0 {
+		t.Fatalf("reset --disable-totp: exit %d", got)
+	}
+	if s, _ := st.GetTOTPStatus(ctx, u.ID); s.Enabled || s.HasSecret {
+		t.Errorf("status after --disable-totp = %+v", s)
+	}
+	if n, _ := unusedRecoveryCodes(t, st, u.ID); n != 0 || rows("ops") != 0 || challenges(u.ID) != 0 {
+		t.Errorf("--disable-totp left %d codes, %d rows, %d challenges", n, rows("ops"), challenges(u.ID))
+	}
+	if s, _ := st.GetTOTPStatus(ctx, bystander.ID); !s.Enabled {
+		t.Error("another account's TOTP was switched off")
+	}
+	entries, _, err := st.ListAuditLogs(ctx, store.AuditFilter{Action: "user.reset_password"})
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("audit entries = %d, %v", len(entries), err)
+	}
+	if entries[0].Details["totp_disabled"] != true || entries[1].Details["totp_disabled"] != nil {
+		t.Errorf("audit details: newest %v, older %v", entries[0].Details, entries[1].Details)
+	}
+}
+
+// unusedRecoveryCodes counts a user's recovery codes that are not spent.
+func unusedRecoveryCodes(t *testing.T, s *store.Store, userID int64) (int, error) {
+	t.Helper()
+	var n int
+	err := s.DB().QueryRow(context.Background(), "SELECT COUNT(*) FROM user_recovery_codes WHERE user_id = $1 AND used_at IS NULL", userID).Scan(&n)
+	return n, err
 }

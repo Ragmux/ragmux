@@ -86,14 +86,22 @@ func TestCreateUserWithProjectsAndStats(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// u has its second factor on, v has an unconfirmed setup and is anonymized.
+	if _, err := s.DB().Exec(ctx, "UPDATE users SET totp_secret_enc = '\\x01', totp_enabled_at = now() WHERE id = $1", u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(ctx, "UPDATE users SET totp_secret_enc = '\\x01', anonymized_at = now() WHERE id = $1", other.ID); err != nil {
+		t.Fatal(err)
+	}
 	list, err := s.ListUsersWithStats(ctx)
 	if err != nil || len(list) != 2 {
 		t.Fatalf("list with stats: %v %+v", err, list)
 	}
-	if list[0].ID != u.ID || list[0].ProjectCount != 2 || list[0].ActiveSessions != 2 {
+	if list[0].ID != u.ID || list[0].ProjectCount != 2 || list[0].ActiveSessions != 2 || !list[0].TOTPEnabled || list[0].AnonymizedAt != nil {
 		t.Errorf("stats for u: %+v", list[0])
 	}
-	if list[1].ID != other.ID || list[1].ProjectCount != 0 || list[1].ActiveSessions != 0 {
+	if list[1].ID != other.ID || list[1].ProjectCount != 0 || list[1].ActiveSessions != 0 || list[1].TOTPEnabled ||
+		list[1].AnonymizedAt == nil || list[1].AnonymizedAt.Location() != time.UTC {
 		t.Errorf("stats for v: %+v", list[1])
 	}
 	got, expires, err := s.UserAndExpiryBySession(ctx, "live1")

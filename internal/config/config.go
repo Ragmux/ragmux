@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ragmux/ragmux/internal/bm25"
+	"github.com/ragmux/ragmux/internal/keysource"
 )
 
 // MaxUpstreamRetries is the ceiling of UPSTREAM_MAX_RETRIES. Backoff is capped
@@ -30,6 +31,12 @@ type Config struct {
 	// SecretKeyHex is the AES-256 key for provider credentials as 64 hex
 	// characters. Empty means fall back to DATA_DIR/secret.key.
 	SecretKeyHex string
+	// KeySource says where the instance key comes from (SECRET_KEY_SOURCE:
+	// env, vault_transit or aws_kms) and carries the Vault / KMS settings.
+	// With the default "env" the key is SecretKeyHex or the secret.key
+	// fallback; with a remote source SecretKeyHex stays empty and the key is
+	// opened from KeySource.Wrapped at startup (see internal/keysource).
+	KeySource keysource.Options
 	// DataDir is only used for the secret.key fallback.
 	DataDir       string
 	Port          int
@@ -96,6 +103,12 @@ type Config struct {
 	// PrivateUpstreamAllowlist lists hostnames (lower-case) that may resolve
 	// to private addresses even when AllowPrivateUpstreams is false.
 	PrivateUpstreamAllowlist map[string]bool
+	// PrivateWebhookAllowlist lists hostnames (lower-case) an outbound webhook
+	// may reach even though they resolve to private, loopback or link-local
+	// addresses (ADR-033). It is deliberately separate from
+	// PrivateUpstreamAllowlist: an upstream exemption must not leak to a URL a
+	// project editor types, and ALLOW_PRIVATE_UPSTREAMS has no effect on webhooks.
+	PrivateWebhookAllowlist map[string]bool
 	// StreamMaxDuration bounds one streaming provider response end to end.
 	StreamMaxDuration time.Duration
 	// RerankTimeout overrides both reranker timeouts: the LLM backend's
@@ -194,7 +207,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	ks, err := loadKeySource(secretKey)
+	if err != nil {
+		return Config{}, err
+	}
 	c := Config{
+		KeySource:          ks,
 		PgSearchTokenizer:  "default",
 		DatabaseURL:        dbURL,
 		DBMaxConns:         10,
@@ -229,7 +247,7 @@ func Load() (Config, error) {
 	if c.DatabaseURL == "" {
 		return c, errors.New("DATABASE_URL (or DATABASE_URL_FILE) is required (e.g. postgres://user:pass@host:5432/ragmux?sslmode=disable)")
 	}
-	if c.SecretKeyHex != "" {
+	if c.SecretKeyHex != "" && !ks.Remote() {
 		key, err := hex.DecodeString(c.SecretKeyHex)
 		if err != nil || len(key) != 32 {
 			return c, errors.New("SECRET_KEY must be 64 hex characters (32 bytes); generate one with: openssl rand -hex 32")
@@ -414,6 +432,12 @@ func Load() (Config, error) {
 	for _, h := range strings.Split(os.Getenv("PRIVATE_UPSTREAM_ALLOWLIST"), ",") {
 		if h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), "."); h != "" {
 			c.PrivateUpstreamAllowlist[h] = true
+		}
+	}
+	c.PrivateWebhookAllowlist = map[string]bool{}
+	for _, h := range strings.Split(os.Getenv("PRIVATE_WEBHOOK_ALLOWLIST"), ",") {
+		if h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), "."); h != "" {
+			c.PrivateWebhookAllowlist[h] = true
 		}
 	}
 	c.StreamMaxDuration = 30 * time.Minute
@@ -713,6 +737,44 @@ func parseKeyValues(name, raw string) (map[string]string, error) {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// loadKeySource reads SECRET_KEY_SOURCE and the settings that go with it. A
+// remote source (Vault Transit, AWS KMS) replaces SECRET_KEY entirely, so the
+// two together are an error rather than one silently winning.
+func loadKeySource(secretKey string) (keysource.Options, error) {
+	o := keysource.Options{Source: strings.ToLower(strings.TrimSpace(os.Getenv("SECRET_KEY_SOURCE")))}
+	if o.Source == "" {
+		o.Source = keysource.SourceEnv
+	}
+	wrapped, err := envOrFile("SECRET_KEY_WRAPPED")
+	if err != nil {
+		return o, err
+	}
+	o.Wrapped = wrapped
+	if o.Remote() {
+		if secretKey != "" {
+			return o, fmt.Errorf("SECRET_KEY (or SECRET_KEY_FILE) is set while SECRET_KEY_SOURCE=%s: the key comes from SECRET_KEY_WRAPPED then; remove SECRET_KEY, and from docker-compose.split.yml / docker-compose.paradedb.yml too (they require it)", o.Source)
+		}
+		o.AWSRegion = strings.TrimSpace(os.Getenv("AWS_REGION"))
+		if o.AWSRegion == "" {
+			o.AWSRegion = strings.TrimSpace(os.Getenv("AWS_DEFAULT_REGION"))
+		}
+		if o.Source == keysource.SourceVaultTransit {
+			o.VaultAddr = strings.TrimSpace(os.Getenv("VAULT_ADDR"))
+			o.VaultTransitKey = strings.TrimSpace(os.Getenv("VAULT_TRANSIT_KEY"))
+			o.VaultTransitMount = strings.TrimSpace(os.Getenv("VAULT_TRANSIT_MOUNT"))
+			o.VaultNamespace = strings.TrimSpace(os.Getenv("VAULT_NAMESPACE"))
+			o.VaultCACert = strings.TrimSpace(os.Getenv("VAULT_CACERT"))
+			if o.VaultToken, err = envOrFile("VAULT_TOKEN"); err != nil {
+				return o, err
+			}
+		}
+	}
+	if err := o.Validate(); err != nil {
+		return o, err
+	}
+	return o, nil
 }
 
 // envOrFile returns the trimmed value of NAME, or the trimmed content of the

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"log/slog"
 	"math/big"
 	"sync"
@@ -47,10 +48,37 @@ type Project struct {
 	// from the store, so the JSON shows [] and not null.
 	ToolAllow []string `json:"tool_allow"`
 	ToolDeny  []string `json:"tool_deny"`
+	// ExtraAllow and ExtraDeny are the lists for the request fields the
+	// gateway does not read itself (ADR-041): a chat request's unknown fields
+	// and the unhandled top-level fields of a native Messages body. They follow
+	// the tool lists' rules and are never nil on a Project read from the store.
+	ExtraAllow []string `json:"extra_allow"`
+	ExtraDeny  []string `json:"extra_deny"`
+	// KeyAllowedCIDRs and KeyAllowedOrigins are the network allowlists of the
+	// project's own "sk-proj-" key (ADR-039), the same lists a user key carries
+	// in api_keys. Empty means no restriction; never nil on a Project read from
+	// the store.
+	KeyAllowedCIDRs   []string `json:"key_allowed_cidrs"`
+	KeyAllowedOrigins []string `json:"key_allowed_origins"`
 	// SessionTokenCap is the prompt+completion tokens one session
 	// (X-Ragmux-Session) may spend before its requests are answered 429; zero
 	// is unlimited (ADR-032).
 	SessionTokenCap int64 `json:"session_token_cap"`
+	// The per-end-user ceilings (ADR-035): what one end user (X-Ragmux-End-User
+	// or the body's own field) may make in a UTC minute (requests, tokens) and
+	// spend in a UTC day and month; zero is unlimited. They bind only a request
+	// that names an end user: they are a guardrail, not a security check.
+	EndUserRPM           int   `json:"end_user_rpm"`
+	EndUserTPM           int   `json:"end_user_tpm"`
+	EndUserDailyTokens   int64 `json:"end_user_daily_tokens"`
+	EndUserMonthlyTokens int64 `json:"end_user_monthly_tokens"`
+	// Guardrails is the project's guardrail configuration as stored: a JSON
+	// object of rules and settings (ADR-034), nil when the project has none.
+	// The gateway reads it on every request through internal/guardrail, which
+	// owns its shape; the admin API reads and writes it on its own routes
+	// (SetProjectGuardrails), not through the project body, so it is not part
+	// of the project JSON.
+	Guardrails json.RawMessage `json:"-"`
 	// MemberIDs lists the users attached to the project.
 	MemberIDs []int64 `json:"member_ids"`
 	CreatedAt string  `json:"created_at"`
@@ -142,7 +170,9 @@ func (p *Project) normalizeRAGSettings() {
 const projCols = `id, name, model_connection_id, rag_store_id, api_key_prefix, system_prompt,
 	rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens, created_at, updated_at,
 	context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
-	tool_allow, tool_deny, session_token_cap,
+	tool_allow, tool_deny, session_token_cap, guardrails,
+	end_user_rpm, end_user_tpm, end_user_daily_tokens, end_user_monthly_tokens,
+	extra_allow, extra_deny, key_allowed_cidrs::text[], key_allowed_origins,
 	ARRAY(SELECT user_id FROM project_members pm WHERE pm.project_id = projects.id ORDER BY user_id)`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
@@ -151,7 +181,9 @@ func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	err := row.Scan(&p.ID, &p.Name, &p.ModelConnectionID, &p.RAGStoreID, &p.APIKeyPrefix, &p.SystemPrompt,
 		&p.RateLimitRPM, &p.RateLimitTPM, &p.BudgetDailyTokens, &p.BudgetMonthlyTokens,
 		&created, &updated, &p.ContextPlacement, &p.RetrievalPolicy, &p.QueryStrategy,
-		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.MemberIDs)
+		&p.HistoryTurnsForQuery, &p.QueryModelConnectionID, &p.ToolAllow, &p.ToolDeny, &p.SessionTokenCap, &p.Guardrails,
+		&p.EndUserRPM, &p.EndUserTPM, &p.EndUserDailyTokens, &p.EndUserMonthlyTokens,
+		&p.ExtraAllow, &p.ExtraDeny, &p.KeyAllowedCIDRs, &p.KeyAllowedOrigins, &p.MemberIDs)
 	if err != nil {
 		return nil, scanErr(err)
 	}
@@ -161,6 +193,18 @@ func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	}
 	if p.ToolDeny == nil {
 		p.ToolDeny = []string{}
+	}
+	if p.ExtraAllow == nil {
+		p.ExtraAllow = []string{}
+	}
+	if p.ExtraDeny == nil {
+		p.ExtraDeny = []string{}
+	}
+	if p.KeyAllowedCIDRs == nil {
+		p.KeyAllowedCIDRs = []string{}
+	}
+	if p.KeyAllowedOrigins == nil {
+		p.KeyAllowedOrigins = []string{}
 	}
 	if p.MemberIDs == nil {
 		p.MemberIDs = []int64{}
@@ -226,12 +270,18 @@ func (s *Store) CreateProjectWithMembers(ctx context.Context, p *Project, member
 		(name, model_connection_id, rag_store_id, api_key_hash, api_key_prefix, system_prompt,
 		rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens,
 		context_placement, retrieval_policy, query_strategy, history_turns_for_query, query_model_connection_id,
-		tool_allow, tool_deny, session_token_cap)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING id`,
+		tool_allow, tool_deny, session_token_cap,
+		end_user_rpm, end_user_tpm, end_user_daily_tokens, end_user_monthly_tokens,
+		extra_allow, extra_deny, key_allowed_cidrs, key_allowed_origins)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+		$25::text[]::cidr[], $26) RETURNING id`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, HashToken(key), keyPrefix(key), p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
 		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
-		nonNilStrings(p.ToolAllow), nonNilStrings(p.ToolDeny), p.SessionTokenCap).Scan(&id)
+		nonNilStrings(p.ToolAllow), nonNilStrings(p.ToolDeny), p.SessionTokenCap,
+		p.EndUserRPM, p.EndUserTPM, p.EndUserDailyTokens, p.EndUserMonthlyTokens,
+		nonNilStrings(p.ExtraAllow), nonNilStrings(p.ExtraDeny),
+		nonNilStrings(p.KeyAllowedCIDRs), nonNilStrings(p.KeyAllowedOrigins)).Scan(&id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -257,7 +307,7 @@ func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error)
 	// than writing the default: a value this build does not know -- written by
 	// a newer release -- reads as the default, and writing that read value
 	// back would overwrite it. The nullif/coalesce pairs are the only place
-	// that distinction survives. The tool lists follow the same rule with nil
+	// that distinction survives. The tool lists, the extra lists and the key allowlists follow the same rule with nil
 	// as "unset": a Project built by hand keeps them, an empty non-nil slice
 	// clears them.
 	_, err := s.pool.Exec(ctx, `UPDATE projects SET name=$1, model_connection_id=$2, rag_store_id=$3,
@@ -268,11 +318,17 @@ func (s *Store) UpdateProject(ctx context.Context, p *Project) (*Project, error)
 		history_turns_for_query=COALESCE(NULLIF($12::int, 0), history_turns_for_query),
 		query_model_connection_id=$13, tool_allow=COALESCE($14::text[], tool_allow), tool_deny=COALESCE($15::text[], tool_deny),
 		session_token_cap=$16,
-		updated_at=now() WHERE id=$17`,
+		end_user_rpm=$17, end_user_tpm=$18, end_user_daily_tokens=$19, end_user_monthly_tokens=$20,
+		extra_allow=COALESCE($21::text[], extra_allow), extra_deny=COALESCE($22::text[], extra_deny),
+		key_allowed_cidrs=COALESCE($23::text[]::cidr[], key_allowed_cidrs),
+		key_allowed_origins=COALESCE($24::text[], key_allowed_origins),
+		updated_at=now() WHERE id=$25`,
 		p.Name, p.ModelConnectionID, p.RAGStoreID, p.SystemPrompt,
 		p.RateLimitRPM, p.RateLimitTPM, p.BudgetDailyTokens, p.BudgetMonthlyTokens,
 		p.ContextPlacement, p.RetrievalPolicy, p.QueryStrategy, p.HistoryTurnsForQuery, p.QueryModelConnectionID,
-		p.ToolAllow, p.ToolDeny, p.SessionTokenCap, p.ID)
+		p.ToolAllow, p.ToolDeny, p.SessionTokenCap,
+		p.EndUserRPM, p.EndUserTPM, p.EndUserDailyTokens, p.EndUserMonthlyTokens,
+		p.ExtraAllow, p.ExtraDeny, p.KeyAllowedCIDRs, p.KeyAllowedOrigins, p.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +350,24 @@ func (s *Store) RotateProjectKey(ctx context.Context, id int64) (string, error) 
 		return "", ErrNotFound
 	}
 	return key, nil
+}
+
+// SetProjectGuardrails replaces the project's guardrail configuration. raw is
+// the JSON object internal/guardrail validated; nil clears it. The project's
+// updated_at moves with it. ErrNotFound when the project does not exist.
+func (s *Store) SetProjectGuardrails(ctx context.Context, id int64, raw json.RawMessage) error {
+	var arg any
+	if raw != nil {
+		arg = []byte(raw)
+	}
+	res, err := s.pool.Exec(ctx, "UPDATE projects SET guardrails=$1::jsonb, updated_at=now() WHERE id=$2", arg, id)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // GetProject fetches one project.

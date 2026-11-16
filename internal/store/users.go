@@ -140,14 +140,21 @@ type UserStats struct {
 	*User
 	ProjectCount   int `json:"project_count"`
 	ActiveSessions int `json:"active_sessions"`
+	// TOTPEnabled is whether the account's second factor is switched on, as
+	// /me reports it (ADR-037); a secret nobody confirmed reads false.
+	TOTPEnabled bool `json:"totp_enabled"`
+	// AnonymizedAt is when the account was anonymized (ADR-040); nil otherwise.
+	AnonymizedAt *time.Time `json:"anonymized_at"`
 }
 
 // ListUsersWithStats returns every account ordered by name together with
-// its number of project memberships and unexpired sessions.
+// its number of project memberships and unexpired sessions, whether its second
+// factor is on and when it was anonymized.
 func (s *Store) ListUsersWithStats(ctx context.Context) ([]*UserStats, error) {
 	rows, err := s.pool.Query(ctx, "SELECT "+userCols+`,
 		(SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = users.id),
-		(SELECT COUNT(*) FROM sessions se WHERE se.user_id = users.id AND se.expires_at > now())
+		(SELECT COUNT(*) FROM sessions se WHERE se.user_id = users.id AND se.expires_at > now()),
+		(totp_secret_enc IS NOT NULL AND totp_enabled_at IS NOT NULL), anonymized_at
 		FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
@@ -160,8 +167,12 @@ func (s *Store) ListUsersWithStats(ctx context.Context) ([]*UserStats, error) {
 		var created time.Time
 		var lastLogin *time.Time
 		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.IsActive, &lastLogin, &created,
-			&st.ProjectCount, &st.ActiveSessions); err != nil {
+			&st.ProjectCount, &st.ActiveSessions, &st.TOTPEnabled, &st.AnonymizedAt); err != nil {
 			return nil, err
+		}
+		if st.AnonymizedAt != nil {
+			t := st.AnonymizedAt.UTC()
+			st.AnonymizedAt = &t
 		}
 		if lastLogin != nil {
 			t := lastLogin.UTC()
@@ -205,6 +216,18 @@ const lockAdminChange int64 = 0x7261676d75780002
 func (s *Store) UpdateUser(ctx context.Context, id int64, role string, isActive bool) (*User, error) {
 	var out *User
 	err := s.adminGuardedTx(ctx, id, func(tx pgx.Tx) error {
+		// An anonymized account stays closed (ADR-040): switching it back on
+		// would let new personal data accumulate under an account that can no
+		// longer be anonymized again.
+		if isActive {
+			var anonymized bool
+			if err := tx.QueryRow(ctx, "SELECT anonymized_at IS NOT NULL FROM users WHERE id = $1", id).Scan(&anonymized); err != nil {
+				return scanErr(err)
+			}
+			if anonymized {
+				return ErrAlreadyAnonymized
+			}
+		}
 		u, err := scanUser(tx.QueryRow(ctx,
 			"UPDATE users SET role = $1, is_active = $2 WHERE id = $3 RETURNING "+userCols, role, isActive, id))
 		out = u
@@ -276,10 +299,29 @@ func (s *Store) adminGuardedTx(ctx context.Context, id int64, fn func(tx pgx.Tx)
 	return tx.Commit(ctx)
 }
 
-// UpdateUserPassword replaces the stored hash.
+// UpdateUserPassword replaces the stored hash. An anonymized account keeps the
+// unusable hash anonymization gave it: the call fails with ErrAlreadyAnonymized
+// and changes nothing (ADR-040).
 func (s *Store) UpdateUserPassword(ctx context.Context, id int64, passwordHash string) error {
-	_, err := s.pool.Exec(ctx, "UPDATE users SET password_hash = $1 WHERE id = $2", passwordHash, id)
-	return err
+	res, err := s.pool.Exec(ctx, "UPDATE users SET password_hash = $1 WHERE id = $2 AND anonymized_at IS NULL", passwordHash, id)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() > 0 {
+		return nil
+	}
+	var anonymized bool
+	err = s.pool.QueryRow(ctx, "SELECT anonymized_at IS NOT NULL FROM users WHERE id = $1", id).Scan(&anonymized)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // unknown id: nothing to change, as before
+	}
+	if err != nil {
+		return err
+	}
+	if anonymized {
+		return ErrAlreadyAnonymized
+	}
+	return nil
 }
 
 // TouchLastLogin records a successful login time.
@@ -355,6 +397,39 @@ func (s *Store) RevokeUserSessions(ctx context.Context, userID int64) (int64, er
 // with the given token hash (the session performing the change).
 func (s *Store) DeleteUserSessionsExcept(ctx context.Context, userID int64, tokenHash string) error {
 	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2", userID, tokenHash)
+	return err
+}
+
+// ClaimSessionPasswordAttempt counts one password try against the session
+// before the password is checked (T10), so that parallel requests cannot try
+// more than SessionPasswordBudget passwords between them. It returns the number
+// of tries the session has made including this one, and ok=false when the
+// budget was already spent or the session is gone: the password must not be
+// tried then.
+func (s *Store) ClaimSessionPasswordAttempt(ctx context.Context, tokenHash string) (tries int, ok bool, err error) {
+	var n int16
+	err = s.pool.QueryRow(ctx, `UPDATE sessions SET password_failures = password_failures + 1
+		WHERE token_hash = $1 AND password_failures < $2 RETURNING password_failures`,
+		tokenHash, SessionPasswordBudget).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return int(n), true, nil
+}
+
+// ResetSessionPasswordAttempts clears the session's tries after a right
+// password.
+func (s *Store) ResetSessionPasswordAttempts(ctx context.Context, tokenHash string) error {
+	_, err := s.pool.Exec(ctx, "UPDATE sessions SET password_failures = 0 WHERE token_hash = $1", tokenHash)
+	return err
+}
+
+// DeleteSessionByHash revokes a session by the hash of its token.
+func (s *Store) DeleteSessionByHash(ctx context.Context, tokenHash string) error {
+	_, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE token_hash = $1", tokenHash)
 	return err
 }
 

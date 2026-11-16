@@ -68,28 +68,27 @@ type Service struct {
 	TrustProxy bool
 }
 
-// ErrInvalidCredentials is returned by Login on a bad username/password.
+// ErrInvalidCredentials is returned by Authenticate on a bad username/password.
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
-// Login checks credentials and creates a session token.
-func (s *Service) Login(ctx context.Context, username, password string) (*store.User, string, error) {
+// Authenticate checks a username and password and returns the account. It
+// issues no session: the caller decides, after asking whether the account has
+// a second factor (ADR-037), between NewSession and a login challenge. There is
+// deliberately no method that does both, so no caller can skip that question.
+func (s *Service) Authenticate(ctx context.Context, username, password string) (*store.User, error) {
 	u, err := s.Store.GetUserByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// Burn similar time to a real comparison.
 			_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$7EqJtq98hPqEX7fNZaFWoOhi5XKnb6.7YyN5m9uI0dKJmB9Zxy1Pa"), []byte(password))
-			return nil, "", ErrInvalidCredentials
+			return nil, ErrInvalidCredentials
 		}
-		return nil, "", err
+		return nil, err
 	}
 	if !CheckPassword(u.PasswordHash, password) || !u.IsActive {
-		return nil, "", ErrInvalidCredentials
+		return nil, ErrInvalidCredentials
 	}
-	tok, err := s.NewSession(ctx, u.ID)
-	if err != nil {
-		return nil, "", err
-	}
-	return u, tok, nil
+	return u, nil
 }
 
 // NewSession issues a session token for a user whose identity the caller
@@ -103,6 +102,22 @@ func (s *Service) NewSession(ctx context.Context, userID int64) (string, error) 
 		return "", err
 	}
 	return tok, nil
+}
+
+// NewSessionIfNoTOTP is NewSession for a one-step login: it issues the session
+// only while the account has no second factor, and reports whether it did. When
+// it did not, TOTP was switched on after the caller last looked, and the caller
+// owes the user a challenge instead.
+func (s *Service) NewSessionIfNoTOTP(ctx context.Context, userID int64) (string, bool, error) {
+	tok, err := store.GenerateSessionToken()
+	if err != nil {
+		return "", false, err
+	}
+	ok, err := s.Store.CreateSessionIfNoTOTP(ctx, userID, tok, s.TTL)
+	if err != nil || !ok {
+		return "", false, err
+	}
+	return tok, true, nil
 }
 
 // Logout revokes the session in the request.

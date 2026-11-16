@@ -166,3 +166,100 @@ func TestQueryCondenseOutcomeIsBounded(t *testing.T) {
 	var nilMetrics *Metrics
 	nilMetrics.RecordQueryCondense(CondenseOK) // must not panic
 }
+
+// TestWebhookDeliveryLabelsAreBounded: purpose and outcome are chosen by the
+// webhook package from closed sets, and RecordWebhookDelivery holds the line
+// even if a caller one day passes it a URL or an error message (ADR-002).
+func TestWebhookDeliveryLabelsAreBounded(t *testing.T) {
+	reg := metrics.New(metrics.Options{})
+	m := New(reg)
+	m.RecordWebhookDelivery(WebhookPurposeAlerts, WebhookDelivered)
+	m.RecordWebhookDelivery(WebhookPurposeGuardrail, WebhookFailed)
+	for _, bad := range []string{"https://hooks.example/secret-path", "ALERTS", "", "x\ny"} {
+		m.RecordWebhookDelivery(bad, bad)
+	}
+	text := reg.Text()
+	if !strings.Contains(text, `ragmux_webhook_deliveries_total{outcome="delivered",purpose="alerts"} 1`) &&
+		!strings.Contains(text, `ragmux_webhook_deliveries_total{purpose="alerts",outcome="delivered"} 1`) {
+		t.Errorf("delivered alert not counted:\n%s", text)
+	}
+	if n := strings.Count(text, "ragmux_webhook_deliveries_total{"); n != 3 {
+		t.Errorf("%d series, want the two real ones plus other/other:\n%s", n, text)
+	}
+	if strings.Contains(text, "hooks.example") || strings.Contains(text, "secret-path") {
+		t.Error("a URL reached a label")
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordWebhookDelivery(WebhookPurposeAlerts, WebhookRetry) // must not panic
+}
+
+// TestGuardrailLabelsAreBounded: the stage, the action and the webhook outcome
+// come from closed sets, and a rule id or any other string a caller passes
+// collapses into "other" instead of becoming a label (ADR-002, PRD rule 10).
+func TestGuardrailLabelsAreBounded(t *testing.T) {
+	reg := metrics.New(metrics.Options{})
+	m := New(reg)
+	m.RecordGuardrailEvents("7", GuardrailStagePreRequest, GuardrailRedact, 3)
+	m.RecordGuardrailEvents("7", GuardrailStagePostResponse, GuardrailBlock, 1)
+	m.RecordGuardrailEvents("7", GuardrailStagePostResponse, GuardrailBlock, 0) // nothing happened: no series
+	for _, bad := range []string{"tckn-rule", "10000000146", "", "x\ny"} {
+		m.RecordGuardrailEvents("7", bad, bad, 1)
+	}
+	m.RecordGuardrailWebhook("7", GuardrailWebhookOK)
+	m.RecordGuardrailWebhook("7", GuardrailWebhookSkippedFailOpen)
+	m.RecordGuardrailWebhook("7", "https://hooks.example/secret-path")
+	text := reg.Text()
+	for _, want := range []string{
+		`ragmux_guardrail_events_total{project="7",stage="pre_request",action="redact"} 3`,
+		`ragmux_guardrail_events_total{project="7",stage="post_response",action="block"} 1`,
+		`ragmux_guardrail_events_total{project="7",stage="other",action="other"} 4`,
+		`ragmux_guardrail_webhook_total{project="7",outcome="ok"} 1`,
+		`ragmux_guardrail_webhook_total{project="7",outcome="skipped_fail_open"} 1`,
+		`ragmux_guardrail_webhook_total{project="7",outcome="other"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %s in:\n%s", want, text)
+		}
+	}
+	if n := strings.Count(text, "ragmux_guardrail_events_total{"); n != 3 {
+		t.Errorf("%d event series, want 3:\n%s", n, text)
+	}
+	for _, leak := range []string{"tckn-rule", "10000000146", "hooks.example"} {
+		if strings.Contains(text, leak) {
+			t.Errorf("%q reached a label", leak)
+		}
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordGuardrailEvents("7", GuardrailStagePreRequest, GuardrailFlag, 1) // must not panic
+	nilMetrics.RecordGuardrailWebhook("7", GuardrailWebhookOK)
+}
+
+// TestKeyDeniedLabelIsBounded: ragmux_gateway_key_denied_total{reason} takes
+// the two reasons of ADR-039 and nothing else; any other string collapses into
+// "other" instead of becoming a label.
+func TestKeyDeniedLabelIsBounded(t *testing.T) {
+	reg := metrics.New(metrics.Options{})
+	m := New(reg)
+	m.RecordKeyDenied(KeyDeniedIP)
+	m.RecordKeyDenied(KeyDeniedIP)
+	m.RecordKeyDenied(KeyDeniedOrigin)
+	m.RecordKeyDenied("203.0.113.9")
+	m.RecordKeyDenied("https://evil.example")
+	text := reg.Text()
+	for _, want := range []string{
+		`ragmux_gateway_key_denied_total{reason="ip_not_allowed"} 2`,
+		`ragmux_gateway_key_denied_total{reason="origin_not_allowed"} 1`,
+		`ragmux_gateway_key_denied_total{reason="other"} 2`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %s in:\n%s", want, text)
+		}
+	}
+	for _, leak := range []string{"203.0.113.9", "evil.example"} {
+		if strings.Contains(text, leak) {
+			t.Errorf("%q reached a label", leak)
+		}
+	}
+	var nilMetrics *Metrics
+	nilMetrics.RecordKeyDenied(KeyDeniedIP) // must not panic
+}

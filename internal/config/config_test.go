@@ -400,3 +400,161 @@ func TestLoadOTLPInsecure(t *testing.T) {
 		t.Errorf("a bad traces value must be rejected naming its variable, got %v", err)
 	}
 }
+
+// PRIVATE_WEBHOOK_ALLOWLIST is its own list (ADR-033): an upstream exemption
+// must not leak to a webhook URL a project editor types, nor the reverse.
+func TestLoadPrivateWebhookAllowlist(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db")
+	t.Setenv("PRIVATE_WEBHOOK_ALLOWLIST", " Guard.Internal ,pii.local.,, ")
+	t.Setenv("PRIVATE_UPSTREAM_ALLOWLIST", "ollama")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"guard.internal": true, "pii.local": true}
+	if len(c.PrivateWebhookAllowlist) != len(want) {
+		t.Fatalf("webhook allowlist = %v, want %v", c.PrivateWebhookAllowlist, want)
+	}
+	for h := range want {
+		if !c.PrivateWebhookAllowlist[h] {
+			t.Errorf("webhook allowlist = %v, missing %q", c.PrivateWebhookAllowlist, h)
+		}
+	}
+	if c.PrivateWebhookAllowlist["ollama"] {
+		t.Error("PRIVATE_UPSTREAM_ALLOWLIST filled the webhook allowlist")
+	}
+	if !c.PrivateUpstreamAllowlist["ollama"] || c.PrivateUpstreamAllowlist["guard.internal"] {
+		t.Errorf("upstream allowlist = %v, want only ollama", c.PrivateUpstreamAllowlist)
+	}
+
+	t.Setenv("PRIVATE_WEBHOOK_ALLOWLIST", "")
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PrivateWebhookAllowlist == nil || len(c.PrivateWebhookAllowlist) != 0 {
+		t.Errorf("unset webhook allowlist = %v, want an empty non-nil map", c.PrivateWebhookAllowlist)
+	}
+}
+
+// keySourceEnv clears every variable the key source reads, so a developer's
+// own environment cannot leak into the test.
+func keySourceEnv(t *testing.T, set map[string]string) {
+	t.Helper()
+	t.Setenv("DATABASE_URL", "postgres://x/y")
+	for _, k := range []string{"SECRET_KEY", "SECRET_KEY_FILE", "SECRET_KEY_SOURCE", "SECRET_KEY_WRAPPED",
+		"SECRET_KEY_WRAPPED_FILE", "VAULT_ADDR", "VAULT_TRANSIT_KEY", "VAULT_TRANSIT_MOUNT", "VAULT_TOKEN",
+		"VAULT_TOKEN_FILE", "VAULT_NAMESPACE", "VAULT_CACERT", "AWS_REGION", "AWS_DEFAULT_REGION"} {
+		t.Setenv(k, "")
+	}
+	for k, v := range set {
+		t.Setenv(k, v)
+	}
+}
+
+func TestLoadKeySourceDefaultsToEnv(t *testing.T) {
+	keySourceEnv(t, map[string]string{"SECRET_KEY": strings.Repeat("ab", 32)})
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.KeySource.Source != "env" || c.KeySource.Remote() || c.SecretKeyHex != strings.Repeat("ab", 32) {
+		t.Errorf("source %q, key %q", c.KeySource.Source, c.SecretKeyHex)
+	}
+
+	// No key at all is still fine: the secret.key fallback.
+	keySourceEnv(t, nil)
+	if c, err := Load(); err != nil || c.KeySource.Source != "env" || c.SecretKeyHex != "" {
+		t.Errorf("fallback: %q %q %v", c.KeySource.Source, c.SecretKeyHex, err)
+	}
+
+	// The 64-hex check still guards the env path.
+	keySourceEnv(t, map[string]string{"SECRET_KEY": "short"})
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "64 hex") {
+		t.Errorf("bad hex: %v", err)
+	}
+}
+
+func TestLoadVaultTransitSource(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "token")
+	wrappedFile := filepath.Join(dir, "wrapped")
+	if err := os.WriteFile(tokenFile, []byte(" s.filetoken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wrappedFile, []byte("vault:v1:abc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keySourceEnv(t, map[string]string{
+		"SECRET_KEY_SOURCE": "Vault_Transit", "SECRET_KEY_WRAPPED_FILE": wrappedFile,
+		"VAULT_ADDR": "https://vault.test:8200", "VAULT_TRANSIT_KEY": "ragmux", "VAULT_TOKEN_FILE": tokenFile,
+		"VAULT_NAMESPACE": "team", "VAULT_CACERT": "/etc/ca.pem", "VAULT_TRANSIT_MOUNT": "kms",
+	})
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks := c.KeySource
+	if ks.Source != "vault_transit" || ks.Wrapped != "vault:v1:abc" || ks.VaultToken != "s.filetoken" ||
+		ks.VaultAddr != "https://vault.test:8200" || ks.VaultTransitKey != "ragmux" || ks.VaultTransitMount != "kms" ||
+		ks.VaultNamespace != "team" || ks.VaultCACert != "/etc/ca.pem" {
+		t.Errorf("key source = %+v", ks)
+	}
+	if c.SecretKeyHex != "" {
+		t.Errorf("SecretKeyHex = %q, want empty", c.SecretKeyHex)
+	}
+
+	t.Setenv("VAULT_TOKEN", "s.plain")
+	if c, err := Load(); err != nil || c.KeySource.VaultToken != "s.plain" {
+		t.Errorf("plain token should win: %q %v", c.KeySource.VaultToken, err)
+	}
+}
+
+func TestLoadAWSKMSSource(t *testing.T) {
+	keySourceEnv(t, map[string]string{"SECRET_KEY_SOURCE": "aws_kms", "SECRET_KEY_WRAPPED": "AAAA", "AWS_REGION": "eu-west-1"})
+	c, err := Load()
+	if err != nil || c.KeySource.AWSRegion != "eu-west-1" || !c.KeySource.Remote() {
+		t.Fatalf("%+v %v", c.KeySource, err)
+	}
+	keySourceEnv(t, map[string]string{"SECRET_KEY_SOURCE": "aws_kms", "SECRET_KEY_WRAPPED": "AAAA", "AWS_DEFAULT_REGION": "us-east-2"})
+	if c, err := Load(); err != nil || c.KeySource.AWSRegion != "us-east-2" {
+		t.Errorf("AWS_DEFAULT_REGION: %q %v", c.KeySource.AWSRegion, err)
+	}
+}
+
+func TestLoadKeySourceErrors(t *testing.T) {
+	vault := map[string]string{"SECRET_KEY_SOURCE": "vault_transit", "SECRET_KEY_WRAPPED": "vault:v1:x",
+		"VAULT_ADDR": "https://v.test", "VAULT_TRANSIT_KEY": "k", "VAULT_TOKEN": "t"}
+	with := func(over map[string]string) map[string]string {
+		m := map[string]string{}
+		for k, v := range vault {
+			m[k] = v
+		}
+		for k, v := range over {
+			m[k] = v
+		}
+		return m
+	}
+	for name, tc := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"unknown source":      {map[string]string{"SECRET_KEY_SOURCE": "gcp"}, "invalid SECRET_KEY_SOURCE"},
+		"vault + SECRET_KEY":  {with(map[string]string{"SECRET_KEY": strings.Repeat("ab", 32)}), "SECRET_KEY"},
+		"vault no wrapped":    {with(map[string]string{"SECRET_KEY_WRAPPED": ""}), "SECRET_KEY_WRAPPED"},
+		"vault no token":      {with(map[string]string{"VAULT_TOKEN": ""}), "VAULT_TOKEN"},
+		"vault http":          {with(map[string]string{"VAULT_ADDR": "http://v.test"}), "https"},
+		"vault missing token": {with(map[string]string{"VAULT_TOKEN": "", "VAULT_TOKEN_FILE": "/nonexistent/token"}), "VAULT_TOKEN_FILE"},
+		"kms no region":       {map[string]string{"SECRET_KEY_SOURCE": "aws_kms", "SECRET_KEY_WRAPPED": "AAAA"}, "AWS_REGION"},
+		"env + wrapped":       {map[string]string{"SECRET_KEY_WRAPPED": "AAAA"}, "SECRET_KEY_WRAPPED"},
+	} {
+		keySourceEnv(t, tc.env)
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want it to mention %q", name, err, tc.want)
+		}
+		if err != nil && strings.Contains(err.Error(), "vault:v1:x") {
+			t.Errorf("%s: the wrapped key is in the error", name)
+		}
+	}
+}

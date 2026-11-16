@@ -169,6 +169,9 @@ func (a *Admin) updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := a.Store.UpdateUser(r.Context(), id, role, active)
 	if err != nil {
+		if anonymizedRefusal(w, err) {
+			return
+		}
 		a.fail(w, err)
 		return
 	}
@@ -243,6 +246,13 @@ func (a *Admin) resetPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
+	// One's own password has a way: changePassword, which asks for the current
+	// one. Resetting it here would walk around that, and around the second
+	// factor's disable (T12; updateUser and deleteUser close the same door).
+	if auth.UserFrom(r.Context()).ID == id {
+		writeErr(w, http.StatusBadRequest, "you cannot reset your own password here; change it with your current password")
+		return
+	}
 	target, err := a.Store.GetUser(r.Context(), id)
 	if err != nil {
 		a.fail(w, err)
@@ -254,6 +264,9 @@ func (a *Admin) resetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Store.UpdateUserPassword(r.Context(), id, hash); err != nil {
+		if anonymizedRefusal(w, err) {
+			return
+		}
 		a.fail(w, err)
 		return
 	}
@@ -266,6 +279,12 @@ func (a *Admin) resetPassword(w http.ResponseWriter, r *http.Request) {
 	// sessions; they would otherwise keep acting on it.
 	revoked, err := a.Store.RevokeUserManagementKeys(r.Context(), id)
 	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	// ... and it is a way out of the second factor's lock: the account's wrong
+	// codes are forgotten and its open challenges closed.
+	if err := a.Store.ClearUserMFAState(r.Context(), id); err != nil {
 		a.fail(w, err)
 		return
 	}

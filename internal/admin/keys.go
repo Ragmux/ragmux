@@ -35,6 +35,35 @@ type keyInput struct {
 	RateLimitTPM        int     `json:"rate_limit_tpm"`
 	BudgetDailyTokens   int64   `json:"budget_daily_tokens"`
 	BudgetMonthlyTokens int64   `json:"budget_monthly_tokens"`
+	// AllowedCIDRs and AllowedOrigins are the key's network allowlists
+	// (ADR-039). A field left out keeps the key's current lists on update and
+	// takes empty lists on create, so a client that does not know them (an
+	// older dashboard, a script) never clears a restriction by saving the rest
+	// of the key; an empty list clears one. Gateway keys only.
+	AllowedCIDRs   *[]string `json:"allowed_cidrs"`
+	AllowedOrigins *[]string `json:"allowed_origins"`
+}
+
+// keyResponse is an updated key with the warnings the save produced, flattened
+// into one JSON object.
+type keyResponse struct {
+	*store.APIKey
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// proxyWarning is what a save that stores a CIDR allowlist says when the
+// deployment trusts X-Forwarded-For from anywhere (ADR-039): the list can then
+// be walked around with a forged header.
+const proxyWarning = "TRUST_PROXY_HEADERS is on and TRUSTED_PROXY_CIDRS is empty, so X-Forwarded-For is " +
+	"accepted from any connection and a client can forge the address the CIDR allowlist checks; " +
+	"set TRUSTED_PROXY_CIDRS to the network of your reverse proxy"
+
+// networkWarnings lists the warnings for a CIDR allowlist that was just saved.
+func (a *Admin) networkWarnings(cidrs []string) []string {
+	if a.ProxyHeadersUnverified && len(cidrs) > 0 {
+		return []string{proxyWarning}
+	}
+	return nil
 }
 
 // expiry parses ExpiresAt. A nil pointer and an empty string both mean "no
@@ -100,6 +129,9 @@ func (a *Admin) validateKey(r *http.Request, in *keyInput, k *store.APIKey) erro
 		if in.RateLimitRPM != 0 || in.RateLimitTPM != 0 || in.BudgetDailyTokens != 0 || in.BudgetMonthlyTokens != 0 {
 			return errors.New("a management key has no rate limits or budgets")
 		}
+		if in.AllowedCIDRs != nil && len(*in.AllowedCIDRs) > 0 || in.AllowedOrigins != nil && len(*in.AllowedOrigins) > 0 {
+			return errors.New("a management key has no network allowlist")
+		}
 		k.ProjectIDs, k.DefaultProjectID = nil, nil
 		k.RateLimitRPM, k.RateLimitTPM, k.BudgetDailyTokens, k.BudgetMonthlyTokens = 0, 0, 0, 0
 		return nil
@@ -109,6 +141,20 @@ func (a *Admin) validateKey(r *http.Request, in *keyInput, k *store.APIKey) erro
 	}
 	k.RateLimitRPM, k.RateLimitTPM = in.RateLimitRPM, in.RateLimitTPM
 	k.BudgetDailyTokens, k.BudgetMonthlyTokens = in.BudgetDailyTokens, in.BudgetMonthlyTokens
+	if in.AllowedCIDRs != nil {
+		cidrs, err := store.NormalizeCIDRs(*in.AllowedCIDRs)
+		if err != nil {
+			return errors.New("allowed_cidrs: " + err.Error())
+		}
+		k.AllowedCIDRs = cidrs
+	}
+	if in.AllowedOrigins != nil {
+		origins, err := store.NormalizeOrigins(*in.AllowedOrigins)
+		if err != nil {
+			return errors.New("allowed_origins: " + err.Error())
+		}
+		k.AllowedOrigins = origins
+	}
 	// The key's own reach is bounded by the owner, not by the caller: an
 	// admin minting a key for someone grants only what that account can see.
 	owner := actor
@@ -265,7 +311,11 @@ func (a *Admin) createKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "apikey.create", "api_key", ptr(out.ID), keyDetails(out))
-	writeJSON(w, http.StatusCreated, map[string]any{"key": out, "api_key": secret})
+	resp := map[string]any{"key": out, "api_key": secret}
+	if warn := a.networkWarnings(out.AllowedCIDRs); warn != nil {
+		resp["warnings"] = warn
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (a *Admin) getKey(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +365,7 @@ func (a *Admin) updateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "apikey.update", "api_key", ptr(out.ID), keyDetails(out))
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, keyResponse{APIKey: out, Warnings: a.networkWarnings(out.AllowedCIDRs)})
 }
 
 func (a *Admin) revokeKey(w http.ResponseWriter, r *http.Request) {
@@ -328,7 +378,7 @@ func (a *Admin) revokeKey(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "apikey.revoke", "api_key", ptr(out.ID), map[string]any{"name": out.Name, "kind": out.Kind})
+	a.audit(r, "apikey.revoke", "api_key", ptr(out.ID), map[string]any{"name": out.Name, "kind": out.Kind, "user_id": out.UserID})
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -349,7 +399,7 @@ func (a *Admin) deleteKey(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.audit(r, "apikey.delete", "api_key", ptr(k.ID), map[string]any{"name": k.Name, "kind": k.Kind})
+	a.audit(r, "apikey.delete", "api_key", ptr(k.ID), map[string]any{"name": k.Name, "kind": k.Kind, "user_id": k.UserID})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -377,6 +427,12 @@ func keyDetails(k *store.APIKey) map[string]any {
 		"scopes": k.Scopes, "key_prefix": k.KeyPrefix}
 	if len(k.ProjectIDs) > 0 {
 		d["project_ids"] = k.ProjectIDs
+	}
+	if len(k.AllowedCIDRs) > 0 {
+		d["allowed_cidrs"] = k.AllowedCIDRs
+	}
+	if len(k.AllowedOrigins) > 0 {
+		d["allowed_origins"] = k.AllowedOrigins
 	}
 	if k.ExpiresAt != nil {
 		d["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)

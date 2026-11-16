@@ -93,12 +93,15 @@ const (
 	RAGSkipToolTurn  = "tool_turn"
 	RAGSkipGreeting  = "greeting"
 	RAGSkipAck       = "ack"
+	// RAGSkipGuardrail is a pre_retrieval block rule (ADR-034): the query
+	// matched, so nothing is searched and the request goes on without context.
+	RAGSkipGuardrail = "guardrail"
 )
 
 // ragSkipReasons is the closed set above, for the guard in RecordRAGSkipped.
 var ragSkipReasons = map[string]bool{
 	RAGSkipPolicyOff: true, RAGSkipClientOff: true, RAGSkipToolTurn: true,
-	RAGSkipGreeting: true, RAGSkipAck: true,
+	RAGSkipGreeting: true, RAGSkipAck: true, RAGSkipGuardrail: true,
 }
 
 // Query condense outcomes (ADR-024), the values of
@@ -116,6 +119,67 @@ const (
 var condenseOutcomes = map[string]bool{
 	CondenseOK: true, CondenseError: true, CondenseTimeout: true, CondenseInvalid: true,
 }
+
+// Webhook purposes and delivery outcomes (ADR-033), the values of
+// ragmux_webhook_deliveries_total{purpose,outcome}. Both sets are closed on
+// purpose: the endpoint URL, the receiver's reply and err.Error() are never
+// labels (ADR-002). "retry" is an attempt that failed and was rescheduled,
+// "failed" a delivery that ran out of attempts (or a synchronous call that
+// failed), "disabled" a 410 Gone that closed the endpoint.
+const (
+	WebhookPurposeGuardrail = "guardrail"
+	WebhookPurposeAlerts    = "alerts"
+
+	WebhookDelivered = "delivered"
+	WebhookRetry     = "retry"
+	WebhookFailed    = "failed"
+	WebhookDisabled  = "disabled"
+)
+
+// Guardrail stages, actions and webhook outcomes (ADR-034), the values of
+// ragmux_guardrail_events_total{project,stage,action} and
+// ragmux_guardrail_webhook_total{project,outcome}. Both are closed sets and the
+// id of a rule is never a label: it is the editor's own string, and the rules
+// that fired are on the request log row. "skipped_fail_open" is a webhook that
+// failed in a project that lets the request through anyway; a failure in a
+// project that does not is "error" or "timeout".
+const (
+	GuardrailStagePreRequest   = "pre_request"
+	GuardrailStagePreRetrieval = "pre_retrieval"
+	GuardrailStagePostResponse = "post_response"
+
+	GuardrailBlock  = "block"
+	GuardrailRedact = "redact"
+	GuardrailFlag   = "flag"
+
+	GuardrailWebhookOK              = "ok"
+	GuardrailWebhookError           = "error"
+	GuardrailWebhookTimeout         = "timeout"
+	GuardrailWebhookSkippedFailOpen = "skipped_fail_open"
+)
+
+var (
+	guardrailStages = map[string]bool{GuardrailStagePreRequest: true, GuardrailStagePreRetrieval: true,
+		GuardrailStagePostResponse: true}
+	guardrailActions = map[string]bool{GuardrailBlock: true, GuardrailRedact: true, GuardrailFlag: true}
+	guardrailOutcome = map[string]bool{GuardrailWebhookOK: true, GuardrailWebhookError: true,
+		GuardrailWebhookTimeout: true, GuardrailWebhookSkippedFailOpen: true}
+)
+
+// Reasons a key's network allowlist refused a request (ADR-039), the values of
+// ragmux_gateway_key_denied_total{reason}: a closed set, and neither the key,
+// the address nor the origin is ever a label.
+const (
+	KeyDeniedIP     = "ip_not_allowed"
+	KeyDeniedOrigin = "origin_not_allowed"
+)
+
+var keyDeniedReasons = map[string]bool{KeyDeniedIP: true, KeyDeniedOrigin: true}
+
+var (
+	webhookPurposes = map[string]bool{WebhookPurposeGuardrail: true, WebhookPurposeAlerts: true}
+	webhookOutcomes = map[string]bool{WebhookDelivered: true, WebhookRetry: true, WebhookFailed: true, WebhookDisabled: true}
+)
 
 // Metrics holds every family this process exports.
 type Metrics struct {
@@ -160,6 +224,13 @@ type Metrics struct {
 	ingestEmbedTok  *metrics.CounterVec
 	ingestClaims    *metrics.CounterVec
 	ingestLeaseLost *metrics.CounterVec
+
+	webhookDeliveries *metrics.CounterVec
+
+	guardrailEvents  *metrics.CounterVec
+	guardrailWebhook *metrics.CounterVec
+
+	keyDenied *metrics.CounterVec
 
 	retentionLastSuccess *metrics.GaugeVec
 }
@@ -241,7 +312,7 @@ func New(reg *metrics.Registry) *Metrics {
 		"Passages returned by retrieval, by store.", "store")
 	m.ragSkipped = reg.Counter("ragmux_rag_skipped_total",
 		"Requests of a project with a RAG store that skipped retrieval, by a fixed reason: policy_off, "+
-			"client_off, tool_turn, greeting or ack.", "project", "reason")
+			"client_off, tool_turn, greeting, ack or guardrail.", "project", "reason")
 	m.ragCondense = reg.Counter("ragmux_rag_query_condense_total",
 		"Query condense calls (query_strategy condense) by outcome: ok, error, timeout or invalid. "+
 			"A failed call falls back to the last user message.", "outcome")
@@ -261,6 +332,23 @@ func New(reg *metrics.Registry) *Metrics {
 		"Dispatcher claim attempts by outcome.", "outcome")
 	m.ingestLeaseLost = reg.Counter("ragmux_ingest_lease_lost_total",
 		"Jobs abandoned because another replica took the document's lease.")
+
+	m.webhookDeliveries = reg.Counter("ragmux_webhook_deliveries_total",
+		"Outbound webhook attempts by purpose (guardrail, alerts) and outcome: delivered, retry, "+
+			"failed or disabled. The endpoint URL is never a label.", "purpose", "outcome")
+
+	m.guardrailEvents = reg.Counter("ragmux_guardrail_events_total",
+		"Guardrail matches by project, stage (pre_request, pre_retrieval, post_response) and action "+
+			"(block, redact, flag). A block counts once per request and stage, a redact or a flag once per "+
+			"match. The rule id is not a label.", "project", "stage", "action")
+	m.guardrailWebhook = reg.Counter("ragmux_guardrail_webhook_total",
+		"Guardrail webhook calls by project and outcome: ok, error, timeout or skipped_fail_open "+
+			"(failed, and the project lets the request through).", "project", "outcome")
+
+	m.keyDenied = reg.Counter("ragmux_gateway_key_denied_total",
+		"Requests refused with 403 because the key's IP or Origin allowlist did not admit them, by "+
+			"reason: ip_not_allowed or origin_not_allowed. The key, the address and the origin are "+
+			"not labels.", "reason")
 
 	m.retentionLastSuccess = reg.Gauge("ragmux_retention_last_success_timestamp_seconds",
 		"Unix time of the last retention pass this replica completed without error; 0 until one has. "+
@@ -526,6 +614,62 @@ func (m *Metrics) RecordQueryCondense(outcome string) {
 		outcome = otherLabel
 	}
 	m.ragCondense.With(outcome).Inc()
+}
+
+// RecordWebhookDelivery counts one webhook attempt. A purpose or outcome
+// outside the closed Webhook* sets is counted as "other" rather than becoming
+// a label.
+func (m *Metrics) RecordWebhookDelivery(purpose, outcome string) {
+	if m == nil {
+		return
+	}
+	if !webhookPurposes[purpose] {
+		purpose = otherLabel
+	}
+	if !webhookOutcomes[outcome] {
+		outcome = otherLabel
+	}
+	m.webhookDeliveries.With(purpose, outcome).Inc()
+}
+
+// RecordKeyDenied counts one request a key's network allowlist refused. A
+// reason outside the closed KeyDenied* set is counted as "other".
+func (m *Metrics) RecordKeyDenied(reason string) {
+	if m == nil {
+		return
+	}
+	if !keyDeniedReasons[reason] {
+		reason = otherLabel
+	}
+	m.keyDenied.With(reason).Inc()
+}
+
+// RecordGuardrailEvents counts n guardrail matches. A stage or action outside
+// the closed Guardrail* sets is counted as "other" rather than becoming a
+// label.
+func (m *Metrics) RecordGuardrailEvents(project, stage, action string, n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	if !guardrailStages[stage] {
+		stage = otherLabel
+	}
+	if !guardrailActions[action] {
+		action = otherLabel
+	}
+	m.guardrailEvents.With(project, stage, action).Add(uint64(n))
+}
+
+// RecordGuardrailWebhook counts one guardrail webhook call. An outcome outside
+// the closed GuardrailWebhook* set is counted as "other".
+func (m *Metrics) RecordGuardrailWebhook(project, outcome string) {
+	if m == nil {
+		return
+	}
+	if !guardrailOutcome[outcome] {
+		outcome = otherLabel
+	}
+	m.guardrailWebhook.With(project, outcome).Inc()
 }
 
 // RecordEmbedQuery records the query embedding call of a retrieval.

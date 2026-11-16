@@ -26,9 +26,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ragmux/ragmux/internal/admin"
+	"github.com/ragmux/ragmux/internal/alerts"
 	"github.com/ragmux/ragmux/internal/auth"
 	"github.com/ragmux/ragmux/internal/config"
 	"github.com/ragmux/ragmux/internal/gateway"
+	"github.com/ragmux/ragmux/internal/keysource"
 	"github.com/ragmux/ragmux/internal/limits"
 	"github.com/ragmux/ragmux/internal/maintenance"
 	"github.com/ragmux/ragmux/internal/mcp"
@@ -40,6 +42,7 @@ import (
 	"github.com/ragmux/ragmux/internal/rag"
 	"github.com/ragmux/ragmux/internal/store"
 	"github.com/ragmux/ragmux/internal/tracing"
+	"github.com/ragmux/ragmux/internal/webhook"
 	"github.com/ragmux/ragmux/web"
 )
 
@@ -94,6 +97,27 @@ func probe(port int) int {
 	return 0
 }
 
+// resolveSecretKey is the one place the instance key is obtained. The gateway,
+// reset-password and rotate-key all open the store through it: a command that
+// skipped it would reach the store with an empty key, take the secret.key
+// fallback and mint a new key in the data directory, then stop at the canary.
+//
+// With SECRET_KEY_SOURCE=env it returns cfg.SecretKeyHex and an empty source,
+// and the store decides between "env" and the secret.key fallback as it
+// always has. With vault_transit or aws_kms it opens SECRET_KEY_WRAPPED
+// (fail-closed, see internal/keysource) and returns the key with the source's
+// name; the store never falls back to a key file for those.
+func resolveSecretKey(ctx context.Context, cfg config.Config, log *slog.Logger) (keyHex, source string, err error) {
+	if !cfg.KeySource.Remote() {
+		return cfg.SecretKeyHex, "", nil
+	}
+	keyHex, err = keysource.Unwrap(ctx, cfg.KeySource, log)
+	if err != nil {
+		return "", "", err
+	}
+	return keyHex, cfg.KeySource.Source, nil
+}
+
 func run(cfg config.Config) error {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
@@ -110,11 +134,17 @@ func run(cfg config.Config) error {
 	bgCtx, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
 
+	// Before the database: a key that cannot be opened stops the process.
+	keyHex, keySource, err := resolveSecretKey(ctx, cfg, log)
+	if err != nil {
+		return fmt.Errorf("secret key: %w", err)
+	}
 	st, err := store.Open(ctx, store.OpenConfig{
-		DatabaseURL:  cfg.DatabaseURL,
-		MaxConns:     cfg.DBMaxConns,
-		SecretKeyHex: cfg.SecretKeyHex,
-		DataDir:      cfg.DataDir,
+		DatabaseURL:     cfg.DatabaseURL,
+		MaxConns:        cfg.DBMaxConns,
+		SecretKeyHex:    keyHex,
+		SecretKeySource: keySource,
+		DataDir:         cfg.DataDir,
 
 		PgSearchTokenizer: cfg.PgSearchTokenizer,
 	}, log)
@@ -294,8 +324,14 @@ func run(cfg config.Config) error {
 	authSvc := &auth.Service{Store: st, TTL: cfg.SessionTTL, Secure: os.Getenv("SECURE_COOKIES") == "true",
 		TrustProxy: cfg.TrustProxyHeaders}
 	usage := &limits.Limiter{Store: st}
+	// One outbound webhook client for the process: the guardrail webhook
+	// (synchronous) uses it through the gateway, and the delivery worker
+	// below shares it. WithMetrics is applied here because the helper takes
+	// only the config; the option is a plain function over the client.
+	webhookClient := newWebhookClient(cfg)
+	webhook.WithMetrics(met)(webhookClient)
 	gw := &gateway.Gateway{Store: st, Providers: providers, Retriever: retriever, Log: log, MaxBodyBytes: 4 << 20,
-		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer,
+		Limiter: usage, Prices: prices, Metrics: met, Tracer: tracer, Webhooks: webhookClient,
 		Rerankers:       func(c *store.ModelConnection) (provider.Reranker, error) { return provider.NewReranker(provCfg(c)) },
 		LLMRerank:       rag.LLMReranker{Timeout: cfg.RerankTimeout, MaxTokens: cfg.RerankMaxTokens},
 		UpstreamTimeout: cfg.UpstreamTimeout, MaxRetries: cfg.UpstreamMaxRetries,
@@ -307,12 +343,16 @@ func run(cfg config.Config) error {
 	adm := &admin.Admin{FTSRebuild: ftsRebuilder, Store: st, Auth: authSvc, Ingester: ingester, Retriever: retriever, Providers: providers,
 		Log: log, MaxUploadBytes: cfg.MaxUploadBytes, WebFS: web.FS, Limiter: limiter, Usage: usage, Prices: prices,
 		ProviderConfig: provCfg, AllowPrivateUpstreams: cfg.AllowPrivateUpstreams, PrivateAllowlist: cfg.PrivateUpstreamAllowlist,
-		MaxDocumentsPerStore: cfg.MaxDocumentsPerStore, MaxBytesPerStore: cfg.MaxBytesPerStore}
+		MaxDocumentsPerStore: cfg.MaxDocumentsPerStore, MaxBytesPerStore: cfg.MaxBytesPerStore,
+		PrivateWebhookAllowlist: cfg.PrivateWebhookAllowlist}
 
 	scriptHash, err := dashboardScriptHash(web.FS)
 	if err != nil {
 		return err
 	}
+
+	adm.ProxyHeadersUnverified = proxyHeadersUnverified(cfg)
+	warnUnverifiedProxyKeys(bgCtx, st, log, adm.ProxyHeadersUnverified)
 
 	r := chi.NewRouter()
 	// obs.RequestID, not middleware.RequestID: chi's starts from the
@@ -373,6 +413,26 @@ func run(cfg config.Config) error {
 	}()
 	log.Info("retention job scheduled", "log_retention_days", cfg.LogRetentionDays,
 		"audit_retention_days", cfg.AuditRetentionDays, "interval", maintenance.DefaultInterval)
+
+	// Limit alerts (ADR-036). The job turns crossed thresholds into outbox
+	// rows once a minute on one replica; the worker, on every replica, signs
+	// and sends them. Neither is on the request path, so a slow or dead
+	// receiver costs a delayed warning and nothing else. The worker is given
+	// the store through the audited wrapper so a receiver's 410 Gone, which
+	// closes its endpoint, is written to the audit trail.
+	deliveryWorker := webhook.NewWorker(alerts.NewAuditedDeliveries(st, log), webhookClient,
+		webhook.WithLogger(log), webhook.WithWorkerMetrics(met))
+	alertJob := alerts.NewJob(st, alerts.WithLogger(log))
+	deliveryWorkerDone := make(chan struct{})
+	go func() {
+		defer close(deliveryWorkerDone)
+		deliveryWorker.Run(bgCtx)
+	}()
+	alertJobDone := make(chan struct{})
+	go func() {
+		defer close(alertJobDone)
+		alertJob.Run(bgCtx)
+	}()
 
 	// The rebuild of the per-store-language full-text column (ADR-027). It
 	// resumes whatever a previous process left half done and is kicked by the
@@ -470,6 +530,8 @@ func run(cfg config.Config) error {
 	stopBackground()
 	<-janitorDone
 	<-ftsRebuildDone
+	<-deliveryWorkerDone
+	<-alertJobDone
 	log.Info("shutdown complete")
 	return shutErr
 }
@@ -546,6 +608,15 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 			log.Info("http", attrs...)
 		})
 	}
+}
+
+// newWebhookClient builds the process's outbound webhook client (ADR-033). It
+// dials through the SSRF guard with PRIVATE_WEBHOOK_ALLOWLIST as the only
+// exemption: PRIVATE_UPSTREAM_ALLOWLIST and ALLOW_PRIVATE_UPSTREAMS are for
+// provider URLs an operator typed and do not apply to a URL a project editor
+// typed.
+func newWebhookClient(cfg config.Config) *webhook.Client {
+	return webhook.NewClient(cfg.PrivateWebhookAllowlist, webhook.WithVersion(version))
 }
 
 // buildMetrics creates the registry and the metric set, or returns nils when
@@ -802,7 +873,8 @@ func cors(origins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Vary", "Origin")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers",
-					"Authorization, Content-Type, X-Ragmux-Project, X-Ragmux-Session, MCP-Protocol-Version, Mcp-Method, Mcp-Name, "+
+					"Authorization, Content-Type, X-Ragmux-Project, X-Ragmux-Session, X-Ragmux-End-User, X-Ragmux-Tags, "+
+						"MCP-Protocol-Version, Mcp-Method, Mcp-Name, "+
 						"x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access")
 				// Without this, browser JS cannot read a single one of the
 				// headers the gateway sets: the fetch API hides every
@@ -810,7 +882,7 @@ func cors(origins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Expose-Headers",
 					"Retry-After, X-Request-Id, request-id, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, "+
 						"x-ratelimit-reset-requests, x-ragmux-budget-daily-remaining, x-ragmux-budget-monthly-remaining, "+
-						"x-ragmux-rag-hits, x-ragmux-rag-sources, x-ragmux-projects, Warning")
+						"x-ragmux-rag-hits, x-ragmux-rag-sources, x-ragmux-projects, x-ragmux-guardrail, Warning")
 				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 			if r.Method == http.MethodOptions {

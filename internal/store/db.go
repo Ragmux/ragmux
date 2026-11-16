@@ -59,6 +59,12 @@ type OpenConfig struct {
 	// SecretKeyHex is the 32-byte credential key as hex. When empty the key
 	// is read from (or created at) DataDir/secret.key.
 	SecretKeyHex string
+	// SecretKeySource names where SecretKeyHex came from when the caller
+	// opened it elsewhere: "vault_transit" or "aws_kms" (internal/keysource).
+	// Store.SecretKeySource then reports it. Empty or "env" keeps the
+	// historical behaviour: "env" for a given key, "file" for the fallback.
+	// A remote source with no key is an error, never the secret.key fallback.
+	SecretKeySource string
 	// DataDir is only used for the secret.key fallback.
 	DataDir string
 	// PgSearchTokenizer names the ParadeDB analyser for the BM25 index;
@@ -71,7 +77,8 @@ type Store struct {
 	pool *pgxpool.Pool
 	// ServerVersion is the PostgreSQL server_version reported at Open.
 	ServerVersion string
-	// SecretKeySource is "env" or "file", depending on where the key came from.
+	// SecretKeySource is "env" or "file", or "vault_transit" / "aws_kms" when
+	// the key was opened from a remote source, depending on where it came from.
 	SecretKeySource string
 	cipher          *cipher
 	log             *slog.Logger
@@ -111,7 +118,7 @@ func Open(ctx context.Context, cfg OpenConfig, log *slog.Logger) (*Store, error)
 		cfg.MaxConns = 10
 	}
 
-	c, source, err := loadCipher(cfg.SecretKeyHex, cfg.DataDir, log)
+	c, source, err := loadCipherFrom(cfg.SecretKeyHex, cfg.DataDir, cfg.SecretKeySource, log)
 	if err != nil {
 		return nil, err
 	}

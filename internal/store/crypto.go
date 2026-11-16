@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/ragmux/ragmux/internal/keysource"
 )
 
 // cipher encrypts provider credentials at rest with AES-256-GCM.
@@ -22,6 +24,30 @@ type cipher struct {
 // loadCipher builds the credential cipher from the hex key when given, and
 // otherwise from (or into) dataDir/secret.key. It returns the source used.
 func loadCipher(keyHex, dataDir string, log *slog.Logger) (*cipher, string, error) {
+	return loadCipherFrom(keyHex, dataDir, "", log)
+}
+
+// loadCipherFrom is loadCipher for a key that may have been opened from a
+// remote source. source is "" or "env" for today's three env/file paths, or
+// the name of the remote source that produced keyHex. A remote source never
+// reaches the secret.key fallback: with no key it fails, because a gateway
+// that minted its own key would seal data nobody else can read.
+func loadCipherFrom(keyHex, dataDir, source string, log *slog.Logger) (*cipher, string, error) {
+	switch source {
+	case "", "env":
+	case keysource.SourceVaultTransit, keysource.SourceAWSKMS:
+		if strings.TrimSpace(keyHex) == "" {
+			return nil, "", fmt.Errorf("SECRET_KEY_SOURCE=%s but no key was opened from it; refusing to fall back to secret.key", source)
+		}
+		key, err := hex.DecodeString(strings.TrimSpace(keyHex))
+		if err != nil || len(key) != 32 {
+			return nil, "", fmt.Errorf("the key opened from %s is not 32 bytes", source)
+		}
+		c, err := newCipher(key)
+		return c, source, err
+	default:
+		return nil, "", fmt.Errorf("unknown secret key source %q", source)
+	}
 	if keyHex != "" {
 		key, err := hex.DecodeString(strings.TrimSpace(keyHex))
 		if err != nil || len(key) != 32 {

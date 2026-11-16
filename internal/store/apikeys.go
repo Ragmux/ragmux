@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,8 +39,14 @@ type APIKey struct {
 	LastUsedAt          *time.Time `json:"last_used_at"`
 	// ProjectIDs is the grant set of a gateway key.
 	ProjectIDs []int64 `json:"project_ids"`
-	CreatedAt  string  `json:"created_at"`
-	UpdatedAt  string  `json:"updated_at"`
+	// AllowedCIDRs and AllowedOrigins are the key's network allowlists
+	// (ADR-039), in the canonical form NormalizeCIDRs and NormalizeOrigins
+	// produce. Empty means no restriction; they are never nil on a key read
+	// from the store, so the JSON shows [] and not null.
+	AllowedCIDRs   []string `json:"allowed_cidrs"`
+	AllowedOrigins []string `json:"allowed_origins"`
+	CreatedAt      string   `json:"created_at"`
+	UpdatedAt      string   `json:"updated_at"`
 }
 
 // Retired reports whether the key is revoked or past its expiry at t.
@@ -49,14 +58,16 @@ func (k *APIKey) Retired(t time.Time) bool {
 const apiKeyCols = `k.id, k.kind, k.name, k.key_prefix, k.user_id, k.created_by, k.scopes, k.default_project_id,
 	k.rate_limit_rpm, k.rate_limit_tpm, k.budget_daily_tokens, k.budget_monthly_tokens,
 	k.expires_at, k.revoked_at, k.last_used_at, k.created_at, k.updated_at,
-	ARRAY(SELECT project_id FROM api_key_projects WHERE api_key_id = k.id ORDER BY project_id)`
+	ARRAY(SELECT project_id FROM api_key_projects WHERE api_key_id = k.id ORDER BY project_id),
+	k.allowed_cidrs::text[], k.allowed_origins`
 
 func scanAPIKey(row interface{ Scan(...any) error }, extra ...any) (*APIKey, error) {
 	k := &APIKey{}
 	var created, updated time.Time
 	dst := []any{&k.ID, &k.Kind, &k.Name, &k.KeyPrefix, &k.UserID, &k.CreatedBy, &k.Scopes, &k.DefaultProjectID,
 		&k.RateLimitRPM, &k.RateLimitTPM, &k.BudgetDailyTokens, &k.BudgetMonthlyTokens,
-		&k.ExpiresAt, &k.RevokedAt, &k.LastUsedAt, &created, &updated, &k.ProjectIDs}
+		&k.ExpiresAt, &k.RevokedAt, &k.LastUsedAt, &created, &updated, &k.ProjectIDs,
+		&k.AllowedCIDRs, &k.AllowedOrigins}
 	if err := row.Scan(append(dst, extra...)...); err != nil {
 		return nil, scanErr(err)
 	}
@@ -65,6 +76,12 @@ func scanAPIKey(row interface{ Scan(...any) error }, extra ...any) (*APIKey, err
 	}
 	if k.ProjectIDs == nil {
 		k.ProjectIDs = []int64{}
+	}
+	if k.AllowedCIDRs == nil {
+		k.AllowedCIDRs = []string{}
+	}
+	if k.AllowedOrigins == nil {
+		k.AllowedOrigins = []string{}
 	}
 	for _, t := range []**time.Time{&k.ExpiresAt, &k.RevokedAt, &k.LastUsedAt} {
 		if *t != nil {
@@ -105,10 +122,12 @@ func (s *Store) CreateAPIKey(ctx context.Context, k *APIKey) (*APIKey, string, e
 	var id int64
 	err = tx.QueryRow(ctx, `INSERT INTO api_keys
 		(kind, name, key_hash, key_prefix, user_id, created_by, scopes, default_project_id,
-		rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+		rate_limit_rpm, rate_limit_tpm, budget_daily_tokens, budget_monthly_tokens, expires_at,
+		allowed_cidrs, allowed_origins)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::text[]::cidr[], $15) RETURNING id`,
 		k.Kind, k.Name, HashToken(key), keyPrefix(key), k.UserID, k.CreatedBy, scopes, k.DefaultProjectID,
-		k.RateLimitRPM, k.RateLimitTPM, k.BudgetDailyTokens, k.BudgetMonthlyTokens, k.ExpiresAt).Scan(&id)
+		k.RateLimitRPM, k.RateLimitTPM, k.BudgetDailyTokens, k.BudgetMonthlyTokens, k.ExpiresAt,
+		nonNilStrings(k.AllowedCIDRs), nonNilStrings(k.AllowedOrigins)).Scan(&id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -152,9 +171,10 @@ func (s *Store) UpdateAPIKey(ctx context.Context, k *APIKey) (*APIKey, error) {
 	}
 	res, err := tx.Exec(ctx, `UPDATE api_keys SET name=$1, scopes=$2, default_project_id=$3,
 		rate_limit_rpm=$4, rate_limit_tpm=$5, budget_daily_tokens=$6, budget_monthly_tokens=$7,
-		expires_at=$8, updated_at=now() WHERE id=$9`,
+		expires_at=$8, allowed_cidrs=$9::text[]::cidr[], allowed_origins=$10, updated_at=now() WHERE id=$11`,
 		k.Name, scopes, k.DefaultProjectID, k.RateLimitRPM, k.RateLimitTPM,
-		k.BudgetDailyTokens, k.BudgetMonthlyTokens, k.ExpiresAt, k.ID)
+		k.BudgetDailyTokens, k.BudgetMonthlyTokens, k.ExpiresAt,
+		nonNilStrings(k.AllowedCIDRs), nonNilStrings(k.AllowedOrigins), k.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -420,4 +440,274 @@ func (s *Store) ListProjectsByIDs(ctx context.Context, ids []int64) ([]*Project,
 	}
 	defer rows.Close()
 	return collectProjects(rows)
+}
+
+// Reasons a key's network allowlist refuses a request (ADR-039). They are the
+// "code" of the 403 the gateway answers and the values of
+// ragmux_gateway_key_denied_total{reason}.
+const (
+	DenyIPNotAllowed     = "ip_not_allowed"
+	DenyOriginNotAllowed = "origin_not_allowed"
+)
+
+// MaxKeyNetworkEntries bounds each of a key's two allowlists.
+const MaxKeyNetworkEntries = 32
+
+// NormalizeCIDRs validates a CIDR allowlist and returns it in the form the
+// store keeps: a bare address becomes /32 or /128, an IPv4-mapped IPv6 network
+// (::ffff:a.b.c.d/n, n >= 96) becomes the IPv4 network it stands for, and
+// repeated entries collapse. A network with bits set to the right of its mask
+// is refused rather than silently widened: 10.0.0.5/24 is more likely a typo
+// than a request for 10.0.0.0/24. The result is never nil.
+func NormalizeCIDRs(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, raw := range in {
+		p, err := parseCIDREntry(raw)
+		if err != nil {
+			return nil, err
+		}
+		s := p.String()
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) > MaxKeyNetworkEntries {
+		return nil, fmt.Errorf("at most %d CIDR entries are allowed", MaxKeyNetworkEntries)
+	}
+	return out, nil
+}
+
+func parseCIDREntry(raw string) (netip.Prefix, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return netip.Prefix{}, errors.New("an empty CIDR entry")
+	}
+	var p netip.Prefix
+	if strings.Contains(v, "/") {
+		var err error
+		if p, err = netip.ParsePrefix(v); err != nil {
+			return netip.Prefix{}, fmt.Errorf("%q is not a CIDR network or an IP address", raw)
+		}
+	} else {
+		a, err := netip.ParseAddr(v)
+		if err != nil {
+			return netip.Prefix{}, fmt.Errorf("%q is not a CIDR network or an IP address", raw)
+		}
+		if a.Zone() != "" {
+			return netip.Prefix{}, fmt.Errorf("%q: an address with a zone is not allowed", raw)
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	if p.Addr().Is4In6() {
+		// An IPv4-mapped network counts as the IPv4 one. A mask shorter than
+		// 96 bits reaches beyond the mapped range and has no IPv4 reading.
+		if p.Bits() < 96 {
+			return netip.Prefix{}, fmt.Errorf("%q: an IPv4-mapped network needs a mask of at least /96", raw)
+		}
+		p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+	}
+	if p.Masked() != p {
+		return netip.Prefix{}, fmt.Errorf("%q has bits set to the right of its mask; did you mean %s", raw, p.Masked())
+	}
+	return p, nil
+}
+
+// hostLabels is the shape of a host name in an allowed origin: dot-separated
+// labels of lower-case ASCII letters, digits and hyphens. A browser sends an
+// internationalised name in punycode, so that is what an entry must hold.
+var hostLabels = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// origin is a parsed allowed-origin entry or request Origin.
+type origin struct {
+	scheme   string
+	host     string // for a wildcard entry, the part after "*."
+	port     string // "" for the scheme's default
+	wildcard bool
+}
+
+// parseOrigin parses scheme://host[:port], lower-cased, with the scheme's
+// default port dropped (a browser leaves it out of the Origin header). With
+// wildcard set a leading "*." on the host is accepted. It does not accept a
+// path, query, fragment or user info.
+func parseOrigin(raw string, wildcard bool) (origin, error) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	v = strings.TrimSuffix(v, "/")
+	scheme, rest, ok := strings.Cut(v, "://")
+	if !ok || (scheme != "http" && scheme != "https") {
+		return origin{}, errors.New(`must look like https://example.com (scheme http or https, then host)`)
+	}
+	if rest == "" || strings.ContainsAny(rest, "/?#@ \t") {
+		return origin{}, errors.New("must not carry a path, query, fragment or user info")
+	}
+	o := origin{scheme: scheme}
+	if strings.HasPrefix(rest, "[") {
+		end := strings.Index(rest, "]")
+		if end < 0 {
+			return origin{}, errors.New("an IPv6 host needs a closing bracket")
+		}
+		a, err := netip.ParseAddr(rest[1:end])
+		if err != nil || !a.Is6() || a.Zone() != "" {
+			return origin{}, errors.New("is not a valid IPv6 host")
+		}
+		rest = rest[end+1:]
+		o.host = "[" + a.String() + "]"
+		if rest != "" {
+			if !strings.HasPrefix(rest, ":") {
+				return origin{}, errors.New("unexpected text after the host")
+			}
+			o.port = rest[1:]
+		}
+	} else {
+		host, port, _ := strings.Cut(rest, ":")
+		if strings.Contains(port, ":") {
+			return origin{}, errors.New("is not a valid host and port")
+		}
+		o.port = port
+		if strings.HasPrefix(host, "*.") {
+			if !wildcard {
+				return origin{}, errors.New("a wildcard is not valid here")
+			}
+			o.wildcard = true
+			host = strings.TrimPrefix(host, "*.")
+			// "*.com" would admit every site of a TLD; a registrable name
+			// has at least one dot after the wildcard.
+			if !strings.Contains(host, ".") {
+				return origin{}, errors.New(`a wildcard needs a domain with a dot after it, such as https://*.example.com`)
+			}
+		}
+		if !hostLabels.MatchString(host) || len(host) > 253 {
+			return origin{}, errors.New("host is not a valid lower-case ASCII host name")
+		}
+		o.host = host
+	}
+	if o.port != "" {
+		n, err := strconv.Atoi(o.port)
+		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != o.port {
+			return origin{}, errors.New("port must be a number between 1 and 65535")
+		}
+		if (scheme == "https" && n == 443) || (scheme == "http" && n == 80) {
+			o.port = ""
+		}
+	}
+	return o, nil
+}
+
+func (o origin) String() string {
+	s := o.scheme + "://"
+	if o.wildcard {
+		s += "*."
+	}
+	s += o.host
+	if o.port != "" {
+		s += ":" + o.port
+	}
+	return s
+}
+
+// NormalizeOrigins validates an Origin allowlist and returns it in the form
+// the store keeps: scheme://host[:port] or scheme://*.domain[:port], lower
+// case, no trailing slash, the scheme's default port dropped, repeated entries
+// collapsed. A lone "*" is refused. The result is never nil.
+func NormalizeOrigins(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, raw := range in {
+		if strings.TrimSpace(raw) == "*" {
+			return nil, errors.New(`"*" alone is not allowed; name the origins`)
+		}
+		o, err := parseOrigin(raw, true)
+		if err != nil {
+			return nil, fmt.Errorf("origin %q: %s", raw, err.Error())
+		}
+		s := o.String()
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) > MaxKeyNetworkEntries {
+		return nil, fmt.Errorf("at most %d origin entries are allowed", MaxKeyNetworkEntries)
+	}
+	return out, nil
+}
+
+// CheckKeyNetwork applies a key's allowlists (ADR-039) to a request and
+// returns "" when it may proceed, else DenyIPNotAllowed or
+// DenyOriginNotAllowed. clientIP is the request's remote address as the
+// gateway sees it ("ip" or "ip:port"; behind TRUST_PROXY_HEADERS the address
+// the proxy reported); origins holds every Origin header value of the request.
+//
+// An empty list restricts nothing. A non-empty one fails closed: an address
+// that does not parse is refused, and so is a request without an Origin, with
+// two different ones, or with one no entry matches ("null" included).
+func CheckKeyNetwork(cidrs, allowedOrigins []string, clientIP string, origins []string) string {
+	if len(cidrs) > 0 && !ipAllowed(cidrs, clientIP) {
+		return DenyIPNotAllowed
+	}
+	if len(allowedOrigins) > 0 && !originAllowed(allowedOrigins, origins) {
+		return DenyOriginNotAllowed
+	}
+	return ""
+}
+
+func ipAllowed(cidrs []string, remote string) bool {
+	var ip netip.Addr
+	if ap, err := netip.ParseAddrPort(remote); err == nil {
+		ip = ap.Addr()
+	} else if a, err := netip.ParseAddr(remote); err == nil {
+		ip = a
+	} else {
+		return false
+	}
+	ip = ip.WithZone("").Unmap()
+	for _, c := range cidrs {
+		p, err := netip.ParsePrefix(c)
+		if err != nil {
+			continue // not a value the store can hold (the column is CIDR)
+		}
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func originAllowed(allowed, got []string) bool {
+	if len(got) != 1 {
+		// No Origin, or several: a browser sends exactly one.
+		return false
+	}
+	o, err := parseOrigin(got[0], false)
+	if err != nil {
+		return false
+	}
+	for _, e := range allowed {
+		a, err := parseOrigin(e, true)
+		if err != nil || a.scheme != o.scheme || a.port != o.port {
+			continue
+		}
+		switch {
+		case !a.wildcard && a.host == o.host:
+			return true
+		case a.wildcard && strings.HasSuffix(o.host, "."+a.host):
+			return true
+		}
+	}
+	return false
+}
+
+// CountCIDRRestricted counts the live gateway keys and the projects whose own
+// key carries a CIDR allowlist (ADR-039). The boot check for an unverified
+// proxy-header setting uses it: it needs to know whether any such list exists,
+// not what it holds.
+func (s *Store) CountCIDRRestricted(ctx context.Context) (keys, projects int64, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM api_keys WHERE kind = 'gateway' AND revoked_at IS NULL
+			AND (expires_at IS NULL OR expires_at > now()) AND cardinality(allowed_cidrs) > 0),
+		(SELECT count(*) FROM projects WHERE cardinality(key_allowed_cidrs) > 0)`).Scan(&keys, &projects)
+	return keys, projects, err
 }
