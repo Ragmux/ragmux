@@ -293,6 +293,9 @@ func flushChunk(like provider.StreamChunk, ci int, key, rest string, folded bool
 	case 'f':
 		raw, _ := marshalPlain([]map[string]any{{"index": idx, "function": map[string]any{"arguments": rest}}})
 		d.ToolCalls = raw
+	case 'k':
+		raw, _ := marshalPlain([]map[string]any{{"index": idx, "custom": map[string]any{"input": rest}}})
+		d.ToolCalls = raw
 	}
 	out.Choices = []provider.StreamChoice{{Index: ci, Delta: d}}
 	return out
@@ -490,8 +493,9 @@ func emptyChunk(c provider.StreamChunk) bool {
 	return true
 }
 
-// toolCalls filters the arguments of a tool_calls delta: each call has its own
-// window, and a call that starts closes the one before it.
+// toolCalls filters the input of a tool_calls delta: each call has its own
+// window, and a call that starts closes the one before it. The input of a
+// function call is its arguments, that of a freeform custom call its input.
 func (sg *streamGuard) toolCalls(ci int, raw json.RawMessage, flush func(key, rest string)) json.RawMessage {
 	var calls []map[string]json.RawMessage
 	if json.Unmarshal(raw, &calls) != nil {
@@ -501,40 +505,65 @@ func (sg *streamGuard) toolCalls(ci int, raw json.RawMessage, flush func(key, re
 	for _, call := range calls {
 		idx := 0
 		_ = json.Unmarshal(call["index"], &idx)
-		var fn map[string]json.RawMessage
+		var fn, custom map[string]json.RawMessage
 		_ = json.Unmarshal(call["function"], &fn)
+		_ = json.Unmarshal(call["custom"], &custom)
+		// A call is a function or a custom one; its own window and its own
+		// kind of flushed delta. A delta that carries neither (an id alone)
+		// keeps the function window it always had.
+		kind, obj, field := byte('f'), fn, "arguments"
+		if custom != nil {
+			kind, obj, field = 'k', custom, "input"
+		}
 		var args string
-		if fn != nil {
-			_ = json.Unmarshal(fn["arguments"], &args)
+		if obj != nil {
+			_ = json.Unmarshal(obj[field], &args)
 		}
-		w := sg.open(ci, pieceKey('f', idx), false, flush)
+		w := sg.open(ci, pieceKey(kind, idx), false, flush)
 		out := sg.push(w, args)
-		var name string
-		if fn != nil {
-			_ = json.Unmarshal(fn["name"], &name)
-		}
-		// The name of a call arrives whole, in the call's first delta.
-		renamed := false
-		if name != "" {
+		// The names of a call arrive whole, in the call's first delta; a call
+		// that has both objects has both read.
+		renamed := map[string]bool{}
+		named := false
+		for _, o := range []struct {
+			key string
+			obj map[string]json.RawMessage
+		}{{"function", fn}, {"custom", custom}} {
+			if o.obj == nil {
+				continue
+			}
+			var name string
+			_ = json.Unmarshal(o.obj["name"], &name)
+			if name == "" {
+				continue
+			}
+			named = true
 			if nn := sg.p.body.ApplyName(name); nn != name {
-				name, renamed = nn, true
-				fn["name"], _ = marshalPlain(nn)
+				o.obj["name"], _ = marshalPlain(nn)
+				renamed[o.key] = true
 			}
 			if sg.p.body.Blocked() {
 				sg.blocked = true
 			}
 		}
-		if fn != nil {
-			if _, had := fn["arguments"]; had {
-				fn["arguments"], _ = marshalPlain(out)
-				renamed = true
-			}
-			if renamed {
-				call["function"], _ = marshalPlain(fn)
+		if obj != nil {
+			if _, had := obj[field]; had {
+				obj[field], _ = marshalPlain(out)
+				if custom != nil {
+					renamed["custom"] = true
+				} else {
+					renamed["function"] = true
+				}
 			}
 		}
+		if renamed["function"] {
+			call["function"], _ = marshalPlain(fn)
+		}
+		if renamed["custom"] {
+			call["custom"], _ = marshalPlain(custom)
+		}
 		_, hasID := call["id"]
-		if out == "" && !hasID && name == "" {
+		if out == "" && !hasID && !named {
 			continue // nothing left in this entry
 		}
 		kept = append(kept, call)

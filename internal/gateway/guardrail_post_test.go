@@ -86,6 +86,9 @@ func (e *env) streamChat(body map[string]any) streamed {
 						Function struct {
 							Arguments string `json:"arguments"`
 						} `json:"function"`
+						Custom struct {
+							Input string `json:"input"`
+						} `json:"custom"`
 					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
@@ -102,7 +105,7 @@ func (e *env) streamChat(body map[string]any) streamed {
 				s.reasoning += *ch.Delta.Reasoning
 			}
 			for _, tc := range ch.Delta.ToolCalls {
-				s.args += tc.Function.Arguments
+				s.args += tc.Function.Arguments + tc.Custom.Input
 			}
 			if ch.FinishReason != nil {
 				s.finish = *ch.FinishReason

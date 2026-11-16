@@ -341,37 +341,49 @@ func mapJSONText(s string, fn, num func(string) string, probe func(string)) stri
 	return fn(s)
 }
 
-// mapToolCalls applies fn to the name and the arguments of every call of an
-// OpenAI tool_calls array: name is the visitor of names, probe is
-// mapJSONText's.
+// toolCallBodies are the objects of an OpenAI tool call that hold what the
+// model wrote for a tool, with the field that carries its input: a function
+// call has arguments (JSON text), a freeform custom call has input (any text).
+var toolCallBodies = []struct{ object, input string }{
+	{"function", "arguments"},
+	{"custom", "input"},
+}
+
+// mapToolCalls applies fn to the name and the input of every call of an
+// OpenAI tool_calls array, function and custom alike: name is the visitor of
+// names, probe is mapJSONText's.
 func mapToolCalls(raw json.RawMessage, fn, num, name func(string) string, probe func(string)) (json.RawMessage, bool) {
 	return mapBlocks(raw, func(call map[string]json.RawMessage) bool {
-		var fnObj map[string]json.RawMessage
-		if json.Unmarshal(call["function"], &fnObj) != nil || fnObj == nil {
-			return false
-		}
-		named := mapStringField(fnObj, "name", name)
-		var args bool
-		switch firstByte(fnObj["arguments"]) {
-		case '{', '[':
-			// Arguments are a string in the API; a server that takes them as
-			// JSON is read as JSON.
-			out, changed := mapToolInput(fnObj["arguments"], fn, num, probe)
-			if changed {
-				fnObj["arguments"], args = out, true
+		changed := false
+		for _, body := range toolCallBodies {
+			var obj map[string]json.RawMessage
+			if json.Unmarshal(call[body.object], &obj) != nil || obj == nil {
+				continue
 			}
-		default:
-			args = mapStringField(fnObj, "arguments", func(a string) string { return mapJSONText(a, fn, num, probe) })
+			named := mapStringField(obj, "name", name)
+			var in bool
+			switch firstByte(obj[body.input]) {
+			case '{', '[':
+				// The input is a string in the API; a server that takes it as
+				// JSON is read as JSON.
+				out, ok := mapToolInput(obj[body.input], fn, num, probe)
+				if ok {
+					obj[body.input], in = out, true
+				}
+			default:
+				in = mapStringField(obj, body.input, func(a string) string { return mapJSONText(a, fn, num, probe) })
+			}
+			if !named && !in {
+				continue
+			}
+			b, err := marshalPlain(obj)
+			if err != nil {
+				continue
+			}
+			call[body.object] = b
+			changed = true
 		}
-		if !named && !args {
-			return false
-		}
-		b, err := marshalPlain(fnObj)
-		if err != nil {
-			return false
-		}
-		call["function"] = b
-		return true
+		return changed
 	})
 }
 
