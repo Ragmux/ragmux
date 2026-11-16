@@ -285,7 +285,7 @@ func TestMigration0033LeavesProjectsReadableWhileItWaits(t *testing.T) {
 // does for a replica that exited.
 func TestMigration0033TimesOutInsteadOfStallingRequests(t *testing.T) {
 	ctx := context.Background()
-	cfg := testdb.Config(t)
+	cfg := testdb.ConfigOwnDatabase(t)
 	s := testdb.OpenWith(t, cfg)
 	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "m", ProviderType: "openai", ModelName: "gpt-4o"})
 	if err != nil {
@@ -384,6 +384,10 @@ func TestMigration0033TimesOutInsteadOfStallingRequests(t *testing.T) {
 // can spend a while queued on that advisory lock before it reaches the table;
 // the deadline allows for it, and a test counts its timeouts from the returned
 // moment. If done is not nil and receives first, the waiter never queued.
+//
+// A test that runs store.Open while holding a transaction uses
+// testdb.ConfigOwnDatabase, or Open can end up waiting for a no-transaction
+// migration of another test that waits for that very transaction.
 func waitForTableLockWaiter(t *testing.T, s *store.Store, done <-chan error) time.Time {
 	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
@@ -421,7 +425,7 @@ func waitForTableLockWaiter(t *testing.T, s *store.Store, done <-chan error) tim
 // read must apply all three.
 func TestUpgradeFromV07DoesNotStallRequests(t *testing.T) {
 	ctx := context.Background()
-	cfg := testdb.Config(t)
+	cfg := testdb.ConfigOwnDatabase(t)
 	s := testdb.OpenWith(t, cfg)
 	conn, err := s.CreateConnection(ctx, &store.ModelConnection{Name: "m", ProviderType: "openai", ModelName: "gpt-4o"})
 	if err != nil {
@@ -515,7 +519,7 @@ func TestUpgradeFromV07DoesNotStallRequests(t *testing.T) {
 // and the retry applies it whole.
 func TestMigration0033RollsBackWhenItsSecondStepTimesOut(t *testing.T) {
 	ctx := context.Background()
-	cfg := testdb.Config(t)
+	cfg := testdb.ConfigOwnDatabase(t)
 	s := testdb.OpenWith(t, cfg)
 	for _, stmt := range []string{
 		"DROP TABLE end_user_usage",

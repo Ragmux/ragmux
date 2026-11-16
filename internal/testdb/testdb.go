@@ -78,6 +78,59 @@ func Config(t *testing.T) store.OpenConfig {
 	}
 }
 
+// ConfigOwnDatabase is Config on a brand-new database (dropped on cleanup)
+// rather than a schema. Advisory locks and the wait of CREATE INDEX
+// CONCURRENTLY for older transactions span the whole database, so a test
+// that keeps a transaction open while store.Open migrates would wait on, and
+// be waited on by, the migrations other tests run in their schemas. Such a
+// test needs a database of its own. The role behind TEST_DATABASE_URL must
+// be allowed to create databases, as the CI and dev-db roles are.
+func ConfigOwnDatabase(t *testing.T) store.OpenConfig {
+	t.Helper()
+	base := os.Getenv(EnvVar)
+	if base == "" {
+		t.Skipf("%s is not set; start a pgvector Postgres (make dev-db) and export it to run this test", EnvVar)
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse %s: %v", EnvVar, err)
+	}
+	name := "test_" + randHex(6)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatalf("connect to %s: %v", EnvVar, err)
+	}
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		_ = admin.Close(ctx)
+		t.Fatalf("create test database: %v", err)
+	}
+	_ = admin.Close(ctx)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c, err := pgx.Connect(ctx, base)
+		if err != nil {
+			t.Logf("cleanup: connect: %v", err)
+			return
+		}
+		defer func() { _ = c.Close(ctx) }()
+		if _, err := c.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)"); err != nil {
+			t.Logf("cleanup: drop database %s: %v", name, err)
+		}
+	})
+
+	u.Path = "/" + name
+	return store.OpenConfig{
+		DatabaseURL:  u.String(),
+		MaxConns:     4,
+		SecretKeyHex: randHex(32),
+		DataDir:      t.TempDir(),
+	}
+}
+
 // Open opens a store on a fresh schema and closes it when the test ends.
 func Open(t *testing.T) *store.Store {
 	t.Helper()
