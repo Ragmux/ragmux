@@ -314,6 +314,26 @@ tr.rowlink{cursor:pointer}
 .sess-id{max-width:200px}
 .sess-cap{display:flex;flex-direction:column;gap:6px}
 
+/* v0.8 security, alerts and feedback */
+.secret-box{display:flex;gap:8px;align-items:center}
+.secret-box code{flex:1;min-width:0;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--field);color:var(--tx);overflow-wrap:anywhere;user-select:all}
+.mfa-codes{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.mfa-codes code{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--field);color:var(--tx);text-align:center;font-size:13px;user-select:all}
+.rule-card{border:1px solid var(--line2);border-radius:12px;background:var(--panel2);padding:12px 14px;display:flex;flex-direction:column;gap:12px}
+.stage-row{display:flex;flex-wrap:wrap;gap:2px 14px}
+.stage-row .check{padding:4px 6px}
+.dl-list{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-size:13px}
+.fb-bars{display:flex;align-items:flex-end;gap:2px;height:96px;border-bottom:1px solid var(--line)}
+.fb-bar{flex:1 1 0;min-width:2px;height:100%;display:flex;flex-direction:column-reverse}
+.fb-bar i{display:block;width:100%}
+.fb-bar .pos{background:var(--mint)}.fb-bar .neg{background:var(--rose)}
+.fb-legend{display:inline-flex;gap:14px}
+.fb-legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.split-bar{display:flex;height:8px;border-radius:999px;overflow:hidden;background:var(--field);border:1px solid var(--line);min-width:80px}
+.split-bar i{display:block;height:100%}
+.note .hint{min-width:0;overflow-wrap:anywhere}
+.drawer-body>*{flex-shrink:0}
+
 /* responsive */
 @media (max-width:1100px){
   .side{width:64px}
@@ -357,6 +377,7 @@ tr.rowlink{cursor:pointer}
       <div class="me"><div class="avatar" id="meAvatar"></div><div><div class="me-name" id="meName"></div><div class="me-role" id="meRole"></div></div></div>
       <div class="side-actions">
         <button class="btn sm ghost" id="btnPassword" title="Change password" aria-label="Change password"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><span class="lbl">Password</span></button>
+        <button class="btn sm ghost" id="btnTotp" title="Two-factor authentication" aria-label="Two-factor authentication"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v5c0 4.5 2.9 8.2 7 10 4.1-1.8 7-5.5 7-10V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></svg><span class="lbl">Two-factor</span></button>
         <button class="btn sm ghost" id="btnLogout" title="Sign out" aria-label="Sign out"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h5M15 8l4 4-4 4M9 12h10"/></svg><span class="lbl">Sign out</span></button>
         <button class="btn sm ghost" id="btnTheme" type="button"><span id="themeIcon" class="row" style="gap:0" aria-hidden="true"></span><span class="lbl" id="themeLbl"></span></button>
       </div>
@@ -497,12 +518,54 @@ async function request(path, opts = {}) {
 }
 async function api(path, opts) {
   const r = await request(path, opts);
-  if (r.status === 401 && !path.startsWith('/login') && !path.startsWith('/setup')) { signedOut(); throw new Error('session expired'); }
-  if (r.status === 403) { const m = errMsg(r.data, 'forbidden'); toast('Not allowed: ' + m, 4000, 'err'); throw new Error(m); }
-  if (!r.ok) throw new Error(errMsg(r.data, r.statusText));
+  const fail = m => Object.assign(new Error(m), { status: r.status, code: (r.data && r.data.error && r.data.error.code) || '', retryAfter: r.headers.get('Retry-After') });
+  if (r.status === 401 && !path.startsWith('/login') && !path.startsWith('/setup')) { signedOut(r.data && r.data.error && r.data.error.code === 'password_attempts_exhausted' ? SESSION_ENDED : ''); throw fail('session expired'); }
+  if (r.status === 403) { const m = errMsg(r.data, 'forbidden'); toast('Not allowed: ' + m, 4000, 'err'); throw fail(m); }
+  if (!r.ok) throw fail(errMsg(r.data, r.statusText));
   return r.data;
 }
 const on = (root, sel, ev, fn) => $$(sel, root).forEach(el => el.addEventListener(ev, e => fn(el, e)));
+// Account calls. The change-password form and every /me/totp/* endpoint ask for the password and answer a wrong
+// one with 403, which here is a form error and not "not allowed", so they bypass api()'s generic 403 toast. A
+// session may try five wrong passwords; the fifth is answered 403 and ends the session, so the next request is a
+// 401 and the user lands on the sign-in screen with the reason (api() and accountPost() both do that).
+const SESSION_PASSWORD_BUDGET = 5;
+const SESSION_ENDED = 'Too many wrong passwords on that session, so it was ended. Sign in again.';
+const retryText = seconds => fmtDur(Math.max(1, Math.ceil(Number(seconds) || 0)) * 1000);
+const lockText = after => `Too many wrong codes: this account's second factor is locked${after ? ` for about ${after}` : ''}. While it is locked even a right code or a recovery code is refused. To get in sooner, another admin can reset your two-factor authentication under Users, or whoever runs the server can use "ragmux reset-password --disable-totp".`;
+function accountError(r) {
+  const err = (r.data && r.data.error) || {}, code = err.code || '', ra = r.headers.get('Retry-After');
+  const msg = {
+    wrong_password: 'Wrong password. Five wrong passwords in a row end this session.',
+    mfa_invalid_code: 'That code is not right. Wait for the next code in your app and try again; five wrong codes within 15 minutes lock the second factor.',
+    mfa_busy: 'Another check of your account is running. Try again in a moment.',
+    totp_already_enabled: 'Two-factor authentication is already on. To set it up on another device, turn it off first (Change device does both).',
+    totp_not_set_up: 'No setup is pending. Start again with Set up.',
+    totp_not_enabled: 'Two-factor authentication is not on for this account.',
+    session_required: 'This needs a signed-in session, not an API key.',
+  }[code] || (code === 'mfa_locked' ? lockText(ra ? retryText(ra) : '') : errMsg(r.data, r.statusText));
+  return Object.assign(new Error(msg), { status: r.status, code, retryAfter: ra });
+}
+// Wrong passwords in a row on this page; the server counts the same per session and resets on a right one.
+let passwordMisses = 0;
+async function accountPost(path, body) {
+  const r = await request(path, { method: 'POST', body });
+  const err = (r.data && r.data.error) || {};
+  // The server resets its per-session count whenever the password was accepted: that is every answer but a wrong password, a
+  // dead session and the 409s of enable, disable and recovery-codes, which are decided before the password is looked at. The
+  // 409 of setup comes after it (totp_already_enabled is only found when the secret is written), so it counts as accepted.
+  if (r.status !== 401 && err.code !== 'wrong_password' && (r.status !== 409 || path === '/me/totp/setup')) passwordMisses = 0;
+  if (r.ok) return r.data;
+  const endSession = notice => { request('/logout', { method: 'POST' }).catch(() => {}); signedOut(notice); return Object.assign(new Error(notice), { signedOut: true }); };
+  if (r.status === 401) throw endSession(err.code === 'password_attempts_exhausted' || passwordMisses > 0 ? SESSION_ENDED : 'Your session has ended. Sign in again.');
+  if (err.code === 'wrong_password' && ++passwordMisses >= SESSION_PASSWORD_BUDGET) throw endSession(SESSION_ENDED);
+  throw accountError(r);
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast('Copied', 1800, 'ok'); }
+  catch (e) { toast('The browser blocked copying here; select the text and copy it by hand.', 4500, 'err'); }
+}
+const bindCopy = root => on(root, '[data-copy]', 'click', b => copyText(b.dataset.copy));
 
 // ---------------------------------------------------------------------------
 // form building blocks
@@ -570,23 +633,24 @@ function drawer({ eyebrow = '', title, body, submitLabel = 'Save', onSubmit, ext
   on(root, '[data-close]', 'click', closeDrawer);
   $('.drawer-bg', root).addEventListener('click', closeDrawer);
   form.onsubmit = async e => { e.preventDefault(); const btn = $('button[type=submit]', form); if (btn) btn.disabled = true;
-    try { await onSubmit(formData(form), form); closeDrawer(); } catch (err) { toast('Error: ' + err.message, 5000, 'err'); } finally { if (btn) btn.disabled = false; } };
+    try { if (await onSubmit(formData(form), form) !== false) closeDrawer(); } catch (err) { toast('Error: ' + err.message, 5000, 'err'); } finally { if (btn) btn.disabled = false; } };
   const first = $('input:not([type=hidden]):not([type=checkbox]):not([type=radio]),select,textarea', form); if (first) setTimeout(() => first.focus(), 60);
   return form;
 }
 function closeDrawer() { const root = $('#drawerRoot'); if (!root.innerHTML) return; root.classList.remove('open'); root.innerHTML = ''; if (lastFocus && lastFocus.focus) lastFocus.focus(); }
-function modal(title, bodyHtml, { submitLabel = 'Confirm', cancelLabel = 'Cancel', onSubmit = async () => {}, danger = false, onClose = () => {} } = {}) {
+// dismissable: false is for a dialog that shows something once (recovery codes): Escape and a click outside do nothing, only its button closes it.
+function modal(title, bodyHtml, { submitLabel = 'Confirm', cancelLabel = 'Cancel', onSubmit = async () => {}, danger = false, onClose = () => {}, dismissable = true } = {}) {
   const root = $('#modalRoot');
   root.innerHTML = `<div class="modal-bg"></div><form class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><h2 id="modalTitle">${esc(title)}</h2>${bodyHtml}
     <div class="row" style="justify-content:flex-end;margin-top:4px">${cancelLabel ? `<button type="button" class="btn ghost" data-close>${esc(cancelLabel)}</button>` : ''}<button class="btn ${danger ? 'danger' : 'primary'}" type="submit">${esc(submitLabel)}</button></div></form>`;
   requestAnimationFrame(() => root.classList.add('open'));
   const form = $('form', root);
   const close = () => { root.classList.remove('open'); root.innerHTML = ''; root.onEscape = null; onClose(); };
-  root.onEscape = close;
+  root.onEscape = dismissable ? close : () => {};
   on(root, '[data-close]', 'click', close);
-  $('.modal-bg', root).addEventListener('click', close);
+  if (dismissable) $('.modal-bg', root).addEventListener('click', close);
   form.onsubmit = async e => { e.preventDefault(); const btn = $('button[type=submit]', form); btn.disabled = true;
-    try { await onSubmit(formData(form), form); root.classList.remove('open'); root.innerHTML = ''; root.onEscape = null; } catch (err) { toast('Error: ' + err.message, 5000, 'err'); } finally { btn.disabled = false; } };
+    try { if (await onSubmit(formData(form), form) !== false) { root.classList.remove('open'); root.innerHTML = ''; root.onEscape = null; } } catch (err) { toast('Error: ' + err.message, 5000, 'err'); } finally { btn.disabled = false; } };
   setTimeout(() => $('button[type=submit]', form).focus(), 60);
   return form;
 }
@@ -598,7 +662,7 @@ document.addEventListener('keydown', e => { if (e.key !== 'Escape') return; cons
 // ---------------------------------------------------------------------------
 // shell: sidebar, session, health line
 // ---------------------------------------------------------------------------
-function signedOut() { state.user = null; state.sessionExp = null; wizard.done(); closeDrawer(); render(); }
+function signedOut(notice = '') { passwordMisses = 0; state.user = null; state.sessionExp = null; state.loginNotice = notice; wizard.done(); closeDrawer(); const mr = $('#modalRoot'); mr.classList.remove('open'); mr.innerHTML = ''; mr.onEscape = null; render(); }
 function render() {
   const shell = $('#shell'), auth = $('#auth');
   if (!state.user) { shell.classList.add('hidden'); auth.classList.remove('hidden'); if (state.needsSetup) renderSetup(); else renderLogin(); return; }
@@ -666,10 +730,151 @@ $('#btnPassword').onclick = () => {
   const form = drawer({ eyebrow: 'Account', title: 'Change password', submitLabel: 'Change password', body: `
     ${field('current_password', 'Current password', input('current_password', '', 'type=password required autocomplete=current-password'))}
     ${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('pwm'))}
-    <p class="hint">Every other session of your account is signed out.</p>`,
-    onSubmit: async d => { await api('/me/password', { method: 'POST', body: { current_password: d.current_password, new_password: d.new_password } }); toast('Password changed', 3500, 'ok'); } });
+    <p class="hint">Every other session of your account is signed out. ${PW_HINT}</p>`,
+    onSubmit: async d => { await accountPost('/me/password', { current_password: d.current_password, new_password: d.new_password }); toast('Password changed', 3500, 'ok'); } });
   bindStrength($('[name=new_password]', form), 'pwm', 12);
 };
+
+// ---------------------------------------------------------------------------
+// two-factor authentication (ADR-037): the second sign-in step and the account dialogs
+// ---------------------------------------------------------------------------
+const noteBox = (cls, pill, text) => `<div class="note ${cls}"><span class="pill ${cls}">${esc(pill)}</span><span class="hint">${esc(text)}</span></div>`;
+// Second sign-in step. The challenge token lives only in this closure: it is single use, lasts five minutes and
+// dies with the fifth wrong code.
+function renderMFA(ch) {
+  let recovery = false;
+  const paint = () => {
+    $('#auth').innerHTML = `${heroHtml()}<section class="auth-form"><form class="card" id="mfaForm">
+      <div><div class="eyebrow">Sign in · step 2 of 2</div><h2>${recovery ? 'Recovery code' : 'Two-factor code'}</h2>
+      <p class="lede" style="font-size:13.5px">${recovery ? 'Enter one of the recovery codes you saved when you turned two-factor authentication on. Each one works once.' : 'Enter the 6-digit code from your authenticator app.'}</p></div>
+      ${recovery ? field('recovery_code', 'Recovery code', input('recovery_code', '', 'required autocomplete=off autocapitalize=characters spellcheck=false maxlength=32 placeholder="xxxxx-xxxxx"')) : field('code', 'Authentication code', input('code', '', 'required inputmode=numeric autocomplete=one-time-code spellcheck=false maxlength=16 placeholder="123456"'))}
+      <div id="loginNote" role="alert"></div>
+      <button type="submit" class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Verify</button>
+      <div class="row between wrap"><button type="button" class="btn sm ghost" id="mfaSwitch">${recovery ? 'Use an authenticator code' : 'Use a recovery code'}</button><button type="button" class="btn sm ghost" id="mfaBack">Back to sign in</button></div>
+      <div class="hint">${ch.expires_at ? `This step expires at ${esc(fmtTime(ch.expires_at))}. ` : ''}Five wrong codes within 15 minutes lock this account's second factor.</div></form></section>`;
+    heroVersion();
+    $('#mfaSwitch').onclick = () => { recovery = !recovery; paint(); };
+    $('#mfaBack').onclick = () => renderLogin();
+    $('#mfaForm').onsubmit = submit;
+    $('#mfaForm input').focus();
+  };
+  const submit = async e => {
+    e.preventDefault(); const form = e.target; const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true; const note = $('#loginNote');
+    const proof = recovery ? { recovery_code: (d.recovery_code || '').trim() } : { code: (d.code || '').replace(/\s+/g, '') };
+    try {
+      const r = await request('/login/mfa', { method: 'POST', body: { challenge_token: ch.challenge_token, ...proof } });
+      if (r.ok) { state.user = r.data.user; state.needsSetup = false; await afterSignIn(); return; }
+      const err = (r.data && r.data.error) || {}, ra = r.headers.get('Retry-After');
+      if (r.status === 401 && err.code === 'mfa_invalid_code') {
+        if (err.attempts_left === 0) { state.loginNotice = 'Five wrong codes ended that sign-in step. Enter your password again.'; renderLogin(); return; }
+        note.innerHTML = noteBox('warn', err.attempts_left != null ? `${fmtN(err.attempts_left)} left` : '401', `That code is not right${err.attempts_left != null ? `. ${err.attempts_left === 1 ? 'One more wrong code ends' : 'Further wrong codes end'} this sign-in step` : ''}. Codes change every 30 seconds.`);
+      } else if (r.status === 401) { state.loginNotice = err.message || 'That sign-in step expired. Enter your password again.'; renderLogin(); return; }
+      else if (r.status === 429 && err.code === 'mfa_locked') note.innerHTML = noteBox('err', 'locked', lockText(ra ? retryText(ra) : ''));
+      else if (r.status === 429) note.innerHTML = noteBox('warn', '429', 'Another check of this account is running. Try again in a second.');
+      else note.innerHTML = noteBox('err', String(r.status), errMsg(r.data, r.statusText));
+    } catch (err) { toast(err.message, 4000, 'err'); } finally { btn.disabled = false; }
+  };
+  paint();
+}
+
+// Account dialogs. Each form keeps its own error line (the shared toast would vanish before a lock message is
+// read). run() returns false when it opened the next dialog itself.
+const PW_HINT = 'Five wrong passwords in a row end this session.';
+const acctPassword = () => field('password', 'Your password', input('password', '', 'type=password required autocomplete=current-password'), PW_HINT);
+const acctCode = (label = 'Code from your app') => field('code', label, input('code', '', 'required inputmode=numeric autocomplete=one-time-code spellcheck=false maxlength=16 placeholder="123456"'), '6 digits.');
+const acctProof = () => field('method', 'Verify with', select('method', [{ value: 'code', label: 'Authenticator code' }, { value: 'recovery_code', label: 'Recovery code' }], 'code')) +
+  acctCode('Authenticator code') + field('recovery_code', 'Recovery code', input('recovery_code', '', 'autocomplete=off autocapitalize=characters spellcheck=false maxlength=32 placeholder="xxxxx-xxxxx"'), 'One of the codes you saved; it is used up.');
+function bindProof(form) {
+  const m = $('[name=method]', form), c = $('[name=code]', form), rc = $('[name=recovery_code]', form);
+  const sync = () => { const rec = m.value === 'recovery_code'; c.closest('.field').classList.toggle('hidden', rec); rc.closest('.field').classList.toggle('hidden', !rec); c.disabled = rec; rc.disabled = !rec; c.required = !rec; rc.required = rec; };
+  m.onchange = sync; sync();
+}
+const proofBody = d => d.method === 'recovery_code' ? { recovery_code: (d.recovery_code || '').trim() } : { code: (d.code || '').replace(/\s+/g, '') };
+const acctErrBox = '<div class="note err hidden" id="acctErr" role="alert"><span class="hint"></span></div>';
+function acctDialog(title, body, { submitLabel, danger = false, cancelLabel = 'Cancel', run }) {
+  const form = modal(title, body + acctErrBox, { submitLabel, danger, cancelLabel, onSubmit: async (d, f) => {
+    const box = $('#acctErr', f); box.classList.add('hidden');
+    try { return await run(d, f); }
+    catch (e) { if (e.signedOut) return; $('.hint', box).textContent = e.message; box.classList.remove('hidden'); return false; } } });
+  bindCopy(form);
+  const first = $('input:not([type=hidden]):not([type=checkbox]),select', form); if (first) setTimeout(() => first.focus(), 80);
+  return form;
+}
+async function refreshMe() { try { const me = await api('/me'); state.user = me; } catch (e) { /* the dialog still reads what the server answered */ } }
+
+async function totpStatus() {
+  let me; try { me = await api('/me'); state.user = me; } catch (e) { toast(e.message, 4000, 'err'); return; }
+  const on = !!me.totp_enabled;
+  const form = modal('Two-factor authentication', `
+    <p class="dim">${on ? 'Two-factor authentication is <span class="pill ok">on</span>. After your password, signing in asks for a code from your authenticator app.' : 'Two-factor authentication is <span class="pill">off</span>. Turn it on and signing in asks for a code from an authenticator app after the password.'}</p>
+    <div class="row wrap">${on ? '<button type="button" class="btn" id="totpRecovery">New recovery codes</button><button type="button" class="btn" id="totpChange">Change device</button><button type="button" class="btn danger" id="totpOff">Turn off</button>' : '<button type="button" class="btn primary" id="totpSetup">Set up</button>'}</div>
+    <p class="hint">Every action here asks for your password again. ${on ? 'Recovery codes are the way in when you lose the device; each works once.' : 'You get ten recovery codes when you turn it on; they are shown once.'}</p>
+    <p class="hint">Management keys (<code>sk-mgmt-…</code>) never ask for a code, and neither do ones minted before you turned this on: review them under API keys. Scripts that sign in with <code>bearer: true</code> need a management key instead.</p>`,
+    { submitLabel: 'Close', cancelLabel: '', onSubmit: async () => {} });
+  if (on) { $('#totpRecovery', form).onclick = totpRecoveryDialog; $('#totpChange', form).onclick = totpChangeDialog; $('#totpOff', form).onclick = totpDisableDialog; }
+  else $('#totpSetup', form).onclick = totpSetupDialog;
+}
+function totpSetupDialog() {
+  acctDialog('Set up two-factor authentication', `
+    <p class="dim">Use any authenticator app that makes time-based codes. The next step shows a setup key to add to it; this dashboard draws no QR code because it loads nothing from outside.</p>${acctPassword()}`, {
+    submitLabel: 'Continue',
+    run: async d => { totpEnrollDialog(await accountPost('/me/totp/setup', { password: d.password })); return false; } });
+}
+function totpEnrollDialog(s) {
+  const uri = String(s.otpauth_uri || '');
+  acctDialog('Add the key to your app', `
+    <ol class="dim" style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px"><li>In the app, add an account and choose "enter a setup key" (or open the link below on this device).</li><li>Type the secret below. Time-based, 6 digits, 30 seconds.</li><li>Enter the code the app shows, with your password, to turn two-factor authentication on.</li></ol>
+    <div class="field"><span class="field"><label>Secret</label></span><div class="secret-box"><code>${esc(s.secret)}</code><button type="button" class="btn sm" data-copy="${esc(s.secret)}">Copy</button></div></div>
+    <div class="field"><span class="field"><label>Setup link</label></span><div class="secret-box"><code>${esc(uri)}</code><button type="button" class="btn sm" data-copy="${esc(uri)}">Copy</button></div>${uri.startsWith('otpauth://') ? `<div class="hint"><a href="${esc(uri)}">Open it in an authenticator app on this device</a></div>` : ''}</div>
+    <div class="note warn"><span class="hint">The secret is shown only now. If you close this window, set up again to get a new one; until you turn two-factor on, signing in stays password-only.</span></div>
+    ${acctPassword()}${acctCode()}`, {
+    submitLabel: 'Turn on',
+    run: async d => {
+      const r = await accountPost('/me/totp/enable', { password: d.password, code: (d.code || '').replace(/\s+/g, '') });
+      await refreshMe();
+      recoveryCodesDialog(r.recovery_codes, 'Two-factor authentication is on. Your other sessions were signed out. Each code below works once, in place of an authenticator code, and they are shown only now.');
+      return false; } });
+}
+function recoveryCodesDialog(codes, note) {
+  const list = codes || [];
+  modal('Recovery codes', `
+    <div class="note warn"><span class="hint">${esc(note)}</span></div>
+    <div class="mfa-codes" role="list" aria-label="Recovery codes">${list.map(c => `<code role="listitem">${esc(c)}</code>`).join('')}</div>
+    <div class="row"><button type="button" class="btn sm" data-copy="${esc(list.join('\n'))}">Copy all</button></div>
+    <label class="check"><input type="checkbox" name="saved" required> I have stored these codes somewhere safe</label>`,
+    { submitLabel: 'Done', cancelLabel: '', dismissable: false, onSubmit: async () => {} });
+  bindCopy($('#modalRoot'));
+}
+function totpRecoveryDialog() {
+  acctDialog('New recovery codes', `<p class="dim">The ten codes you have now stop working. Enter a code from your authenticator app (a recovery code does not do here).</p>${acctPassword()}${acctCode('Authenticator code')}`, {
+    submitLabel: 'Make new codes',
+    run: async d => {
+      const r = await accountPost('/me/totp/recovery-codes', { password: d.password, code: (d.code || '').replace(/\s+/g, '') });
+      recoveryCodesDialog(r.recovery_codes, 'Ten new recovery codes. The old ones no longer work, and these are shown only now.');
+      return false; } });
+}
+function totpDisableDialog() {
+  const form = acctDialog('Turn off two-factor authentication', `
+    <div class="note warn"><span class="hint">Signing in goes back to the password alone and your recovery codes are deleted.</span></div>${acctPassword()}${acctProof()}`, {
+    submitLabel: 'Turn off', danger: true,
+    run: async d => {
+      await accountPost('/me/totp/disable', { password: d.password, ...proofBody(d) });
+      await refreshMe(); toast('Two-factor authentication is off', 3500, 'ok'); } });
+  bindProof(form);
+}
+// Changing the device has no shortcut: the server never replaces a secret that is in use, so it is off, set up, on.
+function totpChangeDialog() {
+  const form = acctDialog('Change device', `
+    <div class="note warn"><span class="hint">Moving to a new device takes three steps: turn two-factor off, set it up on the new device, turn it on. <strong>From the first step until the last your account signs in with the password alone</strong>, and your old recovery codes stop working. Have the new device ready.</span></div>${acctPassword()}${acctProof()}`, {
+    submitLabel: 'Turn off and start setup', danger: true,
+    run: async d => {
+      await accountPost('/me/totp/disable', { password: d.password, ...proofBody(d) });
+      await refreshMe();
+      try { totpEnrollDialog(await accountPost('/me/totp/setup', { password: d.password })); return false; }
+      catch (e) { if (!e.signedOut) toast('Two-factor authentication is off now. Set it up again from the Two-factor button: ' + e.message, 7000, 'err'); } } });
+  bindProof(form);
+}
+$('#btnTotp').onclick = totpStatus;
 
 // ---------------------------------------------------------------------------
 // sign in and first-run setup
@@ -693,12 +898,15 @@ function renderLogin() {
     <button type="submit" class="btn primary" style="min-height:46px;justify-content:center;font-size:15px">Sign in</button>
     <div class="hint" style="text-align:center">Forgot your password? Ask an administrator to reset it.</div></form></section>`;
   heroVersion();
+  if (state.loginNotice) { $('#loginNote').innerHTML = noteBox('warn', 'signed out', state.loginNotice); state.loginNotice = ''; }
   $('#loginForm').onsubmit = async e => { e.preventDefault(); const form = e.target; const d = formData(form); const btn = $('button[type=submit]', form); btn.disabled = true; const note = $('#loginNote');
     try {
       const r = await request('/login', { method: 'POST', body: { username: d.username, password: d.password } });
+      if (r.ok && r.data.mfa_required) { renderMFA(r.data); return; }
       if (r.ok) { state.user = r.data.user; state.needsSetup = false; await afterSignIn(); return; }
       const err = (r.data && r.data.error) || {};
       if (r.status === 401) { const left = err.attempts_remaining; note.innerHTML = `<div class="note warn">${left != null ? `<span class="pill warn">${fmtN(left)} left</span>` : '<span class="pill err">401</span>'}<span class="hint">${esc(err.message || 'invalid username or password')}${left != null ? '. Further failures this minute trigger the per-user limit.' : ''}</span></div>`; }
+      else if (r.status === 429 && err.code === 'mfa_locked') { const ra = r.headers.get('Retry-After'); note.innerHTML = noteBox('err', 'locked', lockText(ra ? retryText(ra) : '')); }
       else if (r.status === 429) { const ra = r.headers.get('Retry-After'); note.innerHTML = `<div class="note err"><span class="pill err">${err.locked ? 'locked' : '429'}</span><span class="hint">${esc(err.message || 'too many login attempts')}${ra ? ` · retry in ${esc(ra)} s` : ''}${err.locked ? ' · this username/address pair is locked out' : ''}</span></div>`; }
       else note.innerHTML = `<div class="note err"><span class="hint">${esc(errMsg(r.data, r.statusText))}</span></div>`;
     } catch (err) { toast(err.message, 4000, 'err'); } finally { btn.disabled = false; } };
@@ -828,6 +1036,7 @@ function renderSetupAdmin() {
     finally { btn.disabled = false; } };
 }
 async function afterSignIn() {
+  passwordMisses = 0; // a new session starts the server's count over
   try { const me = await api('/me'); state.user = me; state.sessionExp = me.session_expires_at || null; } catch (e) { /* login response already carries the user */ }
   try { await loadAll(); } catch (e) { toast(e.message, 4000, 'err'); }
   state.tab = 'overview'; render();
@@ -1427,7 +1636,7 @@ function renderProjects() {
     <div class="split wide"><section class="stack" style="gap:10px">
       ${state.projects.map(p => `<div class="card tight stack ${p.id === state.openProject ? 'sel' : ''}" style="gap:10px" data-card="${p.id}">
         <div class="row between"><div style="font-weight:600;font-size:15px" class="ellip">${esc(p.name)}</div><code class="pill">${esc(p.api_key_prefix)}…</code></div>
-        <div class="kv" style="font-size:12.5px;gap:4px 12px"><span class="k">model</span><span class="mono ellip">${esc(modelName(p.model_connection_id))}</span><span class="k">rag</span><span class="ellip">${esc(ragName(p.rag_store_id))}</span><span class="k">limits</span><span class="mono dim ellip">${esc(limitSummary(p))}</span>${p.rag_store_id ? `<span class="k">retrieval</span><span class="mono dim ellip" title="${esc(ragBehaviourSummary(p) || 'default behaviour')}">${esc(ragBehaviourSummary(p) || 'default')}</span>` : ''}${toolPolicySummary(p) ? `<span class="k">tools</span><span class="mono dim ellip" title="${esc(toolPolicySummary(p))}">${esc(toolPolicySummary(p))}</span>` : ''}</div>
+        <div class="kv" style="font-size:12.5px;gap:4px 12px"><span class="k">model</span><span class="mono ellip">${esc(modelName(p.model_connection_id))}</span><span class="k">rag</span><span class="ellip">${esc(ragName(p.rag_store_id))}</span><span class="k">limits</span><span class="mono dim ellip">${esc(limitSummary(p))}</span>${p.rag_store_id ? `<span class="k">retrieval</span><span class="mono dim ellip" title="${esc(ragBehaviourSummary(p) || 'default behaviour')}">${esc(ragBehaviourSummary(p) || 'default')}</span>` : ''}${toolPolicySummary(p) ? `<span class="k">tools</span><span class="mono dim ellip" title="${esc(toolPolicySummary(p))}">${esc(toolPolicySummary(p))}</span>` : ''}${policyRows(p)}</div>
         <div class="row between" style="margin-top:2px"><span class="hint ellip">${(p.member_ids || []).length} member${(p.member_ids || []).length === 1 ? '' : 's'}${state.users.length ? ' · ' + esc((p.member_ids || []).map(userName).join(', ')) : ''}</span><span class="row" style="gap:6px"><button class="btn sm ghost" data-metrics="${p.id}" aria-pressed="${p.id === state.openProject}">Metrics</button>${w ? `<button class="btn sm ghost" data-edit="${p.id}">Edit</button>` : ''}</span></div></div>`).join('') || `<div class="empty">No projects yet.${state.models.length ? '' : ' Add a model connection first.'}</div>`}</section>
     <section class="stack" style="gap:16px" id="projPanel"></section></div>`;
   if (w) $('#addProject').onclick = () => projectForm();
@@ -1506,7 +1715,7 @@ function projectForm(p) {
     <p class="hint" style="margin-top:-8px">Decides which tools a request may offer the model. A pattern is a tool name where <code>*</code> stands for any run of characters, for example <code>mcp__github__*</code>. One per line.</p>
     ${field('tool_allow', 'Allowed tools', textarea('tool_allow', p ? (p.tool_allow || []).join('\n') : '', 'rows=4 spellcheck=false autocomplete=off aria-describedby=tool_allow-err placeholder="empty: every tool not denied"') + '<div class="meta-err" id="tool_allow-err" role="alert"></div>', 'When not empty, only matching tools are kept.')}
     ${field('tool_deny', 'Denied tools', textarea('tool_deny', p ? (p.tool_deny || []).join('\n') : '', 'rows=4 spellcheck=false autocomplete=off aria-describedby=tool_deny-err placeholder="none"') + '<div class="meta-err" id="tool_deny-err" role="alert"></div>', 'Deny always wins over allow. A denied tool is stripped from the request, which still goes through.')}
-    ${field('session_token_cap', 'Session token cap', input('session_token_cap', p ? p.session_token_cap || 0 : 0, 'type=number min=0 step=1 aria-describedby=session_token_cap-err') + '<div class="meta-err" id="session_token_cap-err" role="alert"></div>', '0 = unlimited. Prompt + completion tokens one <code>X-Ragmux-Session</code> may spend; after that its requests get <code>429</code>.')}
+    ${field('session_token_cap', 'Session token cap', input('session_token_cap', p ? p.session_token_cap || 0 : 0, 'type=number min=0 step=1 aria-describedby=session_token_cap-err') + '<div class="meta-err" id="session_token_cap-err" role="alert"></div>', '0 = unlimited. Prompt + completion tokens one <code>X-Ragmux-Session</code> may spend; after that its requests get <code>429</code>.')}${projectV08Fields(p)}
     <div class="field"><span class="field"><label>Members</label></span>${checklist('members', state.users.map(u => ({ value: u.id, label: `${u.username} (${u.role})` })), p ? p.member_ids || [] : [state.user.id])}<div class="hint">You stay a member of projects you create; an editor cannot remove themselves.</div></div>`,
     onSubmit: async (d, form) => { const members = checkedValues(form, 'members');
       const body = { name: d.name, model_connection_id: Number(d.model_connection_id), rag_store_id: Number(d.rag_store_id) || null, system_prompt: d.system_prompt, rate_limit_rpm: Number(d.rate_limit_rpm) || 0, rate_limit_tpm: Number(d.rate_limit_tpm) || 0, budget_daily_tokens: Number(d.budget_daily_tokens) || 0, budget_monthly_tokens: Number(d.budget_monthly_tokens) || 0 };
@@ -1518,6 +1727,9 @@ function projectForm(p) {
       const toolErr = { tool_allow: toolListError('tool_allow', allow), tool_deny: toolListError('tool_deny', deny),
         session_token_cap: Number.isSafeInteger(cap) && cap >= 0 ? '' : 'session_token_cap must be 0 (unlimited) or a positive whole number' };
       if (showToolErrors(form, toolErr)) throw new Error('Fix the tool policy fields');
+      const v08 = projectV08Body(p, d);
+      if (showV08Errors(form, v08.errs)) throw new Error('Fix the highlighted fields');
+      Object.assign(body, v08.body);
       // Lists and the cap are sent only when they changed, like the RAG settings.
       if (JSON.stringify(allow) !== JSON.stringify(p ? p.tool_allow || [] : [])) body.tool_allow = allow;
       if (JSON.stringify(deny) !== JSON.stringify(p ? p.tool_deny || [] : [])) body.tool_deny = deny;
@@ -1525,16 +1737,22 @@ function projectForm(p) {
       for (const k of ['context_placement', 'retrieval_policy', 'query_strategy']) if (d[k] !== ragCur(p, k)) body[k] = d[k];
       if (d.history_turns_for_query != null && Number(d.history_turns_for_query) !== ragCur(p, 'history_turns_for_query')) body.history_turns_for_query = Number(d.history_turns_for_query);
       if (d.query_model_connection_id != null && (Number(d.query_model_connection_id) || 0) !== ragCur(p, 'query_model_connection_id')) body.query_model_connection_id = Number(d.query_model_connection_id) || null;
+      let warnings = [];
       try {
-        if (p) { await api('/projects/' + p.id, { method: 'PUT', body }); await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: members } }); toast('Saved', 3000, 'ok'); }
-        else { const r = await api('/projects', { method: 'POST', body: { ...body, member_user_ids: members } }); state.openProject = r.project.id; showKey(r.project, r.api_key); }
-      } catch (err) { showToolErrors(form, { [(/^(tool_allow|tool_deny|session_token_cap)\b/.exec(err.message) || [])[1]]: err.message }); throw err; }
-      await loadAll(); render(); } });
+        if (p) { const r = await api('/projects/' + p.id, { method: 'PUT', body }); warnings = r.warnings || []; await api(`/projects/${p.id}/members`, { method: 'PUT', body: { user_ids: members } }); toast('Saved', 3000, 'ok'); }
+        else { const r = await api('/projects', { method: 'POST', body: { ...body, member_user_ids: members } }); state.openProject = r.project.id; showKey(r.project, r.api_key, r.warnings); }
+      } catch (err) {
+        const hit = (/^([a-z_]+)\b/.exec(err.message) || [])[1];
+        if (['tool_allow', 'tool_deny', 'session_token_cap'].includes(hit)) showToolErrors(form, { [hit]: err.message }); else if (V08_FIELDS.includes(hit)) showV08Errors(form, { [hit]: err.message });
+        throw err;
+      }
+      await loadAll(); render(); showWarnings(warnings); } });
   // The two condense-only fields follow the strategy: disabled fields are not
   // submitted, which is what keeps them out of the request body.
   const strategySel = $('[name=query_strategy]', form);
   const syncCondense = () => { for (const n of ['history_turns_for_query', 'query_model_connection_id']) $(`[name=${n}]`, form).disabled = strategySel.value !== 'condense'; };
   strategySel.onchange = syncCondense; syncCondense();
+  bindProjectV08(form);
   for (const name of ['tool_allow', 'tool_deny', 'session_token_cap']) $(`[name=${name}]`, form).addEventListener('input', e => { e.target.removeAttribute('aria-invalid'); $(`#${name}-err`, form).textContent = ''; });
 }
 function membersForm(p) {
@@ -1544,7 +1762,7 @@ function membersForm(p) {
 // showSecret is the reveal-once modal for every credential the API returns.
 // A gateway key that grants more than one project gets the routing header in
 // its snippet; a management key gets the header-only warning instead.
-function showSecret({ title, key, kind = 'gateway', projects = [] }) {
+function showSecret({ title, key, kind = 'gateway', projects = [], note = '', warnings = [] }) {
   const origin = location.origin;
   const projHeader = projects.length > 1 ? `\n  -H "X-Ragmux-Project: ${esc(projects[0])}"` : '';
   const gateway = `<h3>Example</h3><pre>curl ${esc(origin)}/v1/chat/completions \\
@@ -1555,12 +1773,13 @@ function showSecret({ title, key, kind = 'gateway', projects = [] }) {
   const management = `<h3>Example</h3><pre>curl ${esc(origin)}/admin/api/projects \\
   -H "Authorization: Bearer ${esc(key)}"</pre>
     <p class="hint">Management keys are only accepted in the <code>Authorization</code> header — never in the session cookie — and can do no more than the scopes above intersected with your role.</p>`;
-  modal(title, `<p class="dim">Copy this key now — it is not stored and cannot be shown again.</p><pre class="mono" style="font-size:13px;color:var(--amber-tx)">${esc(key)}</pre>
-    ${kind === 'management' ? management : gateway}`, { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
-  if (kind !== 'management') state.playground.key = key;
+  modal(title, `<p class="dim">Copy this ${kind === 'webhook' ? 'secret' : 'key'} now — it is not stored and cannot be shown again.</p><pre class="mono" style="font-size:13px;color:var(--amber-tx)">${esc(key)}</pre>
+    ${(warnings || []).map(w => `<div class="note warn"><span class="hint">${esc(w)}</span></div>`).join('')}
+    ${kind === 'management' ? management : kind === 'webhook' ? `<p class="hint">${note}</p>` : gateway}`, { submitLabel: 'Done', cancelLabel: '', onSubmit: async () => {} });
+  if (kind === 'gateway') state.playground.key = key;
 }
-function showKey(p, key) {
-  showSecret({ title: `API key for ${p.name}`, key, kind: 'gateway', projects: [p.name] });
+function showKey(p, key, warnings = []) {
+  showSecret({ title: `API key for ${p.name}`, key, kind: 'gateway', projects: [p.name], warnings });
 }
 // ---------------------------------------------------------------------------
 // routes (per project)
@@ -1672,11 +1891,17 @@ async function projectPanel() {
       <div class="stat"><div class="l">Latency</div><div class="v">${fmtN(Math.round(win.avg_latency_ms))}<small>ms</small></div><div class="d">p95 ${fmtN(win.p95_latency_ms)} ms</div></div>
       <div class="stat" title="Estimated from the price table; not a bill"><div class="l">Spend 24h (est.)</div><div class="v">${fmtUSD(win.cost_usd)}</div><div class="d">${fmtUSD(t.cost_usd)} all time · ${fmtN(t.requests)} requests</div></div></div>
     <div class="card" id="routesCard"></div>
+    <div class="card" id="guardrailsCard"></div>
+    <div class="card" id="alertsCard"></div>
+    <div class="card" id="feedbackCard"></div>
     <div class="card" id="sessionsCard"></div>
     <div class="card"><div class="card-head"><h2>Recent</h2><span class="hint">last 50 · newest first</span></div>
       <div class="tbl"><table><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Tokens p / c</th><th title="Estimated from the price table">$ (est.)</th><th>Latency</th><th>Flags</th><th>Error</th></tr></thead><tbody>
       ${(m.recent || []).map(r => `<tr><td class="mono muted nowrap" title="${esc(fmtDate(r.created_at))}">${fmtTime(r.created_at)}</td><td class="mono">${esc(r.model_name)}</td><td>${statusPill(r.status_code)}</td><td class="mono">${fmtN(r.prompt_tokens)} / ${fmtN(r.completion_tokens)}${r.estimated ? ' <span class="muted" title="estimated">~</span>' : ''}${r.cached_prompt_tokens ? ` <span class="pill info" title="prompt tokens served from the provider cache">cache ${fmtK(r.cached_prompt_tokens)}</span>` : ''}</td><td class="mono ${r.cost_source === 'none' ? 'muted' : ''}" title="${r.cost_source === 'none' ? 'no price for this model' : 'estimated · ' + esc(r.cost_source) + ' price'}">${r.cost_source === 'none' ? '—' : fmtUSD(r.cost_usd)}</td><td class="mono">${fmtMs(r.latency_ms)}</td><td>${flagPills(r)}</td><td class="muted ellip" style="max-width:260px" title="${esc(r.error)}">${esc(r.error) || '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">None yet.</td></tr>'}</tbody></table></div></div>`;
   renderRoutes(id);
+  renderGuardrails(id);
+  renderAlerts(id);
+  renderFeedback(id);
   renderSessions(id, sessFocus);
   // Live countdown on the reset labels; the minute ring is refetched when its window rolls over.
   const resets = { minute: u.minute.resets_at, day: u.day.resets_at, month: u.month.resets_at };
@@ -1814,6 +2039,319 @@ async function renderSessions(projectId, refocus = null) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.8 project settings: extra fields (ADR-041), key networks (ADR-039), end-user ceilings (ADR-035)
+// ---------------------------------------------------------------------------
+const END_USER_FIELDS = ['end_user_rpm', 'end_user_tpm', 'end_user_daily_tokens', 'end_user_monthly_tokens'];
+const V08_FIELDS = ['extra_allow', 'extra_deny', 'key_allowed_cidrs', 'key_allowed_origins', ...END_USER_FIELDS];
+// The request fields that change cost or what the provider keeps (docs: Request field passthrough).
+const EXTRA_COST_FIELDS = ['store', 'service_tier', 'web_search_options', 'modalities', 'audio', 'prediction', 'mcp_servers', 'container'];
+const MAX_NETWORK_ENTRIES = 32;
+// Same shape and bounds as a tool pattern; the server stays the authority and its message is shown too.
+const fieldListError = (name, list) => {
+  if (list.length > MAX_TOOL_PATTERNS) return `${name} holds at most ${MAX_TOOL_PATTERNS} patterns`;
+  const bad = list.find(x => !TOOL_PATTERN.test(x));
+  return bad === undefined ? '' : `${name}: "${bad}" is not a field pattern; use 1 to 128 of letters, digits and . _ : - *`;
+};
+const CIDR_SHAPE = /^(\d{1,3}(\.\d{1,3}){3}|[0-9a-f]*:[0-9a-f:.]*)(\/\d{1,3})?$/i;
+const cidrListError = (name, list) => {
+  if (list.length > MAX_NETWORK_ENTRIES) return `${name} holds at most ${MAX_NETWORK_ENTRIES} entries`;
+  const bad = list.find(x => !CIDR_SHAPE.test(x));
+  return bad === undefined ? '' : `${name}: "${bad}" is not an IPv4 or IPv6 network or address (for example 203.0.113.0/24)`;
+};
+const originListError = (name, list) => {
+  if (list.length > MAX_NETWORK_ENTRIES) return `${name} holds at most ${MAX_NETWORK_ENTRIES} entries`;
+  for (const o of list) {
+    if (o === '*') return `${name}: a lone * is not allowed; name the origins`;
+    const m = /^https?:\/\/([^\s/]+)\/?$/i.exec(o);
+    if (!m) return `${name}: "${o}" is not an origin; use https://app.example.com or https://*.example.com`;
+    if (m[1].includes('*') && !/^\*\.[^*]+$/.test(m[1])) return `${name}: in "${o}" the * may only stand for the whole first label (https://*.example.com)`;
+  }
+  return '';
+};
+const wholeNumberError = (name, raw) => { const t = String(raw ?? '').trim(), v = t === '' ? 0 : Number(t); return Number.isSafeInteger(v) && v >= 0 ? '' : `${name} must be 0 (unlimited) or a positive whole number`; };
+// Shows each non-empty message under its field, marks the field invalid and focuses the first one.
+function showV08Errors(form, errs) {
+  let first = null;
+  for (const name of V08_FIELDS) {
+    const el = $(`[name=${name}]`, form), box = $(`#${name}-err`, form); if (!el || !box) continue;
+    box.textContent = errs[name] || '';
+    if (errs[name]) { el.setAttribute('aria-invalid', 'true'); first = first || el; } else el.removeAttribute('aria-invalid');
+  }
+  if (first) first.focus();
+  return !!first;
+}
+const errBox = name => `<div class="meta-err" id="${name}-err" role="alert"></div>`;
+const listInput = (name, list, attrs = '') => textarea(name, (list || []).join('\n'), `rows=3 spellcheck=false autocomplete=off aria-describedby=${name}-err ${attrs}`) + errBox(name);
+const countInput = (name, val) => input(name, val || 0, `type=number min=0 step=1 aria-describedby=${name}-err`) + errBox(name);
+// The three new project form sections.
+const projectV08Fields = p => `
+    <h3 style="margin-top:4px">Extra request fields</h3>
+    <p class="hint" style="margin-top:-8px">Fields the gateway does not read itself (<code>seed</code>, <code>store</code>, <code>service_tier</code> …) are forwarded upstream unchanged unless you list them here. A removed field answers with a <code>Warning: 299</code> header; the request still goes through. One pattern per line; <code>*</code> stands for any run of characters.</p>
+    ${field('extra_allow', 'Allowed fields', listInput('extra_allow', p && p.extra_allow, 'placeholder="empty: every field not denied"'), 'When not empty, every other unknown field is removed, <code>seed</code> and the like included.')}
+    ${field('extra_deny', 'Denied fields', listInput('extra_deny', p && p.extra_deny, 'placeholder="none"'), `Deny always wins over allow. Worth listing, because they change cost or what the provider keeps: ${EXTRA_COST_FIELDS.map(f => `<code>${f}</code>`).join(', ')} (the last two only on <code>/v1/messages</code>).`)}
+    <div class="row"><button type="button" class="btn sm" id="extraSuggest">Add the cost and retention fields to the deny list</button></div>
+    <h3 style="margin-top:4px">Where the project key may be used from</h3>
+    <p class="hint" style="margin-top:-8px">Restricts the project's own <code>sk-proj-…</code> key. Both lists are empty by default, which means no restriction. Rotating the key leaves them alone.</p>
+    ${field('key_allowed_cidrs', 'Allowed networks (CIDR)', listInput('key_allowed_cidrs', p && p.key_allowed_cidrs, 'placeholder="203.0.113.0/24"'), 'IPv4 or IPv6 network or single address, up to 32; an address alone is stored as /32 or /128. The address checked is the connection\'s peer or, with <code>TRUST_PROXY_HEADERS=true</code>, the one your proxy reports: set <code>TRUSTED_PROXY_CIDRS</code> as well, or a forged <code>X-Forwarded-For</code> walks around the list.')}
+    ${field('key_allowed_origins', 'Allowed browser origins', listInput('key_allowed_origins', p && p.key_allowed_origins, 'placeholder="https://app.example.com"'), 'Up to 32: <code>https://app.example.com</code> or <code>https://*.example.com</code> (any subdomain, never the bare domain). <strong>A key with an origin list cannot be used from a server:</strong> server-side callers send no <code>Origin</code> header and are refused, so give them a separate key with a CIDR list. The header is a browser signal, not a security boundary.')}
+    <h3 style="margin-top:4px">End-user limits</h3>
+    <p class="hint" style="margin-top:-8px">What one end user, named by the <code>X-Ragmux-End-User</code> header or the request's own field, may make in a UTC minute and spend in a UTC day and month. They bind only requests that name an end user: a request without one is not held to them, so this is a guardrail and not a security check. 0 = unlimited.</p>
+    ${twoCol(field('end_user_rpm', 'Requests / minute', countInput('end_user_rpm', p && p.end_user_rpm)), field('end_user_tpm', 'Prompt tokens / minute', countInput('end_user_tpm', p && p.end_user_tpm)))}
+    ${twoCol(field('end_user_daily_tokens', 'Daily tokens', countInput('end_user_daily_tokens', p && p.end_user_daily_tokens)), field('end_user_monthly_tokens', 'Monthly tokens', countInput('end_user_monthly_tokens', p && p.end_user_monthly_tokens)))}`;
+// What the form changed in the v0.8 fields, or the errors that stop it. Like the tool and RAG settings,
+// only a changed setting is sent, so a save from an older tab cannot reset one it never showed.
+function projectV08Body(p, d) {
+  const lists = { extra_allow: parseToolList(d.extra_allow), extra_deny: parseToolList(d.extra_deny), key_allowed_cidrs: parseToolList(d.key_allowed_cidrs), key_allowed_origins: parseToolList(d.key_allowed_origins) };
+  const errs = { extra_allow: fieldListError('extra_allow', lists.extra_allow), extra_deny: fieldListError('extra_deny', lists.extra_deny),
+    key_allowed_cidrs: cidrListError('key_allowed_cidrs', lists.key_allowed_cidrs), key_allowed_origins: originListError('key_allowed_origins', lists.key_allowed_origins) };
+  for (const n of END_USER_FIELDS) errs[n] = wholeNumberError(n, d[n]);
+  const body = {};
+  for (const [k, list] of Object.entries(lists)) if (JSON.stringify(list) !== JSON.stringify(p ? p[k] || [] : [])) body[k] = list;
+  for (const n of END_USER_FIELDS) { const v = Number(String(d[n] ?? '').trim() || 0); if (v !== (p ? p[n] || 0 : 0)) body[n] = v; }
+  return { body, errs };
+}
+function bindProjectV08(form) {
+  for (const name of V08_FIELDS) $(`[name=${name}]`, form).addEventListener('input', e => { e.target.removeAttribute('aria-invalid'); $(`#${name}-err`, form).textContent = ''; });
+  $('#extraSuggest', form).onclick = () => {
+    const el = $('[name=extra_deny]', form), have = parseToolList(el.value), add = EXTRA_COST_FIELDS.filter(f => !have.includes(f));
+    el.value = [...have, ...add].join('\n'); el.focus();
+    toast(add.length ? `Added ${add.length} field${add.length === 1 ? '' : 's'} to the deny list. Save the project to apply it.` : 'Those fields are already denied.', 3500);
+  };
+}
+// "allow 1 · deny 3", "2 networks · 1 origin", "10 rpm · 200k/day": the project card's one-line summaries.
+const extraSummary = p => [(p.extra_allow || []).length ? `allow ${p.extra_allow.length}` : '', (p.extra_deny || []).length ? `deny ${p.extra_deny.length}` : ''].filter(Boolean).join(' · ');
+const keyNetSummary = p => [(p.key_allowed_cidrs || []).length ? `${p.key_allowed_cidrs.length} network${p.key_allowed_cidrs.length === 1 ? '' : 's'}` : '', (p.key_allowed_origins || []).length ? `${p.key_allowed_origins.length} origin${p.key_allowed_origins.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
+const endUserSummary = p => [p.end_user_rpm ? `${fmtK(p.end_user_rpm)} rpm` : '', p.end_user_tpm ? `${fmtK(p.end_user_tpm)} tpm` : '', p.end_user_daily_tokens ? `${fmtK(p.end_user_daily_tokens)}/day` : '', p.end_user_monthly_tokens ? `${fmtK(p.end_user_monthly_tokens)}/month` : ''].filter(Boolean).join(' · ');
+const policyRows = p => [['fields', extraSummary(p)], ['key from', keyNetSummary(p)], ['end users', endUserSummary(p)]].filter(([, v]) => v)
+  .map(([k, v]) => `<span class="k">${k}</span><span class="mono dim ellip" title="${esc(v)}">${esc(v)}</span>`).join('');
+// A save that went through but needs a word (the CIDR list can be walked around behind a proxy that is trusted blindly).
+function showWarnings(list) {
+  if (!list || !list.length) return;
+  modal('Saved, with a warning', list.map(w => `<div class="note warn"><span class="hint">${esc(w)}</span></div>`).join(''), { submitLabel: 'Understood', cancelLabel: '', onSubmit: async () => {} });
+}
+
+// ---------------------------------------------------------------------------
+// webhook endpoints (ADR-034, ADR-036): one per project and purpose, secret shown once
+// ---------------------------------------------------------------------------
+const WEBHOOK_URL_RULES = 'https only (http only for a host on <code>PRIVATE_WEBHOOK_ALLOWLIST</code>), no credentials in the URL, up to 2048 bytes, and a host that does not resolve only to private or local addresses.';
+const maskUrl = raw => { try { const u = new URL(raw); return u.origin + (u.pathname + u.search + u.hash === '/' ? '' : '/…'); } catch (e) { return '…'; } };
+// Paints the endpoint of one purpose into host; editors only (the URL often carries a token, so the API asks for the editor role to read it).
+async function webhookBlock(host, projectId, purpose, { label, after = () => {} }) {
+  const gone = () => state.openProject !== projectId || !host.isConnected;
+  const url = `/projects/${projectId}/webhooks/${purpose}`;
+  host.innerHTML = '<div class="hint" role="status">Loading the endpoint…</div>';
+  let ep = null;
+  try { ep = await api(url); }
+  catch (e) {
+    if (gone()) return;
+    if (e.status !== 404) { host.innerHTML = `<div class="note err" role="alert"><span class="hint">Could not load the ${esc(label)} endpoint: ${esc(e.message)}</span><span class="grow"></span><button class="btn sm" data-retry>Retry</button></div>`; $('[data-retry]', host).onclick = () => webhookBlock(host, projectId, purpose, { label, after }); return; }
+  }
+  if (gone()) return;
+  const pill = ep ? (ep.disabled ? '<span class="pill err">closed</span>' : '<span class="pill ok">registered</span>') : '<span class="pill warn">not registered</span>';
+  host.innerHTML = `<div class="rule-card"><div class="row between wrap"><div class="row wrap" style="gap:8px"><strong>${esc(label)} webhook endpoint</strong> ${pill}</div>
+    <div class="row wrap" style="gap:6px"><button class="btn sm ${ep ? '' : 'primary'}" data-wh="url">${ep ? 'Change URL' : 'Register'}</button>${ep ? '<button class="btn sm" data-wh="rotate">Rotate secret</button><button class="btn sm ghost danger" data-wh="remove">Remove</button>' : ''}</div></div>
+    ${ep ? `<div class="kv"><span class="k">URL</span><span class="mono ellip" title="The full URL is in the Change URL form">${esc(maskUrl(ep.url))}</span><span class="k">updated</span><span class="mono dim">${esc(fmtDate(ep.updated_at))}</span>${ep.previous_secret_expires_at ? `<span class="k">old secret</span><span class="dim">still signs until ${esc(fmtDay(ep.previous_secret_expires_at))}</span>` : ''}</div>` : '<div class="hint">Register an https URL. The signing secret is created with it and shown once.</div>'}
+    ${ep && ep.disabled ? '<div class="note err"><span class="hint">The receiver answered <code>410 Gone</code>, so deliveries stopped. Save its URL again with Change URL to resume.</span></div>' : ''}</div>`;
+  $('[data-wh=url]', host).onclick = () => modal(`${ep ? 'Change' : 'Register'} the ${label} webhook`,
+    field('url', 'Endpoint URL', input('url', ep ? ep.url : '', 'type=url required maxlength=2048 autocomplete=off spellcheck=false placeholder="https://example.com/hooks/ragmux"'), WEBHOOK_URL_RULES) + (ep ? '' : '<p class="hint">The signing secret (<code>whsec_…</code>) is created with the endpoint and shown once.</p>'),
+    { submitLabel: ep ? 'Save URL' : 'Register', onSubmit: async d => {
+      const r = await api(url, { method: 'PUT', body: { url: d.url.trim() } });
+      after();
+      if (!r.secret) { toast(r.disabled ? 'Saved' : 'URL saved', 3000, 'ok'); return; }
+      showSecret({ title: `${label} webhook secret`, key: r.secret, kind: 'webhook', note: 'Give it to the receiver, which uses it to check the <code>webhook-signature</code> header. If it is lost, rotate it.' });
+      return false; } });
+  if (!ep) return;
+  $('[data-wh=rotate]', host).onclick = async () => {
+    if (!await confirmDialog('Rotate the signing secret? The new one is shown once. The old one keeps signing for 24 hours next to it, so the receiver can switch without dropping a delivery.', { label: 'Rotate secret', danger: false })) return;
+    try {
+      const r = await api(`${url}/rotate-secret`, { method: 'POST' }); after();
+      showSecret({ title: `New ${label} webhook secret`, key: r.secret, kind: 'webhook', note: r.previous_secret_expires_at ? `The previous secret keeps signing until ${esc(fmtDay(r.previous_secret_expires_at))}; switch the receiver before then.` : 'Switch the receiver to it.' });
+    } catch (e) { toast(e.message, 5000, 'err'); } };
+  $('[data-wh=remove]', host).onclick = async () => {
+    const msg = purpose === 'alerts' ? 'Remove the alerts endpoint? Alerts that were not delivered yet are forgotten with it. A limit that is still crossed is sent again when you register a new endpoint.' : 'Remove the guardrail endpoint? While the webhook is enabled on the project, requests are then handled according to its failure mode.';
+    if (!await confirmDialog(msg, { label: 'Remove endpoint' })) return;
+    try { await api(url, { method: 'DELETE' }); toast('Endpoint removed', 3000, 'ok'); after(); } catch (e) { toast(e.message, 5000, 'err'); } };
+}
+
+// ---------------------------------------------------------------------------
+// guardrails (ADR-034): rules, stream window and webhook
+// ---------------------------------------------------------------------------
+const GR_TYPES = [{ value: 'tckn', label: 'tckn — Turkish national id (11 digits, checksum)' }, { value: 'iban', label: 'iban — IBAN (mod-97, country length)' }, { value: 'regex', label: 'regex — RE2 pattern' }, { value: 'keywords', label: 'keywords — whole words, case-insensitive' }];
+const GR_ACTIONS = [{ value: 'block', label: 'block — refuse the request, or replace the answer' }, { value: 'redact', label: 'redact — replace the match with [REDACTED:id]' }, { value: 'flag', label: 'flag — count it, change nothing' }];
+const GR_STAGES = [{ value: 'pre_request', hint: 'what the client sends' }, { value: 'pre_retrieval', hint: 'the search query' }, { value: 'post_response', hint: 'the answer' }];
+const GR_MODES = [{ value: 'fail_closed', label: 'fail_closed — refuse the request (503) when the webhook fails' }, { value: 'fail_open', label: 'fail_open — serve the request when the webhook fails' }];
+const GR_MAX_RULES = 32, GR_ID = /^[a-z0-9_-]{1,32}$/, GR_WINDOW = 128, GR_TIMEOUT = 2000;
+const byteLen = s => new TextEncoder().encode(s).length;
+const grActionPill = a => `<span class="pill ${a === 'block' ? 'err' : a === 'redact' ? 'warn' : 'info'}">${esc(a)}</span>`;
+// A rule's pattern or words are the operator's own and often the very thing being protected, so the summary shows only their size.
+const grBody = r => r.type === 'regex' ? `${byteLen(r.pattern || '')} bytes` : r.type === 'keywords' ? `${(r.keywords || []).length} word${(r.keywords || []).length === 1 ? '' : 's'}` : '';
+async function renderGuardrails(projectId) {
+  const card = $('#guardrailsCard'); if (!card) return; const w = can('editor');
+  const gone = () => state.openProject !== projectId || $('#guardrailsCard') !== card;
+  const head = (actions = '') => `<div class="card-head"><div><h2>Guardrails</h2><div class="hint">Screen what goes into the model and what comes back. A match is counted by rule id; its text, hash and position are stored and logged nowhere.</div></div><div class="row wrap">${actions}</div></div>`;
+  card.innerHTML = head() + '<div class="hint" role="status">Loading guardrails…</div>';
+  let g;
+  try { g = await api(`/projects/${projectId}/guardrails`); }
+  catch (e) {
+    if (gone()) return;
+    card.innerHTML = head() + `<div class="note err" role="alert"><span class="hint">Could not load guardrails: ${esc(e.message)}</span><span class="grow"></span><button class="btn sm" id="grRetry">Retry</button></div>`;
+    $('#grRetry').onclick = () => renderGuardrails(projectId); return;
+  }
+  if (gone()) return;
+  const rules = g.rules || [], wh = g.webhook || {};
+  card.innerHTML = head(w ? '<button class="btn sm primary" id="grEdit">Edit guardrails</button>' : '') + `<div class="stack" style="gap:14px">
+    ${(g.warnings || []).map(x => `<div class="note warn" role="status"><span class="pill warn">warning</span><span class="hint">${esc(x)}</span></div>`).join('')}
+    ${rules.length ? `<div class="tbl"><table><thead><tr><th>Rule</th><th>Type</th><th>Action</th><th>Stages</th><th>Holds</th></tr></thead><tbody>${rules.map(r => `<tr><td class="mono" style="font-weight:500">${esc(r.id)}</td><td><span class="pill">${esc(r.type)}</span></td><td>${grActionPill(r.action)}</td><td><div class="meta-pills">${(r.stages || []).map(s => `<span class="pill">${esc(s)}</span>`).join('')}</div></td><td class="mono muted">${esc(grBody(r)) || '—'}</td></tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty">No rules. Nothing is scanned, no window is held back, and a native <code>/v1/messages</code> stream stays a byte-for-byte copy of the upstream\'s.</div>'}
+    <div class="kv"><span class="k">stream window</span><span class="mono">${fmtN(g.stream_window_chars)} characters</span>
+      <span class="k">webhook</span><span>${wh.enabled ? '<span class="pill ok">enabled</span>' : '<span class="pill">off</span>'}${wh.enabled ? ` <span class="mono dim">${fmtN(wh.timeout_ms)} ms · ${esc(wh.failure_mode)}</span>` : ''}</span></div>
+    <div class="note"><span class="hint">Not scanned: the retrieved RAG passages (they are your own corpus), the project's own system prompt, tool definitions, images, audio and files. For tools and for extra request fields use the lists in the project settings.</span></div>
+    ${w ? '<div id="grWebhook"></div>' : ''}</div>`;
+  if (!w) return;
+  $('#grEdit').onclick = () => guardrailForm(projectId, g, () => renderGuardrails(projectId));
+  webhookBlock($('#grWebhook'), projectId, 'guardrail', { label: 'Guardrail', after: () => renderGuardrails(projectId) });
+}
+function guardrailForm(projectId, g, onSaved) {
+  const wh = g.webhook || {};
+  let rows = (g.rules || []).map(r => ({ id: r.id, type: r.type, action: r.action, stages: r.stages || [], pattern: r.pattern || '', keywords: (r.keywords || []).join('\n') }));
+  const ruleRow = (r, i) => `<div class="rule-card" role="group" aria-label="Rule ${i + 1}" data-row>
+      <div class="row between"><strong>Rule ${i + 1}</strong><button type="button" class="btn sm ghost danger" data-rm aria-label="Remove rule ${i + 1}">Remove</button></div>
+      ${field('r_id', 'Rule id', input('r_id', r.id, 'data-f=id required maxlength=32 autocomplete=off spellcheck=false placeholder="e.g. citizen-id"'), 'a–z, 0–9, <code>_</code> and <code>-</code>, up to 32. It names the rule in the request log and in the placeholder.')}
+      ${twoCol(field('r_type', 'Type', select('r_type', withCurrent(GR_TYPES, r.type), r.type, 'data-f=type')), field('r_action', 'Action', select('r_action', withCurrent(GR_ACTIONS, r.action), r.action, 'data-f=action')))}
+      <fieldset class="field" style="border:0;padding:0;margin:0;gap:4px"><legend>Stages</legend><div class="stage-row">${GR_STAGES.map(s => `<label class="check"><input type="checkbox" data-f="stage" value="${s.value}" ${r.stages.includes(s.value) ? 'checked' : ''}><span>${s.value} <span class="hint">· ${s.hint}</span></span></label>`).join('')}</div></fieldset>
+      <div data-for="regex" class="${r.type === 'regex' ? '' : 'hidden'}">${field('r_pattern', 'Pattern (RE2, up to 512 bytes)', input('r_pattern', r.pattern, 'data-f=pattern maxlength=512 autocomplete=off spellcheck=false'), 'It must not match the empty string. A match longer than the stream window can slip through a streamed answer.')}</div>
+      <div data-for="keywords" class="${r.type === 'keywords' ? '' : 'hidden'}">${field('r_keywords', 'Keywords (one per line)', textarea('r_keywords', r.keywords, 'data-f=keywords rows=4 spellcheck=false autocomplete=off'), 'Up to 500 words of up to 64 bytes. Whole words, case-insensitive; Turkish and other Unicode letters are respected.')}</div>
+      <div class="meta-err" data-err role="alert"></div></div>`;
+  const form = drawer({ eyebrow: 'Edit', title: 'Guardrails', submitLabel: 'Save guardrails', body: `
+    <p class="hint">All rules of a stage run in the order listed; a <code>redact</code> changes the text the rules after it read, and a <code>block</code> anywhere wins. An empty list, or one with no rule for a stage, leaves that stage out entirely. Saving replaces the whole configuration.</p>
+    <div class="stack" id="grRules"></div>
+    <div class="row between"><span class="hint" id="grCount"></span><button type="button" class="btn sm" id="grAdd">${ICON.plus} Add rule</button></div>
+    <h3 style="margin-top:4px">Streaming</h3>
+    ${field('stream_window_chars', 'Stream window (characters)', input('stream_window_chars', g.stream_window_chars || GR_WINDOW, 'type=number min=32 max=2048 step=1 required'), '32 to 2048, default 128. With a <code>post_response</code> rule, the last window-minus-one characters of a streamed answer are held back until they cannot be the start of a match, so <strong>the first text reaches the client later</strong>: about 0.3 to 0.6 s at 128 characters, at the speed of a typical model (an estimate). A bigger window delays it more. A <code>regex</code> that can match more than the window can be missed in a stream.')}
+    <h3 style="margin-top:4px">Webhook</h3>
+    ${toggle('webhook_enabled', !!wh.enabled, 'Consult the guardrail webhook', 'Posted at <code>pre_request</code> and <code>pre_retrieval</code>, after the local rules, synchronously and without retry. It needs an endpoint (register it in the card). Tool-call numbers are never sent to it; local rules read them.')}
+    ${field('webhook_timeout_ms', 'Timeout (ms)', input('webhook_timeout_ms', wh.timeout_ms || GR_TIMEOUT, 'type=number min=100 max=10000 step=1 required'), '100 to 10000, default 2000.')}
+    ${field('webhook_failure_mode', 'When it fails', select('webhook_failure_mode', withCurrent(GR_MODES, wh.failure_mode || 'fail_closed'), wh.failure_mode || 'fail_closed'), 'A timeout, an error, a redirect or an unreadable reply all count as a failure.')}`,
+    onSubmit: async d => {
+      readRows();
+      const errs = rows.map(r => {
+        if (!GR_ID.test(r.id)) return 'Rule id: use 1 to 32 of a–z, 0–9, _ and -.';
+        if (rows.filter(x => x.id === r.id).length > 1) return `Rule id "${r.id}" is used twice; ids are unique in a project.`;
+        if (!r.stages.length) return 'Pick at least one stage.';
+        if (r.type === 'regex') return !r.pattern ? 'A regex rule needs a pattern.' : byteLen(r.pattern) > 512 ? 'The pattern is longer than 512 bytes.' : '';
+        if (r.type === 'keywords') { const k = parseToolList(r.keywords); return !k.length ? 'A keywords rule needs at least one word.' : k.length > 500 ? 'At most 500 words.' : k.find(x => byteLen(x) > 64) ? 'A word is longer than 64 bytes.' : ''; }
+        return '';
+      });
+      $$('[data-err]', box).forEach((el, i) => { el.textContent = errs[i] || ''; });
+      const bad = errs.findIndex(Boolean);
+      if (bad >= 0) { const el = $$('[data-row]', box)[bad]; $('[data-f=id]', el).focus(); throw new Error('Fix the highlighted rule'); }
+      const win = Number(d.stream_window_chars), tmo = Number(d.webhook_timeout_ms);
+      if (!Number.isInteger(win) || win < 32 || win > 2048) throw new Error('The stream window must be a whole number from 32 to 2048.');
+      if (!Number.isInteger(tmo) || tmo < 100 || tmo > 10000) throw new Error('The webhook timeout must be a whole number from 100 to 10000 ms.');
+      const rules = rows.map(r => ({ id: r.id, type: r.type, action: r.action, stages: r.stages, ...(r.type === 'regex' ? { pattern: r.pattern } : {}), ...(r.type === 'keywords' ? { keywords: parseToolList(r.keywords) } : {}) }));
+      await api(`/projects/${projectId}/guardrails`, { method: 'PUT', body: { rules, stream_window_chars: win, webhook: { enabled: d.webhook_enabled, timeout_ms: tmo, failure_mode: d.webhook_failure_mode } } });
+      toast('Guardrails saved', 3000, 'ok'); onSaved(); } });
+  const box = $('#grRules', form);
+  function readRows() { rows = $$('[data-row]', box).map(el => ({ id: $('[data-f=id]', el).value.trim(), type: $('[data-f=type]', el).value, action: $('[data-f=action]', el).value, stages: $$('[data-f=stage]:checked', el).map(x => x.value), pattern: $('[data-f=pattern]', el).value, keywords: $('[data-f=keywords]', el).value })); }
+  function paint(focusIdx) {
+    box.innerHTML = rows.map(ruleRow).join('') || '<div class="empty">No rules yet.</div>';
+    $('#grCount', form).textContent = `${rows.length} of ${GR_MAX_RULES} rules`;
+    $('#grAdd', form).disabled = rows.length >= GR_MAX_RULES;
+    on(box, '[data-rm]', 'click', b => { readRows(); const i = $$('[data-rm]', box).indexOf(b); rows.splice(i, 1); paint(Math.max(0, i - 1)); });
+    on(box, '[data-f=type]', 'change', sel => { const row = sel.closest('[data-row]'); $('[data-for=regex]', row).classList.toggle('hidden', sel.value !== 'regex'); $('[data-for=keywords]', row).classList.toggle('hidden', sel.value !== 'keywords'); });
+    if (focusIdx != null) { const el = $$('[data-f=id]', box)[focusIdx]; if (el) el.focus(); }
+  }
+  $('#grAdd', form).onclick = () => { readRows(); if (rows.length >= GR_MAX_RULES) return; rows.push({ id: '', type: 'tckn', action: 'redact', stages: ['pre_request'], pattern: '', keywords: '' }); paint(rows.length - 1); };
+  paint();
+}
+
+// ---------------------------------------------------------------------------
+// alerts and the money budget (ADR-036)
+// ---------------------------------------------------------------------------
+async function renderAlerts(projectId) {
+  const card = $('#alertsCard'); if (!card) return; const w = can('editor');
+  const gone = () => state.openProject !== projectId || $('#alertsCard') !== card;
+  const head = (actions = '') => `<div class="card-head"><div><h2>Alerts &amp; money budget</h2><div class="hint">A webhook warning when a token budget (the project's, a key's, an end user's) reaches 80 % and 100 %, and when the monthly money budget does. An alert never slows or fails a request.</div></div><div class="row wrap">${actions}</div></div>`;
+  card.innerHTML = head() + '<div class="hint" role="status">Loading alerts…</div>';
+  let a;
+  try { a = await api(`/projects/${projectId}/alerts`); }
+  catch (e) {
+    if (gone()) return;
+    card.innerHTML = head() + `<div class="note err" role="alert"><span class="hint">Could not load alerts: ${esc(e.message)}</span><span class="grow"></span><button class="btn sm" id="alRetry">Retry</button></div>`;
+    $('#alRetry').onclick = () => renderAlerts(projectId); return;
+  }
+  if (gone()) return;
+  const wh = a.webhook || {}, micros = a.budget_monthly_usd_micros || 0;
+  card.innerHTML = head(w ? '<button class="btn sm primary" id="alEdit">Edit alerts</button>' : '') + `<div class="stack" style="gap:14px">
+    ${(a.warnings || []).map(x => `<div class="note warn" role="status"><span class="pill warn">warning</span><span class="hint">${esc(x)}</span></div>`).join('')}
+    <div class="stats four">
+      <div class="stat"><div class="l">Alerts</div><div class="v">${a.enabled ? 'On' : 'Off'}</div><div class="d">${wh.registered ? (wh.disabled ? 'endpoint closed' : 'endpoint registered') : 'no endpoint yet'}</div></div>
+      <div class="stat" title="An estimate from the price table, not a bill"><div class="l">Monthly money budget</div><div class="v">${micros ? fmtUSD(micros / 1e6) : '—'}</div><div class="d">${micros ? 'estimate · warns only' : 'none set'}</div></div>
+      <div class="stat"><div class="l">Thresholds</div><div class="v">80 · 100<small>%</small></div><div class="d">once per limit and window</div></div>
+      <div class="stat"><div class="l">Last saved</div><div class="v" style="font-size:18px">${a.updated_at ? esc(fmtMonthDay(a.updated_at)) : '—'}</div><div class="d">${a.updated_at ? esc(fmtTime(a.updated_at)) : 'never'}</div></div></div>
+    <div class="note"><span class="pill info">estimate</span><span class="hint">The money budget adds up the <strong>estimated</strong> cost of this month's requests from the price table: it is not a bill, and a request whose model has no price adds 0. <strong>It only warns. It never refuses, delays or rate-limits a request</strong>; token budgets keep refusing as before.</span></div>
+    ${w ? '<div id="alWebhook"></div>' : ''}</div>`;
+  if (!w) return;
+  $('#alEdit').onclick = () => alertsForm(projectId, a, () => renderAlerts(projectId));
+  webhookBlock($('#alWebhook'), projectId, 'alerts', { label: 'Alerts', after: () => renderAlerts(projectId) });
+}
+function alertsForm(projectId, a, onSaved) {
+  const micros = a.budget_monthly_usd_micros || 0;
+  drawer({ eyebrow: 'Edit', title: 'Alerts & money budget', submitLabel: 'Save alerts', body: `
+    ${toggle('enabled', !!a.enabled, 'Send alerts', 'Needs an alerts webhook endpoint; nothing is sent until one is registered in the card.')}
+    ${field('budget_usd', 'Monthly money budget (USD, estimate)', input('budget_usd', micros ? String(micros / 1e6) : '0', 'type=number min=0 step=any inputmode=decimal'), '0 = none. An <strong>estimate</strong> from the price table, never a bill; a request whose model has no price adds 0. <strong>It only warns:</strong> reaching it never blocks a request.')}
+    <p class="hint">Thresholds are fixed at 80 % and 100 %. Per-minute limits and the session token cap send nothing.</p>`,
+    onSubmit: async d => {
+      const usd = Number(String(d.budget_usd).trim() || 0), m = Math.round(usd * 1e6);
+      if (!(usd >= 0) || !Number.isSafeInteger(m)) throw new Error('The budget must be 0 or a positive amount of dollars.');
+      await api(`/projects/${projectId}/alerts`, { method: 'PUT', body: { enabled: d.enabled, budget_monthly_usd_micros: m } });
+      toast('Alerts saved', 3000, 'ok'); onSaved(); } });
+}
+
+// ---------------------------------------------------------------------------
+// feedback (ADR-042): counts only, the gateway never receives any content
+// ---------------------------------------------------------------------------
+const FB_RANGES = [7, 30, 90];
+// 'YYYY-MM-DD' is a UTC day: format it in UTC, or a browser west of Greenwich shows the day before.
+const utcDay = day => new Date(day).toLocaleDateString([], { month: 'short', day: '2-digit', timeZone: 'UTC' });
+const fmtRatio = r => r == null ? '—' : `${(Math.round(r * 1000) / 10).toLocaleString('en-US')}%`;
+async function renderFeedback(projectId) {
+  const card = $('#feedbackCard'); if (!card) return;
+  const days = state.feedbackDays = FB_RANGES.includes(state.feedbackDays) ? state.feedbackDays : 30;
+  const gone = () => state.openProject !== projectId || $('#feedbackCard') !== card;
+  const head = (extra = '') => `<div class="card-head"><div><h2>Feedback</h2><div class="hint">Scores clients send with <code>POST /v1/feedback</code>, counted by the day each was first received (UTC). Counts only: the gateway never receives the request or the answer.</div></div>
+    <div class="tabs" role="tablist" aria-label="Range">${FB_RANGES.map(n => `<button class="tab" role="tab" data-fdays="${n}" aria-selected="${n === days}">${n} days</button>`).join('')}</div></div>${extra}`;
+  const wire = () => on(card, '[data-fdays]', 'click', b => { state.feedbackDays = Number(b.dataset.fdays); renderFeedback(projectId); });
+  card.innerHTML = head('<div class="hint" role="status">Loading feedback…</div>'); wire();
+  let f;
+  try { f = await api(`/projects/${projectId}/feedback/summary?days=${days}`); }
+  catch (e) {
+    if (gone()) return;
+    card.innerHTML = head(`<div class="note err" role="alert"><span class="hint">Could not load feedback: ${esc(e.message)}</span><span class="grow"></span><button class="btn sm" id="fbRetry">Retry</button></div>`); wire();
+    $('#fbRetry').onclick = () => renderFeedback(projectId); return;
+  }
+  if (gone()) return;
+  if (!f.total) { card.innerHTML = head(`<div class="empty">No feedback in the last ${days} days. Clients send a score for a request with <code>POST /v1/feedback</code>.</div>`); wire(); return; }
+  // One bar per UTC day of the window, empty days included, so the axis is honest about gaps.
+  const byDay = Object.fromEntries((f.daily || []).map(x => [x.day, x]));
+  const series = []; const end = new Date(); end.setUTCHours(0, 0, 0, 0);
+  for (let i = days - 1; i >= 0; i--) { const dt = new Date(end.getTime() - i * 86400e3), key = dt.toISOString().slice(0, 10); series.push({ day: key, positive: (byDay[key] || {}).positive || 0, negative: (byDay[key] || {}).negative || 0 }); }
+  const peak = Math.max(1, ...series.map(x => x.positive + x.negative));
+  const labels = f.labels || [];
+  card.innerHTML = head(`<div class="stack" style="gap:14px">
+    <div class="stats four">
+      <div class="stat"><div class="l">Positive share</div><div class="v">${fmtRatio(f.ratio)}</div><div class="d">positive / total</div></div>
+      <div class="stat"><div class="l">Positive</div><div class="v">${fmtN(f.positive)}</div><div class="d up">thumbs up</div></div>
+      <div class="stat"><div class="l">Negative</div><div class="v">${fmtN(f.negative)}</div><div class="d ${f.negative ? 'down' : ''}">thumbs down</div></div>
+      <div class="stat"><div class="l">Total</div><div class="v">${fmtN(f.total)}</div><div class="d">last ${days} days</div></div></div>
+    <div><div class="fb-bars" role="img" aria-label="Feedback per day, positive and negative, last ${days} days">${series.map(x => `<div class="fb-bar" title="${esc(x.day)} · ${x.positive} positive · ${x.negative} negative"><i class="pos" style="height:${(100 * x.positive / peak).toFixed(1)}%"></i><i class="neg" style="height:${(100 * x.negative / peak).toFixed(1)}%"></i></div>`).join('')}</div>
+      <div class="chart-x"><span>${esc(utcDay(series[0].day))}</span><span class="fb-legend"><span><i style="background:var(--mint)"></i>positive</span><span><i style="background:var(--rose)"></i>negative</span></span><span>${esc(utcDay(series[series.length - 1].day))}</span></div></div>
+    ${labels.length ? `<div class="tbl"><table><thead><tr><th>Label</th><th class="right">Positive</th><th class="right">Negative</th><th>Split</th></tr></thead><tbody>${labels.map(l => { const t = l.positive + l.negative || 1; return `<tr><td class="mono">${esc(l.label)}</td><td class="mono right">${fmtN(l.positive)}</td><td class="mono right">${fmtN(l.negative)}</td><td><div class="split-bar" role="img" aria-label="${l.positive} positive, ${l.negative} negative"><i style="width:${(100 * l.positive / t).toFixed(1)}%;background:var(--mint)"></i><i style="width:${(100 * l.negative / t).toFixed(1)}%;background:var(--rose)"></i></div></td></tr>`; }).join('')}</tbody></table></div>
+      <div class="hint">The busiest ${fmtN(labels.length)} label${labels.length === 1 ? '' : 's'}; feedback sent without a label is in the totals only.</div>` : '<div class="hint">None of this feedback carries a label.</div>'}
+    <details class="meta-more"><summary>Daily numbers</summary><div class="tbl"><table><thead><tr><th>Day (UTC)</th><th class="right">Positive</th><th class="right">Negative</th></tr></thead><tbody>${[...(f.daily || [])].reverse().map(x => `<tr><td class="mono">${esc(x.day)}</td><td class="mono right">${fmtN(x.positive)}</td><td class="mono right">${fmtN(x.negative)}</td></tr>`).join('')}</tbody></table></div></details></div>`); wire();
+}
+
+// ---------------------------------------------------------------------------
 // playground
 // ---------------------------------------------------------------------------
 const resolveProject = key => key ? state.projects.find(p => p.api_key_prefix && key.startsWith(p.api_key_prefix)) : null;
@@ -1931,7 +2469,7 @@ async function renderKeys() {
         ${can('admin') ? `<div class="tabs" role="tablist" aria-label="Owner"><button class="tab" role="tab" data-mine="1" aria-selected="${f.mine}">mine</button><button class="tab" role="tab" data-mine="0" aria-selected="${!f.mine}">all users</button></div>` : ''}</div>
       <span class="hint">${rows.length} of ${keys.length} keys</span></div>
       <div class="tbl"><table><thead><tr><th>Key</th><th>Scopes</th><th>Projects</th><th>Limits</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>
-      ${rows.map(k => `<tr><td><div style="font-weight:500">${esc(k.name)} ${keyKindPill(k)}</div><div class="hint mono">${esc(k.key_prefix)}…${!mine && k.username ? ` · ${esc(k.username)}` : ''}</div></td>
+      ${rows.map(k => `<tr><td><div style="font-weight:500">${esc(k.name)} ${keyKindPill(k)}</div><div class="hint mono">${esc(k.key_prefix)}…${!mine && k.username ? ` · ${esc(k.username)}` : ''}</div>${keyNetSummary({ key_allowed_cidrs: k.allowed_cidrs, key_allowed_origins: k.allowed_origins }) ? `<div class="hint" title="Where this key may be used from">from ${esc(keyNetSummary({ key_allowed_cidrs: k.allowed_cidrs, key_allowed_origins: k.allowed_origins }))}</div>` : ''}</td>
         <td class="mono muted">${(k.scopes || []).map(s => esc(s)).join(' ') || '—'}</td>
         <td class="ellip" style="max-width:220px">${k.kind === 'management' ? '<span class="muted">—</span>' : ((k.project_ids || []).map(id => esc(projectName(id))).join(', ') || '<span class="pill err">no grants</span>')}${k.default_project_id ? `<div class="hint">default ${esc(projectName(k.default_project_id))}</div>` : ''}</td>
         <td class="mono dim">${k.kind === 'management' ? '—' : esc(limitSummary(k))}</td><td>${keyStatus(k)}</td><td class="mono muted nowrap">${esc(keyLastUsed(k))}</td>
@@ -1970,7 +2508,10 @@ function keyForm(k) {
       ${field('default_project_id', 'Default project', select('default_project_id', [{ value: 0, label: '— none —' }, ...projectOpts], k ? k.default_project_id || 0 : 0), 'Used when a request names no project. Must be one of the checked projects.')}
       ${twoCol(field('rate_limit_rpm', 'Requests / minute', input('rate_limit_rpm', k ? k.rate_limit_rpm : 0, 'type=number min=0 step=1')), field('rate_limit_tpm', 'Tokens / minute', input('rate_limit_tpm', k ? k.rate_limit_tpm : 0, 'type=number min=0 step=1')))}
       ${twoCol(field('budget_daily_tokens', 'Daily token budget', input('budget_daily_tokens', k ? k.budget_daily_tokens : 0, 'type=number min=0 step=1')), field('budget_monthly_tokens', 'Monthly token budget', input('budget_monthly_tokens', k ? k.budget_monthly_tokens : 0, 'type=number min=0 step=1')))}
-      <p class="hint">0 = unlimited. These sit under the project's own limits, against separate counters: the tighter of the two decides and the <code>429</code> says which with <code>"scope"</code>.</p></div>`,
+      <p class="hint">0 = unlimited. These sit under the project's own limits, against separate counters: the tighter of the two decides and the <code>429</code> says which with <code>"scope"</code>.</p>
+      <h3 style="margin-top:4px">Where this key may be used from</h3>
+      ${field('allowed_cidrs', 'Allowed networks (CIDR)', listInput('allowed_cidrs', k && k.allowed_cidrs, 'placeholder="203.0.113.0/24"'), 'Empty = any address. IPv4 or IPv6 network or single address, up to 32. The address checked is the connection\'s peer or, with <code>TRUST_PROXY_HEADERS=true</code>, the one your proxy reports: set <code>TRUSTED_PROXY_CIDRS</code> as well, or a forged <code>X-Forwarded-For</code> walks around the list.')}
+      ${field('allowed_origins', 'Allowed browser origins', listInput('allowed_origins', k && k.allowed_origins, 'placeholder="https://app.example.com"'), 'Empty = any origin. Up to 32: <code>https://app.example.com</code> or <code>https://*.example.com</code>. <strong>A key with an origin list cannot be used from a server:</strong> server-side callers send no <code>Origin</code> header and are refused, so give them a separate key with a CIDR list. The header is a browser signal, not a security boundary.')}</div>`,
     onSubmit: async (d, fm) => {
       const kd = editing ? k.kind : d.kind;
       const scopes = checkedStrings(fm, 'scopes');
@@ -1984,11 +2525,20 @@ function keyForm(k) {
         body.default_project_id = Number(d.default_project_id) || null;
         body.rate_limit_rpm = Number(d.rate_limit_rpm) || 0; body.rate_limit_tpm = Number(d.rate_limit_tpm) || 0;
         body.budget_daily_tokens = Number(d.budget_daily_tokens) || 0; body.budget_monthly_tokens = Number(d.budget_monthly_tokens) || 0;
+        // Like the project's lists: sent only when changed, so saving from an older tab never clears a restriction.
+        const cidrs = parseToolList(d.allowed_cidrs), origins = parseToolList(d.allowed_origins);
+        const errs = { allowed_cidrs: cidrListError('allowed_cidrs', cidrs), allowed_origins: originListError('allowed_origins', origins) };
+        let first = null;
+        for (const [n, m] of Object.entries(errs)) { const el = $(`[name=${n}]`, fm); $(`#${n}-err`, fm).textContent = m; if (m) { el.setAttribute('aria-invalid', 'true'); first = first || el; } else el.removeAttribute('aria-invalid'); }
+        if (first) { first.focus(); throw new Error('Fix the highlighted fields'); }
+        if (JSON.stringify(cidrs) !== JSON.stringify(k ? k.allowed_cidrs || [] : [])) body.allowed_cidrs = cidrs;
+        if (JSON.stringify(origins) !== JSON.stringify(k ? k.allowed_origins || [] : [])) body.allowed_origins = origins;
       }
-      if (editing) { await api('/keys/' + k.id, { method: 'PUT', body }); toast('Saved', 3000, 'ok'); }
+      let warnings = [];
+      if (editing) { const r = await api('/keys/' + k.id, { method: 'PUT', body }); warnings = r.warnings || []; toast('Saved', 3000, 'ok'); }
       else { const r = await api('/keys', { method: 'POST', body });
-        showSecret({ title: `New ${kd} key · ${r.key.name}`, key: r.api_key, kind: kd, projects: (r.key.project_ids || []).map(projectName) }); }
-      renderKeys(); } });
+        showSecret({ title: `New ${kd} key · ${r.key.name}`, key: r.api_key, kind: kd, projects: (r.key.project_ids || []).map(projectName), warnings: r.warnings }); }
+      renderKeys(); showWarnings(warnings); } });
   // The scope list and the gateway-only block follow the chosen kind.
   const paint = () => {
     const kd = editing ? kind : $('[name=kind]', form).value;
@@ -2006,6 +2556,7 @@ function keyForm(k) {
       : 'A scope only narrows. /admin/api intersects it with the owner\'s role, read on every request, so demoting the owner narrows this key at once.';
   };
   if (!editing) $('[name=kind]', form).onchange = paint;
+  for (const n of ['allowed_cidrs', 'allowed_origins']) $(`[name=${n}]`, form).addEventListener('input', e => { e.target.removeAttribute('aria-invalid'); $(`#${n}-err`, form).textContent = ''; });
   paint();
 }
 
@@ -2087,9 +2638,13 @@ async function renderUsers() {
     <section class="card"><div class="card-head"><div class="row wrap"><div class="search" style="width:300px">${ICON.search}<label for="u-q" class="sr">Search users</label><input id="u-q" class="input" placeholder="Search username" value="${esc(f.q)}" style="min-height:38px" autocomplete="off"></div>
         <div class="tabs" role="tablist" aria-label="Filter">${['all', 'admin', 'editor', 'viewer', 'inactive'].map(r => `<button class="tab" role="tab" data-role-filter="${r}" aria-selected="${f.role === r}">${r}</button>`).join('')}</div></div><span class="hint">${rows.length} of ${users.length} users</span></div>
       <div class="tbl"><table><thead><tr><th>User</th><th>Role</th><th>Status</th><th>Last login</th><th>Created</th><th></th></tr></thead><tbody>
-      ${rows.map(u => `<tr><td><div class="row" style="gap:10px">${avatar(u.username, 'sm')}<div><div style="font-weight:500">${esc(u.username)}</div><div class="hint">${[u.id === state.user.id ? 'you' : '', `${u.project_count || 0} project${u.project_count === 1 ? '' : 's'}`, u.active_sessions ? `${u.active_sessions} session${u.active_sessions === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')}</div></div></div></td>
-        <td><span class="pill ${u.role === 'admin' ? 'warn' : u.role === 'editor' ? 'info' : ''}">${esc(u.role)}</span></td><td>${u.is_active ? '<span class="pill ok">active</span>' : '<span class="pill err">inactive</span>'}</td><td class="mono muted nowrap">${u.last_login_at ? fmtDay(u.last_login_at) : 'never'}</td><td class="mono muted nowrap">${fmtMonthDay(u.created_at)}</td>
-        <td class="right nowrap"><button class="btn sm ghost" data-edit="${u.id}">Edit</button> <button class="btn sm ghost" data-reset="${u.id}">Reset password</button> <button class="btn sm ghost" data-revoke="${u.id}">Revoke sessions</button> <button class="btn sm ghost danger" data-del="${u.id}" ${u.id === state.user.id ? 'disabled' : ''}>Delete</button></td></tr>`).join('') || '<tr><td colspan="6" class="muted">No users match.</td></tr>'}</tbody></table></div></section>`;
+      ${rows.map(u => `<tr><td><div class="row" style="gap:10px">${avatar(u.username, 'sm')}<div><div style="font-weight:500">${esc(u.username)}</div><div class="hint">${[u.id === state.user.id ? 'you · password and two-factor are in the sidebar' : '', u.anonymized_at ? `anonymized ${fmtMonthDay(u.anonymized_at)}` : '', `${u.project_count || 0} project${u.project_count === 1 ? '' : 's'}`, u.active_sessions ? `${u.active_sessions} session${u.active_sessions === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')}</div></div></div></td>
+        <td><span class="pill ${u.role === 'admin' ? 'warn' : u.role === 'editor' ? 'info' : ''}">${esc(u.role)}</span></td><td>${u.anonymized_at ? `<span class="pill violet" title="Anonymized ${esc(fmtDate(u.anonymized_at))}. The account stays closed for good.">anonymized</span>` : u.is_active ? '<span class="pill ok">active</span>' : '<span class="pill err">inactive</span>'}</td><td class="mono muted nowrap">${u.last_login_at ? fmtDay(u.last_login_at) : 'never'}</td><td class="mono muted nowrap">${fmtMonthDay(u.created_at)}</td>
+        <td class="right"><div class="row wrap" style="justify-content:flex-end;gap:6px;min-width:220px"><button class="btn sm ghost" data-edit="${u.id}" aria-label="Edit ${esc(u.username)}">Edit</button>${u.id === state.user.id || u.anonymized_at ? '' : `<button class="btn sm ghost" data-reset="${u.id}" aria-label="Reset password of ${esc(u.username)}">Reset password</button>`}${u.id === state.user.id || !u.totp_enabled ? '' : `<button class="btn sm ghost" data-totp="${u.id}" aria-label="Reset two-factor authentication of ${esc(u.username)}">Reset 2FA</button>`}<button class="btn sm ghost" data-revoke="${u.id}" aria-label="Revoke sessions of ${esc(u.username)}">Revoke sessions</button>${u.id === state.user.id || u.anonymized_at ? '' : `<button class="btn sm ghost danger" data-anon="${u.id}" aria-label="Anonymize ${esc(u.username)}">Anonymize</button>`}<button class="btn sm ghost danger" data-del="${u.id}" aria-label="Delete ${esc(u.username)}" ${u.id === state.user.id ? 'disabled' : ''}>Delete</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="muted">No users match.</td></tr>'}</tbody></table></div></section>
+    <section class="card stack" id="euCard" style="gap:14px"><div><h2>Anonymize an end user</h2><div class="hint">For a data-subject request (KVKK) about someone who used a project through an <code>X-Ragmux-End-User</code> identifier. It replaces that identifier with one random pseudonym in request logs, usage counters, alert events and queued alert webhooks. Counts and spend stay.</div></div>
+      <form id="euForm" class="stack" style="gap:14px">${twoCol(field('end_user', 'End user identifier', input('end_user', '', 'required autocomplete=off spellcheck=false autocapitalize=none'), 'Exactly as the client sent it; up to 128 bytes.'), field('project_id', 'Project', select('project_id', [{ value: '', label: 'All projects' }, ...state.projects.map(p => ({ value: p.id, label: p.name }))], ''), 'Limit it to one project or cover them all.'))}
+        <div class="row wrap"><button type="submit" class="btn danger" id="euGo">Anonymize end user…</button><span class="hint">Only a signed-in session can do this; an API key gets <code>403 session_required</code>. It cannot be undone, and a later request that still sends the identifier creates new rows under it.</span></div></form>
+      <div id="euOut" role="status" aria-live="polite"></div></section>`;
   const reload = async () => { await loadAll(); render(); };
   let qTimer; $('#u-q').oninput = e => { f.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(renderUsers, 200); };
   on(app, '[data-role-filter]', 'click', b => { f.role = b.dataset.roleFilter; renderUsers(); });
@@ -2101,14 +2656,55 @@ async function renderUsers() {
       onSubmit: async (d, fm) => { const project_ids = checkedValues(fm, 'project_ids'); await api('/users', { method: 'POST', body: { username: d.username, password: d.password, role: d.role, ...(project_ids.length ? { project_ids } : {}) } }); toast('User created', 3000, 'ok'); await reload(); } });
     bindStrength($('[name=password]', form), 'upw', 12); };
   on(app, '[data-edit]', 'click', b => { const u = users.find(x => x.id == b.dataset.edit);
-    drawer({ eyebrow: 'Edit', title: u.username, submitLabel: 'Save', body: `${roleCards(u.role)}${toggle('is_active', u.is_active, 'Active', 'Inactive users cannot sign in and lose their sessions.')}`,
-      onSubmit: async d => { await api('/users/' + u.id, { method: 'PUT', body: { role: d.role, is_active: d.is_active } }); toast('Saved', 3000, 'ok'); if (u.id === state.user.id) state.user = await api('/me'); await reload(); } }); });
+    drawer({ eyebrow: 'Edit', title: u.username, submitLabel: 'Save', body: `${roleCards(u.role)}${u.anonymized_at ? '<p class="hint">This account was anonymized and stays closed: it cannot be switched back on.</p>' : toggle('is_active', u.is_active, 'Active', 'Inactive users cannot sign in and lose their sessions.')}`,
+      onSubmit: async d => { await api('/users/' + u.id, { method: 'PUT', body: { role: d.role, ...(u.anonymized_at ? {} : { is_active: d.is_active }) } }); toast('Saved', 3000, 'ok'); if (u.id === state.user.id) state.user = await api('/me'); await reload(); } }); });
   on(app, '[data-reset]', 'click', b => { const u = users.find(x => x.id == b.dataset.reset);
     const form = drawer({ eyebrow: 'Reset password', title: u.username, submitLabel: 'Reset password', body: `${field('new_password', 'New password', input('new_password', '', 'type=password required minlength=12 maxlength=72 autocomplete=new-password'), strengthMeter('rpw'))}<p class="hint">All sessions of this user are revoked.</p>`,
       onSubmit: async d => { await api(`/users/${u.id}/reset-password`, { method: 'POST', body: { new_password: d.new_password } }); toast('Password reset', 3000, 'ok'); } });
     bindStrength($('[name=new_password]', form), 'rpw', 12); });
+  on(app, '[data-totp]', 'click', async b => { const u = users.find(x => x.id == b.dataset.totp); if (!u) return;
+    if (!await confirmDialog(`Remove two-factor authentication for ${u.username}? Their secret and recovery codes are deleted and their sessions end. Until they set it up again they sign in with the password alone, so use this only for someone who lost their device.`, { label: 'Reset two-factor' })) return;
+    try { await api(`/users/${u.id}/totp/reset`, { method: 'POST' }); toast('Two-factor authentication reset', 3500, 'ok'); renderUsers(); } catch (e) { toast(e.message, 5000, 'err'); } });
+  on(app, '[data-anon]', 'click', b => { const u = users.find(x => x.id == b.dataset.anon); if (u) anonymizeUserDialog(u, reload); });
+  $('#euForm').onsubmit = e => { e.preventDefault(); endUserAnonymize(e.target); };
   on(app, '[data-revoke]', 'click', async b => { if (!await confirmDialog('Sign this user out everywhere?', { label: 'Revoke sessions' })) return; try { await api(`/users/${b.dataset.revoke}/sessions/revoke`, { method: 'POST' }); toast('Sessions revoked', 3000, 'ok'); renderUsers(); } catch (e) { toast(e.message, 5000, 'err'); } });
   on(app, '[data-del]', 'click', async b => { if (!await confirmDialog('Delete this user? Their sessions and project memberships are removed; audit entries keep the username.', { label: 'Delete user' })) return; try { await api('/users/' + b.dataset.del, { method: 'DELETE' }); toast('Deleted', 3000, 'ok'); await reload(); } catch (e) { toast(e.message, 5000, 'err'); } });
+}
+
+// KVKK anonymisation (ADR-040). Both calls are session-only and cannot be undone.
+function anonymizeUserDialog(u, done) {
+  const form = modal(`Anonymize ${u.username}`, `
+    <div class="note err"><span class="hint"><strong>This cannot be undone.</strong> The original username is stored nowhere afterwards, so nobody, you included, can bring it back.</span></div>
+    <ul class="dl-list dim"><li>The username becomes a random pseudonym (<code>anon-…</code>); the password becomes one nobody knows.</li>
+      <li>The account is deactivated, signed out everywhere, taken out of every project, its two-factor data is deleted and all its API keys are revoked and renamed.</li>
+      <li>Audit entries and login records that carry the name are rewritten. IP addresses in the audit log stay until their retention ends.</li>
+      <li>Usage history stays and now belongs to the pseudonym. The last active admin cannot be anonymized.</li></ul>
+    ${field('confirm', 'Type the username to confirm', input('confirm', '', 'required autocomplete=off autocapitalize=none spellcheck=false'), `Type <code>${esc(u.username)}</code> exactly. The button unlocks when it matches; the server checks it again.`)}`,
+    { submitLabel: 'Anonymize account', danger: true, onSubmit: async d => {
+      try {
+        const r = await api(`/users/${u.id}/anonymize`, { method: 'POST', body: { confirm: d.confirm } });
+        toast(`Anonymized as ${r.pseudonym} · ${fmtN(r.revoked_keys)} key${r.revoked_keys === 1 ? '' : 's'} revoked`, 6000, 'ok');
+        await done();
+      } catch (e) { sync(); throw e; } } });
+  const btn = $('button[type=submit]', form), el = $('[name=confirm]', form);
+  const sync = () => { btn.disabled = el.value !== u.username; };
+  el.addEventListener('input', sync); sync(); el.focus();
+}
+async function endUserAnonymize(form) {
+  const d = formData(form), id = d.end_user, out = $('#euOut');
+  out.innerHTML = '';
+  if (!id || new TextEncoder().encode(id).length > 128) { out.innerHTML = noteBox('err', 'check', 'The identifier is required and at most 128 bytes.'); return; }
+  const proj = d.project_id ? state.projects.find(p => String(p.id) === String(d.project_id)) : null;
+  if (!await confirmDialog(`Replace "${id}" with a random pseudonym in ${proj ? `the project ${proj.name}` : 'every project'}? Request logs, usage counters, alert events and queued alert webhooks are rewritten. This cannot be undone.`, { label: 'Anonymize end user' })) return;
+  const btn = $('#euGo'); btn.disabled = true;
+  try {
+    const r = await api('/end-users/anonymize', { method: 'POST', body: { end_user: id, ...(proj ? { project_id: proj.id } : {}) } });
+    const total = r.request_logs + r.end_user_usage + r.alert_events + r.webhook_deliveries;
+    out.innerHTML = `<div class="note ${total ? 'ok' : 'warn'}"><div class="stack" style="gap:8px;min-width:0"><div class="hint">${total ? `Replaced with <code>${esc(r.pseudonym)}</code>.` : 'Nothing matched that identifier, so nothing changed.'}</div>
+      <div class="kv"><span class="k">request logs</span><span class="mono">${fmtN(r.request_logs)}</span><span class="k">usage counters</span><span class="mono">${fmtN(r.end_user_usage)}</span><span class="k">alert events</span><span class="mono">${fmtN(r.alert_events)}</span><span class="k">alert webhooks</span><span class="mono">${fmtN(r.webhook_deliveries)}</span></div></div></div>`;
+    if (total) form.reset();
+  } catch (e) { out.innerHTML = noteBox('err', e.status === 403 ? 'session only' : 'failed', e.message); }
+  finally { btn.disabled = false; }
 }
 
 // ---------------------------------------------------------------------------

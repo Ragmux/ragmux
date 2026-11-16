@@ -98,7 +98,8 @@ replace the member set freely.
   the fifth ends the session. A right password gives the five back.
 - `POST /admin/api/users` accepts `project_ids`; the memberships are written in the same
   transaction as the account, and an unknown id fails the whole request with `422`.
-- `GET /admin/api/users` reports `project_count` and `active_sessions` per user;
+- `GET /admin/api/users` reports `project_count`, `active_sessions`, `totp_enabled` and
+  `anonymized_at` (`null` unless the account was [anonymised](#anonymisation-kvkk)) per user;
   `GET /admin/api/me` reports `session_expires_at` and whether the session is a bearer
   token (`session_bearer`).
 
