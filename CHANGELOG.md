@@ -6,6 +6,8 @@ All notable changes to Ragmux are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-16
+
 ### Added
 
 - **Guardrails, per project.** Rules read what a client sends and what the model answers, and
@@ -1267,7 +1269,8 @@ projects with `sk-proj-` keys, metrics and an embedded dashboard.
 No git tag was created for this release, so there is no release page for it. The first
 tagged release is [0.2.0](https://github.com/ragmux/ragmux/releases/tag/v0.2.0).
 
-[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ragmux/ragmux/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ragmux/ragmux/releases/tag/v0.8.0
 [0.7.0]: https://github.com/ragmux/ragmux/releases/tag/v0.7.0
 [0.6.1]: https://github.com/ragmux/ragmux/releases/tag/v0.6.1
 [0.6.0]: https://github.com/ragmux/ragmux/releases/tag/v0.6.0

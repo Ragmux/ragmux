@@ -69,7 +69,7 @@ Released in 0.7.0.
 
 ## v0.8 — security, cost visibility and feedback
 
-Done and waiting for its release tag.
+Released in 0.8.0.
 
 - Guardrails before the request, before retrieval and on the response, including PII
   detection with Turkish national ID and IBAN validators, and webhook guardrails.
