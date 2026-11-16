@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ragmux/ragmux/internal/guardrail"
 	"github.com/ragmux/ragmux/internal/store"
@@ -802,5 +803,41 @@ func TestProjectCIDRWarningFollowsProxyHeaderSetting(t *testing.T) {
 	body["key_allowed_cidrs"] = []string{}
 	if _, out = e.do(http.MethodPut, "/api/projects/"+id, body, editor.token); out["warnings"] != nil {
 		t.Errorf("warnings without a list: %v", out["warnings"])
+	}
+}
+
+// The admin user list carries the second-factor flag and the anonymization
+// time, additively next to the counters.
+func TestUserListShowsTOTPAndAnonymization(t *testing.T) {
+	e := newAdminEnv(t)
+	ctx := context.Background()
+	root := e.user("root", "admin")
+	two := e.user("two-factor", "viewer")
+	gone := e.user("Gone Person", "viewer")
+	if _, err := e.st.DB().Exec(ctx, "UPDATE users SET totp_secret_enc = '\\x01', totp_enabled_at = now() WHERE id = $1", two.ID); err != nil {
+		t.Fatal(err)
+	}
+	if st, out := e.do(http.MethodPost, "/api/users/"+itoa(gone.ID)+"/anonymize", map[string]any{"confirm": "Gone Person"}, root.token); st != http.StatusOK {
+		t.Fatalf("anonymize: %d %v", st, out)
+	}
+	st, list := e.doList("/api/users", root.token)
+	if st != http.StatusOK || len(list) != 3 {
+		t.Fatalf("list: %d %v", st, list)
+	}
+	byID := map[float64]map[string]any{}
+	for _, it := range list {
+		m, _ := it.(map[string]any)
+		byID[m["id"].(float64)] = m
+	}
+	if m := byID[float64(root.ID)]; m["totp_enabled"] != false || m["anonymized_at"] != nil {
+		t.Errorf("plain account: %v", m)
+	}
+	if m := byID[float64(two.ID)]; m["totp_enabled"] != true || m["anonymized_at"] != nil {
+		t.Errorf("two-factor account: %v", m)
+	}
+	m := byID[float64(gone.ID)]
+	at, _ := m["anonymized_at"].(string)
+	if _, err := time.Parse(time.RFC3339, at); err != nil || m["totp_enabled"] != false {
+		t.Errorf("anonymized account: %v", m)
 	}
 }

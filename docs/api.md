@@ -1129,7 +1129,7 @@ already knows.
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | GET | `/users/lite` | editor | Active users as `[{id, username, role}]` (for member pickers) |
-| GET | `/users` | admin | All users, each with `project_count` (memberships) and `active_sessions` (unexpired sessions) |
+| GET | `/users` | admin | All users, each with `project_count` (memberships), `active_sessions` (unexpired sessions), `totp_enabled` (two-factor authentication is on) and `anonymized_at` (when the account was [anonymized](users-and-limits.md#anonymisation-kvkk), else `null`) |
 | POST | `/users` | admin | `{username, password, role, project_ids?}` → `201` user (`role` defaults to `viewer`, password at least 12 characters and ≤ 72 bytes, username ≤ 64); `project_ids` adds the memberships in the same transaction, `422` when one of them is unknown; `409` when the username already exists in any casing |
 | GET | `/users/{id}` | admin | Read one |
 | PUT | `/users/{id}` | admin | `{role, is_active}` (both optional); deactivating drops the user's sessions |
@@ -1143,12 +1143,12 @@ already knows.
 | GET | `/audit/export` | admin | The same filters as NDJSON (one entry per line), at most 100 000 rows, newest first, as an attachment; audited as `audit.exported` |
 | GET | `/security/logins` | admin | Failed-login counters and active lockouts |
 
-`GET /users` answers an array of user objects with the two counters:
+`GET /users` answers an array of user objects with the two counters, the second-factor flag and the anonymization time:
 
 ```json
 [{"id": 1, "username": "admin", "role": "admin", "is_active": true,
   "last_login_at": "2026-09-18T10:00:00Z", "created_at": "…",
-  "project_count": 2, "active_sessions": 1}]
+  "project_count": 2, "active_sessions": 1, "totp_enabled": false, "anonymized_at": null}]
 ```
 
 `POST /users/{id}/anonymize` and `POST /end-users/anonymize` are for a signed-in session:

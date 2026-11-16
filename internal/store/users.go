@@ -140,14 +140,21 @@ type UserStats struct {
 	*User
 	ProjectCount   int `json:"project_count"`
 	ActiveSessions int `json:"active_sessions"`
+	// TOTPEnabled is whether the account's second factor is switched on, as
+	// /me reports it (ADR-037); a secret nobody confirmed reads false.
+	TOTPEnabled bool `json:"totp_enabled"`
+	// AnonymizedAt is when the account was anonymized (ADR-040); nil otherwise.
+	AnonymizedAt *time.Time `json:"anonymized_at"`
 }
 
 // ListUsersWithStats returns every account ordered by name together with
-// its number of project memberships and unexpired sessions.
+// its number of project memberships and unexpired sessions, whether its second
+// factor is on and when it was anonymized.
 func (s *Store) ListUsersWithStats(ctx context.Context) ([]*UserStats, error) {
 	rows, err := s.pool.Query(ctx, "SELECT "+userCols+`,
 		(SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = users.id),
-		(SELECT COUNT(*) FROM sessions se WHERE se.user_id = users.id AND se.expires_at > now())
+		(SELECT COUNT(*) FROM sessions se WHERE se.user_id = users.id AND se.expires_at > now()),
+		(totp_secret_enc IS NOT NULL AND totp_enabled_at IS NOT NULL), anonymized_at
 		FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
@@ -160,8 +167,12 @@ func (s *Store) ListUsersWithStats(ctx context.Context) ([]*UserStats, error) {
 		var created time.Time
 		var lastLogin *time.Time
 		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.IsActive, &lastLogin, &created,
-			&st.ProjectCount, &st.ActiveSessions); err != nil {
+			&st.ProjectCount, &st.ActiveSessions, &st.TOTPEnabled, &st.AnonymizedAt); err != nil {
 			return nil, err
+		}
+		if st.AnonymizedAt != nil {
+			t := st.AnonymizedAt.UTC()
+			st.AnonymizedAt = &t
 		}
 		if lastLogin != nil {
 			t := lastLogin.UTC()
